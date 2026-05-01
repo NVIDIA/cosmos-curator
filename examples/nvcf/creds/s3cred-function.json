@@ -1,7 +1,7 @@
 {
     "_comment": [
-        "NOT intended to be used with the 'cosmos-curate nvcf function invoke' command",
-        "Intended to be used with the 'cosmos-curate nvcf function s3cred-function' command",
+        "NOT intended to be used with the 'cosmos-curator nvcf function invoke' command",
+        "Intended to be used with the 'cosmos-curator nvcf function s3cred-function' command",
         "secrets: List of secrets whose value need to be updated",
         "name: The actual name of the secret",
         "value: Updated secret value",

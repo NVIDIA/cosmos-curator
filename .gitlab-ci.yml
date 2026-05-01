@@ -118,7 +118,7 @@ variables:
       - "False"
   CICD_HELM_CHART_NAME:
     description: "Helm chart name for the CICD pipeline"
-    value: "cosmos-curate"
+    value: "cosmos-curator"
   CICD_HELM_CHART_VERSION:
     description: "Helm chart version for the CICD pipeline"
     value: "2.2.2"
@@ -290,9 +290,9 @@ stages:
   setup_curator_cli: &setup_curator_cli |
     poetry install --no-interaction
 
-  # Configure cosmos-curate nvcf CLI
+  # Configure cosmos-curator nvcf CLI
   configure_nvcf_cli: &configure_nvcf_cli |
-    cosmos-curate nvcf config set --org $NGC_NVCF_ORG --key $NVCF_KEY
+    cosmos-curator nvcf config set --org $NGC_NVCF_ORG --key $NVCF_KEY
 
 ruff:
   stage: lint
@@ -327,7 +327,7 @@ unit_tests:
   variables:
     PYTEST_ADDOPTS: >-
       --junitxml=report.xml
-      --cov=cosmos_curate
+      --cov=cosmos_curator
       --cov-report=term
       --cov-report=xml:unit-coverage.xml
       --cov-report=html:unit-htmlcov
@@ -393,11 +393,11 @@ unit_tests:
         echo "MR label 'use-local-xenna-build' detected; building cosmos-xenna wheel from ref '${XENNA_REF:-main}'..."
         bash .gitlab/scripts/build_xenna_wheel.sh
         BUILD_EXTRA_ARGS="${BUILD_EXTRA_ARGS:-} --use-local-xenna-build"
-        echo "Will pass to cosmos-curate image build: ${BUILD_EXTRA_ARGS}"
+        echo "Will pass to cosmos-curator image build: ${BUILD_EXTRA_ARGS}"
       fi
     # Build and push in a single step (BuildKit pushes directly to registry)
     - |
-      cosmos-curate image build \
+      cosmos-curator image build \
       ${BUILD_EXTRA_ARGS:-} \
       --curator-path . \
       --image-name ${BUILD_IMAGE_REPO} \
@@ -622,7 +622,7 @@ slurm_end_to_end:
     - source venv/bin/activate
     - pip install --upgrade pip
     - pip install poetry awscli
-    - poetry install --no-interaction  # Install cosmos-curate CLI
+    - poetry install --no-interaction  # Install cosmos-curator CLI
   script:
     - source venv/bin/activate
     - .gitlab/scripts/slurm_end_to_end.sh
@@ -880,11 +880,11 @@ k8s_gpu_tests:
     - when: never
   before_script:
     - source .gitlab/vault/vault-auth.sh
-    # Install pixi environments into /opt/cosmos-curate (where the slim
+    # Install pixi environments into /opt/cosmos-curator (where the slim
     # image has the source + lockfile) so Ray workers find them.
     - export PIXI_CACHE_DIR=/cache/pixi
     - export CONDA_OVERRIDE_CUDA=13.0.2
-    - pushd /opt/cosmos-curate
+    - pushd /opt/cosmos-curator
     - pixi install --frozen -e default -e unified -e legacy-transformers -e model-download
     - popd
   script:

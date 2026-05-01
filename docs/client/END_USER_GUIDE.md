@@ -1,6 +1,6 @@
-# Cosmos-Curate - End User Guide
+# Cosmos Curator - End User Guide
 
-- [Cosmos-Curate - End User Guide](#cosmos-curate---end-user-guide)
+- [Cosmos Curator - End User Guide](#cosmos-curator---end-user-guide)
   - [Overview](#overview)
   - [Prerequisites](#prerequisites)
       - [Hardware Requirement](#hardware-requirement)
@@ -38,7 +38,7 @@
   - [Responsible Use of AI Models](#responsible-use-of-ai-models)
 
 ## Overview
-Cosmos-Curate is a powerful tool for video curation and processing. This guide will help you get started with using the application.
+Cosmos Curator is a powerful tool for video curation and processing. This guide will help you get started with using the application.
 
 ## Prerequisites
 #### Hardware Requirement
@@ -70,7 +70,7 @@ Cosmos-Curate is a powerful tool for video curation and processing. This guide w
 ## Initial Setup
 This guide covers launching the video curator on multiple platforms (local, DGXC, and slurm). The steps below are platform‑agnostic; complete them on whichever platform you plan to run the video curator on.
 
-1. Create a configuration file at `~/.config/cosmos_curate/config.yaml` and put your credentials. The Hugging Face section is required for model downloads; the Gemini and OpenAI sections are optional but needed for their respective features:
+1. Create a configuration file at `~/.config/cosmos_curator/config.yaml` and put your credentials. The Hugging Face section is required for model downloads; the Gemini and OpenAI sections are optional but needed for their respective features:
 
 ```yaml
 huggingface:
@@ -95,8 +95,8 @@ openai:
    - Log in to your Hugging Face account
    - Click "agree" to accept the model terms; this is required before you can download this model using HuggingFace API with your token
 
-1. By default, `~/cosmos_curate_local_workspace/` is used as the local workspace for model weights and temporary files at runtime. To configure its location, set environment variable `COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX` to move it to `${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX}/cosmos_curate_local_workspace/`.
-   - In other words, `"${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curate_local_workspace"` is used as the local workspace.
+1. By default, `~/cosmos_curator_local_workspace/` is used as the local workspace for model weights and temporary files at runtime. To configure its location, set environment variable `COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX` to move it to `${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX}/cosmos_curator_local_workspace/`.
+   - In other words, `"${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curator_local_workspace"` is used as the local workspace.
 
 1. Log into the NGC container registry via the Docker CLI. For the username, use `'$oauthtoken'` exactly as shown. It is a special name that indicates that you will authenticate with an API key. Paste your key value at the password prompt.
 ```bash
@@ -104,8 +104,8 @@ docker login --username '$oauthtoken' nvcr.io
 ```
 
 1. If you will run pipelines with videos on cloud storage, configure `~/.aws/credentials` properly.
-   - All S3-compatible cloud storage should work with Cosmos-Curate.
-     - Right now, since cosmos-curate only relies on `~/.aws/credentials` (not `~/.aws/config`), certain configuration entries need to be in `~/.aws/credentials`; e.g. `region` and `endpoint_url` if it's not AWS S3.
+   - All S3-compatible cloud storage should work with Cosmos Curator.
+     - Right now, since cosmos-curator only relies on `~/.aws/credentials` (not `~/.aws/config`), certain configuration entries need to be in `~/.aws/credentials`; e.g. `region` and `endpoint_url` if it's not AWS S3.
      - It should look similar to [this example file](../../examples/nvcf/creds/aws_credentials).
    - Azure blob storage is also supported but is tested much less extensively.
      - If using Azure blob storage, `~/.azure/credentials` should be configured properly.
@@ -125,18 +125,18 @@ docker login --username '$oauthtoken' nvcr.io
 
 ```bash
 # 1. Create virtual environment (using micromamba as an example)
-micromamba create -n cosmos-curate -c conda-forge python=3.12.12 poetry
-micromamba activate cosmos-curate
+micromamba create -n cosmos-curator -c conda-forge python=3.12.12 poetry
+micromamba activate cosmos-curator
 
 # 2. Clone the repository and update `cosmos-xenna` submodule
-git clone --recurse-submodules https://github.com/nvidia-cosmos/cosmos-curate.git
-cd cosmos-curate
+git clone --recurse-submodules https://github.com/nvidia-cosmos/cosmos-curate.git cosmos-curator
+cd cosmos-curator
 
 # 3. Install dependencies
 poetry install --extras=local
 
 # 4. Verify the CLI tool is available
-cosmos-curate --help
+cosmos-curator --help
 ```
 
 Alternatively, you may execute `./devset.sh` to complete initial setup of environment **from within your virtual environment**.
@@ -149,20 +149,20 @@ Alternatively, you may execute `./devset.sh` to complete initial setup of enviro
 1. Launch a pipeline
    - locally using local-docker launcher - **focus of this section**
    - on a slurm cluster using slurm launcher
-   - on [NVIDIA Cloud Functions (NVCF)](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html) by reaching out to NVIDIA Cosmos-Curate team.
+   - on [NVIDIA Cloud Functions (NVCF)](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html) by reaching out to NVIDIA Cosmos Curator team.
    - on Kubernetes cluster (coming soon)
 
 ### Run the Hello-World Example Pipeline
 
 The hello-world example pipeline aims to provide a minimal example to help understand the framework.
 
-- Define the class for pipeline task as `HelloWorldTask` in [hello_world_pipeline.py](../../cosmos_curate/pipelines/examples/hello_world_pipeline.py).
-- Define `GPT2` model in [gpt2](../../cosmos_curate/models/gpt2.py).
-- Define 3 simple stages (`_LowerCaseStage`, `_PrintStage`, `_GPT2Stage`) in [hello_world_pipeline.py](../../cosmos_curate/pipelines/examples/hello_world_pipeline.py). So the functionality of this pipeline is:
+- Define the class for pipeline task as `HelloWorldTask` in [hello_world_pipeline.py](../../cosmos_curator/pipelines/examples/hello_world_pipeline.py).
+- Define `GPT2` model in [gpt2](../../cosmos_curator/models/gpt2.py).
+- Define 3 simple stages (`_LowerCaseStage`, `_PrintStage`, `_GPT2Stage`) in [hello_world_pipeline.py](../../cosmos_curator/pipelines/examples/hello_world_pipeline.py). So the functionality of this pipeline is:
   - stage 1: convert the input prompt in each `HelloWorldTask` to lower case;
   - stage 2: print the the converted input prompt;
   - stage 3: call GPT2 to generate some output;
-- Call `cosmos_curate.core.interfaces.pipeline_interface.run_pipeline`.
+- Call `cosmos_curator.core.interfaces.pipeline_interface.run_pipeline`.
 
 There is a detailed walk-through in [Pipeline Design Guide](../curator/guides/PIPELINE_DESIGN.md) to help understand how to build a pipeline.
 The steps below only shows how to run the pipeline.
@@ -171,18 +171,18 @@ The steps below only shows how to run the pipeline.
 # 1. Build a docker image for hello-world pipeline
 #    - The hello-world pipeline uses the GPT-2 model
 #    - We create a dedicated conda environment called transformers to run the GPT-2 model (hence `--env transformers`)
-cosmos-curate image build --image-name cosmos-curate --image-tag hello-world --envs transformers
+cosmos-curator image build --image-name cosmos-curator --image-tag hello-world --envs transformers
 
 # 2. Download the GPT-2 model weights
-cosmos-curate local launch --image-name cosmos-curate --image-tag hello-world -- pixi run --as-is python -m cosmos_curate.core.managers.model_cli download --models gpt2
+cosmos-curator local launch --image-name cosmos-curator --image-tag hello-world -- pixi run --as-is python -m cosmos_curator.core.managers.model_cli download --models gpt2
 
 # 3. Run the hello-world pipeline
-cosmos-curate local launch --image-name cosmos-curate --image-tag hello-world --curator-path . -- pixi run --as-is python -m cosmos_curate.pipelines.examples.hello_world_pipeline
+cosmos-curator local launch --image-name cosmos-curator --image-tag hello-world --curator-path . -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
 ### Run the Reference Video Pipeline
 
-This section of the instructions references the concept of local paths. Note that these local paths are paths inside the container image, not paths on your local machine. Since `"${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curate_local_workspace"` is mounted to `/config/` when launching the container, a path like `~/cosmos_curate_local_workspace/foo/` on your local machine needs to be specified as `/config/foo/` in the `cosmos-curate` commandline arguments.
+This section of the instructions references the concept of local paths. Note that these local paths are paths inside the container image, not paths on your local machine. Since `"${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curator_local_workspace"` is mounted to `/config/` when launching the container, a path like `~/cosmos_curator_local_workspace/foo/` on your local machine needs to be specified as `/config/foo/` in the `cosmos-curator` commandline arguments.
 
 1. **Build a docker image.**
    - Unlike the hello-world example, we run more than one models in this pipeline.
@@ -190,24 +190,24 @@ This section of the instructions references the concept of local paths. Note tha
    - This could take up to 30 minutes for a fresh new build.
 
 ```bash
-cosmos-curate image build --image-name cosmos-curate --image-tag 1.0.0
+cosmos-curator image build --image-name cosmos-curator --image-tag 1.0.0
 ```
 
 2. **Download model weights from Hugging Face.**
    - For the same reason as above, we need to download weights for a few more models and it will take 10+ minutes depends on your network condition.
 
 ```bash
-cosmos-curate local launch --image-name cosmos-curate --image-tag 1.0.0 -- pixi run --as-is python -m cosmos_curate.core.managers.model_cli download
+cosmos-curator local launch --image-name cosmos-curator --image-tag 1.0.0 -- pixi run --as-is python -m cosmos_curator.core.managers.model_cli download
 ```
 
 3. **Run the Split-Annotate Pipeline**
    - **Input and output paths**
      - `--input-video-path` and `--output-clip-path` can be either a local path inside the container or an S3 path.
        - The input videos under `input_video_path` can have any directory hierarchy.
-       - If your videos are under `~/cosmos_curate_local_workspace/raw_videos/` and you want the output to be under `~/cosmos_curate_local_workspace/output_clips/`, you should specify `--input-video-path /config/raw_videos/` and `--output-clip-path /config/output_clips/`.
+       - If your videos are under `~/cosmos_curator_local_workspace/raw_videos/` and you want the output to be under `~/cosmos_curator_local_workspace/output_clips/`, you should specify `--input-video-path /config/raw_videos/` and `--output-clip-path /config/output_clips/`.
      - When giving an S3 path, it need to start with `s3://`.
        - Right now, space is not allowed in a video's S3 path.
-       - For example, you can give `--input-video-path s3://cosmos-curate-oss/raw_videos/` & `--output-clip-path s3://cosmos-curate-oss/output_clips/` to read from `s3://cosmos-curate-oss/raw_videos/` and write to `s3://cosmos-curate-oss/output_clips/`.
+       - For example, you can give `--input-video-path s3://cosmos-curator-oss/raw_videos/` & `--output-clip-path s3://cosmos-curator-oss/output_clips/` to read from `s3://cosmos-curator-oss/raw_videos/` and write to `s3://cosmos-curator-oss/output_clips/`.
        - Please make sure your `~/.aws/credentials` file is configured properly as explained in [Initial Setup](#initial-setup) section above.
    - **`--limit` option**
      - `limit` specifies how many input videos under `input_video_path` to process.
@@ -218,9 +218,9 @@ cosmos-curate local launch --image-name cosmos-curate --image-tag 1.0.0 -- pixi 
      - Failures are often inevitable due to hardware failures/glitches, kernel/driver/library bugs, etc., therefore this pipeline is carefully designed such that it can handle any crash gracefully without loss of compute time and a simple restart would resume from where it left resulting in correct behavior.
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path <local or s3 path containing input videos> \
     --output-clip-path <local or s3 path to store output clips and metadatas> \
     --limit 1
@@ -237,15 +237,15 @@ For more details, please refer to [Split-Annotate Pipeline](../curator/reference
 
 ### Use Gemini for Captioning
 
-Cosmos-Curate can call the Google Gemini API instead of local captioning models. To enable it:
+Cosmos Curator can call the Google Gemini API instead of local captioning models. To enable it:
 
-1. Add your Gemini API key to `~/.config/cosmos_curate/config.yaml` under the `gemini` section as shown in [Initial Setup](#initial-setup). The key must also be accessible inside the container (the config file is mounted automatically when you use `--curator-path .`).
+1. Add your Gemini API key to `~/.config/cosmos_curator/config.yaml` under the `gemini` section as shown in [Initial Setup](#initial-setup). The key must also be accessible inside the container (the config file is mounted automatically when you use `--curator-path .`).
 2. Select the Gemini captioning algorithm when launching the pipeline. The example below also increases `--captioning-max-output-tokens` to `4096`, which avoids Gemini truncation and has worked well in practice:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path <input path> \
     --output-clip-path <output path> \
     --captioning-algorithm gemini \
@@ -263,13 +263,13 @@ If Gemini returns block reasons or empty responses, the stage will surface those
 
 For a second-pass refinement of captions you can call the OpenAI API.
 
-1. Populate the `openai` section in `~/.config/cosmos_curate/config.yaml` with your API key (and optional `base_url`).
+1. Populate the `openai` section in `~/.config/cosmos_curator/config.yaml` with your API key (and optional `base_url`).
 2. Launch the pipeline with the enhance caption stage enabled and point it to your model:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path <input path> \
     --output-clip-path <output path> \
     --enhance-captions \
@@ -299,7 +299,7 @@ vllm serve /opt/models/qwen3-vl-embedding-8b \
   --port 8000
 ```
 
-3. Add the `openai.embedding` section to `~/.config/cosmos_curate/config.yaml`:
+3. Add the `openai.embedding` section to `~/.config/cosmos_curator/config.yaml`:
 
 ```yaml
 openai:
@@ -311,9 +311,9 @@ openai:
 4. Run the split-annotate pipeline with `--embedding-algorithm openai`:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path <input path> \
     --output-clip-path <output path> \
     --embedding-algorithm openai
@@ -326,9 +326,9 @@ The model name defaults to `auto`, which discovers the served model automaticall
 First, launch the container with a service endpoint.
 
 ```bash
-cosmos-curate local launch \
-   --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-   -- pixi run --as-is python cosmos_curate/scripts/onto_nvcf.py --helm False
+cosmos-curator local launch \
+   --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+   -- pixi run --as-is python cosmos_curator/scripts/onto_nvcf.py --helm False
 ```
 
 After `Application startup complete.` is printed in the log, you can invoke the split-annotate with a `curl` command.
@@ -380,7 +380,7 @@ unless you want to manually edit the captions which will require re-generating t
 ### Useful Options for Local Run
 
 Almost all the CLI commands enable `no_args_is_help`, so running a command without any arguments will print out the help message.
-For local launcher, you can simply run `cosmos-curate local launch` to see help messages for all the options.
+For local launcher, you can simply run `cosmos-curator local launch` to see help messages for all the options.
 
 A useful option is `--curator-path`; when this is given, the local launcher will mount the source code into the container,
 such that you don't have to rebuild the container after code changes for local run.
@@ -389,20 +389,20 @@ For faster iteration, you can build a slim image and mount your host pixi enviro
 
 ```bash
 # Build a slim image (lockfile + source only, no pixi install — builds in seconds)
-cosmos-curate image build --slim --image-name cosmos-curate --image-tag slim
+cosmos-curator image build --slim --image-name cosmos-curator --image-tag slim
 
 # Launch with host source code and pixi environments mounted
-cosmos-curate local launch --image-name cosmos-curate --image-tag slim \
+cosmos-curator local launch --image-name cosmos-curator --image-tag slim \
     --curator-path . --pixi-path . \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.examples.hello_world_pipeline
+    -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
 The `--pixi-path .` option mounts the `.pixi` directory from the given path into the container, so the container
 uses your pre-installed environments directly — no environment installation at runtime.
 
 The container runs as your host UID:GID, so files written to bind-mounted paths are owned by you on the host;
-`$HOME` caches (Triton, NVIDIA kernel caches, etc.) persist in `~/.cache/cosmos-curate-home/` across runs. Set
-`COSMOS_CURATE_LOCAL_HOME_DIR` to redirect this scratch dir (e.g. to a local disk when `$HOME` is a remote mount
+`$HOME` caches (Triton, NVIDIA kernel caches, etc.) persist in `~/.cache/cosmos-curator-home/` across runs. Set
+`COSMOS_CURATOR_LOCAL_HOME_DIR` to redirect this scratch dir (e.g. to a local disk when `$HOME` is a remote mount
 or has tight quotas).
 
 #### Configuration Files
@@ -448,11 +448,11 @@ args:
 Example launch with a config file:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
     --extra-volumes /data/models:/config/models,/data/videos:/workspace/input,/data/output:/workspace/output \
-    -- pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline \
-    /opt/cosmos-curate/examples/osmo/split_config.json
+    -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline \
+    /opt/cosmos-curator/examples/osmo/split_config.json
 ```
 
 Per-pipeline reference templates are provided under `examples/osmo/`:
@@ -464,7 +464,7 @@ The `--extra-volumes` option lets you mount additional host directories into the
 Specify comma-separated `HOST_PATH:CONTAINER_PATH` pairs:
 
 ```bash
-cosmos-curate local launch \
+cosmos-curator local launch \
     --extra-volumes /data/models:/config/models,/data/videos:/workspace/input \
     ...
 ```
@@ -534,9 +534,9 @@ subsystem enabled in SSHD; plain SSH shell access alone is not sufficient.
 ```bash
 RCLONE_REMOTE=":sftp,host=my-slurm-login-01.my-cluster.com:"
 
-# Copy ~/.config/cosmos_curate/config.yaml
-ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_COSMOS_CURATE_CONFIG_DIR}
-rclone copyto -P ~/.config/cosmos_curate/config.yaml ${RCLONE_REMOTE}${SLURM_COSMOS_CURATE_CONFIG_DIR}/config.yaml
+# Copy ~/.config/cosmos_curator/config.yaml
+ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_COSMOS_CURATOR_CONFIG_DIR}
+rclone copyto -P ~/.config/cosmos_curator/config.yaml ${RCLONE_REMOTE}${SLURM_COSMOS_CURATOR_CONFIG_DIR}/config.yaml
 
 # (Optional) Copy ~/.aws/credentials if using S3-compatible storage
 ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_AWS_CREDS_DIR}
@@ -548,7 +548,7 @@ rclone copyto -P ~/.azure/credentials ${RCLONE_REMOTE}${SLURM_AZURE_CREDS_DIR}/c
 
 # Copy models
 ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_WORKSPACE}/models
-rclone copy -P ${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curate_local_workspace/models/ ${RCLONE_REMOTE}${SLURM_WORKSPACE}/models/
+rclone copy -P ${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curator_local_workspace/models/ ${RCLONE_REMOTE}${SLURM_WORKSPACE}/models/
 ```
 
 ### Create sqsh Image and Copy to the Slurm Cluster
@@ -558,8 +558,8 @@ rclone copy -P ${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curate_loca
 2. Import the hello world docker image built above to create a `.sqsh` file.
 
 ```bash
-export COSMOS_CURATE_IMAGE_NAME="cosmos-curate_hello-world.sqsh"
-enroot import --output $COSMOS_CURATE_IMAGE_NAME dockerd://cosmos-curate:hello-world
+export COSMOS_CURATOR_IMAGE_NAME="cosmos-curator_hello-world.sqsh"
+enroot import --output $COSMOS_CURATOR_IMAGE_NAME dockerd://cosmos-curator:hello-world
 ```
 
 3. Copy the sqsh file to slurm cluster.
@@ -575,7 +575,7 @@ Otherwise replace `my-slurm-login-01.my-cluster.com` with your real login hostna
 ```bash
 RCLONE_REMOTE=":sftp,host=my-slurm-login-01.my-cluster.com:"
 ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_IMAGE_DIR}
-rclone copyto -P ./$COSMOS_CURATE_IMAGE_NAME ${RCLONE_REMOTE}${SLURM_IMAGE_DIR}/$COSMOS_CURATE_IMAGE_NAME
+rclone copyto -P ./$COSMOS_CURATOR_IMAGE_NAME ${RCLONE_REMOTE}${SLURM_IMAGE_DIR}/$COSMOS_CURATOR_IMAGE_NAME
 ```
 
 ### Launch on Slurm
@@ -589,7 +589,7 @@ Figure out the following information for your Slurm cluster
 Launch!
 
 ```bash
-cosmos-curate slurm submit \
+cosmos-curator slurm submit \
   --login-node my-slurm-login-01.my-cluster.com \
   --username my_username_on_slurm_cluster_if_different_than_local_username \
   --account my_slurm_account \
@@ -598,9 +598,9 @@ cosmos-curate slurm submit \
   --num-nodes 1 \
   --job-name "hello-world" \
   --remote-files-path "${SLURM_USER_DIR}/job_info" \
-  --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATE_IMAGE_NAME}" \
+  --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATOR_IMAGE_NAME}" \
   --container-mounts "${CONTAINER_MOUNTS}" \
-    -- python -m cosmos_curate.pipelines.examples.hello_world_pipeline
+    -- python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
 The command above will print the slurm job id like below
@@ -628,7 +628,7 @@ You can optionally receive email notifications about your SLURM jobs using the `
 **Example with email notifications:**
 
 ```bash
-cosmos-curate slurm submit \
+cosmos-curator slurm submit \
   --login-node my-slurm-login-01.my-cluster.com \
   --username my_username_on_slurm_cluster_if_different_than_local_username \
   --account my_slurm_account \
@@ -637,11 +637,11 @@ cosmos-curate slurm submit \
   --num-nodes 1 \
   --job-name "hello-world" \
   --remote-files-path "${SLURM_USER_DIR}/job_info" \
-  --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATE_IMAGE_NAME}" \
+  --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATOR_IMAGE_NAME}" \
   --container-mounts "${CONTAINER_MOUNTS}" \
   --mail-user your.email@example.com \
   --mail-type END,FAIL \
-    -- python -m cosmos_curate.pipelines.examples.hello_world_pipeline
+    -- python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
 **⚠️ Cluster-Specific Considerations:**
@@ -661,7 +661,7 @@ The slurm job log is at `"${SLURM_LOG_DIR}/{job_name}_{slurm_job_id}.log"` on th
 You can also use the CLI to monitor the log:
 
 ```bash
-cosmos-curate slurm job-log \
+cosmos-curator slurm job-log \
   --login-node my-slurm-login-01.my-cluster.com \
   --username my_username_on_slurm_cluster_if_different_than_local_username \
   --job-id slurm_job_id_printed_above
@@ -701,7 +701,7 @@ aws s3 sync manifests/ s3://bucket/manifests/
 NUM_BATCHES=1000
 for i in $(seq 0 $((NUM_BATCHES - 1))); do
   MANIFEST=$(printf "s3://bucket/manifests/batch_%04d.json" "$i")
-  cosmos-curate slurm submit \
+  cosmos-curator slurm submit \
     --login-node my-slurm-login-01.my-cluster.com \
     --account my_slurm_account \
     --partition my_slurm_gpu_partition \
@@ -709,9 +709,9 @@ for i in $(seq 0 $((NUM_BATCHES - 1))); do
     --num-nodes 1 \
     --job-name "split-batch-${i}" \
     --remote-files-path "${SLURM_USER_DIR}/job_info" \
-    --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATE_IMAGE_NAME}" \
+    --container-image "${SLURM_IMAGE_DIR}/${COSMOS_CURATOR_IMAGE_NAME}" \
     --container-mounts "${CONTAINER_MOUNTS}" \
-      -- python -m cosmos_curate.pipelines.video.run_pipeline split \
+      -- python -m cosmos_curator.pipelines.video.run_pipeline split \
       --input-video-path s3://bucket/videos \
       --input-video-list-json-path "$MANIFEST" \
       --output-clip-path s3://bucket/output
@@ -732,7 +732,7 @@ If you plan to modify or create new pipelines on slurm, it is useful to mount th
 
 #### Add the source-code mount to the `$CONTAINER_MOUNTS`:
 
-This will use the source code that is located at `"${SLURM_SOURCE_DIR}/cosmos_curate/"` on the cluster and will override the source that is inside the container.
+This will use the source code that is located at `"${SLURM_SOURCE_DIR}/cosmos_curator/"` on the cluster and will override the source that is inside the container.
 
 ```bash
 source examples/slurm/source_me_source_code_mount.sh
@@ -750,14 +750,14 @@ Otherwise replace `my-slurm-login-01.my-cluster.com` with your real login hostna
 
 ```bash
 RCLONE_REMOTE=":sftp,host=my-slurm-login-01.my-cluster.com:"
-ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_SOURCE_DIR}/cosmos_curate/
-rclone copy -P ./cosmos_curate/ ${RCLONE_REMOTE}${SLURM_SOURCE_DIR}/cosmos_curate/
+ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_SOURCE_DIR}/cosmos_curator/
+rclone copy -P ./cosmos_curator/ ${RCLONE_REMOTE}${SLURM_SOURCE_DIR}/cosmos_curator/
 ```
 
 Note that:
 
 ```bash
-cosmos-curate slurm submit ...
+cosmos-curator slurm submit ...
 ```
 
 will not sync code from your local machine to the cluster. You'll need to either edit code directly on the cluster, or call the above source-code sync-ing command(s) again.
@@ -776,11 +776,11 @@ This is only useful if there is enough space on the local nodes to store the mod
 
 ## Launch Pipelines on NVIDIA DGX Cloud
 
-Cosmos-Curate can be deployed on [NVIDIA Cloud Function (NVCF)](https://docs.nvidia.com/cloud-functions/index.html) platform.
+Cosmos Curator can be deployed on [NVIDIA Cloud Function (NVCF)](https://docs.nvidia.com/cloud-functions/index.html) platform.
 
-There are a few steps needed to get a new user onboarded to NVCF, so please reach out to NVIDIA Cosmos-Curate team and we will guide you through the process.
+There are a few steps needed to get a new user onboarded to NVCF, so please reach out to NVIDIA Cosmos Curator team and we will guide you through the process.
 
-If you have already onboarded to NVCF and have an NVCF Org, please follow this [NVCF Guide](NVCF_GUIDE.md) to deploy Cosmos-Curate on NVCF.
+If you have already onboarded to NVCF and have an NVCF Org, please follow this [NVCF Guide](NVCF_GUIDE.md) to deploy Cosmos Curator on NVCF.
 
 ## Launch Pipelines on K8s Cluster (coming soon)
 
@@ -794,16 +794,16 @@ The resource usage and bottleneck of the pipeline can vary with:
 Therefore, it is critical to have good observability in place to help debug reliability problems and optimize pipeline throughput.
 
 We have implemented a set of metrics in [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna)
-and included a [Grafana dashboard](../../examples/observability/grafana/cosmos-curate-oss.json) for `Cosmos-Curate` pipelines.
+and included a [Grafana dashboard](../../examples/observability/grafana/cosmos-curator-oss.json) for `Cosmos Curator` pipelines.
 More details can be found in [Observability Guide](../curator/guides/OBSERVABILITY.md).
 
 ## Build the Client package
 
-The `cosmos-curate` client can be built as a wheel and installed in a standalone mode, without the need for the rest of the source environment
+The `cosmos-curator` client can be built as a wheel and installed in a standalone mode, without the need for the rest of the source environment
 
 ```bash
 poetry build
-pip3 install dist/cosmos_curate*.whl
+pip3 install dist/cosmos_curator*.whl
 ```
 
 ## Troubleshooting

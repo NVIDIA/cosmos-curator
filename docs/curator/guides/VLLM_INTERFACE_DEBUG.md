@@ -438,6 +438,6 @@ debug_request(refined_request, "After Stage 2 Creation")
 - **Profiling Guide**: [`PROFILING.md`](PROFILING.md) - Performance profiling
 - **vLLM Documentation**: https://docs.vllm.ai/ - Official vLLM docs
 - **Plugin Examples**: 
-  - `cosmos_curate/models/vllm_qwen.py` - Most complete example
-  - `cosmos_curate/models/vllm_nemotron.py` - Example with video + metadata inputs
-  - `cosmos_curate/models/vllm_cosmos_reason1_vl.py` - NVIDIA model example
+  - `cosmos_curator/models/vllm_qwen.py` - Most complete example
+  - `cosmos_curator/models/vllm_nemotron.py` - Example with video + metadata inputs
+  - `cosmos_curator/models/vllm_cosmos_reason1_vl.py` - NVIDIA model example

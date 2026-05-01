@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1
 
 run_split() {
   log "Running split pipeline -> ${SLURM_E2E_OUTPUT_CLIP_PATH}"
-  python -m cosmos_curate.pipelines.video.run_pipeline split \
+  python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path "${S3_INPUT_VIDEO_PATH}" \
     --output-clip-path "${SLURM_E2E_OUTPUT_CLIP_PATH}" \
     --input-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
@@ -39,7 +39,7 @@ run_split() {
 
 run_dedup() {
   log "Running dedup pipeline -> ${SLURM_E2E_OUTPUT_DEDUP_PATH}"
-  python -m cosmos_curate.pipelines.video.run_pipeline dedup \
+  python -m cosmos_curator.pipelines.video.run_pipeline dedup \
     --input-embeddings-path "${SLURM_E2E_OUTPUT_CLIP_PATH}" \
     --output-path "${SLURM_E2E_OUTPUT_DEDUP_PATH}" \
     --input-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
@@ -50,7 +50,7 @@ run_dedup() {
 
 run_shard() {
   log "Running shard pipeline -> ${SLURM_E2E_OUTPUT_DATASET_PATH}"
-  python -m cosmos_curate.pipelines.video.run_pipeline shard \
+  python -m cosmos_curator.pipelines.video.run_pipeline shard \
     --input-clip-path "${SLURM_E2E_OUTPUT_CLIP_PATH}" \
     --output-dataset-path "${SLURM_E2E_OUTPUT_DATASET_PATH}" \
     --input-semantic-dedup-path "${SLURM_E2E_OUTPUT_DEDUP_PATH}" \

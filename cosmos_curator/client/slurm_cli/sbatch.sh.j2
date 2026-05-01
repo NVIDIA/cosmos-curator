@@ -1,0 +1,119 @@
+#!/bin/bash
+
+#SBATCH --job-name={{job_name}}
+#SBATCH -A {{account}}
+#SBATCH -p {{partition}}
+#SBATCH --nodes={{num_nodes}}
+#SBATCH --ntasks={{num_nodes}}
+#SBATCH --ntasks-per-node=1
+#SBATCH --distribution=cyclic
+#SBATCH --exclusive
+#SBATCH --output={{log_dir}}/%x_%j.log
+{% if comment %}
+#SBATCH --comment="{{comment}}"
+{% else %}
+#SBATCH --comment=fact_off
+{% endif %}
+{% if mail_user %}
+#SBATCH --mail-user={{mail_user}}
+{% endif %}
+{% if mail_type %}
+#SBATCH --mail-type={{mail_type}}
+{% endif %}
+
+{% if time_limit_string %}
+#SBATCH --time={{time_limit_string}}
+{% endif %}
+{% if gres %}
+#SBATCH --gres={{gres}}
+{% endif %}
+{% if exclude_nodes %}
+#SBATCH --exclude={{ exclude_nodes | join(',') }}
+{% endif %}
+{% if requeue %} 
+#SBATCH --requeue
+{% else %}
+#SBATCH --no-requeue
+{% endif %}
+#SBATCH --dependency=singleton
+
+##### Number of total processes
+echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
+echo "Nodelist:= " $SLURM_JOB_NODELIST
+echo "Number of nodes:= " $SLURM_JOB_NUM_NODES
+echo "Ntasks per node:= " $SLURM_NTASKS_PER_NODE
+echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
+
+# ******************* These are read internally it seems ***********************************
+# ******** Master port, address and world size MUST be passed as variables for DDP to work
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+
+export COSMOS_S3_PROFILE_PATH="/creds/s3_creds"
+export COSMOS_AZURE_PROFILE_PATH="/creds/azure_creds"
+export COSMOS_CURATOR_RAY_SLURM_JOB=True
+export HEAD_NODE_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+export HEAD_NODE_ADDR=$head_node
+export PRIMARY_NODE_HOSTNAME=$head_node
+export PRIMARY_NODE_PORT=$HEAD_NODE_PORT
+export RAY_STOP_RETRIES_AFTER={{stop_retries_after}}
+# Remove TQDM spam from log files, tqdm is not needed for sbatch jobs
+export TQDM_MININTERVAL=9000
+
+export SCRIPT_FILE=$(realpath "$0")
+export SCRIPT_FOLDER=$(dirname "$(realpath "$SCRIPT_FILE")")
+echo "This slurm script is located in folder: $SCRIPT_FOLDER"
+
+# Export user-specified environment variables
+{% for env_var, value in env_vars.items() %}
+export {{ env_var }}="{{ value }}"
+{% endfor %}
+
+{% if env_vars %}
+{% set env_keys = env_vars.keys() | join(',') %}
+{% endif %}
+
+echo "HEAD_NODE_ADDR=${HEAD_NODE_ADDR}"
+echo "HEAD_NODE_PORT=${HEAD_NODE_PORT}"
+echo "SLURMD_NODENAME=${SLURMD_NODENAME}"
+echo "WORLD_SIZE=${WORLD_SIZE}"
+
+# Generate a metrics service discovery file for Prometheus
+_SLURM_JOB_NODELIST_FILE="{{job_artifact_path}}/tmp/hostnames_${SLURM_JOB_ID}.txt"
+if [ "{{enable_metrics_scraping}}" == "yes" ]; then
+  # prepare the node list file
+  mkdir -p {{job_artifact_path}}/tmp/
+  scontrol show hostnames $SLURM_JOB_NODELIST > $_SLURM_JOB_NODELIST_FILE
+  # generate the metrics discovery file
+  python {{job_artifact_path}}/prometheus_service_discovery.py \
+    --path "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json" \
+    --job-user $SLURM_JOB_USER \
+    --job-id $SLURM_JOB_ID \
+    --job-name $SLURM_JOB_NAME \
+    --hostfile $_SLURM_JOB_NODELIST_FILE \
+    --port "${XENNA_RAY_METRICS_PORT:-9002}"
+fi
+
+cleanup_on_exit() {
+  echo "Cleaning up any mess ..."
+  if [ "{{enable_metrics_scraping}}" == "yes" ]; then
+    rm -f $_SLURM_JOB_NODELIST_FILE
+    rm -f "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json"
+  fi
+}
+trap cleanup_on_exit EXIT SIGTERM SIGINT
+
+# Actual run command
+echo "$(date) - Calling srun..."
+
+srun \
+  --mpi=none \
+  --container-writable \
+  --no-container-mount-home \
+  --no-container-remap-root \
+  --container-image {{container_image}} \
+  --container-mounts {{container_mounts}} \
+{% if env_keys %} --container-env {{env_keys}} {% endif %} \
+  bash -c 'if [ -n "${COSMOS_CURATOR_SLIM_ENVS:-}" ]; then echo "Installing pixi environments: ${COSMOS_CURATOR_SLIM_ENVS}" && pixi install --frozen -e ${COSMOS_CURATOR_SLIM_ENVS//,/ -e }; fi && exec "$@"' _ {{command}}
+
+echo "$(date) - Srun called."

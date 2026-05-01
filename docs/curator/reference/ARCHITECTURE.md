@@ -1,6 +1,6 @@
-# Cosmos-Curate - Architecture Guide
+# Cosmos Curator - Architecture Guide
 
-- [Cosmos-Curate - Architecture Guide](#cosmos-curate---architecture-guide)
+- [Cosmos Curator - Architecture Guide](#cosmos-curator---architecture-guide)
   - [Overview](#overview)
   - [Logical View](#logical-view)
   - [Physical View](#physical-view)
@@ -13,7 +13,7 @@
   - [Profiling Instrumentation](#profiling-instrumentation)
   - [Reference](#reference)
 
-This guide explains the core architecture of the Cosmos-Curate framework.
+This guide explains the core architecture of the Cosmos Curator framework.
 
 ## Overview
 
@@ -51,7 +51,7 @@ The diagram below illustrates a logical view of a 4-stage pipeline.
   - So when the main orchestration process moves pipeline tasks from one stage to the next, it really moves the object reference, which is essentially a pointer, instead of the actual data.
   - It is the stage worker's responsibility to pull and deserialize the pipeline task from the object store given the object reference. This is why the orchestration can be done in a central process.
 
-![Logical View](../../assets/cosmos-curate-logical-view.png)
+![Logical View](../../assets/cosmos-curator-logical-view.png)
 
 ## Physical View
 
@@ -63,7 +63,7 @@ To support the logical view above, physically what happens is illustrated below.
   - That object reference is scheduled to a worker from the next stage's pool.
   - When the next stage's worker pulls actual object, Ray tells its physical location, either on the local node or a remote node in the Ray cluster.
 
-![Physical View](../../assets/cosmos-curate-physical-view.png)
+![Physical View](../../assets/cosmos-curator-physical-view.png)
 
 ## Key Features
 
@@ -118,7 +118,7 @@ to the shared destination without knowing whether it is a local directory,
 an S3 bucket, or an Azure blob container.
 
 The framework provides `StorageWriter`
-(defined in `cosmos_curate/core/utils/storage/storage_utils.py`) which
+(defined in `cosmos_curator/core/utils/storage/storage_utils.py`) which
 resolves the storage backend once at construction time and exposes a
 uniform API for writing:
 
@@ -137,7 +137,7 @@ know the physical location of the output.
 
 ## Artifact Transport
 
-The `cosmos_curate.core.utils.artifacts` package provides generic,
+The `cosmos_curator.core.utils.artifacts` package provides generic,
 consumer-agnostic utilities for moving files between cluster nodes
 and storage destinations.  All classes are decoupled from any
 specific consumer or subsystem.

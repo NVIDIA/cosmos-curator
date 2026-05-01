@@ -1,3 +1,3 @@
-cosmos_curate/client
-cosmos_curate/examples
-tests/cosmos_curate/client
+cosmos_curator/client
+cosmos_curator/examples
+tests/cosmos_curator/client

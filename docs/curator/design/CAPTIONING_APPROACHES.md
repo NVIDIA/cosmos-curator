@@ -1,6 +1,6 @@
 # Captioning Approaches: In-Process vLLM vs vLLM Async
 
-Two captioning approaches exist in Cosmos-Curate. Both use the same
+Two captioning approaches exist in Cosmos Curator. Both use the same
 underlying vLLM engine; the difference is how that engine is hosted
 and how models are integrated.
 

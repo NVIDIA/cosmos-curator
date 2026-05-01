@@ -11,9 +11,9 @@ echo "=== K8s Helm Chart Deployment Test ==="
 
 # Export for cleanup script
 export NAMESPACE="ci-helm-test-${CI_PIPELINE_ID:-local}"
-RELEASE_NAME="cosmos-curate-test"
-STATEFULSET_NAME="cosmos-curate"  # From chart's nameOverride
-CHART_PATH="charts/cosmos-curate"
+RELEASE_NAME="cosmos-curator-test"
+STATEFULSET_NAME="cosmos-curator"  # From chart's nameOverride
+CHART_PATH="charts/cosmos-curator"
 POLL_TIMEOUT=1800  # 30 minutes
 
 echo "Namespace: ${NAMESPACE}"
@@ -92,7 +92,7 @@ while [ $WAITED -lt $POLL_TIMEOUT ]; do
     echo "Waiting... (${WAITED}s elapsed, ${READY}/${DESIRED} ready)"
 
     # Show pod status for debugging
-    kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curate -o wide --no-headers 2>/dev/null || true
+    kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curator -o wide --no-headers 2>/dev/null || true
 
     sleep 15
     WAITED=$((WAITED + 15))
@@ -101,13 +101,13 @@ done
 if [ $WAITED -ge $POLL_TIMEOUT ]; then
     echo "ERROR: StatefulSet did not become ready in ${POLL_TIMEOUT}s"
     kubectl describe statefulset -n "${NAMESPACE}" "${STATEFULSET_NAME}" || true
-    kubectl describe pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curate || true
-    kubectl logs -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curate --tail=100 || true
+    kubectl describe pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curator || true
+    kubectl logs -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curator --tail=100 || true
     exit 1
 fi
 
 # Get pod name
-POD_NAME=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curate -o jsonpath='{.items[0].metadata.name}')
+POD_NAME=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=cosmos-curator -o jsonpath='{.items[0].metadata.name}')
 echo "Pod ready: ${POD_NAME}"
 
 # Run a mini pipeline test via kubectl exec
@@ -120,7 +120,7 @@ REDUCED_CPU_ARGS=$(get_reduced_cpu_pipeline_args)
 
 kubectl exec -n "${NAMESPACE}" "${POD_NAME}" -- bash -c "
 set -e
-cd /opt/cosmos-curate
+cd /opt/cosmos-curator
 
 echo 'Verifying GPU...'
 nvidia-smi
@@ -133,7 +133,7 @@ export COSMOS_S3_PROFILE_PATH=/s3config/s3.config
 export NVCF_MODEL_CACHE_DIR=/config/models
 export NVCF_MULTI_NODE=true
 
-pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
   --input-video-path '${S3_INPUT_VIDEO_PATH}' \
   --output-clip-path '${K8S_OUTPUT_PATH}' \
   --limit 1 \

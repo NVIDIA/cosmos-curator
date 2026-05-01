@@ -99,7 +99,7 @@ class _Worker:
 
     def _get_nvcf_commands(self) -> list[str]:
         return [
-            "cosmos-curate",
+            "cosmos-curator",
             "nvcf",
             "function",
         ]

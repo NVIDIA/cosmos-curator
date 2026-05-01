@@ -1,13 +1,13 @@
-# Cosmos Curate — Agent Guidelines
+# Cosmos Curator — Agent Guidelines
 
 ## Project Overview
 
-Cosmos-Curate is a video curation system for AI training data generation, built on [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna) (GPU-accelerated streaming pipelines using Ray).
+Cosmos Curator is a video curation system for AI training data generation, built on [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna) (GPU-accelerated streaming pipelines using Ray).
 
 **Architecture**: Three-layer modular design
-- `cosmos_curate/client/`: Deployment CLIs (local, Slurm, NVCF, Docker image management)
-- `cosmos_curate/core/`: Base interfaces (`PipelineTask`, `CuratorStage`, `ModelInterface`), managers, utilities
-- `cosmos_curate/pipelines/`: Video/AV pipelines + examples (start with `hello_world_pipeline.py`)
+- `cosmos_curator/client/`: Deployment CLIs (local, Slurm, NVCF, Docker image management)
+- `cosmos_curator/core/`: Base interfaces (`PipelineTask`, `CuratorStage`, `ModelInterface`), managers, utilities
+- `cosmos_curator/pipelines/`: Video/AV pipelines + examples (start with `hello_world_pipeline.py`)
 
 ## Development
 
@@ -22,13 +22,13 @@ Pre-commit hooks run ruff automatically. A submodule-check hook warns before com
 
 **Testing**:
 - CPU tests: `pytest` (env-marked tests are excluded by default via `pytest.ini`)
-- GPU tests: `cosmos-curate local launch --curator-path . -- pixi run --as-is -e [default|unified] pytest -m env tests/`
+- GPU tests: `cosmos-curator local launch --curator-path . -- pixi run --as-is -e [default|unified] pytest -m env tests/`
 - Mark GPU tests with `@pytest.mark.env("unified")` (or other env name)
 - Place tests in `tests/` mirroring module paths. Uses `--import-mode=importlib`.
 
-**Building**: Poetry frontend with setuptools backend. `poetry build` for client wheel, `cosmos-curate image build` for Docker.
+**Building**: Poetry frontend with setuptools backend. `poetry build` for client wheel, `cosmos-curator image build` for Docker.
 
-**CLI**: `cosmos-curate [local|slurm|nvcf|image|view] --help`
+**CLI**: `cosmos-curator [local|slurm|nvcf|image|view] --help`
 
 ## Code Style
 
@@ -36,15 +36,17 @@ Pre-commit hooks run ruff automatically. A submodule-check hook warns before com
 - PEP 8 (4-space indent, `snake_case`/`CamelCase`), type hints, ruff formatting
 - Config: `pyproject.toml` (Python 3.12, 120 chars)
 - Do NOT add `from __future__ import annotations` — use native Python 3.12 type hints instead (PEP 649 is Python 3.13+)
-- `cosmos-xenna/` is excluded from ruff (via exclude list) and mypy (via `files = ["cosmos_curate"]`) — do not lint or fix code there
+- `cosmos-xenna/` is excluded from ruff (via exclude list) and mypy (via `files = ["cosmos_curator"]`) — do not lint or fix code there
 
 ## Key Imports
 
 Core interfaces have no `__init__.py` re-exports — always use full paths for these imports:
+
 ```python
-from cosmos_curate.core.interfaces.stage_interface import CuratorStage, CuratorStageResource, CuratorStageSpec, PipelineTask
-from cosmos_curate.core.interfaces.pipeline_interface import run_pipeline
-from cosmos_curate.core.interfaces.model_interface import ModelInterface
+from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource, CuratorStageSpec,
+    PipelineTask
+from cosmos_curator.core.interfaces.pipeline_interface import run_pipeline
+from cosmos_curator.core.interfaces.model_interface import ModelInterface
 ```
 
 ## Creating Pipelines
@@ -59,11 +61,11 @@ from cosmos_curate.core.interfaces.model_interface import ModelInterface
 
 Stage lifecycle: `stage_setup_on_node()` (once per node) → `stage_setup()` (once per worker, runs in remote actor in target conda env) → `process_data()` (batches of `stage_batch_size`, default 1)
 
-**Models**: Inherit from `ModelInterface`. Implement `conda_env_name`, `model_id_names`, `setup()`. Register in `cosmos_curate/models/all_models.py`.
+**Models**: Inherit from `ModelInterface`. Implement `conda_env_name`, `model_id_names`, `setup()`. Register in `cosmos_curator/models/all_models.py`.
 
 **Running**: `run_pipeline(input_tasks, stages)` — accepts bare `CuratorStage` or `CuratorStageSpec`. Use `CuratorStageSpec(MyStage(), num_workers_per_node=N)` for tuning.
 
-See `cosmos_curate/pipelines/examples/hello_world_pipeline.py` and `docs/curator/guides/PIPELINE_DESIGN.md`
+See `cosmos_curator/pipelines/examples/hello_world_pipeline.py` and `docs/curator/guides/PIPELINE_DESIGN.md`
 
 ## Pixi Environments
 

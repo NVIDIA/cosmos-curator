@@ -26,8 +26,8 @@ Usage (inside the sam3 pixi env):
         --output /config/output/toothless_tracked.mp4 \
         --fps 10
 
-Run via cosmos-curate local launch:
-    micromamba run -n cosmos-curate cosmos-curate local launch --curator-path . -- \
+Run via cosmos-curator local launch:
+    micromamba run -n cosmos-curator cosmos-curator local launch --curator-path . -- \
         "pixi run -e sam3 python tools/sam3_bbox_demo.py \
          --video /config/videos/toothless.mp4 \
          --prompts 'a dragon' 'a viking' \
@@ -46,8 +46,8 @@ import numpy as np
 import torch
 from loguru import logger
 
-from cosmos_curate.models.sam3 import SAM3Model
-from cosmos_curate.pipelines.video.tracking.visualization import Detection, draw_frame
+from cosmos_curator.models.sam3 import SAM3Model
+from cosmos_curator.pipelines.video.tracking.visualization import Detection, draw_frame
 
 
 def _log_memory(label: str = "") -> None:

@@ -59,10 +59,10 @@ CONTAINER_ENV=(
 CONTAINER_ENV_STR=$(IFS=, ; echo "${CONTAINER_ENV[*]}")
 
 LOGIN_NODE="${SLURM_LOGIN_NODE:-$(hostname -f)}"
-JOB_NAME="${SLURM_ACCOUNT}-cosmos_curate_e2e.${CI_JOB_ID}"
+JOB_NAME="${SLURM_ACCOUNT}-cosmos_curator_e2e.${CI_JOB_ID}"
 
 submit_cmd=(
-  cosmos-curate slurm submit
+  cosmos-curator slurm submit
   --login-node "${LOGIN_NODE}"
   --account "${SLURM_ACCOUNT}"
   --partition "${SLURM_PARTITION}"

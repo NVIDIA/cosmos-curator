@@ -43,16 +43,16 @@ RUN ARCH="$(uname -m)" \
 
 USER $MAMBA_USER
 
-COPY --chown=mambauser:mambauser pyproject.toml poetry.lock /tmp/cosmos-curate/
+COPY --chown=mambauser:mambauser pyproject.toml poetry.lock /tmp/cosmos-curator/
 
 RUN micromamba create -n curator python=3.12.13 poetry pip -y \
-    && RUFF_VERSION="$(micromamba run -n curator python -c 'import tomllib; print(tomllib.load(open("/tmp/cosmos-curate/pyproject.toml", "rb"))["tool"]["poetry"]["group"]["dev"]["dependencies"]["ruff"])')" \
+    && RUFF_VERSION="$(micromamba run -n curator python -c 'import tomllib; print(tomllib.load(open("/tmp/cosmos-curator/pyproject.toml", "rb"))["tool"]["poetry"]["group"]["dev"]["dependencies"]["ruff"])')" \
     && micromamba run -n curator pip install --no-cache-dir awscli coverage "ruff==${RUFF_VERSION}" \
     && micromamba clean --all --yes
 
-RUN cd /tmp/cosmos-curate \
+RUN cd /tmp/cosmos-curator \
     && micromamba run -n curator poetry config virtualenvs.create false \
     && micromamba run -n curator poetry install --extras=local --no-interaction --no-root \
     && (micromamba run -n curator poetry cache clear pypi --all -n || true) \
-    && rm -rf /home/mambauser/.cache/pypoetry /home/mambauser/.cache/pip /tmp/pypoetry-cache /tmp/cosmos-curate
+    && rm -rf /home/mambauser/.cache/pypoetry /home/mambauser/.cache/pip /tmp/pypoetry-cache /tmp/cosmos-curator
 

@@ -64,7 +64,7 @@ import sys
 import pandas as pd
 from loguru import logger
 
-from cosmos_curate.core.utils.misc import summarize
+from cosmos_curator.core.utils.misc import summarize
 
 # ---------------------------------------------------------------------------
 # Filename parsing

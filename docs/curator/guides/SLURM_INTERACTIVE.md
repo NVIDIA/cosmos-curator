@@ -1,6 +1,6 @@
 # Slurm Interactive Slim Image Guide
 
-This guide describes the quick-development workflow for running Cosmos-Curate interactively on a Slurm compute node with a slim container image.
+This guide describes the quick-development workflow for running Cosmos Curator interactively on a Slurm compute node with a slim container image.
 
 The goal is to avoid rebuilding the image when changing Python code or Pixi environments. The slim image provides the base system and Pixi binary; your Lustre checkout provides the live source tree, `pixi.toml`, `pixi.lock`, and `.pixi` environments.
 
@@ -10,15 +10,15 @@ The goal is to avoid rebuilding the image when changing Python code or Pixi envi
 - You have already imported it with `enroot import`.
 - You have copied the resulting `.sqsh` file to shared storage visible from the Slurm compute node.
 - You are running inside an interactive Slurm allocation.
-- You have a Cosmos-Curate repo checkout on Lustre.
+- You have a Cosmos Curator repo checkout on Lustre.
 
 ## Repo Location
 
-`${REPO}` is the Cosmos-Curate repo root. It should not be just the `cosmos_curate` Python package directory.
+`${REPO}` is the Cosmos Curator repo root. It should not be just the `cosmos_curator` Python package directory.
 It should contain:
 
 ```text
-${REPO}/cosmos_curate
+${REPO}/cosmos_curator
 ${REPO}/pixi.toml
 ${REPO}/pixi.lock
 ${REPO}/.pixi
@@ -28,7 +28,7 @@ Use a path like:
 
 ```bash
 USER_DIR=/path/to/${USER}
-REPO=${USER_DIR}/src/cosmos-curate
+REPO=${USER_DIR}/src/cosmos-curator
 mkdir -p "${REPO}/.pixi"
 ```
 
@@ -41,12 +41,12 @@ Set paths for the cluster filesystem:
 
 ```bash
 USER_DIR=/path/to/${USER}
-REPO=${USER_DIR}/src/cosmos-curate
-CONTAINER_NAME=cosmos-curate+1.0.0-slim
+REPO=${USER_DIR}/src/cosmos-curator
+CONTAINER_NAME=cosmos-curator+1.0.0-slim
 CONTAINER_DIR=${USER_DIR}/container_images
-WORKSPACE=${USER_DIR}/cosmos_curate_local_workspace
-CONFIG=${HOME}/.config/cosmos_curate/config.yaml
-CACHE_DIR=${USER_DIR}/cache/cosmos-curate
+WORKSPACE=${USER_DIR}/cosmos_curator_local_workspace
+CONFIG=${HOME}/.config/cosmos_curator/config.yaml
+CACHE_DIR=${USER_DIR}/cache/cosmos-curator
 ```
 
 Create the workspace and cache directories if needed:
@@ -70,7 +70,7 @@ fi
 
 Start the container. The repo is mounted twice:
 
-- `/opt/cosmos-curate` is the path Cosmos-Curate code expects inside the container.
+- `/opt/cosmos-curator` is the path Cosmos Curator code expects inside the container.
 - `${REPO}` preserves the original Lustre path, which lets scripts inside `.pixi/envs/*/bin` resolve shebangs that point
   back to the path where the environment was created.
 
@@ -78,8 +78,8 @@ Start the container. The repo is mounted twice:
 enroot start -w \
   -m "${HOME}/.aws/credentials":/creds/s3_creds \
   -m "${WORKSPACE}":/config \
-  -m "${CONFIG}":/cosmos_curate/config/cosmos_curate.yaml \
-  -m "${REPO}":/opt/cosmos-curate \
+  -m "${CONFIG}":/cosmos_curator/config/cosmos_curator.yaml \
+  -m "${REPO}":/opt/cosmos-curator \
   -m "${REPO}":"${REPO}" \
   -m "${CACHE_DIR}":/cache \
   -e CONDA_OVERRIDE_CUDA=13.0.2 \
@@ -99,7 +99,7 @@ Notes:
   is mounted from Lustre in this quick-development flow.
 - `PIXI_CACHE_DIR` moves Pixi's package cache off the small home filesystem. `XDG_CACHE_HOME`, `UV_CACHE_DIR`, and
   `PIP_CACHE_DIR` catch other installer caches that would otherwise default to `${HOME}/.cache`.
-- The config mount path is `/cosmos_curate/config/cosmos_curate.yaml`.
+- The config mount path is `/cosmos_curator/config/cosmos_curator.yaml`.
 - If you need Azure credentials, add a mount such as `-m /path/to/azure_creds:/creds/azure_creds`.
 
 ## Verify the Mounts
@@ -107,7 +107,7 @@ Notes:
 Inside the container:
 
 ```bash
-cd /opt/cosmos-curate
+cd /opt/cosmos-curator
 ls pixi.toml pixi.lock
 ls .pixi/envs
 pixi info --extended | grep "Cache dir"
@@ -147,7 +147,7 @@ worker nodes, pass the intended head node explicitly with `-e HEAD_NODE_ADDR=<no
 Then launch through Pixi:
 
 ```bash
-pixi run --as-is python3 -m cosmos_curate.pipelines.video.run_pipeline split \
+pixi run --as-is python3 -m cosmos_curator.pipelines.video.run_pipeline split \
   --input-video-path "s3://my-bucket/input-videos" \
   --output-clip-path "/config/output-qwen-test" \
   --captioning-algorithm "qwen" \
@@ -168,21 +168,21 @@ but do not mount `${REPO}/.pixi`.
 Example additional setup:
 
 ```bash
-CACHE_DIR=${USER_DIR}/cache/cosmos-curate
+CACHE_DIR=${USER_DIR}/cache/cosmos-curator
 mkdir -p "${CACHE_DIR}/pixi"
 ```
 
 Example mounts and environment:
 
 ```bash
--m "${REPO}/cosmos_curate":/opt/cosmos-curate/cosmos_curate
--m "${REPO}/pixi.toml":/opt/cosmos-curate/pixi.toml
--m "${REPO}/pixi.lock":/opt/cosmos-curate/pixi.lock
+-m "${REPO}/cosmos_curator":/opt/cosmos-curator/cosmos_curator
+-m "${REPO}/pixi.toml":/opt/cosmos-curator/pixi.toml
+-m "${REPO}/pixi.lock":/opt/cosmos-curator/pixi.lock
 -m "${CACHE_DIR}/pixi":/pixi-cache
 -e PIXI_CACHE_DIR=/pixi-cache
 ```
 
-Then run `pixi install --frozen ...` from `/opt/cosmos-curate` inside the container. This writes `.pixi` into the
+Then run `pixi install --frozen ...` from `/opt/cosmos-curator` inside the container. This writes `.pixi` into the
 container filesystem while reusing package downloads from `/pixi-cache`.
 
 ## Troubleshooting
@@ -194,15 +194,15 @@ the container:
 ls -la "${REPO}/.pixi/envs"
 ```
 
-If `pixi run --as-is` fails with a missing environment, run the install step again from `/opt/cosmos-curate`:
+If `pixi run --as-is` fails with a missing environment, run the install step again from `/opt/cosmos-curator`:
 
 ```bash
 pixi install --frozen -e default
 pixi install --frozen -e unified
 ```
 
-If Cosmos-Curate cannot find the config file, verify the mount target:
+If Cosmos Curator cannot find the config file, verify the mount target:
 
 ```bash
-ls -la /cosmos_curate/config/cosmos_curate.yaml
+ls -la /cosmos_curator/config/cosmos_curator.yaml
 ```

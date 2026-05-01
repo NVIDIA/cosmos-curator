@@ -18,8 +18,8 @@
 from collections.abc import Sequence
 from typing import TypeVar
 
-from cosmos_curate.core.interfaces.runner_interface import RunnerInterface
-from cosmos_curate.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec, PipelineTask
+from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
+from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec, PipelineTask
 
 T = TypeVar("T", bound=PipelineTask)
 

@@ -10,7 +10,7 @@ title: Code of Conduct
 
 ## Overview
 
-Define the code of conduct followed and enforced for all Cosmos-Curate projects.
+Define the code of conduct followed and enforced for all Cosmos Curator projects.
 
 ### Intended audience
 

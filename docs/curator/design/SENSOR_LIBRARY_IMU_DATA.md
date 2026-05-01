@@ -1,8 +1,8 @@
 # Sensor Library IMU Data Design
 
 This note documents the design rationale for the first generic IMU data
-structure in the Cosmos-Curate Sensor Library. `ImuData` is implemented in
-`cosmos_curate/core/sensors/data/imu_data.py`. This note does not define
+structure in the Cosmos Curator Sensor Library. `ImuData` is implemented in
+`cosmos_curator/core/sensors/data/imu_data.py`. This note does not define
 `ImuSensor`, IMU parsing, preintegration, bias correction, calibration, or
 coordinate transforms.
 
@@ -295,12 +295,12 @@ each lower-rate alignment row.
 
 The implementation adds:
 
-1. `cosmos_curate/core/sensors/data/imu_data.py`, with an attrs-based
+1. `cosmos_curator/core/sensors/data/imu_data.py`, with an attrs-based
    `ImuData` class matching this design note.
-2. Shared validation helpers in `cosmos_curate/core/sensors/utils/validation.py`
+2. Shared validation helpers in `cosmos_curator/core/sensors/utils/validation.py`
    for finite `float64` arrays and 1-D `uint64` arrays.
-3. Tests under `tests/cosmos_curate/core/sensors/data/test_imu_data.py` and
-   `tests/cosmos_curate/core/sensors/utils/test_validation.py`.
+3. Tests under `tests/cosmos_curator/core/sensors/data/test_imu_data.py` and
+   `tests/cosmos_curator/core/sensors/utils/test_validation.py`.
 
 DriveWorks 6.0.9 documentation was reviewed as part of this design. The
 implementation keeps `sensor_timestamps_ns` as the canonical selected source
@@ -328,15 +328,15 @@ angular velocity, linear acceleration, or temperature.
 ## References
 
 - <a id="ref-sensor-data"></a>`SensorData` protocol:
-  `cosmos_curate/core/sensors/data/sensor_data.py`
+  `cosmos_curator/core/sensors/data/sensor_data.py`
 - <a id="ref-aligned-frame"></a>`AlignedFrame`:
-  `cosmos_curate/core/sensors/data/aligned_frame.py`
+  `cosmos_curator/core/sensors/data/aligned_frame.py`
 - <a id="ref-camera-data"></a>`CameraData`:
-  `cosmos_curate/core/sensors/data/camera_data.py`
+  `cosmos_curator/core/sensors/data/camera_data.py`
 - <a id="ref-video-index"></a>`VideoIndex`:
-  `cosmos_curate/core/sensors/data/video.py`
+  `cosmos_curator/core/sensors/data/video.py`
 - <a id="ref-validation-helpers"></a>Sensor validation helpers:
-  `cosmos_curate/core/sensors/utils/validation.py`
+  `cosmos_curator/core/sensors/utils/validation.py`
 - <a id="ref-driveworks-imu"></a>DriveWorks SDK Reference: IMU Sensor
   (Drive OS 6.0.9, DriveWorks 5.16.65):
   <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/group__imu__group.html>

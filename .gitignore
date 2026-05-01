@@ -23,7 +23,7 @@ ci_secrets.env
 # pixi environments
 .pixi
 
-/cosmos-curate-*.tgz
+/cosmos-curator-*.tgz
 /run-all.sh
 /run-benchmark.sh
 /cosmos-cookbook/

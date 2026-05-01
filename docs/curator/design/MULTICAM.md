@@ -4,7 +4,7 @@
 
 ### In scope
 
-- Extend the **video** splitting pipeline ([cosmos_curate/pipelines/video/splitting_pipeline.py](../../../cosmos_curate/pipelines/video/splitting_pipeline.py)) to support multi-cam sessions
+- Extend the **video** splitting pipeline ([cosmos_curator/pipelines/video/splitting_pipeline.py](../../../cosmos_curator/pipelines/video/splitting_pipeline.py)) to support multi-cam sessions
 - Split clips will be time aligned
 - fixed-stride only for multi-cam
 - session-based input (prefix + configurable session-dir pattern, no DB).
@@ -18,7 +18,7 @@
 
 ## Data Model: Multi-Cam in SplitPipeTask and Video
 
-**File**: [cosmos_curate/pipelines/video/utils/data_model.py](../../../cosmos_curate/pipelines/video/utils/data_model.py)
+**File**: [cosmos_curator/pipelines/video/utils/data_model.py](../../../cosmos_curator/pipelines/video/utils/data_model.py)
 
 - Replace `video: Video` with `videos: list[Video]` as the canonical field on `SplitPipeTask`.
 - **Backward compatibility**: Keep a single-video view for existing code:

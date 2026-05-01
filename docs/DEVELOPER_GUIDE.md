@@ -1,6 +1,6 @@
-# Cosmos-Curate - Developer Guide
+# Cosmos Curator - Developer Guide
 
-- [Cosmos-Curate - Developer Guide](#cosmos-curate---developer-guide)
+- [Cosmos Curator - Developer Guide](#cosmos-curator---developer-guide)
   - [Development Environment Setup](#development-environment-setup)
     - [Working with Pixi Environments](#working-with-pixi-environments)
       - [Installing Pixi](#installing-pixi)
@@ -29,7 +29,7 @@
 Please refer to the following section in [End User Guide](./client/END_USER_GUIDE.md):
 - [Prerequisites](./client/END_USER_GUIDE.md#prerequisites) for hardware and software requirements.
 - [Initial Setup](./client/END_USER_GUIDE.md#initial-setup) for preparaing configurations files and workspace directories, etc.
-- [Setup Environment and Install Dependencies](./client/END_USER_GUIDE.md#setup-environment-and-install-dependencies) for setting up Cosmos-Curate.
+- [Setup Environment and Install Dependencies](./client/END_USER_GUIDE.md#setup-environment-and-install-dependencies) for setting up Cosmos Curator.
 
 For developers to contribute back to the repo, the following additional steps are needed:
 
@@ -49,10 +49,10 @@ pre-commit install
 
 ### Working with Pixi Environments
 
-Cosmos-Curate uses [Pixi](https://pixi.sh) to manage Python environments inside Docker images. As a developer, you may
+Cosmos Curator uses [Pixi](https://pixi.sh) to manage Python environments inside Docker images. As a developer, you may
 need to inspect or work with these environments locally.
 
-The `pixi.toml` file at the repository root defines all Pixi environments used by Cosmos-Curate.
+The `pixi.toml` file at the repository root defines all Pixi environments used by Cosmos Curator.
 
 #### Installing Pixi
 
@@ -157,10 +157,10 @@ mypy
 ```
 
 ## Building the Client package
-   - The `cosmos-curate` client can be built as a wheel and installed in a standalone mode, without the need for the rest of the source environment
+   - The `cosmos-curator` client can be built as a wheel and installed in a standalone mode, without the need for the rest of the source environment
 ```bash
 poetry build
-pip3 install dist/cosmos_curate*.whl
+pip3 install dist/cosmos_curator*.whl
 ```
 
 ## Testing
@@ -184,8 +184,8 @@ collected 155 items / 26 deselected / 129 selected
 
 tests/client/slurm_cli/test_slurm.py .....................................                      [ 36%]
 tests/client/slurm_cli/test_start_ray.py ...................................                    [ 70%]
-tests/cosmos_curate/pipelines/video/filtering/motion/test_motion_filter.py .                    [ 71%]
-tests/cosmos_curate/pipelines/video/utils/test_decoder_utils.py .............................   [100%]
+tests/cosmos_curator/pipelines/video/filtering/motion/test_motion_filter.py .                    [ 71%]
+tests/cosmos_curator/pipelines/video/utils/test_decoder_utils.py .............................   [100%]
 ================ 102 passed, 6 deselected, 2 warnings in 2.98s ================
 ```
 
@@ -195,17 +195,17 @@ Launch the docker container locally and simply run `pytest` command:
 
 ```bash
 for conda_env in default legacy-transformers transformers unified; do
-   cosmos-curate local launch --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-   -- pixi run --as-is -e $conda_env pytest -m env tests/cosmos_curate/{pipelines,models}/;
+   cosmos-curator local launch --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+   -- pixi run --as-is -e $conda_env pytest -m env tests/cosmos_curator/{pipelines,models}/;
 done
 
 ================ test session starts ================
 configfile: pytest.ini
 collected 58 items / 40 deselected / 18 selected
 
-tests/cosmos_curate/pipelines/video/clipping/test_fixed_stride_extraction.py ........           [ 44%]
-tests/cosmos_curate/pipelines/video/clipping/test_transnetv2_extraction.py .....                [ 72%]
-tests/cosmos_curate/pipelines/video/filtering/motion/test_motion_filter.py .                    [100%]
+tests/cosmos_curator/pipelines/video/clipping/test_fixed_stride_extraction.py ........           [ 44%]
+tests/cosmos_curator/pipelines/video/clipping/test_transnetv2_extraction.py .....                [ 72%]
+tests/cosmos_curator/pipelines/video/filtering/motion/test_motion_filter.py .                    [100%]
 ================ 18 passed, 40 deselected, 3 warning in 14.44 ================
 
 ...
@@ -214,8 +214,8 @@ tests/cosmos_curate/pipelines/video/filtering/motion/test_motion_filter.py .    
 configfile: pytest.ini
 collected 58 items / 52 deselected / 6 selected
 
-tests/cosmos_curate/pipelines/video/captioning/test_t5_embedding.py .                           [ 16%]
-tests/cosmos_curate/pipelines/video/filtering/aesthetics/test_aesthetic_filter.py .....         [100%]
+tests/cosmos_curator/pipelines/video/captioning/test_t5_embedding.py .                           [ 16%]
+tests/cosmos_curator/pipelines/video/filtering/aesthetics/test_aesthetic_filter.py .....         [100%]
 ================ 6 passed, 52 deselected, 2 warning in 30.02 ================
 ```
 
@@ -230,9 +230,9 @@ The CI will test more scenarios.
 
 **Where it lives**
 
-- Shared flags (S3 profiles, execution mode, limit, model weights, profiling): [`cosmos_curate/pipelines/common_pipeline_settings.py`](../cosmos_curate/pipelines/common_pipeline_settings.py) — class `CommonPipelineSettings`, helpers `cli()`, `add_settings_cli_arguments`, and `CommonPipelineSettings.from_namespace`.
-- Shard-only flags: [`cosmos_curate/pipelines/video/shard_pipeline_settings.py`](../cosmos_curate/pipelines/video/shard_pipeline_settings.py) — class `ShardPipelineSettings`, `add_shard_args`.
-- Parser registration used by multiple entry points: [`cosmos_curate/pipelines/pipeline_args.py`](../cosmos_curate/pipelines/pipeline_args.py) (`add_common_args`, `add_profiling_args`).
+- Shared flags (S3 profiles, execution mode, limit, model weights, profiling): [`cosmos_curator/pipelines/common_pipeline_settings.py`](../cosmos_curator/pipelines/common_pipeline_settings.py) — class `CommonPipelineSettings`, helpers `cli()`, `add_settings_cli_arguments`, and `CommonPipelineSettings.from_namespace`.
+- Shard-only flags: [`cosmos_curator/pipelines/video/shard_pipeline_settings.py`](../cosmos_curator/pipelines/video/shard_pipeline_settings.py) — class `ShardPipelineSettings`, `add_shard_args`.
+- Parser registration used by multiple entry points: [`cosmos_curator/pipelines/pipeline_args.py`](../cosmos_curator/pipelines/pipeline_args.py) (`add_common_args`, `add_profiling_args`).
 
 **How to add a new flag (shard example)**
 
@@ -240,7 +240,7 @@ The CI will test more scenarios.
 2. Put **validation** on the field with `validator=` (for example `validators.ge(1)`, `validators.in_(choices)`, `validators.min_len(1)`). This runs whenever the settings instance is constructed (CLI, NVCF JSON → `Namespace`, and any code path that builds the class explicitly).
 3. Attach CLI metadata with **`metadata=cli(...)`** on the same field. Typical keys are `help=`, `default=`, and when needed `arg_type=int` / `float`, `choices=frozenset(...)`, `required=True`, `action=` or `action=argparse.BooleanOptionalAction`, or a custom `flag="--my-name"`. The field name becomes argparse **`dest`** unless you override the flag string only (the dest stays the field name).
 4. **Register** flags by calling `add_settings_cli_arguments(parser, YourSettingsClass)` (or the thin wrappers `add_shard_args` / `add_common_args`). Do not add a second manual `add_argument` for the same option.
-5. **Build settings** at the pipeline entry point from the parsed `Namespace` (see `shard()` in [`sharding_pipeline.py`](../cosmos_curate/pipelines/video/sharding_pipeline.py): `CommonPipelineSettings.from_namespace(args)` plus shard fields keyed by field name). Pipeline logic should take **`ShardPipelineSettings`** (or the relevant settings type), not raw `args`, for the refactored paths.
+5. **Build settings** at the pipeline entry point from the parsed `Namespace` (see `shard()` in [`sharding_pipeline.py`](../cosmos_curator/pipelines/video/sharding_pipeline.py): `CommonPipelineSettings.from_namespace(args)` plus shard fields keyed by field name). Pipeline logic should take **`ShardPipelineSettings`** (or the relevant settings type), not raw `args`, for the refactored paths.
 6. **attrs field order**: optional fields with defaults cannot appear before required fields. Keep pipeline-specific constraints in mind (see existing comments on `ShardPipelineSettings`).
 
 **NVCF and Slurm**
@@ -250,7 +250,7 @@ The CI will test more scenarios.
 
 **Tests**
 
-- [`tests/cosmos_curate/pipelines/video/test_shard_pipeline_settings.py`](../tests/cosmos_curate/pipelines/video/test_shard_pipeline_settings.py) checks parser `dest` sets against settings fields and exercises attrs validation after parse.
+- [`tests/cosmos_curator/pipelines/video/test_shard_pipeline_settings.py`](../tests/cosmos_curator/pipelines/video/test_shard_pipeline_settings.py) checks parser `dest` sets against settings fields and exercises attrs validation after parse.
 
 Other large pipelines may still use legacy patterns until migrated; follow the existing module when changing them.
 
@@ -285,18 +285,18 @@ Other large pipelines may still use legacy patterns until migrated; follow the e
 
 ## Environment Variables
 
-Cosmos-Curate uses several `COSMOS_CURATE_*` environment variables for
+Cosmos Curator uses several `cosmos_curator_*` environment variables for
 internal communication between the driver process and Ray workers.
 Most are set automatically by the framework; developers rarely need to
 set them manually.
 
 | Variable | Set by | Purpose |
 |---|---|---|
-| `COSMOS_CURATE_ARTIFACTS_STAGING_DIR` | `ArtifactDelivery.create()` | Shared base directory for artifact staging on each node.  Workers inherit this from the driver so all processes agree on the same temp path.  Subdirectories (`profiling/`, `traces/`) isolate different artifact kinds. |
-| `COSMOS_CURATE_TRACE_DIR` | `enable_tracing()` | Per-process directory for OTel span files.  Defaults to `<staging>/traces/` when `COSMOS_CURATE_ARTIFACTS_STAGING_DIR` is set, otherwise `/tmp/cosmos_curate_traces`. |
-| `COSMOS_CURATE_TRACEPARENT` | `propagate_trace_context()` | W3C traceparent header propagated from the driver's root span so all stage spans join a single distributed trace. |
-| `COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX` | User (optional) | Override the home-directory prefix for the local workspace (`~/cosmos_curate_local_workspace`).  See [End User Guide](./client/END_USER_GUIDE.md). |
-| `COSMOS_CURATE_DOCKER_BUILD_ULIMIT` | User (optional) | Custom `nofile` ulimit for Docker image builds (default 65536). |
+| `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` | `ArtifactDelivery.create()` | Shared base directory for artifact staging on each node.  Workers inherit this from the driver so all processes agree on the same temp path.  Subdirectories (`profiling/`, `traces/`) isolate different artifact kinds. |
+| `COSMOS_CURATOR_TRACE_DIR` | `enable_tracing()` | Per-process directory for OTel span files.  Defaults to `<staging>/traces/` when `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` is set, otherwise `/tmp/cosmos_curator_traces`. |
+| `COSMOS_CURATOR_TRACEPARENT` | `propagate_trace_context()` | W3C traceparent header propagated from the driver's root span so all stage spans join a single distributed trace. |
+| `COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX` | User (optional) | Override the home-directory prefix for the local workspace (`~/cosmos_curator_local_workspace`).  See [End User Guide](./client/END_USER_GUIDE.md). |
+| `COSMOS_CURATOR_DOCKER_BUILD_ULIMIT` | User (optional) | Custom `nofile` ulimit for Docker image builds (default 65536). |
 
 For details on the artifact delivery mechanism and why env vars are
 used, see the [Artifact Transport Guide](./curator/reference/ARTIFACT_TRANSPORT.md#environment-variables).

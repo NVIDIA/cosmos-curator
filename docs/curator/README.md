@@ -1,4 +1,4 @@
-# Cosmos-Curate Curator Docs
+# Cosmos Curator Curator Docs
 
 This directory collects documentation for the curator pipeline layer. It is organized by the dominant purpose of each document:
 

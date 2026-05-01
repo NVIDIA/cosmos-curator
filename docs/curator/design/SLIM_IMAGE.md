@@ -1,7 +1,7 @@
 # Slim Image Design
 
 > **Note:** "Image" throughout this document refers to the Docker/OCI container image built by
-> `cosmos-curate image build`.
+> `cosmos-curator image build`.
 
 > **Phasing note:** Phases 1-2 (removing `ffmpeg_gpu`, switching to conda-forge FFmpeg) and Phase 4 (cleanup) are
 > valuable independently of the slim image work — they unblock CUDA 13, simplify compliance, and reduce image size for
@@ -22,13 +22,13 @@
 
 ## High-Level Design
 
-**Two image modes** via `cosmos-curate image build [--slim]`:
+**Two image modes** via `cosmos-curator image build [--slim]`:
 
 - Default (full) — pre-installs pixi environments at build time. Best for platforms without shared/persistent storage
   (NVCF, air-gapped deployments). With no `--envs` flag, installs all environments. With `--envs env1,env2,...`,
   installs only the specified subset (e.g. `--envs default,unified`).
 - `--slim` — lockfile (`pixi.toml` + `pixi.lock`) and source code only. `--envs` selects which environments to
-  install at runtime (same default as full mode). The image stores the env list in `COSMOS_CURATE_SLIM_ENVS` and the
+  install at runtime (same default as full mode). The image stores the env list in `COSMOS_CURATOR_SLIM_ENVS` and the
   launch flow runs `pixi install --frozen` before the user command. Combined with `--pixi-path .`, this is ideal for
   local development (near-instant rebuilds, the install is a fast no-op). Cluster use (Slurm/k8s with shared storage)
   is promising but needs validation.
@@ -130,14 +130,14 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 
 ### Phase 3: Slim image (lockfile-only)
 
-- [x] **3a. Add `--slim` flag to `cosmos-curate image build`**
+- [x] **3a. Add `--slim` flag to `cosmos-curator image build`**
     - `--slim`: skip `pixi install`, image contains only lockfile + source
     - `--envs` selects which environments to install at runtime (same default as full mode); the list is stored in the
-      image as `ENV COSMOS_CURATE_SLIM_ENVS` and `LABEL cosmos-curate.slim=true`
+      image as `ENV COSMOS_CURATOR_SLIM_ENVS` and `LABEL cosmos-curator.slim=true`
     - Default (no flag): pre-install pixi environments at build time, `--envs` selects subset
     - Full mode retains the NVIDIA wheel pre-download hack and retry logic
 
-- [x] **3b. Add `--pixi-path` flag to `cosmos-curate local launch`**
+- [x] **3b. Add `--pixi-path` flag to `cosmos-curator local launch`**
     - Mount the host `.pixi` directory into the container (envs, cache, config)
     - For local dev, `--curator-path . --pixi-path .` mounts both source and `.pixi` from the project root
     - For cluster deployments, `--pixi-path /mnt/shared/pixi` can point to shared storage independently
@@ -152,7 +152,7 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 
 - [x] **3d. Auto-warmup for local launch**
     - `local launch` prepends a conditional `pixi install --frozen` to the container command
-    - Reads `COSMOS_CURATE_SLIM_ENVS` from the image; no-op when the variable is unset (full images)
+    - Reads `COSMOS_CURATOR_SLIM_ENVS` from the image; no-op when the variable is unset (full images)
     - With `--pixi-path`, environments are already present so the install is a fast no-op
     - Without `--pixi-path`, installs environments into the container's ephemeral filesystem
 
@@ -164,7 +164,7 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 
 - [x] **3f. Add auto-warmup to sbatch template**
     - `sbatch.sh.j2` wraps the srun command with a conditional `pixi install --frozen` preamble
-    - Reads `COSMOS_CURATE_SLIM_ENVS` from the image; no-op when unset (full images)
+    - Reads `COSMOS_CURATOR_SLIM_ENVS` from the image; no-op when unset (full images)
     - Installs environments inside the container's writable overlay (RAM-backed on compute nodes)
     - Same pattern as `local launch` auto-warmup (3d)
 
@@ -177,7 +177,7 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 - [x] **3h. Validate slim image on k8s CI**
     - Switched `k8s_gpu_tests` to the slim image with in-container `pixi install` from a persistent
       hostPath cache (`/cache/pixi`)
-    - `pixi install` runs from `/opt/cosmos-curate` (where the slim image has source + lockfile),
+    - `pixi install` runs from `/opt/cosmos-curator` (where the slim image has source + lockfile),
       not from the GitLab checkout directory
     - Results: slim pod startup 9s + pixi install 37s = 46s overhead, total 7:43.
       Full image pod startup varies widely depending on image layer caching: 7s (cached) to 4:40

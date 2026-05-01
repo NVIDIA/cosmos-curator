@@ -1,6 +1,6 @@
 # Open Source License Attribution
 
-Cosmos-Curate use Open Source components. You can find the details of these open-source projects along with license information below, sorted alphabetically.
+Cosmos Curator use Open Source components. You can find the details of these open-source projects along with license information below, sorted alphabetically.
 We are grateful to the developers for their contributions to open source and acknowledge these below.
 
 ## aiofiles - [Apache 2.0 License](https://github.com/Tinche/aiofiles/blob/main/LICENSE)
@@ -6954,10 +6954,10 @@ SOFTWARE.
 ```text
 (c) copyright Blender Foundation | durian.blender.org
 
-Test video fixtures (tests/cosmos_curate/pipelines/video/data/) are clips
+Test video fixtures (tests/cosmos_curator/pipelines/video/data/) are clips
 trimmed from the Sintel open movie trailer.
 
-Test image fixtures (tests/cosmos_curate/pipelines/image/data) are images taken
+Test image fixtures (tests/cosmos_curator/pipelines/image/data) are images taken
 from the Sintel open movie trailer. 
 
 Source: https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4

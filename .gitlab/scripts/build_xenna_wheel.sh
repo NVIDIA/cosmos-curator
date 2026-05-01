@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build a cosmos-xenna wheel from the submodule checkout so that the
-# subsequent `cosmos-curate image build --use-local-xenna-build` step has a
+# subsequent `cosmos-curator image build --use-local-xenna-build` step has a
 # matching manylinux wheel in cosmos-xenna/target/wheels/.
 #
 # The ref to build is controlled by the XENNA_REF env var (default: main).

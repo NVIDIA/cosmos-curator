@@ -1,7 +1,7 @@
 # Distributed Tracing Guide
 
 Deep-dive into the OpenTelemetry-based distributed tracing subsystem
-for Cosmos-Curate pipelines.  This guide covers the public span API,
+for Cosmos Curator pipelines.  This guide covers the public span API,
 the Ray tracing hook, trace context propagation, library
 auto-instrumentation, and configuration.
 
@@ -129,13 +129,13 @@ The resulting span tree:
 
 ```
 [Ray: actor_method process_data]                         <-- automatic
-  +-- [cosmos_curate: VideoDownloader.process_data]      <-- lifecycle span
+  +-- [cosmos_curator: VideoDownloader.process_data]      <-- lifecycle span
        | attrs: stage.name, stage.num_input_tasks, stage.process_time_s, ...
        | event: batch_start (stage.input_data_size_b, stage.rss_before_mb)
        |
-       +-- [cosmos_curate: VideoDownloader.sample]       <-- per-sample span
+       +-- [cosmos_curator: VideoDownloader.sample]       <-- per-sample span
        |   attrs: stage.name, stage.num_samples
-       +-- [cosmos_curate: VideoDownloader.sample]
+       +-- [cosmos_curator: VideoDownloader.sample]
        ...
 ```
 
@@ -150,7 +150,7 @@ This gives three complementary views:
 
 ## Public Span API
 
-The public API lives in `cosmos_curate/core/utils/infra/tracing.py`
+The public API lives in `cosmos_curator/core/utils/infra/tracing.py`
 and is the only module that application code needs to import.  All
 functions and methods are zero-cost no-ops when no `TracerProvider`
 has been configured.
@@ -162,7 +162,8 @@ automatically closed when the context manager exits.  Duration is
 recorded by OTel.
 
 ```python
-from cosmos_curate.core.utils.infra.tracing import TracedSpan, traced_span
+from cosmos_curator.core.utils.infra.tracing import TracedSpan, traced_span
+
 
 class MyStage(CuratorStage):
     def process_data(self, tasks):
@@ -185,7 +186,8 @@ For functions where the entire body should be a single span, use
 the `@traced` decorator instead of a context manager:
 
 ```python
-from cosmos_curate.core.utils.infra.tracing import traced
+from cosmos_curator.core.utils.infra.tracing import traced
+
 
 @traced("MyModel.predict", attributes={"model": "resnet50"})
 def predict(self, batch: list[Frame]) -> list[float]:
@@ -233,7 +235,7 @@ visible in traces, use `record_exception()` and `set_status()`:
 
 ```python
 from opentelemetry.trace import StatusCode
-from cosmos_curate.core.utils.infra.tracing import traced_span
+from cosmos_curator.core.utils.infra.tracing import traced_span
 
 with traced_span("MyStage.download") as span:
     try:
@@ -267,7 +269,7 @@ proxy provider creates lightweight `NonRecordingSpan` objects).
 ## Ray Tracing Hook
 
 The Ray-specific integration lives in
-`cosmos_curate/core/utils/infra/tracing_hook.py`.
+`cosmos_curator/core/utils/infra/tracing_hook.py`.
 
 ### How the Hook Works
 
@@ -279,7 +281,7 @@ a Python function referenced as a `"module:attribute"` string:
 ```python
 ray.init(
     _tracing_startup_hook=(
-        "cosmos_curate.core.utils.infra.tracing_hook:setup_tracing"
+        "cosmos_curator.core.utils.infra.tracing_hook:setup_tracing"
     ),
     ...
 )
@@ -303,16 +305,16 @@ enable_tracing()
 +-- 1. Set XENNA_RAY_TRACING_HOOK env var
 |       (read by init_or_connect_to_cluster -> ray.init)
 |
-+-- 2. Set COSMOS_CURATE_TRACE_DIR env var
++-- 2. Set COSMOS_CURATOR_TRACE_DIR env var
 |       (read by setup_tracing on each worker)
 |
-+-- 3. Clear stale COSMOS_CURATE_TRACEPARENT
++-- 3. Clear stale COSMOS_CURATOR_TRACEPARENT
 |       (driver is the root -- must not inherit old trace)
 |
 +-- 4. Call setup_tracing() on the driver itself
 |       (workers get their own call via Ray's hook)
 |
-+-- 5. Ensure PYTHONPATH includes cosmos_curate
++-- 5. Ensure PYTHONPATH includes cosmos_curator
         (so bare raylet workers can import the hook)
 ```
 
@@ -327,7 +329,7 @@ setup_tracing()
 +-- re-entrancy guard (no-op if already called)
 |
 +-- TracingConfig.from_env()
-|       Parse COSMOS_CURATE_TRACE_DIR,
+|       Parse COSMOS_CURATOR_TRACE_DIR,
 |       OTEL_EXPORTER_OTLP_ENDPOINT, etc.
 |
 +-- _TracingBackend(config)
@@ -423,7 +425,7 @@ profiling_scope()
       +-- trace_root_anchor() starts    <-- anchor span (root, no parent)
       |     +-- anchor.end()            <-- exported immediately
       |     +-- propagate_context()     <-- reads anchor's trace_id + span_id
-      |     |     +-- writes COSMOS_CURATE_TRACEPARENT env var
+      |     |     +-- writes COSMOS_CURATOR_TRACEPARENT env var
       |     |          format: "{trace_id_hex}:{span_id_hex}"
       |     |
       |     +-- state.scope("main")     <-- _root.main (child of anchor)
@@ -432,7 +434,7 @@ profiling_scope()
       +-- trace_root_anchor exits       <-- detach anchor context
       |
       v
-[workers read COSMOS_CURATE_TRACEPARENT in setup_tracing()]
+[workers read COSMOS_CURATOR_TRACEPARENT in setup_tracing()]
       |
       +-- _attach_remote_parent()
       |     Construct remote SpanContext(trace_id, span_id)
@@ -529,19 +531,19 @@ feature.
 
 ### Environment Variables
 
-**Cosmos-Curate specific:**
+**Cosmos Curator specific:**
 
 | Variable | Set by | Read by | Purpose |
 |---|---|---|---|
-| `COSMOS_CURATE_TRACE_DIR` | `enable_tracing()` | `setup_tracing()` (workers) | Local directory for span files (defaults to `<staging>/traces/`) |
-| `COSMOS_CURATE_TRACEPARENT` | `propagate_trace_context()` | `setup_tracing()` (workers) | Trace context for correlating worker spans under a single trace |
+| `COSMOS_CURATOR_TRACE_DIR` | `enable_tracing()` | `setup_tracing()` (workers) | Local directory for span files (defaults to `<staging>/traces/`) |
+| `COSMOS_CURATOR_TRACEPARENT` | `propagate_trace_context()` | `setup_tracing()` (workers) | Trace context for correlating worker spans under a single trace |
 | `XENNA_RAY_TRACING_HOOK` | `enable_tracing()` | `init_or_connect_to_cluster()` | `"module:attribute"` string passed to `ray.init(_tracing_startup_hook=...)` |
 
 **Standard OTel environment variables:**
 
 | Variable | Purpose |
 |---|---|
-| `OTEL_SERVICE_NAME` | Override resource `service.name` (default: `cosmos_curate`) |
+| `OTEL_SERVICE_NAME` | Override resource `service.name` (default: `cosmos_curator`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base collector endpoint (e.g. `http://localhost:4318`) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Trace-specific override (takes precedence) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers as `key=value,key2=value2` |
@@ -560,7 +562,7 @@ Tempo:
 
 | Resource Attribute | Value | Purpose |
 |---|---|---|
-| `service.name` | `cosmos_curate` (or `OTEL_SERVICE_NAME`) | Identifies the application |
+| `service.name` | `cosmos_curator` (or `OTEL_SERVICE_NAME`) | Identifies the application |
 | `host.name` | Short hostname (e.g. `node03`) | Identifies the machine |
 | `process.pid` | OS PID (e.g. `6135`) | Identifies the worker process |
 
@@ -573,8 +575,8 @@ docker run -d --name jaeger \
   jaegertracing/all-in-one:latest
 
 # Run pipeline with tracing
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-tracing --verbose
@@ -584,7 +586,7 @@ cosmos-curate local launch --curator-path . -- \
 
 By default the OTLP exporter sends spans to `http://localhost:4318`,
 so a Jaeger instance on the host receives spans out of the box.
-Because `cosmos-curate local launch` runs inside Docker,
+Because `cosmos-curator local launch` runs inside Docker,
 `OTEL_EXPORTER_OTLP_ENDPOINT` must be set **inside** the container
 (e.g. baked into the Docker image or passed via `docker run -e`)
 to reach a non-localhost collector.
@@ -655,5 +657,5 @@ OpenTelemetry:
 
 | File | Description |
 |---|---|
-| `cosmos_curate/core/utils/infra/tracing.py` | Public span API: `TracedSpan`, `traced_span`, `@traced`, `trace_root_anchor`, `StatusCode` |
-| `cosmos_curate/core/utils/infra/tracing_hook.py` | Ray hook: `enable_tracing`, `setup_tracing`, `_TracingBackend`, `TracingConfig`, library auto-instrumentors |
+| `cosmos_curator/core/utils/infra/tracing.py` | Public span API: `TracedSpan`, `traced_span`, `@traced`, `trace_root_anchor`, `StatusCode` |
+| `cosmos_curator/core/utils/infra/tracing_hook.py` | Ray hook: `enable_tracing`, `setup_tracing`, `_TracingBackend`, `TracingConfig`, library auto-instrumentors |

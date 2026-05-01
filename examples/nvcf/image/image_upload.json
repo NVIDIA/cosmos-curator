@@ -11,7 +11,7 @@
         "multinode: Is image multinode. Defaults to false",
         "display_name: Display name of image. Defaults to null"
     ],
-    "image": "[FILL_IN_OPTIONAL_TEAM/]cosmos-curate",
+    "image": "[FILL_IN_OPTIONAL_TEAM/]cosmos-curator",
     "tag": "FILL_IN",
     "definition": {
         "desc": null,

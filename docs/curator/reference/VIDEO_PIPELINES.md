@@ -1,6 +1,6 @@
-# Cosmos-Curate - Reference Video Pipelines
+# Cosmos Curator - Reference Video Pipelines
 
-- [Cosmos-Curate - Reference Video Pipelines](#cosmos-curate---reference-video-pipelines)
+- [Cosmos Curator - Reference Video Pipelines](#cosmos-curator---reference-video-pipelines)
   - [Split-Annotate Pipeline](#split-annotate-pipeline)
     - [Split-Annotate Pipeline Stages](#split-annotate-pipeline-stages)
     - [Split-Annotate Pipeline Output Format](#split-annotate-pipeline-output-format)
@@ -27,7 +27,7 @@ There are three reference video pipelines:
 
 The overall workflow is described in the diagram below:
 
-![Pipelines](../../assets/cosmos-curate-pipelines.png)
+![Pipelines](../../assets/cosmos-curator-pipelines.png)
 
 ## Split-Annotate Pipeline
 
@@ -95,9 +95,9 @@ Today the split-annotate pipeline produces the following artifacts under the pat
 Below is a summary of the important options for the split-annotate pipeline. There are many more options available and can be seen from the help message:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- python3 -m cosmos_curate.pipelines.video.run_pipeline split --help
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- python3 -m cosmos_curator.pipelines.video.run_pipeline split --help
 ```
 
 > **Tip:** Instead of passing many CLI flags, you can put all settings in a JSON or
@@ -111,9 +111,9 @@ cosmos-curate local launch \
 **Options for Input/Output**
 
 - `--input-video-path`: path on local disk or `s3://` bucket that contains videos.
-- `--input-presigned-s3-url`: presigned **HTTPS** URL that points to a ZIP file on S3. Cosmos-Curate will download, extract, and treat the extracted directory as `input_video_path`. Use this when you cannot expose the entire bucket but can issue a single presigned URL.
+- `--input-presigned-s3-url`: presigned **HTTPS** URL that points to a ZIP file on S3. Cosmos Curator will download, extract, and treat the extracted directory as `input_video_path`. Use this when you cannot expose the entire bucket but can issue a single presigned URL.
 - `--output-clip-path`: destination directory (local or `s3://`) for individual clip files and metadata.
-- `--output-presigned-s3-url`: presigned **HTTPS** URL where Cosmos-Curate will upload a single ZIP archive of everything it wrote to `output_clip_path`. Useful for one-shot batch jobs where the caller only needs one file to download.
+- `--output-presigned-s3-url`: presigned **HTTPS** URL where Cosmos Curator will upload a single ZIP archive of everything it wrote to `output_clip_path`. Useful for one-shot batch jobs where the caller only needs one file to download.
 
 Using presigned URLs embeds all necessary authentication in the link itself, so the pipeline **does not need AWS credentials configured** when these flags are used.
 
@@ -218,10 +218,10 @@ Below are a few key options for dedup pipeline:
 An example command is as follows assuming you have used the default `internvideo2` embedding model in `split-annotate` pipeline:
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
   -- pixi run --as-is \
-  python3 -m cosmos_curate.pipelines.video.run_pipeline dedup \
+  python3 -m cosmos_curator.pipelines.video.run_pipeline dedup \
   --input-embeddings-path <local or s3 path to store clips and metadatas produced by split-annotate pipeline>/ \
   --output-path <local or s3 path to store semantic-dedup output>
 ```
@@ -229,10 +229,10 @@ cosmos-curate local launch \
 A full list of options can be seen from the help message
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
   -- pixi run --as-is \
-  python3 -m cosmos_curate.pipelines.video.run_pipeline dedup --help
+  python3 -m cosmos_curator.pipelines.video.run_pipeline dedup --help
 ```
 
 ## Shard-Dataset Pipeline
@@ -286,7 +286,7 @@ Today the shard-dataset pipeline produces the following artifacts under the path
 ### Shard-Dataset Pipeline Configurable Options
 
 Below are a few key options for shard-dataset pipeline:
-- `--input-clip-path`: path inside the container or on cloud storage that holds all all the clips, captions, and metadatas. If you need to use a local path, the directory `~/cosmos_curate_local_workspace/` is mounted to `/config/`.
+- `--input-clip-path`: path inside the container or on cloud storage that holds all all the clips, captions, and metadatas. If you need to use a local path, the directory `~/cosmos_curator_local_workspace/` is mounted to `/config/`.
 - `--output-dataset-path`: where the output dataset will be stored. It functions similarly to `--input-clip-path` in terms of mounts.
 - `--annotation-version`: annotation version to use for the clip metadata. This helps in scenarios where another process updates the clip metadata (e.g., captions) to a newer version (e.g., `v1`) after the splitting pipeline produced version `v0`.
 - `--input-semantic-dedup-path`: path that holds the output from `dedup` pipeline.
@@ -294,9 +294,9 @@ Below are a few key options for shard-dataset pipeline:
 An example command is as follows assuming you have not update the clip metadata to a new version:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- python3 -m cosmos_curate.pipelines.video.run_pipeline shard --help
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- python3 -m cosmos_curator.pipelines.video.run_pipeline shard --help
     --input-clip-path <local or s3 path to store clips and metadatas produced by split-annotate pipeline> \
     --output-dataset-path <local or s3 path to store output dataset> \
     --annotation-version v0
@@ -305,7 +305,7 @@ cosmos-curate local launch \
 Again, a full list of options can be seen from the help message
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- python3 -m cosmos_curate.pipelines.video.run_pipeline shard --help
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- python3 -m cosmos_curator.pipelines.video.run_pipeline shard --help
 ```

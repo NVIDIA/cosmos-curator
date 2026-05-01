@@ -2,7 +2,7 @@
 
 ## Overview
 
-This guide walks you through adding a new vLLM model to cosmos-curate by implementing a plugin. Plugins allow you to integrate new models without modifying core `vllm_interface` code or needing to add stages.
+This guide walks you through adding a new vLLM model to cosmos-curator by implementing a plugin. Plugins allow you to integrate new models without modifying core `vllm_interface` code or needing to add stages.
 
 **Prerequisites:**
 - Familiarity with vLLM library and the model you want to add
@@ -17,10 +17,10 @@ This guide walks you through adding a new vLLM model to cosmos-curate by impleme
 
 Adding a new model requires 4 files and ~260 lines of code:
 
-1. **Create plugin**: `cosmos_curate/models/vllm_mymodel.py` (~150 lines)
-2. **Register plugin**: Add to `cosmos_curate/models/vllm_interface.py` (2 lines)
-3. **Add model ID**: Add to `cosmos_curate/models/vllm_model_ids.py` (1 line)
-4. **Add model info**: Add to `cosmos_curate/configs/all_models.json` (7 lines)
+1. **Create plugin**: `cosmos_curator/models/vllm_mymodel.py` (~150 lines)
+2. **Register plugin**: Add to `cosmos_curator/models/vllm_interface.py` (2 lines)
+3. **Add model ID**: Add to `cosmos_curator/models/vllm_model_ids.py` (1 line)
+4. **Add model info**: Add to `cosmos_curator/configs/all_models.json` (7 lines)
 4. **Test plugin**: `tests/models/test_vllm_mymodel.py` (~100 lines)
 
 **Time estimate:** 2-4 hours for a well-understood model
@@ -92,7 +92,7 @@ both image and video should use `config.use_image_input` to choose the modality.
 
 ### Step 1: Create Plugin File
 
-Create `cosmos_curate/models/vllm_mymodel.py`:
+Create `cosmos_curator/models/vllm_mymodel.py`:
 
 ```python
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -118,8 +118,8 @@ from typing import Any
 from transformers import AutoProcessor
 from vllm import LLM
 
-from cosmos_curate.models.vllm_plugin import VllmPlugin
-from cosmos_curate.pipelines.video.utils.data_model import (
+from cosmos_curator.models.vllm_plugin import VllmPlugin
+from cosmos_curator.pipelines.video.utils.data_model import (
     VllmCaptionRequest,
     VllmConfig,
 )
@@ -132,7 +132,7 @@ class VllmMyModel(VllmPlugin):
     def model_variant() -> str:
         """Return the model variant name."""
         return "mymodel"
-    
+
     # Implement other methods below...
 ```
 
@@ -479,10 +479,10 @@ if "prompt_token_ids" in stage2_request.inputs:
 
 ### Step 7: Register Plugin
 
-Add your plugin to the registry in `cosmos_curate/models/vllm_interface.py`:
+Add your plugin to the registry in `cosmos_curator/models/vllm_interface.py`:
 
 ```python
-from cosmos_curate.models.vllm_mymodel import VllmMyModel
+from cosmos_curator.models.vllm_mymodel import VllmMyModel
 
 _VLLM_PLUGINS = {
     VllmNemotronNano12Bv2VL.model_variant(): VllmNemotronNano12Bv2VL,
@@ -495,7 +495,7 @@ _VLLM_PLUGINS = {
 
 ### Step 8: Add Model ID Mapping
 
-Add your model's HuggingFace ID to `cosmos_curate/models/vllm_model_ids.py`:
+Add your model's HuggingFace ID to `cosmos_curator/models/vllm_model_ids.py`:
 
 ```python
 _VLLM_MODELS = {
@@ -523,8 +523,8 @@ import torch
 from vllm import RequestOutput
 from vllm.outputs import CompletionOutput
 
-from cosmos_curate.models.vllm_mymodel import VllmMyModel
-from cosmos_curate.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
+from cosmos_curator.models.vllm_mymodel import VllmMyModel
+from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
 
 
 def test_model_variant():
@@ -569,11 +569,11 @@ def test_model():
 def test_make_llm_input():
     """Test LLM input creation."""
     pytest.skip("Requires processor - implement after model download")
-    
+
     frames = torch.rand(8, 3, 224, 224)
     prompt = "Describe this video"
     processor = VllmMyModel.processor()
-    
+
     inputs = VllmMyModel.make_llm_input(
         prompt,
         frames,
@@ -581,12 +581,12 @@ def test_make_llm_input():
         processor,
         VllmConfig(model_variant="mymodel"),
     )
-    
+
     # Verify structure
     assert isinstance(inputs, dict)
     assert "prompt_token_ids" in inputs or "prompt" in inputs
     assert "multi_modal_data" in inputs
-    
+
     mm_data = inputs["multi_modal_data"]
     assert "video" in mm_data or "image" in mm_data
 
@@ -600,7 +600,7 @@ def test_decode():
         outputs=[CompletionOutput(index=0, text="A person walking", token_ids=[])],
         finished=True,
     )
-    
+
     caption = VllmMyModel.decode(mock_output)
     assert isinstance(caption, str)
     assert caption == "A person walking"
@@ -609,7 +609,7 @@ def test_decode():
 def test_make_refined_llm_request():
     """Test stage 2 request creation."""
     pytest.skip("Requires processor - implement after model download")
-    
+
     # Create stage 1 request
     stage1_request = VllmCaptionRequest(
         request_id="stage1-test",
@@ -620,12 +620,12 @@ def test_make_refined_llm_request():
         caption="A person walking",
         stage2_prompt="Refine this",
     )
-    
+
     processor = VllmMyModel.processor()
     stage2_request = VllmMyModel.make_refined_llm_request(
         stage1_request, processor, "Refine this"
     )
-    
+
     # Verify structure
     assert stage2_request.request_id != stage1_request.request_id
     assert stage2_request.caption is None
@@ -639,7 +639,7 @@ Run tests:
 pytest tests/models/test_vllm_mymodel.py -v
 
 # Integration tests (requires GPU and model weights)
-cosmos-curate local launch --curator-path . -- \
+cosmos-curator local launch --curator-path . -- \
     pixi run --as-is -e unified pytest tests/models/test_vllm_mymodel.py -m env -v
 ```
 
@@ -652,31 +652,31 @@ Test end-to-end captioning:
 @pytest.mark.slow
 def test_mymodel_e2e_captioning():
     """End-to-end test for MyModel plugin."""
-    from cosmos_curate.models.vllm_interface import (
+    from cosmos_curator.models.vllm_interface import (
         auto_processor,
         make_model_inputs,
         sampling_params,
         vllm_caption,
         vllm_model,
     )
-    
+
     config = VllmConfig(
         model_variant="mymodel",
         num_gpus=1,
         batch_size=2,
         max_output_tokens=128,
     )
-    
+
     # Setup
     llm = vllm_model(config)
     processor = auto_processor(config)
     samp_params = sampling_params(config)
-    
+
     # Create test inputs
     frames = torch.rand(8, 3, 224, 224)
     metadata = make_metadata([frames], WindowConfig(sampling_fps=1.0))
     model_inputs = make_model_inputs([frames], metadata, config, processor, "Describe this video")
-    
+
     # Test stage 1
     captions = vllm_caption(
         model_inputs,
@@ -687,12 +687,12 @@ def test_mymodel_e2e_captioning():
         max_inflight_requests=0,
         inflight_batching=True,
     )
-    
+
     assert len(captions) == 1
     assert isinstance(captions[0], str)
     assert captions[0] != "Unknown caption"
     print(f"Stage 1 caption: {captions[0]}")
-    
+
     # Test stage 2
     captions_s2 = vllm_caption(
         model_inputs,
@@ -704,7 +704,7 @@ def test_mymodel_e2e_captioning():
         inflight_batching=True,
         stage2_prompts=["Refine this caption"],
     )
-    
+
     assert len(captions_s2) == 1
     assert isinstance(captions_s2[0], str)
     assert captions_s2[0] != "Unknown caption"
@@ -943,7 +943,7 @@ Don't just test with random tensors:
 
 ```python
 # Load a real video for testing
-from cosmos_curate.pipelines.video.utils.video_utils import decode_video
+from cosmos_curator.pipelines.video.utils.video_utils import decode_video
 
 video_path = "test_data/sample_video.mp4"
 frames = decode_video(video_path, num_frames=8)
@@ -982,7 +982,7 @@ Use this checklist to ensure your plugin is complete:
 **Error:** `FileNotFoundError: Model not found at path/to/model`
 
 **Solutions:**
-1. Download model weights: `pixi run --as-is -e model-download python -m cosmos_curate.models.download_model mymodel`
+1. Download model weights: `pixi run --as-is -e model-download python -m cosmos_curator.models.download_model mymodel`
 2. Check `vllm_model_ids.py` has correct HuggingFace ID
 3. Verify `model_path()` returns correct path
 
@@ -1032,8 +1032,8 @@ import torch
 from transformers import AutoProcessor
 from vllm import LLM, RequestOutput
 
-from cosmos_curate.models.vllm_plugin import VllmPlugin
-from cosmos_curate.pipelines.video.utils.data_model import (
+from cosmos_curator.models.vllm_plugin import VllmPlugin
+from cosmos_curator.pipelines.video.utils.data_model import (
     VllmCaptionRequest,
     VllmConfig,
 )
@@ -1070,7 +1070,7 @@ class VllmVideoLLaMA(VllmPlugin):
     @classmethod
     def model(cls, config: VllmConfig) -> LLM:
         quantization = "fp8" if config.fp8 else None
-        
+
         return LLM(
             model=str(cls.model_path()),
             quantization=quantization,
@@ -1083,11 +1083,11 @@ class VllmVideoLLaMA(VllmPlugin):
 
     @staticmethod
     def make_llm_input(
-        prompt: str,
-        frames: torch.Tensor,
-        metadata: dict[str, Any],
-        processor: AutoProcessor,
-        config: VllmConfig,
+            prompt: str,
+            frames: torch.Tensor,
+            metadata: dict[str, Any],
+            processor: AutoProcessor,
+            config: VllmConfig,
     ) -> dict[str, Any]:
         message = VideoLLaMAMessage(
             role="user",
@@ -1096,14 +1096,14 @@ class VllmVideoLLaMA(VllmPlugin):
                 {"type": "text", "text": prompt},
             ],
         )
-        
+
         prompt_ids = processor.apply_chat_template(
             [message],
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
         )[0].tolist()
-        
+
         return {
             "prompt_token_ids": prompt_ids,
             "multi_modal_data": {"video": [(frames, metadata)]},
@@ -1111,19 +1111,19 @@ class VllmVideoLLaMA(VllmPlugin):
 
     @staticmethod
     def make_refined_llm_request(
-        request: VllmCaptionRequest,
-        processor: AutoProcessor,
-        refine_prompt: str | None = None,
+            request: VllmCaptionRequest,
+            processor: AutoProcessor,
+            refine_prompt: str | None = None,
     ) -> VllmCaptionRequest:
         _refine_prompt = _DEFAULT_REFINE_PROMPT if refine_prompt is None else refine_prompt
-        
+
         if request.caption is None:
             msg = "Request caption is None"
             raise ValueError(msg)
-        
+
         final_prompt = _refine_prompt + request.caption
         video_frames = request.inputs["multi_modal_data"]["video"]
-        
+
         message = VideoLLaMAMessage(
             role="user",
             content=[
@@ -1131,14 +1131,14 @@ class VllmVideoLLaMA(VllmPlugin):
                 {"type": "text", "text": final_prompt},
             ],
         )
-        
+
         prompt_ids = processor.apply_chat_template(
             [message],
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
         )[0].tolist()
-        
+
         return VllmCaptionRequest(
             request_id=secrets.token_hex(8),
             inputs={
@@ -1159,11 +1159,11 @@ class VllmVideoLLaMA(VllmPlugin):
 
 ## References
 
-- **Plugin Interface Definition**: `cosmos_curate/models/vllm_plugin.py`
+- **Plugin Interface Definition**: `cosmos_curator/models/vllm_plugin.py`
 - **Existing Plugin Examples**:
-  - `cosmos_curate/models/vllm_qwen.py` - Token-based with video
-  - `cosmos_curate/models/vllm_nemotron.py` - Video + metadata format
-  - `cosmos_curate/models/vllm_cosmos_reason1_vl.py` - NVIDIA model
+  - `cosmos_curator/models/vllm_qwen.py` - Token-based with video
+  - `cosmos_curator/models/vllm_nemotron.py` - Video + metadata format
+  - `cosmos_curator/models/vllm_cosmos_reason1_vl.py` - NVIDIA model
 - **vLLM Documentation**: https://docs.vllm.ai/
 - **Design Document**: [VLLM_INTERFACE.md](../design/VLLM_INTERFACE.md)
 - **Debug Guide**: [VLLM_INTERFACE_DEBUG.md](VLLM_INTERFACE_DEBUG.md)

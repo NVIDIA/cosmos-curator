@@ -43,7 +43,7 @@ Quick start -- Jaeger all-in-one (simplest)
     #    Connections > Data sources > Add Jaeger
     #    URL: http://host.docker.internal:16686
 
-    # 4. Open http://localhost:16686, select service "cosmos_curate"
+    # 4. Open http://localhost:16686, select service "cosmos_curator"
 
 Quick start -- Grafana + Tempo (richer dashboards)
 --------------------------------------------------

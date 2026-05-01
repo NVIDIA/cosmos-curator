@@ -1,6 +1,6 @@
-# Cosmos-Curate - Observability Guide
+# Cosmos Curator - Observability Guide
 
-- [Cosmos-Curate - Observability Guide](#cosmos-curate---observability-guide)
+- [Cosmos Curator - Observability Guide](#cosmos-curator---observability-guide)
   - [Profiling and Instrumentation](#profiling-and-instrumentation)
     - [CLI Flags](#cli-flags)
     - [CPU Profiling (pyinstrument)](#cpu-profiling-pyinstrument)
@@ -19,7 +19,7 @@ This guide walks through profiling, instrumentation, metrics, monitoring dashboa
 
 ## Profiling and Instrumentation
 
-Cosmos-Curate provides automatic, framework-level profiling at three levels:
+Cosmos Curator provides automatic, framework-level profiling at three levels:
 
 1. **Per-stage** -- injected transparently by `_build_pipeline_stage_specs()` in
    `pipeline_interface.py`.  Every stage's lifecycle methods (`stage_setup_on_node`,
@@ -80,8 +80,8 @@ Produces:
 Example:
 
 ```bash
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-cpu --verbose
@@ -99,8 +99,8 @@ Produces:
 Example:
 
 ```bash
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-memory --verbose
@@ -111,8 +111,8 @@ The driver process (`_root`) is excluded from memory profiling by default
 to avoid the memray/pyinstrument `sys.setprofile` conflict:
 
 ```bash
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-cpu --profile-memory --verbose
@@ -133,8 +133,8 @@ Produces:
 Example:
 
 ```bash
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-gpu --verbose
@@ -159,8 +159,8 @@ Produces per-worker NDJSON span files under `<staging-dir>/traces/`
 to an OTLP collector (Jaeger, Grafana Tempo, etc.).
 
 ```bash
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
     --profile-tracing --verbose
@@ -169,7 +169,7 @@ cosmos-curate local launch --curator-path . -- \
 #### Instrumenting Custom Stage Code
 
 The public tracing API lives in
-`cosmos_curate/core/utils/infra/tracing.py`.  All functions are
+`cosmos_curator/core/utils/infra/tracing.py`.  All functions are
 **safe to call unconditionally** -- when tracing is not enabled
 (`--profile-tracing` not passed), they become zero-cost no-ops.
 No `if tracing_enabled` guards are needed.
@@ -222,9 +222,10 @@ At scale (100 M+ items), per-item spans generate excessive trace
 data.  Record per-item details as aggregated attributes instead.
 
 ```python
-from cosmos_curate.core.utils.infra.tracing import (
+from cosmos_curator.core.utils.infra.tracing import (
     TracedSpan, traced, traced_span, StatusCode,
 )
+
 
 class MyStage(CuratorStage):
 
@@ -333,7 +334,7 @@ sum by (stage) (ray_pipeline_actor_resource_usage{stage!="", resource="memory"})
 
 ## Grafana Dashboard
 
-An awesome monitoring dashboard is provided at [cosmos-curate-oss.json](../../../examples/observability/grafana/cosmos-curate-oss.json).
+An awesome monitoring dashboard is provided at [cosmos-curator-oss.json](../../../examples/observability/grafana/cosmos-curator-oss.json).
 
 The panels are organized in the following rows:
 - `Pipeline`:
@@ -356,18 +357,18 @@ The panels are organized in the following rows:
   - cross-stage data movement size (this goes through front-end CPU network and hence should not be too large)
   - timing of main loop of streaming executor (whether the main orchestration thread is the bottleneck)
 
-![Monitoring Dashboard](../../assets/cosmos-curate-dashboard.png)
+![Monitoring Dashboard](../../assets/cosmos-curator-dashboard.png)
 
 ## Deployment
 
 ### K8s-based Platforms
 
 On K8s-based platforms, including [NVCF](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html),
-the [Helm chart](../../../charts/cosmos-curate/README.md) provided includes a [Prometheus Agent](https://prometheus.io/blog/2021/11/16/agent/)
+the [Helm chart](../../../charts/cosmos-curator/README.md) provided includes a [Prometheus Agent](https://prometheus.io/blog/2021/11/16/agent/)
 which can scrape the metrics endpoint and [remote-write](https://prometheus.io/docs/specs/prw/remote_write_spec/)
 to a [Thanos-like](https://thanos.io/) endpoint.
 
-The relevant configurable entries in the chart can be found in [values.yaml](../../../charts/cosmos-curate/values.yaml):
+The relevant configurable entries in the chart can be found in [values.yaml](../../../charts/cosmos-curator/values.yaml):
 
 ```yaml
 metrics:
@@ -382,7 +383,7 @@ Do note that current version of the Helm chart will need some tweaks to work on 
 
 ### Slurm Environment
 
-On Slurm, there is an option `--prometheus-service-discovery-path` to the `cosmos-curate slurm submit` command.
+On Slurm, there is an option `--prometheus-service-discovery-path` to the `cosmos-curator slurm submit` command.
 
 If you provide a valid path, which needs to be accessible from the compute nodes,
 a service-discovery file named `prometheus_service_discovery_{slurm_job_id}.json` will be created under that path.
@@ -411,7 +412,7 @@ Then you can configure the cluster's Prometheus with the [file-based service dis
 
 ```yaml
 scrape_configs:
-- job_name: 'cosmos-curate'
+- job_name: 'cosmos-curator'
   file_sd_configs:
   - files:
     - '<the same path you passed in>/prometheus_service_discovery_*.json'

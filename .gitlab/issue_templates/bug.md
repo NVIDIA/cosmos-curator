@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Create a bug report to help us improve Cosmos-Curate
+about: Create a bug report to help us improve Cosmos Curator
 title: "[BUG]"
 labels: "? - Needs Triage, bug"
 assignees: ''

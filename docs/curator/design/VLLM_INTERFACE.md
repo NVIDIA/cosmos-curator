@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `vllm_interface` module provides a unified, plugin-based abstraction layer for integrating vLLM-powered vision-language models (VLMs) into the Cosmos-Curate video curation pipeline. It enables efficient, GPU-accelerated video captioning with support for multiple model backends, two-stage caption refinement, and flexible batching strategies.
+The `vllm_interface` module provides a unified, plugin-based abstraction layer for integrating vLLM-powered vision-language models (VLMs) into the Cosmos Curator video curation pipeline. It enables efficient, GPU-accelerated video captioning with support for multiple model backends, two-stage caption refinement, and flexible batching strategies.
 
 The `vllm_interface` provides separation of concerns, enabling CuratorStage classes to focus on data routing while `vllm_interface` handles model setup, caption generation, and in-flight batching. This eliminates the need for stages to re-implement this functionality.
 
-**Location**: `cosmos_curate/models/vllm_interface.py`
+**Location**: `cosmos_curator/models/vllm_interface.py`
 
 **Primary Purpose**: Abstract away model-specific implementation details and provide a consistent interface for video captioning using vLLM's high-performance inference engine.
 
@@ -104,7 +104,7 @@ _VLLM_PLUGINS = {
 
 ### 2. VllmPlugin Interface
 
-**Location**: `cosmos_curate/models/vllm_plugin.py`
+**Location**: `cosmos_curator/models/vllm_plugin.py`
 
 **Required Methods**:
 - `model_variant() -> str`: Returns unique identifier for the model
@@ -120,7 +120,7 @@ _VLLM_PLUGINS = {
 
 #### VllmConfig
 
-**Location**: `cosmos_curate/pipelines/video/utils/data_model.py`
+**Location**: `cosmos_curator/pipelines/video/utils/data_model.py`
 
 ```python
 @attrs.define
@@ -144,7 +144,7 @@ class VllmConfig:
 
 #### VllmCaptionRequest
 
-**Location**: `cosmos_curate/pipelines/video/utils/data_model.py`
+**Location**: `cosmos_curator/pipelines/video/utils/data_model.py`
 
 ```python
 @attrs.define
@@ -461,7 +461,7 @@ See **[`VLLM_INTERFACE_PLUGIN.md`](../guides/VLLM_INTERFACE_PLUGIN.md)** for the
 - ✅ Complete working example (VideoLLaMA plugin)
 
 **Quick Summary:**
-1. Create plugin file: `cosmos_curate/models/vllm_mymodel.py` (~150 lines)
+1. Create plugin file: `cosmos_curator/models/vllm_mymodel.py` (~150 lines)
 2. Implement 5 methods: `model_variant()`, `processor()`, `model()`, `make_llm_input()`, `decode()`, `make_refined_llm_request()`
 3. Register in `vllm_interface.py` (1 line) and `vllm_model_ids.py` (1 line)
 4. Write tests and verify end-to-end captioning works
@@ -612,8 +612,8 @@ except Exception:
 
 ### Internal Dependencies
 
-- `cosmos_curate.core.utils.misc.grouping`: Batch splitting utilities
-- `cosmos_curate.pipelines.video.utils.data_model`: Configuration and request objects
+- `cosmos_curator.core.utils.misc.grouping`: Batch splitting utilities
+- `cosmos_curator.pipelines.video.utils.data_model`: Configuration and request objects
 - Plugin implementations: `vllm_nemotron.py`, `vllm_qwen.py`, `vllm_cosmos_reason1_vl.py`, `vllm_cosmos_reason2_vl.py`
 
 ### Conda Environment
@@ -727,5 +727,5 @@ See **[`VLLM_INTERFACE_DEBUG.md`](../guides/VLLM_INTERFACE_DEBUG.md)** for:
 - vLLM Documentation: https://docs.vllm.ai/
 - Cosmos-Xenna (Ray pipeline framework): https://github.com/nvidia-cosmos/cosmos-xenna
 - [Pipeline Design Guide](../guides/PIPELINE_DESIGN.md)
-- [Model Interface](../../../cosmos_curate/core/interfaces/model_interface.py)
-- [VllmCaptionStage](../../../cosmos_curate/pipelines/video/captioning/vllm_caption_stage.py)
+- [Model Interface](../../../cosmos_curator/core/interfaces/model_interface.py)
+- [VllmCaptionStage](../../../cosmos_curator/pipelines/video/captioning/vllm_caption_stage.py)

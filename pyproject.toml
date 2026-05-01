@@ -14,9 +14,9 @@
 # limitations under the License.
 
 [project]
-name = "cosmos_curate"
+name = "cosmos_curator"
 version = "1.4.0"
-description = "Cosmos-Curate"
+description = "Cosmos Curator"
 readme = "README.md"
 authors = [
     {name = "NVIDIA Corporation"},
@@ -62,10 +62,10 @@ Homepage = "https://github.com/nvidia-cosmos/cosmos-curate"
 Repository = "https://github.com/nvidia-cosmos/cosmos-curate.git"
 
 [tool.poetry.scripts]
-cosmos-curate = 'cosmos_curate.client.cli:cosmos_curator'
+cosmos-curator = 'cosmos_curator.client.cli:cosmos_curator'
 
 [project.scripts]
-cosmos-curate = 'cosmos_curate.client.cli:cosmos_curator'
+cosmos-curator = 'cosmos_curator.client.cli:cosmos_curator'
 
 [build-system]
 requires = ["setuptools==80.7.1", "jinja2>=3.1.6", "tomli>=2.2.1", "wheel"]
@@ -132,7 +132,7 @@ local = [
 # ``importlib.resources`` lookups (e.g. prompt templates used by
 # ``PerEventCaptionStage``) keep working when the package is installed from a
 # built wheel rather than from the source tree.
-"cosmos_curate" = [
+"cosmos_curator" = [
     "pipelines/video/captioning/prompts/*.md",
     "configs/*.json",
     "models/configs/*.json",
@@ -151,7 +151,7 @@ exclude = [
     "build/",
     "dist/",
     "cosmos-xenna/",
-    "cosmos_curate/models/internvideo2_multi_modality/",
+    "cosmos_curator/models/internvideo2_multi_modality/",
 ]
 
 [tool.ruff.lint]
@@ -165,10 +165,10 @@ extend-select = ["I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["INP001", "SLF001", "PLR2004"]
-"cosmos_curate/pipelines/video/super_resolution/inference_seedvr2_window.py" = ["ALL"]
+"cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py" = ["ALL"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["cosmos_curate", "cosmos_xenna"]
+known-first-party = ["cosmos_curator", "cosmos_xenna"]
 
 [tool.mypy]
 allow_redefinition = false
@@ -191,22 +191,22 @@ warn_return_any = true
 warn_unreachable = true
 warn_unused_ignores = false
 disable_error_code = ["override"]
-files = ["cosmos_curate"]
+files = ["cosmos_curator"]
 exclude = [
     "build/",
     "dist/",
     "cosmos-xenna/",
-    "cosmos_curate/core/managers/postgres_cli.py",
-    "cosmos_curate/models/internvideo2_multi_modality/",
-    "cosmos_curate/pipelines/video/super_resolution/inference_seedvr2_window.py",
-    "cosmos_curate/pipelines/video/utils/vision_process.py",
-    "cosmos_curate/pipelines/video/utils/nvcodec_utils.py",
+    "cosmos_curator/core/managers/postgres_cli.py",
+    "cosmos_curator/models/internvideo2_multi_modality/",
+    "cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py",
+    "cosmos_curator/pipelines/video/utils/vision_process.py",
+    "cosmos_curator/pipelines/video/utils/nvcodec_utils.py",
 ]
 
 [[tool.mypy.overrides]]
 module = [
-    "cosmos_curate.models.internvideo2_multi_modality.*",
-    "cosmos_curate.pipelines.video.utils.*",
+    "cosmos_curator.models.internvideo2_multi_modality.*",
+    "cosmos_curator.pipelines.video.utils.*",
     "cudf.*",
     "cuml.*",
     "cupy.*",

@@ -1,8 +1,8 @@
-# Cosmos-Curate - AV Reference Pipelines
+# Cosmos Curator - AV Reference Pipelines
 
 The AV pipelines are similar to the video pipelines, but are designed around dataset curation for autonomous vehicles.
 
-- [Cosmos-Curate - AV Reference Pipelines](#cosmos-curate---av-reference-pipelines)
+- [Cosmos Curator - AV Reference Pipelines](#cosmos-curator---av-reference-pipelines)
   - [AV Split-Caption Pipeline](#av-split-caption-pipeline)
     - [AV Split-Caption Pipeline Stages](#av-split-caption-pipeline-stages)
     - [AV Split-Caption Terminology](#av-split-caption-terminology)
@@ -94,9 +94,9 @@ The av-split-caption pipeline produces the following artifacts under the path sp
 Below is a summary of the important options for the av-split-caption pipeline. There are many more options available and can be seen from the help message:
 
 ```bash
-cosmos-curate local launch \
-    --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-    -- pixi run --as-is python3 -m cosmos_curate.pipelines.av.run_pipeline split --help
+cosmos-curator local launch \
+    --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+    -- pixi run --as-is python3 -m cosmos_curator.pipelines.av.run_pipeline split --help
 ```
 
 **Options for Input/Output**

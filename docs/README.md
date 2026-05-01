@@ -1,6 +1,6 @@
-# Cosmos-Curate Documentation
+# Cosmos Curator Documentation
 
-- [Cosmos-Curate Documentation](#cosmos-curate-documentation)
+- [Cosmos Curator Documentation](#cosmos-curator-documentation)
   - [Documentation Structure](#documentation-structure)
     - [1. End User Guide and Reference Pipelines Guide for Video, AV, and Image](#1-end-user-guide-and-reference-pipelines-guide-for-video-av-and-image)
     - [2. Architecture Guide and Pipeline Design Guide](#2-architecture-guide-and-pipeline-design-guide)
@@ -12,12 +12,12 @@
   - [Support](#support)
   - [Contributing to Documentation](#contributing-to-documentation)
 
-Welcome to the Cosmos-Curate documentation. This documentation is organized into five main categories to help you understand and use the system effectively.
+Welcome to the Cosmos Curator documentation. This documentation is organized into five main categories to help you understand and use the system effectively.
 
 ## Documentation Structure
 
 ### 1. [End User Guide](client/END_USER_GUIDE.md) and Reference Pipelines Guide for [Video](curator/reference/VIDEO_PIPELINES.md), [AV](curator/reference/AV_PIPELINES.md), and [Image](curator/reference/IMAGE_PIPELINE.md)
-The end user guide is designed for users who want to use the Cosmos-Curate to process and curate videos and images:
+The end user guide is designed for users who want to use the Cosmos Curator to process and curate videos and images:
 - Prerequisites and environment setup
 - Basic usage instructions
 - Running pipelines
@@ -28,7 +28,7 @@ The reference pipelines guides are for users to understand the details of refere
 - Explanation of the configuration parameters
 
 **When to use these guides:**
-- If you're new to Cosmos-Curate
+- If you're new to Cosmos Curator
 - If you want to run existing pipelines
 - If you need help with basic operations
 
@@ -56,7 +56,7 @@ The observability and deployment guides are for users who want to run curation p
 - If you want to optimize the pipeline performance
 
 ### 4. [Developer Guide](DEVELOPER_GUIDE.md)
-The developer guide is for contributors who want to work on the Cosmos-Curate codebase:
+The developer guide is for contributors who want to work on the Cosmos Curator codebase:
 - Development environment setup
 - Code quality standards
 - Testing procedures
@@ -69,7 +69,7 @@ The developer guide is for contributors who want to work on the Cosmos-Curate co
 
 **Additional Development Resources:**
 - [Stage Replay Guide](curator/guides/STAGE_REPLAY.md) - Debug pipeline stages in isolation without re-running entire pipelines
-- [Interactive Slurm Development Guide](curator/guides/SLURM_INTERACTIVE.md) - Iterate on Cosmos-Curate from an interactive Slurm allocation
+- [Interactive Slurm Development Guide](curator/guides/SLURM_INTERACTIVE.md) - Iterate on Cosmos Curator from an interactive Slurm allocation
 
 ### 5. [Curator Pipeline Docs](curator/README.md)
 The curator docs are organized by purpose:

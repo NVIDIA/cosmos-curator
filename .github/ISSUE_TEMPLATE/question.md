@@ -1,6 +1,6 @@
 ---
 name: Submit question
-about: Ask a general question about Cosmos-Curate
+about: Ask a general question about Cosmos Curator
 title: "[QST]"
 labels: "? - Needs Triage, question"
 assignees: ''

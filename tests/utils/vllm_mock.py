@@ -1,7 +1,7 @@
 """Test-only mock vLLM plugin and engine.
 
 This module provides lightweight stand-ins for the vLLM types used by
-`cosmos_curate.models.vllm_interface` so unit tests can run without
+`cosmos_curator.models.vllm_interface` so unit tests can run without
 pulling heavy dependencies or models.
 """
 
@@ -12,8 +12,8 @@ from typing import cast
 from transformers import AutoProcessor
 from vllm import CompletionOutput, RequestOutput
 
-from cosmos_curate.models.vllm_plugin import VllmPlugin
-from cosmos_curate.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
+from cosmos_curator.models.vllm_plugin import VllmPlugin
+from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
 
 # ruff: noqa: ARG002, D102, D107
 

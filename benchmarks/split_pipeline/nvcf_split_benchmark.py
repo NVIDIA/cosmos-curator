@@ -24,8 +24,8 @@ from rich import print_json
 from benchmarks.cloudevent import make_cloudevent, push_cloudevent
 from benchmarks.secrets import KratosSecrets, NvcfSecrets, S3Secrets
 from benchmarks.summary import make_summary_metrics
-from cosmos_curate.client.nvcf_cli.ncf.launcher.nvcf_driver import _get_s3_config_str
-from cosmos_curate.client.nvcf_cli.ncf.launcher.nvcf_function import NvcfFunction, NvcfFunctionAlreadyDeployedError
+from cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_driver import _get_s3_config_str
+from cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_function import NvcfFunction, NvcfFunctionAlreadyDeployedError
 
 
 class RetryableBenchmarkAttemptError(RuntimeError):

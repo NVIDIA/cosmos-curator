@@ -1,6 +1,6 @@
-# Cosmos-Curate - Reference Image Pipeline
+# Cosmos Curator - Reference Image Pipeline
 
-- [Cosmos-Curate - Reference Image Pipeline](#cosmos-curate---reference-image-pipeline)
+- [Cosmos Curator - Reference Image Pipeline](#cosmos-curator---reference-image-pipeline)
   - [Annotate Pipeline](#annotate-pipeline)
     - [Annotate Pipeline Stages](#annotate-pipeline-stages)
     - [Annotate Pipeline Output Format](#annotate-pipeline-output-format)
@@ -107,9 +107,9 @@ When the same output path is used across runs, the pipeline treats images that a
 A summary of important options is below. For the full list, run:
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-  -- pixi run python3 -m cosmos_curate.pipelines.image.run_pipeline annotate --help
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+  -- pixi run python3 -m cosmos_curator.pipelines.image.run_pipeline annotate --help
 ```
 
 **Required**
@@ -120,9 +120,9 @@ cosmos-curate local launch \
 **Pipeline Examples**
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-  -- pixi run python3 -m cosmos_curate.pipelines.image.run_pipeline annotate \
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+  -- pixi run python3 -m cosmos_curator.pipelines.image.run_pipeline annotate \
   --input-image-path /path/to/images \
   --output-path /path/to/output \
   --captioning-algorithm qwen \
@@ -132,9 +132,9 @@ cosmos-curate local launch \
 Captioning with Gemini:
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-  -- pixi run python3 -m cosmos_curate.pipelines.image.run_pipeline annotate \
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+  -- pixi run python3 -m cosmos_curator.pipelines.image.run_pipeline annotate \
   --input-image-path /path/to/images \
   --output-path /path/to/output \
   --captioning-algorithm gemini
@@ -143,9 +143,9 @@ cosmos-curate local launch \
 Filtering plus embeddings:
 
 ```bash
-cosmos-curate local launch \
-  --image-name cosmos-curate --image-tag 1.0.0 --curator-path . \
-  -- pixi run python3 -m cosmos_curate.pipelines.image.run_pipeline annotate \
+cosmos-curator local launch \
+  --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
+  -- pixi run python3 -m cosmos_curator.pipelines.image.run_pipeline annotate \
   --input-image-path /path/to/images \
   --output-path /path/to/output \
   --semantic-filter enable \

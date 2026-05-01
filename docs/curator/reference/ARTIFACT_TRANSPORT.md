@@ -1,6 +1,6 @@
 # Artifact Transport Guide
 
-Deep-dive into the `cosmos_curate.core.utils.artifacts` package --
+Deep-dive into the `cosmos_curator.core.utils.artifacts` package --
 the generic, consumer-agnostic utilities for moving files between
 cluster nodes and storage destinations.
 
@@ -127,7 +127,7 @@ destinations**.  For remote destinations (S3 / Azure), each worker
 uploads directly via `_NodeUploader` -- see
 [Remote Collection Path](#remote-collection-path).
 
-See `cosmos_curate/core/utils/artifacts/collector.py` for
+See `cosmos_curator/core/utils/artifacts/collector.py` for
 implementation.
 
 ### Node Discovery
@@ -448,7 +448,7 @@ knows nothing about the nature of the files it moves -- all
 behaviour is controlled by constructor parameters (`kind`,
 `upload_subdir`, `collect_on_shutdown`, `strict`).
 
-See `cosmos_curate/core/utils/artifacts/delivery.py` for
+See `cosmos_curator/core/utils/artifacts/delivery.py` for
 implementation.
 
 ### Three-phase Lifecycle
@@ -459,7 +459,7 @@ Phase 1: Staging (before pipeline)
 
   ArtifactDelivery.create(kind="<kind>", output_dir=...)
         |
-        +-- Set COSMOS_CURATE_ARTIFACTS_STAGING_DIR env var
+        +-- Set COSMOS_CURATOR_ARTIFACTS_STAGING_DIR env var
         +-- Derive staging_dir = <base>/<kind>
         +-- Register collect() as pre-shutdown hook (optional)
 
@@ -495,7 +495,7 @@ because the factory handles side effects that a constructor should
 not perform:
 
 1. Reads or creates the base staging directory from the
-   `COSMOS_CURATE_ARTIFACTS_STAGING_DIR` env var.  If the env var
+   `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` env var.  If the env var
    is already set (e.g. by a prior `create()` call from another
    subsystem), it is read idempotently.
 2. Derives the staging subdirectory as `<base>/<kind>` so different
@@ -625,7 +625,7 @@ without adding parameters to stage APIs.
 
 | Variable | Set by | Read by | Purpose |
 |---|---|---|---|
-| `COSMOS_CURATE_ARTIFACTS_STAGING_DIR` | `ArtifactDelivery.create()` | Consumer backends on workers | Shared base staging directory for all artifact kinds |
+| `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` | `ArtifactDelivery.create()` | Consumer backends on workers | Shared base staging directory for all artifact kinds |
 
 Additional consumer-specific environment variables (e.g. for
 tracing or profiling) are documented alongside their respective
@@ -637,6 +637,6 @@ for an example.
 
 | File | Description |
 |---|---|
-| `cosmos_curate/core/utils/artifacts/__init__.py` | Package overview docstring |
-| `cosmos_curate/core/utils/artifacts/collector.py` | `RayFileTransport`, `_NodeCollector`, `_FileChunk`, `CollectResult` |
-| `cosmos_curate/core/utils/artifacts/delivery.py` | `ArtifactDelivery`, `_NodeUploader`, `ArtifactDeliveryError` |
+| `cosmos_curator/core/utils/artifacts/__init__.py` | Package overview docstring |
+| `cosmos_curator/core/utils/artifacts/collector.py` | `RayFileTransport`, `_NodeCollector`, `_FileChunk`, `CollectResult` |
+| `cosmos_curator/core/utils/artifacts/delivery.py` | `ArtifactDelivery`, `_NodeUploader`, `ArtifactDeliveryError` |

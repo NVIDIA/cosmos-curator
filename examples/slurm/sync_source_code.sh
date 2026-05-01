@@ -9,9 +9,9 @@ if [ -z "${SLURM_SOURCE_DIR}" ]; then
     echo "Error: SLURM_SOURCE_DIR is not defined"
 else
     echo "sync-ing source code"
-    ssh my-slurm-login-01.my-cluster.com mkdir -p "${SLURM_SOURCE_DIR}/cosmos_curate/"
+    ssh my-slurm-login-01.my-cluster.com mkdir -p "${SLURM_SOURCE_DIR}/cosmos_curator/"
     rclone copy -P --exclude="*.pyc" --exclude="__pycache__/**" \
-        "${ROOT_DIR}/cosmos_curate/" \
-        "${RCLONE_REMOTE}${SLURM_SOURCE_DIR}/cosmos_curate/"
+        "${ROOT_DIR}/cosmos_curator/" \
+        "${RCLONE_REMOTE}${SLURM_SOURCE_DIR}/cosmos_curator/"
 fi
 

@@ -1,6 +1,6 @@
-# Cosmos-Curate - Pipeline Design Guide
+# Cosmos Curator - Pipeline Design Guide
 
-- [Cosmos-Curate - Pipeline Design Guide](#cosmos-curate---pipeline-design-guide)
+- [Cosmos Curator - Pipeline Design Guide](#cosmos-curator---pipeline-design-guide)
   - [Core Components](#core-components)
     - [Pipeline Task Class](#pipeline-task-class)
     - [Pipeline Stage Class](#pipeline-stage-class)
@@ -14,18 +14,18 @@
     - [Extract CPU Processing to Separate Stages](#extract-cpu-processing-to-separate-stages)
     - [Pack Multiple GPU Workers to One GPU](#pack-multiple-gpu-workers-to-one-gpu)
 
-This guide explains how to modify existing pipelines or add new pipelines into the Cosmos-Curate system.
+This guide explains how to modify existing pipelines or add new pipelines into the Cosmos Curator system.
 
 ## Core Components
 
-Let's use the [hello_world_pipeline](../../../cosmos_curate/pipelines/examples/hello_world_pipeline.py) as an example to walk through the core components.
+Let's use the [hello_world_pipeline](../../../cosmos_curator/pipelines/examples/hello_world_pipeline.py) as an example to walk through the core components.
 
 ### Pipeline Task Class
 
 Each new pipeline should define a class representing the tasks being passed between stages.
 
 This class need to inherit `PipelineTask` base class defined in
-[cosmos_curate/core/interfaces/stage_interface.py](../../../cosmos_curate/core/interfaces/stage_interface.py).
+[cosmos_curator/core/interfaces/stage_interface.py](../../../cosmos_curator/core/interfaces/stage_interface.py).
 No function overriding is needed today but may needed later as the underlying layer improves.
 
 For the Hello-World pipeline, it defines a simple `HelloWorldTask` class:
@@ -50,7 +50,7 @@ tasks: list[PipelineTask] = [HelloWorldTask(prompt=x) for x in prompts]
 ### Pipeline Stage Class
 
 Each pipeline stage should define a class that inherits `CuratorStage` base class defined in
-[cosmos_curate/core/interfaces/stage_interface.py](../../../cosmos_curate/core/interfaces/stage_interface.py).
+[cosmos_curator/core/interfaces/stage_interface.py](../../../cosmos_curator/core/interfaces/stage_interface.py).
 
 **The following methods need to be overridden always:**
 
@@ -60,7 +60,7 @@ Each pipeline stage should define a class that inherits `CuratorStage` base clas
    - There are two more advanced use cases:
      - The number of input tasks can be different than the number of output tasks.
        - This is the "dynamic chunking" feature discussed in the [How to handle large variation in input data?](../reference/ARCHITECTURE.md#how-to-handle-large-variation-in-input-data) section.
-       - The other [demo_task_chunking_pipeline](../../../cosmos_curate/pipelines/examples/demo_task_chunking_pipeline.py) demonstrates the feature with a similar minimal example.
+       - The other [demo_task_chunking_pipeline](../../../cosmos_curator/pipelines/examples/demo_task_chunking_pipeline.py) demonstrates the feature with a similar minimal example.
      - The type of input tasks can be different than the type of output tasks.
 
 ```python
@@ -116,9 +116,9 @@ class _GPT2Stage(CuratorStage):
 ### Model Class
 
 Each model should be wrapped in a class, which inherits `ModelInterface` base class defined in
-[cosmos_curate/core/interfaces/model_interface.py](../../../cosmos_curate/core/interfaces/model_interface.py). If you're adding support for a vLLM-based model, follow this guide: [VLLM Interface Plugin Guide](VLLM_INTERFACE_PLUGIN.md)
+[cosmos_curator/core/interfaces/model_interface.py](../../../cosmos_curator/core/interfaces/model_interface.py). If you're adding support for a vLLM-based model, follow this guide: [VLLM Interface Plugin Guide](VLLM_INTERFACE_PLUGIN.md)
 
-The hello-world pipeline uses `GPT2` model defined in [cosmos_curate/models/gpt2.py](../../../cosmos_curate/models/gpt2.py).
+The hello-world pipeline uses `GPT2` model defined in [cosmos_curator/models/gpt2.py](../../../cosmos_curator/models/gpt2.py).
 
 The following methods are required to be overriden:
 
@@ -142,7 +142,7 @@ class GPT2(ModelInterface):
         self.model.to("cuda")
 ```
 
-To help management of models, add a section in [all_models.json](../../../cosmos_curate/configs/all_models.json).
+To help management of models, add a section in [all_models.json](../../../cosmos_curator/configs/all_models.json).
 - If only a few files are needed from the huggingface repo, the list of file names can be specified under `filelist` entry.
 - When running on [NVIDIA Cloud Function](../../client/NVCF_GUIDE.md#upload-model-weights), the model ID used on NVCF model registry can be specified under `nvcf_model_id` entry.
 
@@ -169,10 +169,10 @@ Note as a convention enforced by `pixi`, you should use `-` instead of `_` for t
 
 Then when building the docker image for running pipelines, use option `--envs` to specify which conda environments to be included in the build.
 
-In case you find it hard to configure your `env` using `pixi`, you can add a `post_install.sh` script under `package/cosmos_curate/envs/<env_name>/`.
+In case you find it hard to configure your `env` using `pixi`, you can add a `post_install.sh` script under `package/cosmos_curator/envs/<env_name>/`.
 We have an example for `paddle-ocr` env which only installs the basic packages in [pixi.toml](../../../pixi.toml)
 and then installs `paddlepaddle-gpu`
-from [package/cosmos_curate/envs/paddle-ocr/post_install.sh](../../../package/cosmos_curate/envs/paddle-ocr/post_install.sh).
+from [package/cosmos_curator/envs/paddle-ocr/post_install.sh](../../../package/cosmos_curator/envs/paddle-ocr/post_install.sh).
 Note that if you want to use `pip` inside your `post_install.sh` script, you will need to add `pip` feature to your `env`
 in [pixi.toml](../../../pixi.toml); e.g. for `paddle-ocr` env, we have `paddle-ocr = ["core", "pip"]` in [pixi.toml](../../../pixi.toml).
 
@@ -182,7 +182,7 @@ Once we have
 - a list of input pipeline tasks
 - a list of pipeline stages
 
-We can call `run_pipeline()` defined in [cosmos_curate/core/interfaces/pipeline_interface.py](../../../cosmos_curate/core/interfaces/pipeline_interface.py).
+We can call `run_pipeline()` defined in [cosmos_curator/core/interfaces/pipeline_interface.py](../../../cosmos_curator/core/interfaces/pipeline_interface.py).
 
 ```python
 run_pipeline(
@@ -235,8 +235,9 @@ Two commonly used properties are:
 For pipelines with multiple logical groups of stages, each group has a dedicated **factory function** and a frozen **config dataclass**. This keeps stage construction modular and testable without introducing extra abstractions.
 
 ```python
-from cosmos_curate.pipelines.video.clipping.clipping_builders import TranscodeConfig, TransNetV2SplitConfig, build_transcode_stages, build_transnetv2_split_stages
-from cosmos_curate.pipelines.video.read_write.read_write_builders import IngestConfig, build_ingest_stages
+from cosmos_curator.pipelines.video.clipping.clipping_builders import TranscodeConfig, TransNetV2SplitConfig,
+    build_transcode_stages, build_transnetv2_split_stages
+from cosmos_curator.pipelines.video.read_write.read_write_builders import IngestConfig, build_ingest_stages
 
 stages: list[CuratorStage | CuratorStageSpec] = []
 stages.extend(build_ingest_stages(IngestConfig(input_path=...)))
@@ -246,7 +247,7 @@ stages.extend(build_transcode_stages(TranscodeConfig()))
 run_pipeline(input_tasks, stages)
 ```
 
-Each `build_*_stages()` function takes a config and returns a `list[CuratorStage | CuratorStageSpec]`. Configs and builders live alongside the stages they wrap — for example `cosmos_curate/pipelines/video/captioning/captioning_builders.py`, `clipping/clipping_builders.py`, `embedding/embedding_builders.py`, etc.
+Each `build_*_stages()` function takes a config and returns a `list[CuratorStage | CuratorStageSpec]`. Configs and builders live alongside the stages they wrap — for example `cosmos_curator/pipelines/video/captioning/captioning_builders.py`, `clipping/clipping_builders.py`, `embedding/embedding_builders.py`, etc.
 
 ### Writing Artifacts in Multi-Node Clusters
 
@@ -256,14 +257,14 @@ profiling captures, reports) to a shared destination that could be a
 local directory, an S3 bucket, or an Azure blob container.
 
 The framework provides `StorageWriter`
-(see `cosmos_curate/core/utils/storage/storage_utils.py`) so that stage
+(see `cosmos_curator/core/utils/storage/storage_utils.py`) so that stage
 code never needs to know the underlying storage backend.
 
 **Quick start** -- create a `StorageWriter` once and use its methods
 inside `process_data()`:
 
 ```python
-from cosmos_curate.core.utils.storage.storage_utils import StorageWriter
+from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
 
 # Construct from a local or remote path (S3/Azure).
 writer = StorageWriter(output_dir)
@@ -311,7 +312,7 @@ If such preprocessing happens inside the GPU stage, it will waste GPU time.
 This framework makes it very easy to address such problems.
 We can simply extract such CPU work into a separate stage and pass the processed tensors into the GPU stage directly.
 As a result, the GPU stage will push the GPU utilization higher while the CPU stage would be effectively free by hidding under the GPU processing time.
-The `QwenInputPreparationStage` and `QwenCaptionStage` in [cosmos_curate/pipelines/video/captioning/captioning_stage.py](../../../cosmos_curate/pipelines/video/captioning/captioning_stages.py) are an example of such optimizations.
+The `QwenInputPreparationStage` and `QwenCaptionStage` in [cosmos_curator/pipelines/video/captioning/captioning_stage.py](../../../cosmos_curator/pipelines/video/captioning/captioning_stages.py) are an example of such optimizations.
 
 ### Pack Multiple GPU Workers to One GPU
 
@@ -319,7 +320,7 @@ For small models, sometimes it is difficult to push up the GPU utilization.
 One way is to request a fraction of GPU and allow multiple stage workers to be allocated on the same GPU.
 The GPU memory usage metric above would help define this fractional number to maximize the GPU usage while avoiding CUDA OOM.
 
-In the reference video pipeline, `AestheticFilterStage` in [cosmos_curate/pipelines/video/filtering/aesthetics/aesthetic_filter_stages.py](../../../cosmos_curate/pipelines/video/filtering/aesthetics/aesthetic_filter_stages.py) requests 0.25 GPUs per worker.
+In the reference video pipeline, `AestheticFilterStage` in [cosmos_curator/pipelines/video/filtering/aesthetics/aesthetic_filter_stages.py](../../../cosmos_curator/pipelines/video/filtering/aesthetics/aesthetic_filter_stages.py) requests 0.25 GPUs per worker.
 
 ## Pipeline Debugging
 

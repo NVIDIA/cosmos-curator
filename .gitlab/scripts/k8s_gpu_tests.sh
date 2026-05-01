@@ -10,7 +10,7 @@ source "$(dirname "$0")/common.sh"
 echo "=== K8s GPU Pipeline Test ==="
 echo "Running mini split pipeline with GPU model to verify full stack"
 
-cd /opt/cosmos-curate
+cd /opt/cosmos-curator
 
 # Verify GPU is available
 nvidia-smi
@@ -31,7 +31,7 @@ echo "Output: ${K8S_OUTPUT_PATH}"
 
 # Run split pipeline with GPU stages (transnetv2 + embeddings + captions)
 # shellcheck disable=SC2046
-pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
   --input-video-path "${S3_INPUT_VIDEO_PATH}" \
   --output-clip-path "${K8S_OUTPUT_PATH}" \
   --limit 1 \

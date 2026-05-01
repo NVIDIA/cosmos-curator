@@ -1,8 +1,8 @@
 # Sensor Library GPS Data Design
 
 This note documents the research and implemented data model for the first
-generic GPS/GNSS data structure in the Cosmos-Curate Sensor Library. The
-implementation is `GpsData` under `cosmos_curate/core/sensors/data/`.
+generic GPS/GNSS data structure in the Cosmos Curator Sensor Library. The
+implementation is `GpsData` under `cosmos_curator/core/sensors/data/`.
 This note does not define `GpsSensor`, GPS/GNSS parsing, map projection,
 localization fusion, filtering, or coordinate transforms.
 
@@ -317,15 +317,15 @@ and filtering semantics than GPS/GNSS fix rows.
 ## References
 
 - <a id="ref-sensor-data"></a>`SensorData` protocol:
-  `cosmos_curate/core/sensors/data/sensor_data.py`
+  `cosmos_curator/core/sensors/data/sensor_data.py`
 - <a id="ref-aligned-frame"></a>`AlignedFrame`:
-  `cosmos_curate/core/sensors/data/aligned_frame.py`
+  `cosmos_curator/core/sensors/data/aligned_frame.py`
 - <a id="ref-camera-data"></a>`CameraData`:
-  `cosmos_curate/core/sensors/data/camera_data.py`
+  `cosmos_curator/core/sensors/data/camera_data.py`
 - <a id="ref-video-index"></a>`VideoIndex`:
-  `cosmos_curate/core/sensors/data/video.py`
+  `cosmos_curator/core/sensors/data/video.py`
 - <a id="ref-validation-helpers"></a>Sensor validation helpers:
-  `cosmos_curate/core/sensors/utils/validation.py`
+  `cosmos_curator/core/sensors/utils/validation.py`
 - <a id="ref-driveworks-gps"></a>DriveWorks SDK Reference: GPS Sensor
   (Drive OS 6.0.9, DriveWorks 5.16.65):
   <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/group__gps__group.html>

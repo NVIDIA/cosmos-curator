@@ -10,12 +10,12 @@ RESOLVED_HOST="${RESOLVED_HOST:-${SLURM_LOGIN_HOST}}"
 
 RCLONE_REMOTE=":sftp,host=${RESOLVED_HOST},key_use_agent=true:"
 
-if [ -z "${SLURM_COSMOS_CURATE_CONFIG_DIR}" ]; then
-    echo "Error: SLURM_COSMOS_CURATE_CONFIG_DIR is not defined"
+if [ -z "${SLURM_COSMOS_CURATOR_CONFIG_DIR}" ]; then
+    echo "Error: SLURM_COSMOS_CURATOR_CONFIG_DIR is not defined"
 else
-    echo "sync-ing cosmos_curate config yaml"
-    ssh "${SLURM_LOGIN_HOST}" mkdir -p "${SLURM_COSMOS_CURATE_CONFIG_DIR}"
-    rclone copyto -P ~/.config/cosmos_curate/config.yaml "${RCLONE_REMOTE}${SLURM_COSMOS_CURATE_CONFIG_DIR}/config.yaml"
+    echo "sync-ing cosmos_curator config yaml"
+    ssh "${SLURM_LOGIN_HOST}" mkdir -p "${SLURM_COSMOS_CURATOR_CONFIG_DIR}"
+    rclone copyto -P ~/.config/cosmos_curator/config.yaml "${RCLONE_REMOTE}${SLURM_COSMOS_CURATOR_CONFIG_DIR}/config.yaml"
 fi
 
 if [ -z "${SLURM_AWS_CREDS_DIR}" ]; then
@@ -41,7 +41,7 @@ fi
 if [ -z "${SLURM_WORKSPACE}" ]; then
     echo "Error: SLURM_WORKSPACE is not defined"
 else
-    LOCAL_MODELS="${COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curate_local_workspace/models"
+    LOCAL_MODELS="${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curator_local_workspace/models"
     if [ -d "${LOCAL_MODELS}" ] && [ "$(ls -A "${LOCAL_MODELS}" 2>/dev/null)" ]; then
         echo "sync-ing models from local workspace"
         ssh "${SLURM_LOGIN_HOST}" mkdir -p "${SLURM_WORKSPACE}/models"
@@ -49,6 +49,6 @@ else
     else
         echo "No local models found at ${LOCAL_MODELS}, skipping model sync."
         echo "Tip: large models (e.g. SeedVR2) are faster to download directly on the"
-        echo "cluster via: pixi run --as-is -e model-download python -m cosmos_curate.core.managers.model_cli download --models seedvr2_3b"
+        echo "cluster via: pixi run --as-is -e model-download python -m cosmos_curator.core.managers.model_cli download --models seedvr2_3b"
     fi
 fi

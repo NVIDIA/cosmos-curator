@@ -1,4 +1,4 @@
-# Cosmos-Curate Sensor Library Interface Design
+# Cosmos Curator Sensor Library Interface Design
 
 A Pythonic sensor library for reading video, IMU, GPS, lidars, radar, and other sensors that supports streaming through data to create aligned frames. Designed for cars and robots with arbitrary sensor combinations.
 
@@ -37,7 +37,7 @@ Examples of packets:
 - **Arbitrary sensor combinations**: Support any mix of cameras, lidars, IMU, GPS, radar, ultrasonics, etc. Frames may omit sensors (e.g., IMU + lidar only).
 - **Format-agnostic**: Binary data loaders are modular and pluggable.
 - **SoA data**: Data classes for sensor data contain structures of arrays for better performance.
-- **Self-contained:** cosmos-curate relies on this library, not the other way around. Goal is maximum reusability.
+- **Self-contained:** cosmos-curator relies on this library, not the other way around. Goal is maximum reusability.
 
 ### Timestamp-First Design
 
@@ -173,7 +173,7 @@ sampling rule is sensor-specific:
 - IMU may select decoded source samples, interpolate, or preintegrate over a
   band around the reference timestamp. The first generic IMU data structure,
   `ImuData`, represents point samples rather than preintegrated windows; see
-  `cosmos_curate/core/sensors/data/imu_data.py` and the design rationale in
+  `cosmos_curator/core/sensors/data/imu_data.py` and the design rationale in
   `SENSOR_LIBRARY_IMU_DATA.md`.
 - GPS/GNSS may select the nearest decoded fix, meaning the receiver's computed
   position solution at one point in time, or interpolate between decoded fixes.
@@ -496,8 +496,8 @@ passes, so it is not a supported input to this library.
 - **Sensors**: One per data source (CameraSensor, ImuSensor, GpsSensor, LidarSensor, etc.). Expose `start_ns`, `end_ns`, and **`sample(spec)`** — a generator over **`spec.grid`** **windows**. Each yield returns SoA with batch dimension **`N`**. Uses **`spec.policy`** when validating matches (e.g. tolerance). Each sensor type implements its own sampling strategy (nearest, interpolate, preintegrate, bucket).
 - **SensorGroup**: Group of sensors. Holds `sensors`; provides `start_ns`, `end_ns` from sensor bounds. Call `.sample(spec)` to iterate.
 - **SensorGroup.sample()**: Takes **`spec: SamplingSpec`**. Walks **`spec.grid`** in window order (`for window in spec.grid`). For each **`window`**, `window.timestamps_ns` is the alignment batch; each sensor's **`sample(spec)`** is advanced in lockstep so every payload has batch dimension `N`. Uses **`spec.policy`** for cross-sensor checks (e.g. minimum temporal overlap, tolerance). Assembles `AlignedFrame(align_timestamps_ns=window.timestamps_ns, sensor_data=…)`.
-- **AlignedFrame**: Batch of timestamp-aligned data (SoA). Fields: `align_timestamps_ns` `(N,)` (that window’s active alignment times from the `SamplingGrid`), and `sensor_data: dict[str, SensorData]` (e.g. `CameraData` with `align_timestamps_ns`, `sensor_timestamps_ns`, `frames` each of length `N`). Index with `frame[sensor_id]` or `frame.sensor_data[sensor_id]`. See `cosmos_curate/core/sensors/data/aligned_frame.py`.
-- **ImuData**: `cosmos_curate/core/sensors/data/imu_data.py` implements the
+- **AlignedFrame**: Batch of timestamp-aligned data (SoA). Fields: `align_timestamps_ns` `(N,)` (that window’s active alignment times from the `SamplingGrid`), and `sensor_data: dict[str, SensorData]` (e.g. `CameraData` with `align_timestamps_ns`, `sensor_timestamps_ns`, `frames` each of length `N`). Index with `frame[sensor_id]` or `frame.sensor_data[sensor_id]`. See `cosmos_curator/core/sensors/data/aligned_frame.py`.
+- **ImuData**: `cosmos_curator/core/sensors/data/imu_data.py` implements the
   first generic IMU payload as SoA point samples with required angular velocity
   and linear acceleration vectors plus optional orientation, covariance,
   validity, host timestamp, sequence, and temperature fields. The design
@@ -513,7 +513,7 @@ passes, so it is not a supported input to this library.
 ## Module Layout
 
 ```text
-cosmos_curate
+cosmos_curator
 └── core
     └── sensors
         ├── containers

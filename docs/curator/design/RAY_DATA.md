@@ -2,7 +2,7 @@
 
 ## Summary
 
-This document defines the architecture for building Cosmos Curate pipelines on Ray Data as an alternative execution
+This document defines the architecture for building Cosmos Curator pipelines on Ray Data as an alternative execution
 engine alongside Cosmos-Xenna. Ray Data pipelines are **implemented separately** from Xenna pipelines — no shared
 orchestration, no adapter layers, no bridge code. Each Ray Data pipeline is written idiomatically using Ray Data's
 native primitives (`with_column`, `map`, `flat_map`, `map_batches`), while Xenna pipelines continue to run unchanged.
@@ -106,7 +106,7 @@ When a stage produces N artifacts per input row (e.g. N clips per video), there 
 - Downstream stages operate per-sub-unit (per-clip GPU inference). Fan-out once early, reuse the shape throughout.
 - Per-source-unit atomicity can be recovered with a terminal `groupby` or side-channel state.
 
-For cosmos-curate, `flat_map` is the safer default because the pipeline must handle AV sessions in addition to
+For cosmos-curator, `flat_map` is the safer default because the pipeline must handle AV sessions in addition to
 short videos. The current splitting pipeline uses `flat_map` at the transcode stage.
 
 ### Arrow as the internal block format

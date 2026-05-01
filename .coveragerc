@@ -3,11 +3,11 @@ branch = True
 omit =
     */__init__.py
     */examples/*
-    cosmos_curate/models/internvideo2_multi_modality/*
-    cosmos_curate/scripts/onto_nvcf.py
+    cosmos_curator/models/internvideo2_multi_modality/*
+    cosmos_curator/scripts/onto_nvcf.py
 parallel = True
 relative_files = True
-source = cosmos_curate
+source = cosmos_curator
 
 [report]
 exclude_lines =

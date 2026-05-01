@@ -11,7 +11,7 @@ timestamp and keyframe flag, read from the container index (moov/cues atom) with
 demuxing.  This lets us pre-compute a complete seek plan as a pure numpy operation
 before opening the decoder at all.
 
-**Primary location**: `cosmos_curate/core/sensors/utils/video.py`
+**Primary location**: `cosmos_curator/core/sensors/utils/video.py`
 
 ## Problem Statement
 
@@ -307,7 +307,7 @@ index and flow through `sample_closest_indices` → `make_decode_plan` →
 
 ## Testing
 
-Tests live in `tests/cosmos_curate/core/sensors/utils/test_video.py`.
+Tests live in `tests/cosmos_curator/core/sensors/utils/test_video.py`.
 
 ### `make_decode_plan` test coverage
 

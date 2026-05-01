@@ -54,7 +54,7 @@ def make_cloudevent(data: dict[str, Any]) -> dict[str, Any]:
         "specversion": "1.0",
         "id": f"{uuid.uuid4()!s}",
         "time": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "source": f"cosmos-curate-{uuid.uuid4()!s}",
+        "source": f"cosmos-curator-{uuid.uuid4()!s}",
         "type": "performance-benchmark",
         "subject": "nvcf-performance-metrics",
         "data": data,

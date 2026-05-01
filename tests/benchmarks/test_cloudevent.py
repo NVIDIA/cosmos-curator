@@ -90,7 +90,7 @@ def test_make_cloudevent(mock_uuid: MagicMock, mock_datetime: MagicMock) -> None
         "specversion": "1.0",
         "id": test_uuid_id,
         "time": test_timestamp,
-        "source": f"cosmos-curate-{test_uuid_source}",
+        "source": f"cosmos-curator-{test_uuid_source}",
         "type": "performance-benchmark",
         "subject": "nvcf-performance-metrics",
         "data": test_data,

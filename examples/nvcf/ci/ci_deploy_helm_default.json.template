@@ -6,7 +6,7 @@
     "configuration": {
         "image": {
             "tag": "${HELM_IMAGE_TAG}",
-            "repository": "nvcr.io/${NGC_NVCF_ORG}/cosmos-curate"
+            "repository": "nvcr.io/${NGC_NVCF_ORG}/cosmos-curator"
         },
         "resources": {
             "requests": {

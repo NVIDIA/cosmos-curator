@@ -1,7 +1,7 @@
 # Profiling Guide
 
 Deep-dive into the automatic stage profiling subsystem for
-Cosmos-Curate pipelines.  This guide covers the architecture,
+Cosmos Curator pipelines.  This guide covers the architecture,
 backend internals, file naming, artifact delivery, and error
 handling.
 
@@ -57,7 +57,7 @@ Adding a new per-stage backend requires only local changes inside
 `_ProfilingState` -- no stage code or pipeline wiring changes.
 
 The implementation lives in a single module:
-`cosmos_curate/core/utils/infra/profiling.py`.
+`cosmos_curator/core/utils/infra/profiling.py`.
 
 ## Architecture
 
@@ -393,7 +393,7 @@ profiling_scope(args)
 |      (returns None if no flags -> yield immediately, zero overhead)
 |
 +-- 2. ArtifactDelivery.create(kind="profiling")
-|      Sets COSMOS_CURATE_ARTIFACTS_STAGING_DIR env var.
+|      Sets COSMOS_CURATOR_ARTIFACTS_STAGING_DIR env var.
 |      Registers pre-shutdown hook for collection.
 |      MUST happen first: sets the shared staging directory
 |      that all subsequent steps depend on.
@@ -402,13 +402,13 @@ profiling_scope(args)
 |      MUST happen BEFORE enable_tracing().
 |      Reason: enable_tracing() reads STAGING_DIR to determine
 |      the trace directory.  If not set yet, it falls back to
-|      /tmp/cosmos_curate_traces/ which would not match the
+|      /tmp/cosmos_curator_traces/ which would not match the
 |      staging dir that ArtifactDelivery creates, causing
 |      collection to find zero trace files.
 |
 +-- 4. enable_tracing()  [if tracing enabled]
 |      Sets XENNA_RAY_TRACING_HOOK env var (read by ray.init).
-|      Sets COSMOS_CURATE_TRACE_DIR env var (read by workers).
+|      Sets COSMOS_CURATOR_TRACE_DIR env var (read by workers).
 |      Calls setup_tracing() on the driver itself.
 |      Configures TracerProvider + span exporters.
 |      MUST happen AFTER step 3 (needs staging dir).
@@ -425,7 +425,7 @@ profiling_scope(args)
 |      Creates the true root span (no parent).
 |      Exported immediately so backends receive it first.
 |      +-- propagate_trace_context()
-|          Writes trace_id:span_id to COSMOS_CURATE_TRACEPARENT.
+|          Writes trace_id:span_id to COSMOS_CURATOR_TRACEPARENT.
 |          Workers inherit this via env var at fork time.
 |
 +-- 8. state.scope("main")
@@ -474,9 +474,9 @@ Two `ArtifactDelivery` instances are created, each with a distinct
 
 The traces `ArtifactDelivery` **must** be created before
 `enable_tracing()`.  `enable_tracing()` reads
-`COSMOS_CURATE_ARTIFACTS_STAGING_DIR` to determine the trace
+`COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` to determine the trace
 directory.  If the staging dir env var is not yet set,
-`enable_tracing()` falls back to `/tmp/cosmos_curate_traces/`
+`enable_tracing()` falls back to `/tmp/cosmos_curator_traces/`
 which would not match the staging directory that
 `ArtifactDelivery` creates, causing collection to find zero files.
 
@@ -578,7 +578,7 @@ supported automatically.
 
 In multi-node Ray or Slurm clusters, each worker writes profiling
 artifacts to a **local staging directory** on its node (set via the
-`COSMOS_CURATE_ARTIFACTS_STAGING_DIR` environment variable).  After
+`COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` environment variable).  After
 the pipeline completes (or fails), `ArtifactDelivery` instances
 collect profiling artifacts and trace files from every node,
 uploading them to the final `<output-path>/profile` via
@@ -589,8 +589,8 @@ ensures artifacts survive even when workers are killed via SIGKILL.
 
 ```bash
 # Remote profiling: artifacts are staged locally, then uploaded to S3
-cosmos-curate local launch --curator-path . -- \
-  pixi run --as-is python -m cosmos_curate.pipelines.video.run_pipeline split \
+cosmos-curator local launch --curator-path . -- \
+  pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path s3://bucket/videos/ \
     --output-clip-path s3://bucket/output/ \
     --profile-cpu --profile-memory --verbose
@@ -652,7 +652,7 @@ Phase 2: Post-pipeline (driver, pre-shutdown hooks)
 Key components:
 
 - **`RayFileTransport`**
-  (`cosmos_curate/core/utils/artifacts/collector.py`): Generic
+  (`cosmos_curator/core/utils/artifacts/collector.py`): Generic
   cross-node file transport.  Deploys one `_NodeCollector` actor
   per node, which streams files via Ray streaming generators with
   per-file chunking and double-layer backpressure.  The driver
@@ -662,9 +662,9 @@ Key components:
   isolation ensures partial collection on failures.
 
 - **`ArtifactDelivery`**
-  (`cosmos_curate/core/utils/artifacts/delivery.py`): Generic,
+  (`cosmos_curator/core/utils/artifacts/delivery.py`): Generic,
   consumer-agnostic orchestrator.  Sets the
-  `COSMOS_CURATE_ARTIFACTS_STAGING_DIR` environment variable before
+  `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` environment variable before
   the pipeline, then uses `RayFileTransport` + `StorageWriter` to
   collect and upload artifacts.  Parameterised by `kind` (staging
   subdirectory name) and `upload_subdir` (optional path appended to
@@ -779,11 +779,11 @@ Docker).
 (py-spy live sampling, memray Dashboard UI, task/actor timeline
 download) are interactive and require Ray Dashboard access.  In
 production deployments the Dashboard is often unreachable, so
-Cosmos-Curate implements fire-and-forget profiling: enable via CLI
+Cosmos Curator implements fire-and-forget profiling: enable via CLI
 flags, run the pipeline, retrieve all artifacts from the output
 directory.  No interactive session required.
 
-| Aspect | Ray Dashboard approach | Cosmos-Curate approach |
+| Aspect | Ray Dashboard approach | Cosmos Curator approach |
 |---|---|---|
 | **CPU** | py-spy (sampling, Dashboard-integrated), cProfile | pyinstrument: automatic per-call HTML flame-trees, `.pyisession` merge -- all written to disk |
 | **Memory** | memray (Dashboard UI: flamegraph, table, leaks, native, pymalloc) | Same memray with `native_traces=True`, `trace_python_allocators=True`; automatic `.bin` + HTML flamegraph per call |
@@ -800,9 +800,9 @@ kernel analysis beyond what `torch.profiler` captures.
 
 | File | Description |
 |---|---|
-| `cosmos_curate/core/utils/infra/profiling.py` | Profiling backends, `_ProfilingState`, `_ProfiledStage`, `profiling_wrapper`, `profiling_scope` |
-| `cosmos_curate/core/utils/infra/tracing.py` | `artifact_id()`, `process_tag()` (shared naming convention) |
-| `cosmos_curate/core/utils/artifacts/delivery.py` | `ArtifactDelivery` orchestrator for post-pipeline collection |
-| `cosmos_curate/core/utils/artifacts/collector.py` | `RayFileTransport` for cross-node file streaming |
+| `cosmos_curator/core/utils/infra/profiling.py` | Profiling backends, `_ProfilingState`, `_ProfiledStage`, `profiling_wrapper`, `profiling_scope` |
+| `cosmos_curator/core/utils/infra/tracing.py` | `artifact_id()`, `process_tag()` (shared naming convention) |
+| `cosmos_curator/core/utils/artifacts/delivery.py` | `ArtifactDelivery` orchestrator for post-pipeline collection |
+| `cosmos_curator/core/utils/artifacts/collector.py` | `RayFileTransport` for cross-node file streaming |
 | `benchmarks/merge_cpu_profiles.py` | Merge multiple `.pyisession` files into one report |
 | `benchmarks/merge_memory_profiles.py` | Summarize multiple memray `.bin` captures |

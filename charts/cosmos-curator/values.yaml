@@ -1,0 +1,281 @@
+# Default values for multi-node-test.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Override the chart name used in pod/service names without affecting the release name
+nameOverride: "cosmos-curator"
+
+service:
+  type: ClusterIP
+
+# To be injected by NVCF
+helmChartServiceName: "cosmos-curator"
+ngcImagePullSecretName: "inference-container-pull-secret"
+
+imagePullSecret:
+  create: false
+  dockerConfigJson:
+    registry: "nvcr.io"
+    username: "$oauthtoken"
+    password: ""
+    email: ""
+
+# Maps to NODES_PER_INSTANCE environment variable in the container
+replicas: 1
+
+image:
+  repository: nvcr.io/FILL_IN/cosmos-curator
+  pullPolicy: Always
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: false  # Set to true if your app doesn't need to write to the root filesystem
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# Optional scratch directory for temporary files
+scratchDir: ""
+
+# Persistent storage for /config directory
+# When enabled, uses a volumeClaimTemplate instead of hostPath/emptyDir
+persistence:
+  enabled: false
+  # Storage class to use for the PVC (leave empty for default)
+  storageClass: ""
+  # Size of the persistent volume
+  size: 10Gi
+  # Access mode for the PVC
+  accessMode: ReadWriteOnce
+  # Additional labels for the PVC
+  labels: {}
+  # Additional annotations for the PVC
+  annotations: {}
+  # whenDeleted: Delete = auto-delete PVCs when StatefulSet is deleted - keep from accumulating copies. Can be set to retain and cache model downloads
+  # whenScaled: Retain = keep PVCs when scaling down
+  retentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+
+# Optional custom environment variables
+customEnvVars: {}
+
+# Default resource requirements
+resources:
+#  limits:
+#    cpu: "4"
+#    memory: "8Gi"
+#    nvidia.com/gpu: 1
+  requests:
+    cpu: "8"
+    memory: "10Gi"
+    nvidia.com/gpu: 1
+
+# Overly broad - but too much variation in the various GPU node taints
+tolerations:
+  - operator: Exists
+
+affinity: {}
+
+rayPorts:
+  gcsServerPort: 6379
+  dashboardPort: 8265
+  objectManagerPort: 8076
+  nodeManagerPort: 8077
+
+rayMetrics:
+  enableOpenTelemetry: false #Default to legacy opencensus implementation
+# Ray authentication token configuration
+rayAuth:
+  enabled: false
+  # Leave empty to auto-generate a 64-character hex token
+  token: ""
+
+readiness:
+  initialDelaySeconds: 5  # With the startup probe, no need to delay significantly
+
+huggingFaceHubToken: ""
+curator:
+  port: 8000
+health:
+  endpoint: /api/local_raylet_healthz
+  port: 52365
+shmem:
+  limit: 55Gi
+s3:
+  credsPath: "/dev/shm/aws.config"
+  secret:
+    enabled: false
+    name: "s3-config"
+    data: ""
+
+# Catalog credentials for retrieving models from NGC Catalog
+ngcCatalog:
+  secret:
+    enabled: false
+    name: "ngc-secret"
+    key: ""  # Set your NGC API key here
+    org: ""  # Set your NGC organization here
+    team: ""  # Optional: Set your NGC team here
+
+metrics:
+  enabled: true  # Controls OTEL collector (subchart + ConfigMap).
+  # Port where Ray exposes Prometheus metrics (always exposed)
+  port: 9002
+  # Path where metrics are exposed
+  path: /metrics
+  # Whether to use the init container to extract NVCF secrets
+  extractNVCFSecrets: true
+  # Static external labels that will be added to all metrics
+  externalLabels:
+    service: "cosmos-curator"
+  # Additional external labels that can be added without overriding the static ones
+  extraExternalLabels: {}
+
+  prometheus:
+    scrapeConfigs:
+      - job_name: "ray-service-metrics"
+        scrape_interval: 30s
+        sample_limit: 10000
+        label_limit: 30
+        metric_relabel_configs:
+          - source_labels:
+              - __name__
+            regex: ray_tasks
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_actors
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_object_store_memory|ray_object_store_dist_bucket
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_total_lineage_bytes
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_gcs_placement_.*|ray_gcs_storage_.*
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_scheduler_.*
+            action: drop
+          - source_labels:
+              - __name__
+            regex: ray_pull_manager_.*
+            action: drop
+        # static-config.targets will be generated in the config map template based on service name and replica count
+  remoteWrite:
+    enabled: true
+    endpoint: "https://FILL_IN/api/v1/receive"
+    certPath: "/etc/curator-remote-write/certs/tls.crt"
+    keyPath: "/etc/curator-remote-write/certs/tls.key"
+  
+  otlp:
+    enabled: false
+    endpoint: "${env:OTEL_EXPORTER_OTLP_METRICS_ENDPOINT}"
+    certPath: ""
+    keyPath: ""
+    insecureSkipVerify: false
+
+  # ServiceMonitor for Prometheus Operator (independent of metrics.enabled)
+  # Requires prometheus-operator CRDs installed
+  serviceMonitor:
+    enabled: false  # Set true to enable Prometheus Operator scraping
+    # Namespace where ServiceMonitor will be created (defaults to release namespace)
+    namespace: ""
+    # Additional labels for ServiceMonitor (e.g., for Prometheus selector)
+    labels: {}
+    # Scrape interval
+    interval: 30s
+    # Scrape timeout
+    scrapeTimeout: 10s
+    # Relabeling configs applied before scraping
+    relabelings: []
+    # Additional metric relabel configs (merged with common metricRelabelConfigs above)
+    additionalMetricRelabelings: []
+
+opentelemetry-collector:
+  mode: deployment
+  image:
+    tag: "0.144.0"
+    repository: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib
+    #nvcr.io/FILL_IN
+  extraEnvs:
+    - name: POD_NS
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+  imagePullSecrets:
+  - name: inference-container-pull-secret
+  initContainers:
+    - name: secret-extractor
+      image: nvcr.io/nvidia/distroless/python:3.13-v3.1.3
+      command: ["python"]
+      args: ["/scripts/extractor.py"]
+      volumeMounts:
+        - name: secret-extractor-script
+          mountPath: /scripts
+        - name: cert-store
+          mountPath: /etc/curator-remote-write/certs
+        - name: input-secrets
+          mountPath: /var/secrets
+  extraVolumes:
+    - name: secret-extractor-script
+      configMap:
+        name: secret-extractor
+        defaultMode: 0755
+    - name: cert-store
+      emptyDir:
+        medium: Memory
+        sizeLimit: 5Mi
+    - name: input-secrets
+      secret:
+        secretName: nvcf-secrets
+  extraVolumeMounts:
+    - name: cert-store
+      mountPath: /etc/curator-remote-write/certs
+  service:
+    enabled: false
+  ports:
+    otlp:
+      enabled: false
+    otlp-http:
+      enabled: false
+    jaeger-compact:
+      enabled: false
+    jaeger-thrift:
+      enabled: false
+    jaeger-grpc:
+      enabled: false
+    zipkin:
+      enabled: false
+  configMap:
+    existingName: otel-collector-config
+    create: false
+  serviceAccount:
+    create: false
+
+modelCacheDir: "/config/models"
+triton:
+  home: "/tmp/.triton"

@@ -6,7 +6,7 @@
     "configuration": {
         "image": {
             "tag": "FILL_IN",
-            "repository": "nvcr.io/FILL_IN/cosmos-curate"
+            "repository": "nvcr.io/FILL_IN/cosmos-curator"
         },
         "resources": {
             "requests": {

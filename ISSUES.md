@@ -9,7 +9,7 @@ title: Issues
 
 ## Overview
 
-Overview of the best practices for creating and updating issues for Cosmos-Curate projects.
+Overview of the best practices for creating and updating issues for Cosmos Curator projects.
 
 ### Intended audience
 
@@ -29,14 +29,14 @@ __Important:__ Before creating an issue, please search existing open & closed is
 
 Follow the steps [here](https://help.github.com/articles/creating-an-issue/) to start the process of creating an issue.
 
-Issues in Cosmos-Curate projects fall into four types. When creating the issue, select the best fit from these options:
+Issues in Cosmos Curator projects fall into four types. When creating the issue, select the best fit from these options:
 
 | Issue type | Title Prefix | Description |
 |:-----------|:-------------|:------------|
 | Bug | `[BUG]` | Report a problem with the code |
 | Documentation | `[DOC]` | Report a problem or suggestion related to documentation
 | Feature | `[FEA]` | Suggest a new idea or enhancement |
-| Question | `[QST]` | Ask the Cosmos-Curate team a question about the project |
+| Question | `[QST]` | Ask the Cosmos Curator team a question about the project |
 
 If you have an issue which truly is not one of the above, you can select `Open a regular issue`. Use this sparingly.
 

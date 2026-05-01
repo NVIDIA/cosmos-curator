@@ -7,13 +7,13 @@
 # When executed: --write-dotenv [path] writes STAGING_TAG / STAGING_IMAGE (override: STAGING_TAG_OVERRIDE).
 # When sourced: defines nvcf_registry_latest_tag() for nvcf_helm_deploy.sh (no side effects).
 #
-# Requires: cosmos-curate nvcf config set (configure_nvcf_cli) before list-image-detail.
+# Requires: cosmos-curator nvcf config set (configure_nvcf_cli) before list-image-detail.
 
 set -euo pipefail
 
 nvcf_registry_latest_tag() {
   local iname="${1:?base image name required}"
-  cosmos-curate nvcf image list-image-detail --iname "${iname}" \
+  cosmos-curator nvcf image list-image-detail --iname "${iname}" \
     | grep latestTag | sed "s/['│,]//g" | awk '{print $2}' | head -n1
 }
 
