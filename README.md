@@ -33,16 +33,16 @@ which is now open-sourced independently as [Cosmos-Xenna](https://github.com/nvi
 Comprehensive documentation is available under [docs/](docs/README.md) directory.
 
 ### User Documentation
-- [End User Guide](docs/client/END_USER_GUIDE.md) - instructions to setup environment and run data pipelines
-- [Reference Video Pipelines Guide](docs/curator/reference/VIDEO_PIPELINES.md) - details for general video processing pipelines
-- [Reference AV Pipelines Guide](docs/curator/reference/AV_PIPELINES.md) - details for multi-camera video, and (upcoming) GPS & LiDAR processing pipelines for autonomous vehicle (AV)
-- [NVCF Guide](docs/client/NVCF_GUIDE.md) - deployment instruction on [Nvidia Cloud Functions](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html)
+- [End User Guide](docs/client/end-user-guide.md) - instructions to setup environment and run data pipelines
+- [Reference Video Pipelines Guide](docs/curator/reference/video-pipelines.md) - details for general video processing pipelines
+- [Reference AV Pipelines Guide](docs/curator/reference/av-pipelines.md) - details for multi-camera video, and (upcoming) GPS & LiDAR processing pipelines for autonomous vehicle (AV)
+- [NVCF Guide](docs/client/nvcf-guide.md) - deployment instruction on [Nvidia Cloud Functions](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html)
 
 ### Developer Documentation
-- [Developer Guide](docs/DEVELOPER_GUIDE.md) - information for contributors
-- [Architecture Guide](docs/curator/reference/ARCHITECTURE.md) - diagrams and description to help understand core architecture
-- [Pipeline Design Guide](docs/curator/guides/PIPELINE_DESIGN.md) - detailed walk-through of the hello-world pipeline and performance optimization points
-- [Observability Guide](docs/curator/guides/OBSERVABILITY.md) - instructions to setup and understand monitoring dashboard
+- [Developer Guide](docs/developer-guide.md) - information for contributors
+- [Architecture Guide](docs/curator/reference/architecture.md) - diagrams and description to help understand core architecture
+- [Pipeline Design Guide](docs/curator/guides/pipeline-design.md) - detailed walk-through of the hello-world pipeline and performance optimization points
+- [Observability Guide](docs/curator/guides/observability.md) - instructions to setup and understand monitoring dashboard
 
 ### AI Agent Context Files
 - [AGENTS.md](AGENTS.md) - Context file for Codex

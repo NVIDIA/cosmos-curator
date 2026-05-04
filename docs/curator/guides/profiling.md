@@ -51,7 +51,7 @@ Four backends are supported:
 The first three (CPU, Memory, GPU) are **per-stage** backends that
 run inside each Ray actor.  Tracing operates at the **cluster level**
 via Ray's `_tracing_startup_hook` (see
-[Distributed Tracing Guide](../reference/DISTRIBUTED_TRACING.md)).
+[Distributed Tracing Guide](../reference/distributed-tracing.md)).
 
 Adding a new per-stage backend requires only local changes inside
 `_ProfilingState` -- no stage code or pipeline wiring changes.
@@ -676,7 +676,7 @@ idempotency guards (no double-collection).
 
 For a comprehensive deep-dive into the artifact transport
 subsystem, see the
-[Artifact Transport Guide](../reference/ARTIFACT_TRANSPORT.md).
+[Artifact Transport Guide](../reference/artifact-transport.md).
 
 ## Combining CPU Profiles
 

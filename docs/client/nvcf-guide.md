@@ -14,7 +14,7 @@
 is a serverless API to deploy & manage AI workloads on GPUs.
 Cosmos Curator can be deployed on NVCF for a semi/full-managed experience.
 
-As mentioned in [End User Guide](./END_USER_GUIDE.md#launch-pipelines-on-nvidia-dgx-cloud),
+As mentioned in [End User Guide](./end-user-guide.md#launch-pipelines-on-nvidia-dgx-cloud),
 please reach out to NVIDIA Cosmos Curator team to get help for onboarding.
 
 **Note this guide does not cover the complete process for NVCF deployment,** but assumes onboarding and initial setup have been completed.

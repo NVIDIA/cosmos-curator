@@ -59,7 +59,7 @@ Each pipeline stage should define a class that inherits `CuratorStage` base clas
    - In the hello-world pipeline, the `_LowerCaseStage` simply convert the `prompt` field to lower case in each pipeline task.
    - There are two more advanced use cases:
      - The number of input tasks can be different than the number of output tasks.
-       - This is the "dynamic chunking" feature discussed in the [How to handle large variation in input data?](../reference/ARCHITECTURE.md#how-to-handle-large-variation-in-input-data) section.
+       - This is the "dynamic chunking" feature discussed in the [How to handle large variation in input data?](../reference/architecture.md#how-to-handle-large-variation-in-input-data) section.
        - The other [demo_task_chunking_pipeline](../../../cosmos_curator/pipelines/examples/demo_task_chunking_pipeline.py) demonstrates the feature with a similar minimal example.
      - The type of input tasks can be different than the type of output tasks.
 
@@ -116,7 +116,7 @@ class _GPT2Stage(CuratorStage):
 ### Model Class
 
 Each model should be wrapped in a class, which inherits `ModelInterface` base class defined in
-[cosmos_curator/core/interfaces/model_interface.py](../../../cosmos_curator/core/interfaces/model_interface.py). If you're adding support for a vLLM-based model, follow this guide: [VLLM Interface Plugin Guide](VLLM_INTERFACE_PLUGIN.md)
+[cosmos_curator/core/interfaces/model_interface.py](../../../cosmos_curator/core/interfaces/model_interface.py). If you're adding support for a vLLM-based model, follow this guide: [VLLM Interface Plugin Guide](vllm-interface-plugin.md)
 
 The hello-world pipeline uses `GPT2` model defined in [cosmos_curator/models/gpt2.py](../../../cosmos_curator/models/gpt2.py).
 
@@ -144,7 +144,7 @@ class GPT2(ModelInterface):
 
 To help management of models, add a section in [all_models.json](../../../cosmos_curator/configs/all_models.json).
 - If only a few files are needed from the huggingface repo, the list of file names can be specified under `filelist` entry.
-- When running on [NVIDIA Cloud Function](../../client/NVCF_GUIDE.md#upload-model-weights), the model ID used on NVCF model registry can be specified under `nvcf_model_id` entry.
+- When running on [NVIDIA Cloud Function](../../client/nvcf-guide.md#upload-model-weights), the model ID used on NVCF model registry can be specified under `nvcf_model_id` entry.
 
 ```json
 {
@@ -200,8 +200,8 @@ automatically builds a `ProfilingConfig` and wraps every stage with profiling
 instrumentation -- no changes to stage code are needed.  Profiling artifacts
 are written to `<output-path>/profile` (a static subdirectory derived from
 the pipeline output path).  See the
-[Observability Guide](OBSERVABILITY.md#profiling-and-instrumentation)
-for CLI flags and the [Profiling Guide](PROFILING.md) for
+[Observability Guide](observability.md#profiling-and-instrumentation)
+for CLI flags and the [Profiling Guide](profiling.md) for
 full details on backend internals, file naming, and artifact delivery.
 
 In hello-world pipeline, 
@@ -282,7 +282,7 @@ path.close()
 ```
 
 For a detailed explanation of the storage abstractions and multi-node
-behavior, see [Architecture Guide - Multi-Node Storage I/O](../reference/ARCHITECTURE.md#multi-node-storage-io).
+behavior, see [Architecture Guide - Multi-Node Storage I/O](../reference/architecture.md#multi-node-storage-io).
 
 > **Note**: `StorageWriter` is the right tool for **stage-level artifacts**
 > (pipeline outputs, intermediate files, reports).  **Profiling artifacts**
@@ -290,7 +290,7 @@ behavior, see [Architecture Guide - Multi-Node Storage I/O](../reference/ARCHITE
 > framework through a separate staging + collection mechanism
 > (`ArtifactDelivery` + `RayFileTransport`) -- stage authors do not need
 > to manage profiling output.  See the
-> [Profiling Guide - Artifact Delivery Flow](PROFILING.md#artifact-delivery-flow)
+> [Profiling Guide - Artifact Delivery Flow](profiling.md#artifact-delivery-flow)
 > for details.
 
 ## Quiz: Adding WordCount Stage to Hello-World Pipeline
@@ -299,7 +299,7 @@ As a simple exercise, consider adding a `WordCountStage` after the `_GPT2Stage` 
 - Add a field `word_count` to `HelloWorldTask(PipelineTask)`
 - Define a new `WordCountStage(CuratorStage)` and implement `resources()`, `process_data`, etc.
 - Add the stage to `stages: list[CuratorStage | CuratorStageSpec]` before sending to `run_pipeline`.
-- Run the new pipeline with instructions in [End User Guide](../../client/END_USER_GUIDE.md#run-the-hello-world-example-pipeline).
+- Run the new pipeline with instructions in [End User Guide](../../client/end-user-guide.md#run-the-hello-world-example-pipeline).
 
 ## Pipeline Performance
 
@@ -326,7 +326,7 @@ In the reference video pipeline, `AestheticFilterStage` in [cosmos_curator/pipel
 
 When developing or debugging pipeline stages, you can use **Stage Replay** to run individual stages in isolation without re-executing the entire pipeline.
 
-See the [Stage Replay Guide](STAGE_REPLAY.md) for:
+See the [Stage Replay Guide](stage-replay.md) for:
 - Saving task inputs from specific stages
 - Replaying stages with saved data
 - Rapid iteration on stage logic

@@ -95,7 +95,7 @@ An auto-scaler works out an allocation plan to balance the throughputs of all st
 ### How to handle large variation in input data?
 
 The memory consumption and processing time for a video curation pipeline is very input data dependent.
-Take the [split-annotate pipeline](./VIDEO_PIPELINES.md#shard-dataset-pipeline) as an example,
+Take the [split-annotate pipeline](./video-pipelines.md#shard-dataset-pipeline) as an example,
 the input video can be either 1-min long or 5-hour long.
 plus the pipeline might only knows this after a video finishes the first `VideoDownloader` stage.
 
@@ -168,7 +168,7 @@ Worker C --+        |                           +--> Worker C
 For a comprehensive deep-dive into the artifact transport subsystem
 including concurrency models, backpressure mechanics, memory
 accounting, environment variables, and error handling flows, see the
-[Artifact Transport Guide](ARTIFACT_TRANSPORT.md).
+[Artifact Transport Guide](artifact-transport.md).
 
 ## Profiling Instrumentation
 
@@ -182,7 +182,7 @@ collected post-pipeline by `ArtifactDelivery` instances.
 
 For a full deep-dive -- backend internals, LIFO nesting,
 `profiling_scope` driver setup, file naming, and error handling --
-see the [Profiling Guide](../guides/PROFILING.md).
+see the [Profiling Guide](../guides/profiling.md).
 
 ## Reference
 

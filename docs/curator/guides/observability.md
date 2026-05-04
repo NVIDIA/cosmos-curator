@@ -260,7 +260,7 @@ class MyStage(CuratorStage):
 For the full deep-dive -- public span API (`TracedSpan`, `traced_span`,
 `@traced`), Ray tracing hook internals, trace context propagation,
 library auto-instrumentation, environment variables, and Jaeger setup --
-see the **[Distributed Tracing Guide](../reference/DISTRIBUTED_TRACING.md)**.
+see the **[Distributed Tracing Guide](../reference/distributed-tracing.md)**.
 
 ### Output and Post-processing
 
@@ -279,7 +279,7 @@ Quick reference for viewing results:
 For the full deep-dive -- backend internals, dynamic subclass architecture,
 LIFO nesting, `profiling_scope` driver setup, file naming convention,
 artifact delivery flow, profile merging scripts, and error handling --
-see the **[Profiling Guide](PROFILING.md)**.
+see the **[Profiling Guide](profiling.md)**.
 
 ## Performance Metrics
 

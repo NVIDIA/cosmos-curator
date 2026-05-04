@@ -26,10 +26,10 @@
 
 ## Development Environment Setup
 
-Please refer to the following section in [End User Guide](./client/END_USER_GUIDE.md):
-- [Prerequisites](./client/END_USER_GUIDE.md#prerequisites) for hardware and software requirements.
-- [Initial Setup](./client/END_USER_GUIDE.md#initial-setup) for preparaing configurations files and workspace directories, etc.
-- [Setup Environment and Install Dependencies](./client/END_USER_GUIDE.md#setup-environment-and-install-dependencies) for setting up Cosmos Curator.
+Please refer to the following section in [End User Guide](./client/end-user-guide.md):
+- [Prerequisites](./client/end-user-guide.md#prerequisites) for hardware and software requirements.
+- [Initial Setup](./client/end-user-guide.md#initial-setup) for preparaing configurations files and workspace directories, etc.
+- [Setup Environment and Install Dependencies](./client/end-user-guide.md#setup-environment-and-install-dependencies) for setting up Cosmos Curator.
 
 For developers to contribute back to the repo, the following additional steps are needed:
 
@@ -137,7 +137,7 @@ Note: For pipeline execution, always use the Docker container as shown in the te
 ### Interactive Slurm Development
 
 For GPU development on a Slurm compute node, use the
-[Interactive Slurm Development Guide](./curator/guides/SLURM_INTERACTIVE.md). It covers starting the slim container
+[Interactive Slurm Development Guide](./curator/guides/slurm-interactive.md). It covers starting the slim container
 from an interactive allocation, using a live Lustre checkout, running a pipeline command, and troubleshooting common
 environment issues.
 
@@ -221,7 +221,7 @@ tests/cosmos_curator/pipelines/video/filtering/aesthetics/test_aesthetic_filter.
 
 ### End-to-End Pipeline Tests
 
-Run the reference video pipeline based on instructions in [Run the Split-Annotate Pipeline](./client/END_USER_GUIDE.md#run-the-reference-video-pipeline) section to make sure everything works.
+Run the reference video pipeline based on instructions in [Run the Split-Annotate Pipeline](./client/end-user-guide.md#run-the-reference-video-pipeline) section to make sure everything works.
 
 The CI will test more scenarios.
 
@@ -295,11 +295,11 @@ set them manually.
 | `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` | `ArtifactDelivery.create()` | Shared base directory for artifact staging on each node.  Workers inherit this from the driver so all processes agree on the same temp path.  Subdirectories (`profiling/`, `traces/`) isolate different artifact kinds. |
 | `COSMOS_CURATOR_TRACE_DIR` | `enable_tracing()` | Per-process directory for OTel span files.  Defaults to `<staging>/traces/` when `COSMOS_CURATOR_ARTIFACTS_STAGING_DIR` is set, otherwise `/tmp/cosmos_curator_traces`. |
 | `COSMOS_CURATOR_TRACEPARENT` | `propagate_trace_context()` | W3C traceparent header propagated from the driver's root span so all stage spans join a single distributed trace. |
-| `COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX` | User (optional) | Override the home-directory prefix for the local workspace (`~/cosmos_curator_local_workspace`).  See [End User Guide](./client/END_USER_GUIDE.md). |
+| `COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX` | User (optional) | Override the home-directory prefix for the local workspace (`~/cosmos_curator_local_workspace`).  See [End User Guide](./client/end-user-guide.md). |
 | `COSMOS_CURATOR_DOCKER_BUILD_ULIMIT` | User (optional) | Custom `nofile` ulimit for Docker image builds (default 65536). |
 
 For details on the artifact delivery mechanism and why env vars are
-used, see the [Artifact Transport Guide](./curator/reference/ARTIFACT_TRANSPORT.md#environment-variables).
+used, see the [Artifact Transport Guide](./curator/reference/artifact-transport.md#environment-variables).
 
 ## Contributing
 
@@ -323,7 +323,7 @@ If you encounter issues during development:
    - Check for conflicting dependencies
 
 3. **Pipeline Stage Debugging**:
-   - Use [Stage Replay](./curator/guides/STAGE_REPLAY.md) to debug specific stages without re-running entire pipelines
+   - Use [Stage Replay](./curator/guides/stage-replay.md) to debug specific stages without re-running entire pipelines
    - Save task inputs from problematic stages and replay them in isolation
    - Iterate rapidly on stage logic by replaying saved tasks
 

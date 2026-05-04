@@ -11,9 +11,9 @@ The `vllm_interface` provides separation of concerns, enabling CuratorStage clas
 **Primary Purpose**: Abstract away model-specific implementation details and provide a consistent interface for video captioning using vLLM's high-performance inference engine.
 
 **📚 Documentation Structure**:
-- **This document** (VLLM_INTERFACE.md): Architecture, API reference, configuration, usage examples
-- **[VLLM_INTERFACE_PLUGIN.md](../guides/VLLM_INTERFACE_PLUGIN.md)**: Step-by-step guide for adding new model plugins
-- **[VLLM_INTERFACE_DEBUG.md](../guides/VLLM_INTERFACE_DEBUG.md)**: Code flow tracing, debugging scenarios, troubleshooting
+- **This document** (vllm-interface.md): Architecture, API reference, configuration, usage examples
+- **[vllm-interface-plugin.md](../guides/vllm-interface-plugin.md)**: Step-by-step guide for adding new model plugins
+- **[vllm-interface-debug.md](../guides/vllm-interface-debug.md)**: Code flow tracing, debugging scenarios, troubleshooting
 
 ## Architecture
 
@@ -452,7 +452,7 @@ def _vllm_caption(model_inputs, stage2_prompts):
 
 **Want to add support for a new vLLM vision-language model?**
 
-See **[`VLLM_INTERFACE_PLUGIN.md`](../guides/VLLM_INTERFACE_PLUGIN.md)** for the complete step-by-step guide covering:
+See **[`vllm-interface-plugin.md`](../guides/vllm-interface-plugin.md)** for the complete step-by-step guide covering:
 - ✅ Plugin interface overview and requirements
 - ✅ Step-by-step implementation for each of the 5 required methods
 - ✅ Testing checklist (unit tests, integration tests, e2e tests)
@@ -708,7 +708,7 @@ pixi run --as-is -e unified pytest -m env tests/
 
 **Need to understand how the code works internally or debug an issue?**
 
-See **[`VLLM_INTERFACE_DEBUG.md`](../guides/VLLM_INTERFACE_DEBUG.md)** for:
+See **[`vllm-interface-debug.md`](../guides/vllm-interface-debug.md)** for:
 - ✅ Complete code flow example tracing a video through the system
 - ✅ Request state lifecycle and transitions
 - ✅ Common debugging scenarios (captions failing, stage 2 not triggering, requests dropped)
@@ -726,6 +726,6 @@ See **[`VLLM_INTERFACE_DEBUG.md`](../guides/VLLM_INTERFACE_DEBUG.md)** for:
 
 - vLLM Documentation: https://docs.vllm.ai/
 - Cosmos-Xenna (Ray pipeline framework): https://github.com/nvidia-cosmos/cosmos-xenna
-- [Pipeline Design Guide](../guides/PIPELINE_DESIGN.md)
+- [Pipeline Design Guide](../guides/pipeline-design.md)
 - [Model Interface](../../../cosmos_curator/core/interfaces/model_interface.py)
 - [VllmCaptionStage](../../../cosmos_curator/pipelines/video/captioning/vllm_caption_stage.py)

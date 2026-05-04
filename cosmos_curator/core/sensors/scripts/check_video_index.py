@@ -34,7 +34,7 @@ ERROR_EXIT_CODE = 2
 
 VIDEO_REQUIREMENTS_DOCS_URL = (
     "https://github.com/nvidia-cosmos/cosmos-curate/blob/main/docs/curator/design/"
-    "SENSOR_LIBRARY_EFFICIENT_VIDEO_DECODE.md#from_header-vs-full_demux"
+    "sensor-library-efficient-video-decode.md#from_header-vs-full_demux"
 )
 _S3_CREDENTIALS_HINT = (
     "Use --s3-profile-name to select an AWS profile, or configure standard AWS credentials "

@@ -630,7 +630,7 @@ without adding parameters to stage APIs.
 Additional consumer-specific environment variables (e.g. for
 tracing or profiling) are documented alongside their respective
 subsystems.  See the
-[Profiling Guide](../guides/PROFILING.md#artifact-delivery-flow)
+[Profiling Guide](../guides/profiling.md#artifact-delivery-flow)
 for an example.
 
 ## Source File Reference

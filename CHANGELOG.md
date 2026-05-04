@@ -336,7 +336,7 @@
 ### Documentation
 
 - Added documentation
-  for [vllm_interface](https://github.com/nvidia-cosmos/cosmos-curate/tree/main/docs/curator/design/VLLM_INTERFACE.md)
+  for [vllm_interface](https://github.com/nvidia-cosmos/cosmos-curate/tree/main/docs/curator/design/vllm-interface.md)
   which simplifies the integration of new vLLM-powered VLMs for captioning.
 
 ## [1.1.7]
@@ -473,7 +473,7 @@
 
 ### Added
 
-- Use [pixi](docs/DEVELOPER_GUIDE.md#working-with-pixi-environments) to manage environments inside container image
+- Use [pixi](docs/developer-guide.md#working-with-pixi-environments) to manage environments inside container image
 - Use absolute URL for [cosmos-xenna](https://github.com/nvidia-cosmos/cosmos-xenna) submodule; PLEASE run
   `git submodule sync` after pulling update
 - Support for [Cosmos-Reason1](https://github.com/nvidia-cosmos/cosmos-reason1) as an alternative model for captioning

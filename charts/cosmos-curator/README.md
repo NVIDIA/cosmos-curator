@@ -72,7 +72,7 @@ helm package charts/cosmos-curator --version ${CHART_VERSION}
 ngc registry chart push ${NGC_NVCF_ORG}/cosmos-curator:${CHART_VERSION}
 ```
 
-3. **Deploy using NVCF CLI** (see [NVCF documentation](docs/client/END_USER_GUIDE.md)):
+3. **Deploy using NVCF CLI** (see [NVCF documentation](docs/client/end-user-guide.md)):
 ```bash
 cosmos-curator nvcf --help
 ```

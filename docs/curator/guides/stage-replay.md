@@ -703,9 +703,9 @@ python compare_outputs.py \
 
 ## Related Documentation
 
-- **Pipeline Design**: [`PIPELINE_DESIGN.md`](PIPELINE_DESIGN.md) - Creating custom stages
-- **Architecture**: [`ARCHITECTURE.md`](../reference/ARCHITECTURE.md) - Understanding Cosmos Curator structure
-- **Debugging vLLM**: [`VLLM_INTERFACE_DEBUG.md`](VLLM_INTERFACE_DEBUG.md) - Debugging caption stages
+- **Pipeline Design**: [`pipeline-design.md`](pipeline-design.md) - Creating custom stages
+- **Architecture**: [`architecture.md`](../reference/architecture.md) - Understanding Cosmos Curator structure
+- **Debugging vLLM**: [`vllm-interface-debug.md`](vllm-interface-debug.md) - Debugging caption stages
 - **Core Implementation**: `cosmos_curator/core/utils/misc/debug.py` - Stage replay source code
 
 ---

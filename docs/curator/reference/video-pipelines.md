@@ -106,7 +106,7 @@ cosmos-curator local launch \
 > mutually exclusive. The config format matches the NVCF invoke payload
 > (`{"pipeline": "split", "args": {...}}`). Per-pipeline reference templates are
 > provided under `examples/osmo/` (`split_config.json`, `shard_config.json`,
-> `dedup_config.json`). See the [End User Guide](../../client/END_USER_GUIDE.md#configuration-files) for details.
+> `dedup_config.json`). See the [End User Guide](../../client/end-user-guide.md#configuration-files) for details.
 
 **Options for Input/Output**
 
@@ -140,7 +140,7 @@ In case you want the output to be in a different S3 bucket than the input, you c
 
 - `--limit`: how many videos to process
 - `--no-generate-embeddings`: disables InterVideo2/Cosmos-Embed1 embedding generation; use `"generate_embeddings": false` in API endpoint.
-- `--embedding-algorithm`: specifies embedding model, available options are `cosmos-embed1-224p`, `cosmos-embed1-336p`, `cosmos-embed1-448p`, `internvideo2` (default), and `openai` (requires an OpenAI-compatible endpoint; see [Use an OpenAI-Compatible Endpoint for Embedding](../../client/END_USER_GUIDE.md#use-an-openai-compatible-endpoint-for-embedding)). The `cosmos-embed1-*` suffix selects the input resolution; 224p is faster with 256-dim vectors, while 336p/448p are slower but score higher on retrieval/classification benchmarks and produce 768-dim vectors.
+- `--embedding-algorithm`: specifies embedding model, available options are `cosmos-embed1-224p`, `cosmos-embed1-336p`, `cosmos-embed1-448p`, `internvideo2` (default), and `openai` (requires an OpenAI-compatible endpoint; see [Use an OpenAI-Compatible Endpoint for Embedding](../../client/end-user-guide.md#use-an-openai-compatible-endpoint-for-embedding)). The `cosmos-embed1-*` suffix selects the input resolution; 224p is faster with 256-dim vectors, while 336p/448p are slower but score higher on retrieval/classification benchmarks and produce 768-dim vectors.
 - `--no-generate-captions`: disables VLM captioning; use `"generate_captions": false` in API endpoint.
 - `--generate-previews`: enables web preview generation.
 - `--upload-clip-info-in-chunks`: enables metadata jsonl for a group of clips and disables per-clip embedding & metadata writes.

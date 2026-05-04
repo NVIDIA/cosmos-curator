@@ -174,7 +174,7 @@ sampling rule is sensor-specific:
   band around the reference timestamp. The first generic IMU data structure,
   `ImuData`, represents point samples rather than preintegrated windows; see
   `cosmos_curator/core/sensors/data/imu_data.py` and the design rationale in
-  `SENSOR_LIBRARY_IMU_DATA.md`.
+  `sensor-library-imu-data.md`.
 - GPS/GNSS may select the nearest decoded fix, meaning the receiver's computed
   position solution at one point in time, or interpolate between decoded fixes.
   GNSS is the broader satellite-positioning category that includes GPS; WGS-84
@@ -182,7 +182,7 @@ sampling rule is sensor-specific:
   system commonly used by GPS/GNSS receivers. The first generic GPS data
   structure, `GpsData`, represents WGS-84 fix rows rather than map-projected
   localization output. See
-  `SENSOR_LIBRARY_GPS_DATA.md`.
+  `sensor-library-gps-data.md`.
 
 This has several important consequences:
 
@@ -501,14 +501,14 @@ passes, so it is not a supported input to this library.
   first generic IMU payload as SoA point samples with required angular velocity
   and linear acceleration vectors plus optional orientation, covariance,
   validity, host timestamp, sequence, and temperature fields. The design
-  rationale in `docs/curator/design/SENSOR_LIBRARY_IMU_DATA.md` also documents
+  rationale in `docs/curator/design/sensor-library-imu-data.md` also documents
   why preintegrated windows and ragged source-sample windows should remain
   separate future structures.
 - **GpsData**: The first generic GPS/GNSS payload is a SoA batch of
   WGS-84 fix rows with required latitude, longitude, altitude, and position
   validity plus optional covariance, velocity, fix type, satellite count,
   accuracy, dilution of precision, host/UTC timestamps, and sequence fields.
-  See `docs/curator/design/SENSOR_LIBRARY_GPS_DATA.md`.
+  See `docs/curator/design/sensor-library-gps-data.md`.
 
 ## Module Layout
 

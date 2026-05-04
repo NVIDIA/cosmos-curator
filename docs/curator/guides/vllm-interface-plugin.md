@@ -10,8 +10,8 @@ This guide walks you through adding a new vLLM model to cosmos-curator by implem
 - Model weights downloaded locally (see model download guide)
 
 **Related Documentation:**
-- **[VLLM_INTERFACE.md](../design/VLLM_INTERFACE.md)**: Architecture and API reference
-- **[VLLM_INTERFACE_DEBUG.md](VLLM_INTERFACE_DEBUG.md)**: Debugging and troubleshooting
+- **[vllm-interface.md](../design/vllm-interface.md)**: Architecture and API reference
+- **[vllm-interface-debug.md](vllm-interface-debug.md)**: Debugging and troubleshooting
 
 ## Quick Start
 
@@ -1004,7 +1004,7 @@ Use this checklist to ensure your plugin is complete:
 1. Check `decode()` implementation - ensure it returns string
 2. Verify vLLM model generates output: add logging in `decode()`
 3. Test `decode()` with mock RequestOutput
-4. See [VLLM_INTERFACE_DEBUG.md](VLLM_INTERFACE_DEBUG.md) Scenario 1
+4. See [vllm-interface-debug.md](vllm-interface-debug.md) Scenario 1
 
 ### Stage 2 Not Working
 
@@ -1014,7 +1014,7 @@ Use this checklist to ensure your plugin is complete:
 1. Verify `make_refined_llm_request()` sets `caption=None` and `stage2_prompt=None`
 2. Check refined request has new `request_id`
 3. Verify refinement prompt is combined with stage 1 caption
-4. See [VLLM_INTERFACE_DEBUG.md](VLLM_INTERFACE_DEBUG.md) Scenario 2
+4. See [vllm-interface-debug.md](vllm-interface-debug.md) Scenario 2
 
 ---
 
@@ -1165,6 +1165,6 @@ class VllmVideoLLaMA(VllmPlugin):
   - `cosmos_curator/models/vllm_nemotron.py` - Video + metadata format
   - `cosmos_curator/models/vllm_cosmos_reason1_vl.py` - NVIDIA model
 - **vLLM Documentation**: https://docs.vllm.ai/
-- **Design Document**: [VLLM_INTERFACE.md](../design/VLLM_INTERFACE.md)
-- **Debug Guide**: [VLLM_INTERFACE_DEBUG.md](VLLM_INTERFACE_DEBUG.md)
-- **Profiling Guide**: [PROFILING.md](PROFILING.md)
+- **Design Document**: [vllm-interface.md](../design/vllm-interface.md)
+- **Debug Guide**: [vllm-interface-debug.md](vllm-interface-debug.md)
+- **Profiling Guide**: [profiling.md](profiling.md)

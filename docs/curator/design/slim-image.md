@@ -191,7 +191,7 @@ while `pynvc` is measurably faster. This removal is justified independently of t
       environments, which caused worker spawn timeouts in k8s CI
     - Applied to `PixiRuntimeEnv` (Ray actor spawns), CI scripts, Dockerfile post-install steps,
       and all in-container docs examples
-    - Local dev commands (DEVELOPER_GUIDE.md) left without `--as-is` since envs may not be
+    - Local dev commands (developer-guide.md) left without `--as-is` since envs may not be
       pre-installed
 
 ### Phase 4: Cleanup and optimization

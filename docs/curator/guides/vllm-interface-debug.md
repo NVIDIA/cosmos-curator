@@ -2,14 +2,14 @@
 
 ## Overview
 
-This guide helps you understand the internal code flow of the `vllm_interface` module and debug common issues. If you're just looking to **use** the interface, see [`VLLM_INTERFACE.md`](../design/VLLM_INTERFACE.md) for architecture, API reference, and configuration examples.
+This guide helps you understand the internal code flow of the `vllm_interface` module and debug common issues. If you're just looking to **use** the interface, see [`vllm-interface.md`](../design/vllm-interface.md) for architecture, API reference, and configuration examples.
 
 **Use this guide when:**
 - 🐛 Debugging caption generation issues
 - 🔍 Understanding how requests flow through the system
 - 📚 Learning the codebase internals
 
-**For adding new plugins, see:** [`VLLM_INTERFACE_PLUGIN.md`](VLLM_INTERFACE_PLUGIN.md)
+**For adding new plugins, see:** [`vllm-interface-plugin.md`](vllm-interface-plugin.md)
 
 ## Quick Navigation
 
@@ -433,9 +433,9 @@ debug_request(refined_request, "After Stage 2 Creation")
 
 ## References
 
-- **Design Document**: [`VLLM_INTERFACE.md`](../design/VLLM_INTERFACE.md) - Architecture, API reference, configuration
-- **Plugin Guide**: [`VLLM_INTERFACE_PLUGIN.md`](VLLM_INTERFACE_PLUGIN.md) - Step-by-step guide for adding new models
-- **Profiling Guide**: [`PROFILING.md`](PROFILING.md) - Performance profiling
+- **Design Document**: [`vllm-interface.md`](../design/vllm-interface.md) - Architecture, API reference, configuration
+- **Plugin Guide**: [`vllm-interface-plugin.md`](vllm-interface-plugin.md) - Step-by-step guide for adding new models
+- **Profiling Guide**: [`profiling.md`](profiling.md) - Performance profiling
 - **vLLM Documentation**: https://docs.vllm.ai/ - Official vLLM docs
 - **Plugin Examples**: 
   - `cosmos_curator/models/vllm_qwen.py` - Most complete example

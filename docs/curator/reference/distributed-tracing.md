@@ -608,7 +608,7 @@ Tracing produces two types of output:
   `<staging-dir>/traces/` during the run.  Collected to
   `<output-path>/profile/traces/` post-pipeline by
   `ArtifactDelivery` (see
-  [Artifact Transport Guide](ARTIFACT_TRANSPORT.md)).
+  [Artifact Transport Guide](artifact-transport.md)).
 - **Live spans** sent to the OTLP collector (when endpoint is
   configured).
 
