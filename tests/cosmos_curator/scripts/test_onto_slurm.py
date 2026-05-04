@@ -504,6 +504,9 @@ class TestDisplayNvidiaSmi:
         test_hostname = "test-gpu-node"
         monkeypatch.setattr("cosmos_curator.scripts.onto_slurm.hostname", lambda: test_hostname)
 
+        # Mock shutil.which to simulate nvidia-smi being present
+        monkeypatch.setattr("cosmos_curator.scripts.onto_slurm.shutil.which", lambda _: "/usr/bin/nvidia-smi")
+
         # Mock asyncio.run to avoid actually running the subprocess
         mock_asyncio_run = MagicMock()
         mock_asyncio_run.side_effect = lambda _: None  # Just run the coroutine's side effects
@@ -519,6 +522,28 @@ class TestDisplayNvidiaSmi:
             mock_logger.info.assert_called_once()
             mock_asyncio_run.assert_called_once()
             mock_run_subprocess_async.assert_called_once_with(["nvidia-smi"])
+
+    def test_display_nvidia_smi_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that display_nvidia_smi logs a warning and skips nvidia-smi when not available (e.g. CPU nodes).
+
+        Args:
+            monkeypatch: The monkeypatch object.
+
+        """
+        test_hostname = "test-cpu-node"
+        monkeypatch.setattr("cosmos_curator.scripts.onto_slurm.hostname", lambda: test_hostname)
+
+        # Mock shutil.which to simulate nvidia-smi not being present
+        monkeypatch.setattr("cosmos_curator.scripts.onto_slurm.shutil.which", lambda _: None)
+
+        mock_asyncio_run = MagicMock()
+        monkeypatch.setattr("asyncio.run", mock_asyncio_run)
+
+        with patch("cosmos_curator.scripts.onto_slurm.logger") as mock_logger:
+            display_nvidia_smi()
+            mock_logger.info.assert_called_once()
+            mock_logger.warning.assert_called_once()
+            mock_asyncio_run.assert_not_called()
 
 
 class TestStartRay:

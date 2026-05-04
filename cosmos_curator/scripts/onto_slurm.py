@@ -50,6 +50,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -363,7 +364,10 @@ def display_nvidia_smi() -> None:
 
     """
     logger.info("NVIDIA SMI for %s", hostname())
-    asyncio.run(run_subprocess_async(["nvidia-smi"]))
+    if shutil.which("nvidia-smi") is not None:
+        asyncio.run(run_subprocess_async(["nvidia-smi"]))
+    else:
+        logger.warning("nvidia-smi not found, skipping")
 
 
 def start_ray(
