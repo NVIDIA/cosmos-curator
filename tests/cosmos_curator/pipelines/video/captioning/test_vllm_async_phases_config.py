@@ -136,7 +136,8 @@ class TestBuildersNumWorkersPerNode:
         assert len(stages) == 3
         assert isinstance(stages[0], CuratorStageSpec)
         assert isinstance(stages[0].stage, VllmAsyncPrepStage)
-        assert isinstance(stages[1], PreviewStage)
+        assert isinstance(stages[1], CuratorStageSpec)
+        assert isinstance(stages[1].stage, PreviewStage)
         assert isinstance(stages[2], CuratorStageSpec)
         assert isinstance(stages[2].stage, VllmAsyncCaptionStage)
 

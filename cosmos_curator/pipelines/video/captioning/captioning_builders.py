@@ -279,11 +279,14 @@ def build_captioning_stages(config: CaptioningConfig) -> list[CuratorStage | Cur
 
     if config.generate_previews:
         stages.append(
-            PreviewStage(
-                target_fps=config.preview_target_fps,
-                target_height=config.preview_target_height,
-                verbose=config.verbose,
-                log_stats=config.perf_profile,
+            CuratorStageSpec(
+                PreviewStage(
+                    target_fps=config.preview_target_fps,
+                    target_height=config.preview_target_height,
+                    verbose=config.verbose,
+                    log_stats=config.perf_profile,
+                ),
+                over_provision_factor=4.0,
             )
         )
 
