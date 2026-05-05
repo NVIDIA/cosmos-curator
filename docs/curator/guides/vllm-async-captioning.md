@@ -21,13 +21,118 @@ engine within each Ray worker actor. It generates captions via async
 
 ## Architecture
 
-Three-stage pipeline:
+Two-stage pipeline (three with previews enabled):
 
 ```
-VllmAsyncPrepStage (CPU) --> VllmAsyncPromptRenderStage (CPU) --> VllmAsyncCaptionStage (GPU)
-  decode frames, build         render TextPrompt to                engine.generate()
-  TextPrompt                   ProcessorInputs                    assign captions
+VllmAsyncPrepStage (CPU) --> VllmAsyncCaptionStage (GPU, continuous mode)
+  decode frames, build         inline render under asyncio.Lock + asyncio.to_thread,
+  TextPrompt + frames          AsyncLLM.generate(), assign captions
 ```
+
+Render is performed inline inside `VllmAsyncCaptionStage`, which
+implements `cosmos_xenna.ray_utils.continuous_stage.ContinuousInterface`
+and is driven by Xenna's `run_continuous` loop instead of per-batch
+`process_data` calls.
+
+### Per-window dispatch flow (inside the GPU actor)
+
+The `run_continuous` loop alternates between reaping completed in-flight
+work and pulling more input from the queue. When nothing is in flight it
+blocks on `input_queue.get()` with a `_INPUT_GET_TIMEOUT_S` ceiling so
+`stop_event` is observed promptly. Termination is driven exclusively by
+`stop_event` (set by Xenna's `_watch_stop_flag`); there is no in-band
+sentinel.
+
+`_register_task` first calls `_extract_prepared_windows`. If the task
+yields zero prepared windows (upstream prep produced nothing), the
+output is emitted synchronously to `output_queue` and no tracker is
+inserted -- the pipeline never stalls on inputs whose render budget is
+empty. Otherwise the tracker is inserted *after* extract succeeds and
+one stage-1 task per window is spawned. `_emit_completed_tasks` runs
+unconditionally on every loop tick as defense-in-depth.
+
+```
+                +-----------------------------------+
+                | input_queue.get()                 |
+                | (block, _INPUT_GET_TIMEOUT_S)     |
+                +-----------------+-----------------+
+                                  |
+                                  v
+                +-----------------------------------+
+                | _register_task                    |
+                |   _extract_prepared_windows       |
+                +--------+----------------+---------+
+                         |                |
+                  windows: yes      windows: zero
+                         |                |
+                         v                v
+        +-------------------------+   +-----------------------------+
+        | _generate_and_assign    |   | output_queue.put(emit)      |
+        | (render via Lock + to_  |   | (synchronous; no tracker)   |
+        |  thread; AsyncLLM.gen)  |   +-----------------------------+
+        +-----------+-------------+
+                    |
+                    v
+        +-------------------------+
+        | _await_and_reap (raise) |
+        +-----------+-------------+
+                    |
+                    v
+        +-------------------------+
+        | _emit_completed_tasks   |   (runs unconditionally
+        +-------------------------+    on every loop tick)
+```
+
+The renderer is invoked inline via:
+
+```python
+async with self._render_lock:
+    rendered = await asyncio.to_thread(self._engine.renderer.render_cmpl, payload)
+```
+
+`asyncio.Lock` serialises HF tokenizer calls (which raise
+`RuntimeError("Already borrowed")` under concurrent use), and
+`asyncio.to_thread` keeps the event loop free while the blocking
+renderer runs on an OS thread. A fresh payload dict and a fresh
+`multi_modal_data` mapping are built per call so the renderer's
+in-place mutations never leak across windows.
+
+### Failure semantics
+
+There is **no per-window error isolation** in continuous mode. Any
+exception inside a stage-1 or stage-2 task propagates out of
+`_await_and_reap`, exits `run_continuous`, and triggers a Xenna
+actor restart. Multi-actor parallelism cushions the blast radius,
+but other in-flight windows on the failing actor are forfeited.
+
+#### Actor-restart cleanup contract
+
+The eager in-actor cleanup in `_generate_and_assign`
+(`finally: del rendered_prompt`) and `_extract_prepared_windows`
+(`window.model_input.pop(variant, None)`) is **horizontal memory
+hygiene**, not recovery-path mutation. Two invariants make it safe
+across a Xenna actor restart:
+
+1. **Ray pickles task arguments at the actor boundary.** In-actor
+   mutation of a deserialized `SplitPipeTask` never propagates back
+   to the upstream-queue copy.
+2. **Continuous mode acks on emit.** A task is removed from the
+   upstream queue only after `_emit_completed_tasks` puts a matching
+   `ContinuousTaskOutput`. If the actor dies first, Xenna
+   re-dispatches a fresh deserialization of the original input.
+
+```
+upstream queue --pickle-----> in-actor task --(del / pop)--> dies
+upstream queue --re-pickle--> fresh actor (cleanup never observed)
+```
+
+`del rendered_prompt` releases only the per-window vLLM-rendered
+tensors; the raw `prompt_text` and `decoded_rgb_frames` remain reachable
+through `_PreparedWindow` for the lifetime of the in-flight task.
+`window.model_input.pop(variant, None)` evicts the upstream cache
+entry *after* its values have been copied into a `_PreparedWindow`;
+the upstream-queue copy is untouched. Neither cleanup is reachable
+from the recovery path, so no work is lost on restart.
 
 ### N-Actors vs DP Mode
 
@@ -128,11 +233,15 @@ sets it to `32768`. For other models:
 --vllm-async-max-num-batched-tokens 32768
 ```
 
-### EngineDeadError
+### Engine / renderer failures
 
-GPU OOM-kill of the `EngineCore` subprocess. The stage re-raises
-`EngineDeadError` to crash the Ray actor; Xenna restarts it with a
-fresh engine.
+In continuous mode the caption stage no longer special-cases
+`EngineDeadError` (or any other per-window error). Any uncaught
+exception during render or generate -- engine OOM, GPU CUDA fault,
+renderer error -- propagates out of `run_continuous` and crashes
+the Ray actor. Xenna restarts it with a fresh `AsyncLLM` engine.
+Other in-flight windows on the failing actor are lost; sibling
+actors are unaffected.
 
 ### CUBLAS_STATUS_INVALID_VALUE
 

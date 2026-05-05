@@ -194,22 +194,7 @@ def _build_vllm_async_prep_stage(config: CaptioningConfig, vsc: VllmAsyncCaption
         verbose=config.verbose,
         log_stats=config.perf_profile,
     )
-    return CuratorStageSpec(stage, over_provision_factor=2.0)
-
-
-def _build_vllm_async_render_stage(config: CaptioningConfig, vsc: VllmAsyncCaptionConfig) -> CuratorStageSpec:
-    """Build the vLLM async render stage (TextPrompt -> ProcessorInputs)."""
-    serve_config = _require_vllm_async_serve_config(vsc)
-
-    from cosmos_curator.pipelines.video.captioning.vllm_async_stage import VllmAsyncPromptRenderStage  # noqa: PLC0415
-
-    stage = VllmAsyncPromptRenderStage(
-        serve_config=serve_config,
-        model_name=vsc.model_name,
-        verbose=config.verbose,
-        log_stats=config.perf_profile,
-    )
-    return CuratorStageSpec(stage, over_provision_factor=1.5)
+    return CuratorStageSpec(stage, over_provision_factor=4.0)
 
 
 def _build_captioning_caption_stage(config: CaptioningConfig) -> CuratorStage | CuratorStageSpec:
@@ -280,8 +265,12 @@ def _build_vllm_async_caption_stage(config: CaptioningConfig, vsc: VllmAsyncCapt
     if serve_config.data_parallel_size > 1:
         return CuratorStageSpec(stage, num_workers_per_node=1, worker_max_lifetime_m=0)
     if vsc.num_workers_per_node > 0:
-        return CuratorStageSpec(stage, num_workers_per_node=vsc.num_workers_per_node, worker_max_lifetime_m=0)
-    return CuratorStageSpec(stage, worker_max_lifetime_m=0, over_provision_factor=1.5)
+        return CuratorStageSpec(
+            stage,
+            num_workers_per_node=vsc.num_workers_per_node,
+            worker_max_lifetime_m=0,
+        )
+    return CuratorStageSpec(stage, worker_max_lifetime_m=0, over_provision_factor=2.0)
 
 
 def build_captioning_stages(config: CaptioningConfig) -> list[CuratorStage | CuratorStageSpec]:
@@ -297,9 +286,6 @@ def build_captioning_stages(config: CaptioningConfig) -> list[CuratorStage | Cur
                 log_stats=config.perf_profile,
             )
         )
-
-    if isinstance(config.backend, VllmAsyncCaptionConfig):
-        stages.append(_build_vllm_async_render_stage(config, config.backend))
 
     stages.append(_build_captioning_caption_stage(config))
 

@@ -18,14 +18,13 @@
 import asyncio
 import collections
 import concurrent.futures
-import contextvars
 import itertools
 import json
 import logging
 import os
 import time
 import warnings
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import attrs
 import numpy as np
@@ -35,7 +34,7 @@ import ray
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_cleanup, gpu_stage_startup
-from cosmos_curator.core.utils.infra.performance_utils import StageTimer
+from cosmos_curator.core.utils.infra.performance_utils import StagePerfStats, StageTimer
 from cosmos_curator.core.utils.infra.tracing import StatusCode, TracedSpan, traced_span
 from cosmos_curator.core.utils.misc.logging_utils import make_tagged_logger
 from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
@@ -61,7 +60,13 @@ from cosmos_curator.pipelines.video.utils.windowing_utils import (
     compute_windows,
     window_source_time_trace_attributes,
 )
+from cosmos_xenna.ray_utils.continuous_stage import (
+    ContinuousInterface,
+    ContinuousTaskInput,
+    ContinuousTaskOutput,
+)
 from cosmos_xenna.ray_utils.runtime_envs import CondaEnv, RuntimeEnv
+from cosmos_xenna.utils.exception_utils import unwrap_taskgroup_exception_group
 from cosmos_xenna.utils.gpu import get_gpu_ids_from_cuda_env_vars
 
 if TYPE_CHECKING:
@@ -71,7 +76,6 @@ if TYPE_CHECKING:
     from vllm.multimodal.processing.inputs import ProcessorInputs
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.exceptions import EngineDeadError
 
 if conda_utils.is_running_in_env("unified"):
     from transformers import AutoProcessor
@@ -79,13 +83,9 @@ if conda_utils.is_running_in_env("unified"):
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.utils.gc_utils import freeze_gc_heap
     from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.exceptions import EngineDeadError
 
     from cosmos_curator.models.vllm_interface import sampling_params as build_sampling_params
 else:
-
-    class EngineDeadError(Exception):  # type: ignore[no-redef]
-        """Placeholder when vLLM is not installed; never raised at runtime."""
 
     def freeze_gc_heap() -> None:  # type: ignore[misc]
         """No-op fallback when vLLM is not installed."""
@@ -176,33 +176,6 @@ def _build_engine_args(config: VllmAsyncConfig, model_path: str) -> "AsyncEngine
         skip_mm_profiling=config.skip_mm_profiling,
         use_tqdm_on_load=False,
         mm_processor_kwargs=mm_kwargs,
-    )
-
-
-def _build_render_engine_args(config: VllmAsyncConfig, model_path: str) -> "AsyncEngineArgs":
-    """Build minimal ``AsyncEngineArgs`` for standalone Renderer creation."""
-    limit_mm: dict[str, Any] | None = None
-    if config.limit_mm_per_prompt:
-        limit_mm = json.loads(config.limit_mm_per_prompt)
-
-    mm_kwargs: dict[str, Any] | None = None
-    if config.mm_processor_kwargs:
-        mm_kwargs = json.loads(config.mm_processor_kwargs)
-
-    return AsyncEngineArgs(
-        model=model_path,
-        served_model_name=[config.model_variant],
-        tensor_parallel_size=1,
-        data_parallel_size=1,
-        gpu_memory_utilization=0.85,
-        max_model_len=config.max_model_len if config.max_model_len > 0 else None,  # type: ignore[arg-type]
-        dtype=config.dtype,
-        trust_remote_code=config.trust_remote_code,
-        limit_mm_per_prompt=limit_mm,  # type: ignore[arg-type]
-        mm_processor_kwargs=mm_kwargs,
-        mm_processor_cache_gb=config.mm_processor_cache_gb,
-        mm_processor_cache_type=config.mm_processor_cache_type or None,  # type: ignore[arg-type]
-        use_tqdm_on_load=False,
     )
 
 
@@ -326,13 +299,12 @@ class VllmAsyncPrepStage(CuratorStage):
         self._logger.debug("Prompt template computed ({} chars)", len(prompt_text))
         return prompt_text
 
-    def _build_prompt(self, video_frames: npt.NDArray[np.uint8]) -> tuple[str, dict[str, list[npt.NDArray[np.uint8]]]]:
-        """Pair the precomputed prompt template with multimodal frame data."""
+    def _build_prompt(self) -> str:
+        """Return the precomputed chat-template prompt for one window."""
         if self._prompt_template is None:
             msg = "Prompt template not initialized; call stage_setup first."
             raise RuntimeError(msg)
-        mm_data: dict[str, list[npt.NDArray[np.uint8]]] = {"video": [video_frames]}
-        return self._prompt_template, mm_data
+        return self._prompt_template
 
     def _create_windows_and_decode(self, clip: Clip) -> list[Window]:
         """Create windows from ``clip.encoded_data`` and decode frames via memfd."""
@@ -396,22 +368,35 @@ class VllmAsyncPrepStage(CuratorStage):
 
             frames_slice = all_frames[offset : offset + actual]
             offset += actual
-            window = Window(start_frame=wi.start, end_frame=wi.end)
-            clip.windows.append(window)
-
-            prompt_text, mm_data = self._build_prompt(frames_slice)
-            frames_shape = tuple(frames_slice.shape)
-            window.model_input[self._model_variant] = {
-                "prompt_input": {"prompt": prompt_text, "multi_modal_data": mm_data},
-                "frames_shape": frames_shape,
-            }
-            windows.append(window)
-            self._logger.debug(
-                "Window [{}, {}]: frames_shape={}",
-                wi.start,
-                wi.end,
-                frames_shape,
-            )
+            try:
+                window = Window(start_frame=wi.start, end_frame=wi.end)
+                prompt_text = self._build_prompt()
+                frames_shape = tuple(frames_slice.shape)
+                window.model_input[self._model_variant] = {
+                    "prompt": prompt_text,
+                    "video_frames": frames_slice,
+                    "frames_shape": frames_shape,
+                }
+                # Append only after the window is fully assembled so failed
+                # windows never leak as partially-built orphans onto clip.windows.
+                clip.windows.append(window)
+                windows.append(window)
+                self._logger.debug(
+                    "Window [{}, {}]: frames_shape={}",
+                    wi.start,
+                    wi.end,
+                    frames_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                clip.errors[f"vllm_async_prep_window_{wi.start}_{wi.end}"] = f"window assembly failed: {exc}"
+                self._logger.warning(
+                    "window assembly failed for clip {} window [{}, {}]: {}",
+                    clip.uuid,
+                    wi.start,
+                    wi.end,
+                    exc,
+                    exc_info=True,
+                )
 
         if self._prep_config.keep_mp4:
             self._extract_mp4_bytes_for_windows(clip_data, windows)
@@ -481,220 +466,97 @@ class VllmAsyncPrepStage(CuratorStage):
         return tasks
 
 
-class VllmAsyncPromptRenderStage(CuratorStage):
-    """CPU-only stage that renders ``TextPrompt`` dicts into ``ProcessorInputs``."""
+_MAX_ACCEPT_PER_LOOP: int = 4
+"""Upper bound on tasks pulled from the input queue per ``run_continuous`` loop tick.
 
-    RENDER_CHUNK_SIZE: ClassVar[int] = 32  # windows per render_cmpl_async call
+Bounding the per-tick intake keeps registration latency low without
+starving the in-flight reaping / emission code paths in the same loop.
+"""
 
-    def __init__(
-        self,
-        *,
-        serve_config: VllmAsyncConfig,
-        model_name: str,
-        verbose: bool = False,
-        log_stats: bool = False,
-    ) -> None:
-        """Initialize the render stage with serve config."""
-        super().__init__()
-        self._timer = StageTimer(self)
-        self._serve_config = serve_config
-        self._model_name = model_name
-        self._model_variant = "vllm_async"
-        self._verbose = verbose
-        self._log_stats = log_stats
-        self._vllm_model = _VllmAsyncModel(serve_config.model_variant)
-        self._log_tag = f"[asyncvLLM-render:{serve_config.model_variant}]"
-        self._logger = make_tagged_logger(self._log_tag)
-        self._renderer: Any = None
-        self._runner: asyncio.Runner | None = None
+_INPUT_GET_TIMEOUT_S: float = 0.1
+"""Maximum block time on ``input_queue.get()`` when nothing is in flight.
 
-    def __getstate__(self) -> dict[str, Any]:
-        """Exclude non-serializable objects from pickling."""
-        state = self.__dict__.copy()
-        state.pop("_logger", None)
-        state.pop("_renderer", None)
-        state.pop("_runner", None)
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore instance state and recreate non-serializable objects."""
-        self.__dict__.update(state)
-        self._logger = make_tagged_logger(self._log_tag)
-        self._renderer = None
-        self._runner = None
-
-    def secondary_name(self) -> str:
-        """Return the model variant for logging."""
-        return self._model_variant
-
-    @property
-    def model(self) -> ModelInterface:
-        """Return the model interface for automatic weight download."""
-        return self._vllm_model
-
-    @property
-    def resources(self) -> CuratorStageResource:
-        """Declare CPU resources for Xenna scheduling."""
-        return CuratorStageResource(cpus=0.5)
-
-    @property
-    def conda_env_name(self) -> str:
-        """Return the conda environment where vLLM is installed."""
-        return "unified"
-
-    def stage_setup(self) -> None:
-        """Create a standalone vLLM ``Renderer`` (tokenizer + HF processor)."""
-        self._logger.info("stage_setup starting")
-
-        model_id = get_vllm_model_id(self._serve_config.model_variant)
-        model_path = resolve_model_path(model_id)
-
-        engine_args = _build_render_engine_args(self._serve_config, model_path)
-        vllm_config = engine_args.create_engine_config()
-
-        from vllm.renderers import renderer_from_config  # noqa: PLC0415
-
-        start_time = time.monotonic()
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=".*trust_remote_code.*Auto classes.*It has no effect here and is ignored.*",
-            )
-            self._renderer = renderer_from_config(vllm_config)
-        elapsed = time.monotonic() - start_time
-        self._logger.info("Renderer ready model={} startup={:.1f}s", model_path, elapsed)
-
-        self._runner = asyncio.Runner()
-        self._logger.info("stage_setup complete")
-
-    def destroy(self) -> None:
-        """Release the Renderer and close the asyncio Runner."""
-        if self._runner is not None:
-            self._runner.close()
-            self._runner = None
-        self._renderer = None
-        self._logger.info("destroy complete")
-
-    def _collect_renderable_windows(
-        self,
-        tasks: list[SplitPipeTask],
-    ) -> list[tuple[Clip, int, Window, dict[str, Any]]]:
-        """Collect windows that have a valid ``TextPrompt`` in ``model_input``."""
-        variant = self._model_variant
-        result: list[tuple[Clip, int, Window, dict[str, Any]]] = []
-        for task in tasks:
-            for clip in task.video.clips:
-                for wi, window in enumerate(clip.windows):
-                    cached = window.model_input.get(variant)
-                    if cached is None:
-                        continue
-                    if "prompt_input" not in cached:
-                        clip.errors[f"{variant}_render_{wi}"] = "missing prompt_input in model_input"
-                        window.model_input.pop(variant, None)
-                        self._logger.warning("clip {} window {} missing prompt_input, skipping", clip.uuid, wi)
-                        continue
-                    result.append((clip, wi, window, cached))
-        return result
-
-    async def _render_all_windows_async(
-        self,
-        tasks: list[SplitPipeTask],
-    ) -> None:
-        """Render all windows' ``TextPrompt`` dicts to ``ProcessorInputs``."""
-        renderer = self._renderer
-        if renderer is None:
-            msg = "Renderer not initialized; call stage_setup() before process_data()."
-            raise RuntimeError(msg)
-
-        variant = self._model_variant
-        windows_to_render = self._collect_renderable_windows(tasks)
-
-        if not windows_to_render:
-            return
-
-        for chunk in itertools.batched(windows_to_render, self.RENDER_CHUNK_SIZE):
-            try:
-                prompt_primitives: list[tuple[str, npt.NDArray[np.uint8]]] = []
-                for _clip, _wi, _window, cached in chunk:
-                    prompt_input = cached["prompt_input"]
-                    prompt_text = prompt_input["prompt"]
-                    decoded_rgb_frames = prompt_input["multi_modal_data"]["video"][0]
-                    prompt_primitives.append((prompt_text, decoded_rgb_frames))
-                prompts = [
-                    _build_render_payload(prompt_text, decoded_rgb_frames, self._serve_config.mm_processor_kwargs)
-                    for prompt_text, decoded_rgb_frames in prompt_primitives
-                ]
-                rendered_list = await renderer.render_cmpl_async(prompts)
-            except Exception as e:  # noqa: BLE001
-                for clip, wi, window, _cached in chunk:
-                    clip.errors[f"{variant}_render_{wi}"] = f"chunk render failed: {e}"
-                    window.model_input.pop(variant, None)
-                self._logger.warning(
-                    "chunk render failed for {} windows: {}",
-                    len(chunk),
-                    e,
-                    exc_info=True,
-                )
-                continue
-
-            for (_clip, _wi, window, cached), (prompt_text, decoded_rgb_frames), rendered in zip(
-                chunk, prompt_primitives, rendered_list, strict=True
-            ):
-                window.model_input[variant] = {
-                    "rendered_prompt": rendered,
-                    "frames_shape": cached["frames_shape"],
-                    "raw_prompt": prompt_text,
-                    "decoded_rgb_frames": decoded_rgb_frames,
-                }
-
-    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask]:
-        """Render all tasks' windows from ``TextPrompt`` to ``ProcessorInputs``."""
-        if self._runner is None or self._renderer is None:
-            msg = "stage_setup() must be called before process_data()."
-            raise RuntimeError(msg)
-
-        total_windows = sum(len(clip.windows) for task in tasks for clip in task.video.clips)
-        self._logger.debug("process_data: tasks={}, windows={}", len(tasks), total_windows)
-        major_size = sum(task.get_major_size() for task in tasks)
-        self._timer.reinit(self, major_size)
-
-        with self._timer.time_process():
-            self._runner.run(self._render_all_windows_async(tasks))
-
-        rendered_count = sum(
-            1
-            for task in tasks
-            for clip in task.video.clips
-            for w in clip.windows
-            if (vd := w.model_input.get(self._model_variant)) is not None and "rendered_prompt" in vd
-        )
-        self._logger.info(
-            "Rendered {} / {} windows for {} tasks",
-            rendered_count,
-            total_windows,
-            len(tasks),
-        )
-
-        if self._log_stats:
-            stage_name, stage_perf_stats = self._timer.log_stats()
-            for task in tasks:
-                task.stage_perf[stage_name] = stage_perf_stats
-
-        return tasks
+Mirrors the framework's ``_collect_continuous_async`` polling cadence so
+``stop_event`` is observed within ~100 ms even when no new input arrives.
+"""
 
 
 @attrs.define(eq=False)
-class _RenderedWindow:
-    """Pre-rendered window ready for GPU inference."""
+class _PreparedWindow:
+    """Stable raw inputs for a single window awaiting GPU inference."""
 
     clip: Clip
     window_index: int
     window: Window
-    rendered_prompt: "ProcessorInputs | None"
+    prompt_text: str
+    decoded_rgb_frames: npt.NDArray[np.uint8]
     sampling_params: "SamplingParams"
     frames_shape: tuple[int, ...]
-    raw_prompt: str | None
-    decoded_rgb_frames: npt.NDArray[np.uint8] | None
+
+
+@attrs.define(eq=False)
+class _ContinuousTaskTracker:
+    """In-flight bookkeeping for one ``ContinuousTaskInput`` (one ``SplitPipeTask``).
+
+    ``pending`` collects the asyncio tasks driving stage-1 generation and
+    optional stage-2 refinement for every window in the pipeline task.
+    ``stage2_queue`` buffers stage-1 captions awaiting refinement so the
+    main loop can spawn them in batch on the next tick.
+
+    Why the tracker exists: the 1:1 contract
+    -----------------------------------------
+    Cosmos-Curate's stage interface defines a strict 1-task-in / 1-task-out
+    contract: every ``CuratorStage`` (sync ``process_data`` or continuous
+    ``run_continuous``) consumes one ``PipelineTask`` and must emit either
+    the same task or ``None``.  ``SplitPipeTask`` carries
+    ``list[Video] -> list[Clip] -> list[Window]``, so a single input task
+    fans out to N (often 10-100+) per-window GPU inference units inside
+    this stage, but only ONE ``ContinuousTaskOutput`` may leave the stage
+    - and only after EVERY window in the task is done.
+
+    The tracker is the bookkeeping that bridges N-window fan-out to
+    1-task fan-in: it owns every per-window asyncio task and the stage-2
+    queue tied to one ``ContinuousTaskInput`` so :meth:`all_done` can
+    decide when the whole pipeline task is ready to emit.
+
+    Cost the contract imposes
+    ------------------------------------------------------
+    - **Memory growth**: each tracker holds N ``_PreparedWindow`` objects
+      alive (each a multi-MB ``decoded_rgb_frames`` ndarray + ``prompt_text`` +
+      a rendered prompt during inference).  Until ``all_done()`` returns
+      True, none of them can be released, even for windows whose stage-1
+      and stage-2 captions are already written back into the task.
+    - **OOM risk**: with K concurrent tasks in flight on the actor,
+      memory footprint is O(K * N * frame_buffer_bytes).  K is bounded by
+      the input queue and the framework's continuous concurrency, but N
+      is unbounded - a single long video can pin the actor for the
+      duration of its slowest window.
+    - **Head-of-line blocking**: 1 slow / failed window of N delays
+      emission of the entire task; downstream writer / metadata stages
+      stay idle waiting for the remaining 99% of work that is already
+      complete.
+    - **Complexity**: the tracker, ``stage2_queue``, ``all_done``
+      reaping, and the unconditional emit in :meth:`run_continuous` only
+      exist to bridge fan-out -> fan-in.  Per-window emission would
+      collapse this into a single forward-and-forget primitive.
+    """
+
+    task_input: ContinuousTaskInput
+    pending: set[asyncio.Task[None]] = attrs.field(factory=set)
+    stage2_queue: collections.deque[tuple["_PreparedWindow", str]] = attrs.field(factory=collections.deque)
+    wall_start: float = attrs.field(factory=time.time)
+
+    def all_done(self) -> bool:
+        """Return ``True`` once every window has emitted a final caption.
+
+        Gate that enforces the 1:1 contract: the task can only leave the
+        stage after BOTH the per-window inference set (``pending``) and
+        the stage-2 refinement backlog (``stage2_queue``) are empty.  A
+        single straggling window keeps the entire ``SplitPipeTask`` (and
+        all its already-completed siblings' frame buffers) pinned in
+        memory.
+        """
+        return not self.pending and not self.stage2_queue
 
 
 @attrs.define(frozen=True)
@@ -764,12 +626,12 @@ def _vllm_async_collect_gpu_trace_attributes(stage: CuratorStage) -> dict[str, s
                 ns = str(node_id).strip()
                 if ns:
                     out["stage.ray_node_id"] = ns
-    except Exception as e:  # noqa: BLE001 -- tracing must never break stage_setup
+    except Exception as e:  # noqa: BLE001 - tracing must never break stage_setup
         _module_logger.debug("GPU trace attribute collection failed: {}", e, exc_info=True)
     return out
 
 
-class VllmAsyncCaptionStage(CuratorStage):
+class VllmAsyncCaptionStage(CuratorStage, ContinuousInterface):  # type: ignore[misc]
     """GPU stage that runs an in-process ``AsyncLLM`` engine for video captioning."""
 
     def __init__(  # noqa: PLR0913
@@ -779,26 +641,23 @@ class VllmAsyncCaptionStage(CuratorStage):
         model_name: str,
         max_concurrent_requests: int = 0,
         stage_batch_size: int = 0,
-        verbose: bool = False,
         log_stats: bool = False,
+        verbose: bool = False,
         stage2_caption: bool = False,
         stage2_prompt_text: str | None = None,
     ) -> None:
         """Initialize stage with engine config."""
         super().__init__()
-        self._timer = StageTimer(self)
         self._model_name = model_name
         self._model_variant = "vllm_async"
         self._max_concurrent_requests = max_concurrent_requests
         self._verbose = verbose
         self._log_stats = log_stats
-        self._engine_dead: bool = False
         self._serve_config = serve_config
         self._mode = _resolve_mode(serve_config)
         self._stage_batch_size = stage_batch_size
         self._vllm_model = _VllmAsyncModel(serve_config.model_variant)
         self._engine: AsyncLLM | None = None
-        self._runner: asyncio.Runner = asyncio.Runner()
         self._request_counter: itertools.count[int] = itertools.count()
         self._log_tag = f"[asyncvLLM:{serve_config.model_variant}]"
         self._logger = make_tagged_logger(self._log_tag)
@@ -806,12 +665,18 @@ class VllmAsyncCaptionStage(CuratorStage):
         self._stage2_prompt_text = stage2_prompt_text
         self._stage2_processor: AutoProcessor | None = None
         self._gpu_trace_attributes: dict[str, str | int | float | bool] = {}
+        # asyncio.Lock serialising calls to the in-process vLLM Renderer.
+        # HF tokenizers raise RuntimeError("Already borrowed") under
+        # concurrent use; the lock + asyncio.to_thread dispatch keeps the
+        # event loop free while ensuring at most one renderer call is
+        # in flight inside this actor at any moment.
+        self._render_lock: asyncio.Lock = asyncio.Lock()
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable and derived objects from pickling."""
         state = self.__dict__.copy()
         state.pop("_logger", None)
-        state.pop("_runner", None)
+        state.pop("_render_lock", None)  # asyncio.Lock not picklable
         state.pop("_request_counter", None)
         state.pop("_mode", None)  # derived from _serve_config
         state.pop("_sampling_params", None)  # rebuilt in stage_setup from _serve_config
@@ -823,7 +688,7 @@ class VllmAsyncCaptionStage(CuratorStage):
         self.__dict__.update(state)
         self._mode = _resolve_mode(self._serve_config)
         self._logger = make_tagged_logger(self._log_tag)
-        self._runner = asyncio.Runner()
+        self._render_lock = asyncio.Lock()
         self._request_counter = itertools.count()
         self._stage2_processor = None  # loaded in stage_setup
         if not hasattr(self, "_gpu_trace_attributes"):
@@ -989,8 +854,6 @@ class VllmAsyncCaptionStage(CuratorStage):
         freeze_gc_heap()
         self._logger.debug("GC heap frozen after engine init")
 
-        self._engine_dead = False
-
         self._sampling_params = build_sampling_params(self._serve_config.sampling_config)
         self._logger.info("SamplingParams: {}", self._sampling_params)
 
@@ -1018,220 +881,193 @@ class VllmAsyncCaptionStage(CuratorStage):
         window.caption_status = "error"
         window.caption_failure_reason = "exception"
 
-    def _extract_rendered_windows(
+    def _extract_prepared_windows(
         self,
-        tasks: list[SplitPipeTask],
-    ) -> list[_RenderedWindow]:
-        """Extract pre-rendered ``ProcessorInputs`` from all windows across tasks."""
-        result: list[_RenderedWindow] = []
+        task: SplitPipeTask,
+    ) -> list[_PreparedWindow]:
+        """Read flat prep-stage primitives into a :class:`_PreparedWindow` per window.
+
+        ``VllmAsyncPrepStage`` populates ``window.model_input[variant]`` with
+        the flat shape ``{"prompt": <str>, "video_frames": <ndarray>,
+        "frames_shape": <tuple>}`` - three stable primitives, none of which
+        the renderer can mutate in place.  This method copies the references
+        into a :class:`_PreparedWindow` and evicts the cached dict so any
+        downstream mutation (vLLM / Transformers) cannot leak back into
+        upstream state.  Any per-window extraction failure (missing keys
+        from a producer-side bug, unexpected types, etc.) is caught,
+        recorded on ``clip.errors``, and skipped; the loop continues with
+        remaining windows so one bad window cannot poison its siblings.
+        """
+        result: list[_PreparedWindow] = []
         variant = self._model_variant
-        for task in tasks:
-            for clip in task.video.clips:
-                for wi, window in enumerate(clip.windows):
-                    try:
-                        cached = window.model_input.get(variant)
-                        if cached is None:
-                            continue
-                        rendered_prompt = cached.get("rendered_prompt")
-                        if rendered_prompt is None:
-                            msg = (
-                                f"window.model_input[{variant!r}] missing 'rendered_prompt'. "
-                                f"VllmAsyncPromptRenderStage must run before VllmAsyncCaptionStage."
-                            )
-                            raise RuntimeError(msg)  # noqa: TRY301
-                        result.append(
-                            _RenderedWindow(
-                                clip=clip,
-                                window_index=wi,
-                                window=window,
-                                rendered_prompt=rendered_prompt,
-                                sampling_params=self._sampling_params,
-                                frames_shape=cached["frames_shape"],
-                                raw_prompt=cached.get("raw_prompt"),
-                                decoded_rgb_frames=cached.get("decoded_rgb_frames"),
-                            )
+        for clip in task.video.clips:
+            for wi, window in enumerate(clip.windows):
+                cached = window.model_input.get(variant)
+                if cached is None:
+                    continue
+                try:
+                    result.append(
+                        _PreparedWindow(
+                            clip=clip,
+                            window_index=wi,
+                            window=window,
+                            prompt_text=cached["prompt"],
+                            decoded_rgb_frames=cached["video_frames"],
+                            sampling_params=self._sampling_params,
+                            frames_shape=cached["frames_shape"],
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        clip.errors[f"{variant}_caption_{wi}"] = f"input extraction failed: {exc}"
-                        self._mark_window_error(window)
-                        self._logger.warning(
-                            "input extraction failed for clip {} window {} frames=[{}, {}]: {}",
-                            clip.uuid,
-                            wi,
-                            window.start_frame,
-                            window.end_frame,
-                            exc,
-                        )
-                    finally:
-                        window.model_input.pop(variant, None)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    clip.errors[f"{variant}_caption_{wi}"] = f"input extraction failed: {exc}"
+                    self._mark_window_error(window)
+                    self._logger.warning(
+                        "input extraction failed for clip {} window {} frames=[{}, {}]: {}",
+                        clip.uuid,
+                        wi,
+                        window.start_frame,
+                        window.end_frame,
+                        exc,
+                        exc_info=True,
+                    )
+                finally:
+                    # Renderer mutates dicts in place; release upstream ref on every path.
+                    window.model_input.pop(variant, None)
         return result
+
+    async def _render_payload(
+        self,
+        prompt_text: str,
+        video_frames: npt.NDArray[np.uint8],
+    ) -> "ProcessorInputs":
+        """Render a fresh prompt payload on a worker thread under ``_render_lock``.
+
+        The renderer is not thread-safe (HF tokenizers raise
+        ``RuntimeError("Already borrowed")`` under concurrent use), so the
+        ``asyncio.Lock`` enforces single-flight semantics inside this actor.
+        ``asyncio.to_thread`` keeps the event loop free for ``AsyncLLM.generate``
+        result polling while the blocking renderer call executes.
+        """
+        engine = self._require_engine()
+        payload = _build_render_payload(
+            prompt_text,
+            video_frames,
+            self._serve_config.mm_processor_kwargs,
+        )
+        async with self._render_lock:
+            rendered_list = await asyncio.to_thread(engine.renderer.render_cmpl, [payload])  # type: ignore[list-item]
+        rendered: ProcessorInputs = rendered_list[0]
+        return rendered  # type: ignore[no-any-return]
 
     async def _generate_and_assign(
         self,
-        rw: _RenderedWindow,
+        pw: _PreparedWindow,
         semaphore: asyncio.Semaphore,
-        stage2_queue: collections.deque[tuple[_RenderedWindow, str]],
+        stage2_queue: "collections.deque[tuple[_PreparedWindow, str]]",
     ) -> None:
-        """Generate a caption for a single pre-rendered window and assign it."""
+        """Render + generate a caption for a single window and assign it.
+
+        If renderer or engine fails, ``_await_and_reap`` re-raises the exception,
+        ``run_continuous`` exits, and Xenna restarts the actor.
+        """
         with traced_span(
             "VllmAsyncCaptionStage.generate_and_assign",
             attributes={
-                "window.index": rw.window_index,
-                "window.clip_uuid": str(rw.clip.uuid),
-                "window.start_frame": rw.window.start_frame,
-                "window.end_frame": rw.window.end_frame,
-                "window.clip_source": rw.clip.source_video,
+                "window.index": pw.window_index,
+                "window.clip_uuid": str(pw.clip.uuid),
+                "window.start_frame": pw.window.start_frame,
+                "window.end_frame": pw.window.end_frame,
+                "window.clip_source": pw.clip.source_video,
                 **self._gpu_trace_attributes,
-                **window_source_time_trace_attributes(rw.clip, rw.window),
+                **window_source_time_trace_attributes(pw.clip, pw.window),
             },
         ):
-            stage2_enqueued = False
+            rendered_prompt = await self._render_payload(pw.prompt_text, pw.decoded_rgb_frames)
             try:
                 async with semaphore:
-                    try:
-                        if rw.rendered_prompt is None:
-                            msg = f"rendered_prompt is None for clip {rw.clip.uuid} window {rw.window_index}"
-                            raise RuntimeError(msg)  # noqa: TRY301
-                        caption, tc = await self._generate_caption_async(
-                            rw.rendered_prompt,
-                            rw.sampling_params,
-                            rw.frames_shape,
-                            rw.clip.source_video,
-                            rw.window_index,
-                        )
-                        rw.window.token_counts[self._model_variant] = tc
-
-                        if self._stage2_caption and self._stage2_processor is not None:
-                            stage2_queue.append((rw, caption))
-                            stage2_enqueued = True
-                            return
-
-                    except Exception as exc:  # noqa: BLE001
-                        if isinstance(exc, EngineDeadError):
-                            self._engine_dead = True
-                        rw.clip.errors[f"{self._model_variant}_caption_{rw.window_index}"] = str(exc)
-                        self._mark_window_error(rw.window)
-                        self._logger.warning(
-                            "captioning failed for clip {} window {} frames=[{}, {}]: {}",
-                            rw.clip.uuid,
-                            rw.window_index,
-                            rw.window.start_frame,
-                            rw.window.end_frame,
-                            exc,
-                            exc_info=True,
-                        )
-                        return
-                    finally:
-                        rw.rendered_prompt = None
-
-                self._mark_window_success(rw.window, caption)
-                if self._verbose:
-                    self._logger.info(
-                        "Caption for clip {} window {} frames=[{}, {}]: {}",
-                        rw.clip.uuid,
-                        rw.window_index,
-                        rw.window.start_frame,
-                        rw.window.end_frame,
-                        caption,
+                    caption, tc = await self._generate_caption_async(
+                        rendered_prompt,
+                        pw.sampling_params,
+                        pw.frames_shape,
+                        pw.clip.source_video,
+                        pw.window_index,
                     )
             finally:
-                if not stage2_enqueued:
-                    rw.raw_prompt = None
-                    rw.decoded_rgb_frames = None
+                # Drop the rendered prompt eagerly even on error so sibling
+                # in-flight tasks do not stack up multimodal tensors during
+                # actor teardown.  Mirrors `_stage2_refine_and_assign`.
+                del rendered_prompt
 
-    async def _stage2_refine_and_assign(
-        self,
-        rw: _RenderedWindow,
-        stage1_caption: str,
-        engine: "AsyncLLM",
-        semaphore: asyncio.Semaphore,
-    ) -> None:
-        """Run stage-2 refinement on a window and assign the final caption."""
-        with traced_span(
-            "VllmAsyncCaptionStage.stage2_refine",
-            attributes={
-                "window.index": rw.window_index,
-                "window.clip_uuid": str(rw.clip.uuid),
-                "window.start_frame": rw.window.start_frame,
-                "window.end_frame": rw.window.end_frame,
-                "window.clip_source": rw.clip.source_video,
-                **window_source_time_trace_attributes(rw.clip, rw.window),
-            },
-        ):
-            caption = stage1_caption
-            try:
-                if rw.raw_prompt is None or rw.decoded_rgb_frames is None:
-                    self._logger.warning(
-                        "stage-2 skipped for clip {} window {}: prompt primitives are missing",
-                        rw.clip.uuid,
-                        rw.window_index,
-                    )
-                    self._mark_window_success(rw.window, stage1_caption)
-                    return
-                refined_prompt = build_refinement_prompt_text(
-                    self._stage2_processor,
-                    stage1_caption,
-                    self._stage2_prompt_text,
-                )
-                stage2_prompt_input = _build_render_payload(
-                    refined_prompt,
-                    rw.decoded_rgb_frames,
-                    self._serve_config.mm_processor_kwargs,
-                )
-                renderer = cast("Any", engine).renderer
-                (stage2_rendered,) = await renderer.render_cmpl_async([stage2_prompt_input])
-                try:
-                    async with semaphore:
-                        caption, s2_tc = await self._generate_caption_async(
-                            stage2_rendered,
-                            rw.sampling_params,
-                            rw.frames_shape,
-                            rw.clip.source_video,
-                            rw.window_index,
-                        )
-                        # Accumulate stage-2 tokens on top of stage-1 counts already stored
-                        existing = rw.window.token_counts.get(self._model_variant, TokenCounts())
-                        rw.window.token_counts[self._model_variant] = TokenCounts(
-                            existing.prompt_tokens + s2_tc.prompt_tokens,
-                            existing.output_tokens + s2_tc.output_tokens,
-                        )
-                finally:
-                    del stage2_rendered
-            except EngineDeadError as e:
-                self._engine_dead = True
-                rw.clip.errors[f"{self._model_variant}_caption_{rw.window_index}"] = (
-                    f"EngineDeadError during stage-2: {e}"
-                )
-                self._logger.warning(
-                    "stage-2 EngineDeadError for clip {} window {}: {}",
-                    rw.clip.uuid,
-                    rw.window_index,
-                    e,
-                    exc_info=True,
-                )
-                caption = stage1_caption  # best-effort: use stage-1 result
-            except Exception as exc:  # noqa: BLE001
-                rw.clip.errors[f"{self._model_variant}_caption_{rw.window_index}"] = f"stage-2 refinement failed: {exc}"
-                self._logger.warning(
-                    "stage-2 refinement failed for clip {} window {}, using stage-1 caption: {}",
-                    rw.clip.uuid,
-                    rw.window_index,
-                    exc,
-                    exc_info=True,
-                )
-                caption = stage1_caption  # best-effort: use stage-1 result
-            finally:
-                rw.raw_prompt = None
-                rw.decoded_rgb_frames = None
+            pw.window.token_counts[self._model_variant] = tc
 
-            self._mark_window_success(rw.window, caption)
+            if self._stage2_caption and self._stage2_processor is not None:
+                stage2_queue.append((pw, caption))
+                return
+
+            self._mark_window_success(pw.window, caption)
             if self._verbose:
                 self._logger.info(
                     "Caption for clip {} window {} frames=[{}, {}]: {}",
-                    rw.clip.uuid,
-                    rw.window_index,
-                    rw.window.start_frame,
-                    rw.window.end_frame,
+                    pw.clip.uuid,
+                    pw.window_index,
+                    pw.window.start_frame,
+                    pw.window.end_frame,
+                    caption,
+                )
+
+    async def _stage2_refine_and_assign(
+        self,
+        pw: _PreparedWindow,
+        stage1_caption: str,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Run stage-2 refinement on a window and assign the final caption.
+
+        As with stage 1, exceptions are not caught - they propagate up to
+        ``_await_and_reap`` and trigger an actor restart.
+        """
+        with traced_span(
+            "VllmAsyncCaptionStage.stage2_refine",
+            attributes={
+                "window.index": pw.window_index,
+                "window.clip_uuid": str(pw.clip.uuid),
+                "window.start_frame": pw.window.start_frame,
+                "window.end_frame": pw.window.end_frame,
+                "window.clip_source": pw.clip.source_video,
+                **window_source_time_trace_attributes(pw.clip, pw.window),
+            },
+        ):
+            refined_prompt_text = build_refinement_prompt_text(
+                self._stage2_processor,
+                stage1_caption,
+                self._stage2_prompt_text,
+            )
+            stage2_rendered = await self._render_payload(refined_prompt_text, pw.decoded_rgb_frames)
+            try:
+                async with semaphore:
+                    caption, s2_tc = await self._generate_caption_async(
+                        stage2_rendered,
+                        pw.sampling_params,
+                        pw.frames_shape,
+                        pw.clip.source_video,
+                        pw.window_index,
+                    )
+                    # Accumulate stage-2 tokens on top of stage-1 counts already stored.
+                    existing = pw.window.token_counts.get(self._model_variant, TokenCounts())
+                    pw.window.token_counts[self._model_variant] = TokenCounts(
+                        existing.prompt_tokens + s2_tc.prompt_tokens,
+                        existing.output_tokens + s2_tc.output_tokens,
+                    )
+            finally:
+                del stage2_rendered
+
+            self._mark_window_success(pw.window, caption)
+            if self._verbose:
+                self._logger.info(
+                    "Caption for clip {} window {} frames=[{}, {}]: {}",
+                    pw.clip.uuid,
+                    pw.window_index,
+                    pw.window.start_frame,
+                    pw.window.end_frame,
                     caption,
                 )
 
@@ -1307,106 +1143,230 @@ class VllmAsyncCaptionStage(CuratorStage):
                 raise RuntimeError(msg)
             return str(caption_text).strip(), TokenCounts(prompt_tokens, generated_tokens)
 
-    async def _process_all_tasks_async(self, tasks: list[SplitPipeTask]) -> None:
-        """Submit all pre-rendered windows to the engine for GPU inference."""
-        rendered_windows = self._extract_rendered_windows(tasks)
-        if not rendered_windows:
+    def _register_task(
+        self,
+        trackers: dict[str, _ContinuousTaskTracker],
+        task_input: ContinuousTaskInput,
+        semaphore: asyncio.Semaphore,
+        output_queue: "asyncio.Queue[ContinuousTaskOutput]",
+    ) -> None:
+        """Register a continuous-mode task and drive its prepared windows."""
+        # Pin wall_start at the moment the actor takes ownership of the task so
+        # the perf row attributes the extraction cost (and, on the early-exit
+        # branch, the only work done) to this stage instead of reporting ~0s.
+        entry_time = time.time()
+        pipe_tasks: list[SplitPipeTask] = []
+        for item in task_input.data:
+            if not isinstance(item, SplitPipeTask):
+                msg = f"VllmAsyncCaptionStage expected SplitPipeTask in task_input.data, got {type(item).__name__}"
+                raise TypeError(msg)
+            pipe_tasks.append(item)
+
+        prepared = [pw for t in pipe_tasks for pw in self._extract_prepared_windows(t)]
+        if not prepared:
+            self._logger.debug(
+                "task {} produced no prepared windows; emitting synchronously",
+                task_input.task_id,
+            )
+            if self._log_stats:
+                # Synthesize an instantaneous tracker so the perf row exists
+                # for tasks that bypass the inference loop entirely.
+                self._record_stage_perf(_ContinuousTaskTracker(task_input=task_input, wall_start=entry_time))
+            output_queue.put_nowait(self._build_output(task_input))
             return
 
-        with traced_span(
-            "VllmAsyncCaptionStage.inference",
-            attributes={
-                "stage.window_count": len(rendered_windows),
-                "stage.model_variant": self._model_variant,
-                "stage.has_stage2": self._stage2_caption,
-                "stage.semaphore_limit": self._effective_max_concurrent_requests,
-            },
-        ) as inference_span:
-            engine = self._require_engine()
-            semaphore = asyncio.Semaphore(self._effective_max_concurrent_requests)
-            stage2_queue: collections.deque[tuple[_RenderedWindow, str]] = collections.deque()
+        tracker = _ContinuousTaskTracker(task_input=task_input, wall_start=entry_time)
+        trackers[task_input.task_id] = tracker
+        for pw in prepared:
+            tracker.pending.add(asyncio.create_task(self._generate_and_assign(pw, semaphore, tracker.stage2_queue)))
 
-            in_flight: set[asyncio.Task[None]] = {
-                asyncio.create_task(self._generate_and_assign(rw, semaphore, stage2_queue)) for rw in rendered_windows
-            }
-            del rendered_windows
+    @staticmethod
+    def _build_output(task_input: ContinuousTaskInput) -> ContinuousTaskOutput:
+        """Construct the ``ContinuousTaskOutput`` that mirrors a ``ContinuousTaskInput``.
 
-            completed_count = 0
-            uncaught_error_count = 0
-            while in_flight:
-                done, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    exc = t.exception()
-                    if exc is not None:
-                        uncaught_error_count += 1
-                        self._logger.warning("window generate failed: {}", exc)
-                    else:
-                        completed_count += 1
+        Single source of truth for the input-to-output field copy used by both
+        the synchronous zero-window emit in ``_register_task`` and the
+        per-tick emit in ``_emit_completed_tasks``.  Keeps the two sites in
+        lockstep if a new field is later added to ``ContinuousTaskOutput``.
 
-                while stage2_queue:
-                    rw, stage1_caption = stage2_queue.popleft()
-                    in_flight.add(
-                        asyncio.create_task(self._stage2_refine_and_assign(rw, stage1_caption, engine, semaphore))
-                    )
+        ``out_data`` is the **same list** carried by ``task_input.data``:
+        captioning mutates each contained ``SplitPipeTask`` in place (window
+        captions / token counts / errors are written onto the existing
+        ``Window`` instances), so passing the input list through verbatim
+        carries all stage results downstream without any copy.
+        """
+        return ContinuousTaskOutput(
+            task_id=task_input.task_id,
+            out_data=task_input.data,
+            timing=task_input.timing,
+            object_sizes=task_input.object_sizes,
+        )
 
-            inference_span.set_attributes(
-                {
-                    "stage.completed_count": completed_count,
-                    "stage.uncaught_error_count": uncaught_error_count,
-                }
-            )
+    def _record_stage_perf(self, tracker: _ContinuousTaskTracker) -> None:
+        """Attach this stage's per-task perf entry to the first ``SplitPipeTask``.
 
-    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask]:
-        """Submit all pre-rendered windows to the engine for GPU inference."""
-        total_windows = sum(len(clip.windows) for task in tasks for clip in task.video.clips)
-        self._logger.debug("process_data: tasks={}, windows={}", len(tasks), total_windows)
-        major_size = sum(task.get_major_size() for task in tasks)
-        self._timer.reinit(self, major_size)
+        Continuous mode keeps many tasks in flight inside a single actor;
+        writing to every contained ``SplitPipeTask`` would cause
+        ``_summarize_perf_stats`` to multi-count residence time.  Mirrors
+        the convention used by sync ``VllmCaptionStage`` (writes to
+        ``tasks[0]`` only).
+
+        ``actor_idle_time`` / ``input_data_size_mb`` / RSS deltas are left
+        at their zero defaults: they are derived from
+        ``StageTimer.reinit/log_stats`` book-keeping that has no meaningful
+        per-task definition when N tasks overlap on one actor.
+
+        Aggregation note: with N tasks in flight per actor, the summed
+        ``process_time`` across tasks is total **task-seconds** spent in
+        this stage and may exceed wall-clock duration by up to N. Use the
+        min/max-aggregated ``wall_start`` / ``wall_end`` for the wall span.
+        """
+        pipe_tasks = [t for t in tracker.task_input.data if isinstance(t, SplitPipeTask)]
+        if not pipe_tasks:
+            return
+        stage_perf = getattr(pipe_tasks[0], "stage_perf", None)
+        if stage_perf is None:
+            return
+        wall_end = time.time()
+        stage_perf[type(self).__name__] = StagePerfStats(
+            process_time=wall_end - tracker.wall_start,
+            wall_start=tracker.wall_start,
+            wall_end=wall_end,
+        )
+
+    def _drain_input_queue(
+        self,
+        input_queue: "asyncio.Queue[ContinuousTaskInput]",
+        trackers: dict[str, _ContinuousTaskTracker],
+        semaphore: asyncio.Semaphore,
+        output_queue: "asyncio.Queue[ContinuousTaskOutput]",
+    ) -> None:
+        """Drain up to ``_MAX_ACCEPT_PER_LOOP`` already-buffered items without blocking.
+
+        Called after a successful blocking ``input_queue.get()`` to absorb
+        additional ready tasks in the same loop tick.  Shutdown is driven
+        exclusively by ``stop_event`` - there is no in-band sentinel.
+        """
+        for _ in range(_MAX_ACCEPT_PER_LOOP):
+            try:
+                task_input = input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            # ``output_queue`` is forwarded so zero-window tasks emit
+            # synchronously rather than waiting for the next loop tick.
+            self._register_task(trackers, task_input, semaphore, output_queue)
+
+    def _spawn_stage2_tasks(
+        self,
+        trackers: dict[str, _ContinuousTaskTracker],
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Spawn pending stage-2 refinement tasks across all in-flight trackers."""
+        for tracker in trackers.values():
+            while tracker.stage2_queue:
+                pw, stage1_caption = tracker.stage2_queue.popleft()
+                tracker.pending.add(asyncio.create_task(self._stage2_refine_and_assign(pw, stage1_caption, semaphore)))
+
+    async def _await_and_reap(
+        self,
+        trackers: dict[str, _ContinuousTaskTracker],
+    ) -> None:
+        """Wait for at least one in-flight task to complete and re-raise errors."""
+        all_pending = {task for tracker in trackers.values() for task in tracker.pending}
+        if not all_pending:
+            return
+        done, _ = await asyncio.wait(all_pending, return_when=asyncio.FIRST_COMPLETED)
+        # Drop completed tasks from each tracker's pending set in one pass.
+        for tracker in trackers.values():
+            tracker.pending -= done
+        # Retrieve every exception so asyncio does not log "Task exception was
+        # never retrieved" at GC; Task.exception() raises CancelledError on
+        # cancelled tasks, so the explicit loop with try/except keeps the drain
+        # watertight even during actor teardown.
+        exceptions: list[BaseException] = []
+        for task in done:
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError as cancelled:
+                exc = cancelled
+            if exc is not None:
+                exceptions.append(exc)
+        if exceptions:
+            raise unwrap_taskgroup_exception_group(BaseExceptionGroup("vLLM caption tasks failed", exceptions))
+
+    def _emit_completed_tasks(
+        self,
+        trackers: dict[str, _ContinuousTaskTracker],
+        output_queue: "asyncio.Queue[ContinuousTaskOutput]",
+    ) -> None:
+        """Emit ``ContinuousTaskOutput`` for every fully completed pipeline task."""
+        completed_ids = [task_id for task_id, tr in trackers.items() if tr.all_done()]
+        for task_id in completed_ids:
+            tracker = trackers.pop(task_id)
+            if self._log_stats:
+                self._record_stage_perf(tracker)
+            output_queue.put_nowait(self._build_output(tracker.task_input))
+
+    async def run_continuous(
+        self,
+        input_queue: "asyncio.Queue[ContinuousTaskInput]",
+        output_queue: "asyncio.Queue[ContinuousTaskOutput]",
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Drive the GPU stage in continuous mode."""
+        trackers: dict[str, _ContinuousTaskTracker] = {}
+        semaphore = asyncio.Semaphore(self._effective_max_concurrent_requests)
 
         TracedSpan.current().set_attributes(self._gpu_trace_attributes)
-
-        source_duration = sum(v.metadata.duration or 0.0 for task in tasks for v in task.videos)
-        with self._timer.time_process(source_video_duration_s=source_duration):
-            TracedSpan.current().set_attributes(self._gpu_trace_attributes)
-            self._runner.run(
-                self._process_all_tasks_async(tasks),
-                context=contextvars.copy_context(),
-            )
-
-        captioned_windows = sum(
-            1 for task in tasks for clip in task.video.clips for w in clip.windows if self._model_variant in w.caption
-        )
         self._logger.info(
-            "Generated {} captions for {} tasks ({} windows total)",
-            captioned_windows,
-            len(tasks),
-            total_windows,
+            "run_continuous starting (semaphore={})",
+            self._effective_max_concurrent_requests,
         )
 
-        if self._engine_dead:
-            msg = (
-                f"AsyncLLM engine died (EngineDeadError) during batch processing. "
-                f"tasks={len(tasks)}, windows={total_windows}. "
-                f"Crashing actor so Xenna can replace it with a fresh instance."
-            )
-            raise RuntimeError(msg)
+        while not stop_event.is_set():
+            self._spawn_stage2_tasks(trackers, semaphore)
 
-        if self._log_stats:
-            stage_name, stage_perf_stats = self._timer.log_stats()
-            for task in tasks:
-                task.stage_perf[stage_name] = stage_perf_stats
-        return tasks
+            has_pending = any(tr.pending for tr in trackers.values())
+            if has_pending:
+                await self._await_and_reap(trackers)
+
+            self._emit_completed_tasks(trackers, output_queue)
+
+            if has_pending:
+                # Opportunistically pull more work without blocking.
+                self._drain_input_queue(input_queue, trackers, semaphore, output_queue)
+                continue
+
+            # Nothing pending: block on the input queue until either a task
+            # arrives or the stop-event timeout fires.
+            try:
+                async with asyncio.timeout(_INPUT_GET_TIMEOUT_S):
+                    task_input = await input_queue.get()
+            except TimeoutError:
+                continue
+            self._register_task(trackers, task_input, semaphore, output_queue)
+            self._drain_input_queue(input_queue, trackers, semaphore, output_queue)
+
+        # stop_event fired - drain any in-flight work before exiting.
+        while trackers:
+            self._spawn_stage2_tasks(trackers, semaphore)
+            if any(tr.pending for tr in trackers.values()):
+                await self._await_and_reap(trackers)
+            self._emit_completed_tasks(trackers, output_queue)
+
+        self._logger.info("run_continuous exiting")
 
     def destroy(self) -> None:
-        """Shut down ``asyncio.Runner``, ``AsyncLLM`` engine, and release GPU memory."""
-        try:
-            self._runner.close()
-        except Exception as e:  # noqa: BLE001
-            self._logger.warning("asyncio runner close failed: {}", e)
+        """Shut down the ``AsyncLLM`` engine and release GPU memory.
 
-        if self._engine is not None:
-            self._logger.info("destroy: shutting down AsyncLLM engine")
-            self._engine.shutdown()  # type: ignore[no-untyped-call]
-            self._engine = None
-        self._stage2_processor = None
-        gpu_stage_cleanup(self.__class__.__name__)
+        ``gpu_stage_cleanup`` always runs (even if ``engine.shutdown()``
+        raises) so GPU memory is reliably released on actor teardown.
+        """
+        try:
+            if self._engine is not None:
+                self._logger.info("destroy: shutting down AsyncLLM engine")
+                self._engine.shutdown()  # type: ignore[no-untyped-call]
+                self._engine = None
+            self._stage2_processor = None
+        finally:
+            gpu_stage_cleanup(self.__class__.__name__)

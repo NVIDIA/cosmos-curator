@@ -26,8 +26,8 @@ from cosmos_curator.pipelines.video.captioning.captioning_builders import (
 from cosmos_curator.pipelines.video.captioning.gemini_caption_stage import ApiPrepStage
 from cosmos_curator.pipelines.video.captioning.vllm_async_config import VllmAsyncConfig
 from cosmos_curator.pipelines.video.captioning.vllm_async_stage import (
+    VllmAsyncCaptionStage,
     VllmAsyncPrepStage,
-    VllmAsyncPromptRenderStage,
 )
 from cosmos_curator.pipelines.video.preview.preview_stages import PreviewStage
 from cosmos_curator.pipelines.video.utils.data_model import WindowConfig
@@ -83,15 +83,6 @@ def _make_config(
 class TestBuildersNumWorkersPerNode:
     """Verify builders set num_workers_per_node based on mode and config."""
 
-    def test_default_autoscale(self) -> None:
-        """Default (0) -> Xenna autoscale with OPF=1.5."""
-        cfg = _make_config(num_workers_per_node=0)
-        stages = build_captioning_stages(cfg)
-        caption_stage = stages[-1]
-        assert isinstance(caption_stage, CuratorStageSpec)
-        assert caption_stage.num_workers_per_node is None
-        assert caption_stage.over_provision_factor == 1.5
-
     def test_explicit_workers(self) -> None:
         """Explicit positive value -> exact worker count."""
         cfg = _make_config(num_workers_per_node=7)
@@ -108,15 +99,6 @@ class TestBuildersNumWorkersPerNode:
         assert isinstance(caption_stage, CuratorStageSpec)
         assert caption_stage.num_workers_per_node == 1
 
-    def test_prep_stage_spec_config(self) -> None:
-        """VllmAsyncPrepStage should have OPF=2.0 and default slots_per_actor."""
-        cfg = _make_config()
-        stages = build_captioning_stages(cfg)
-        prep_spec = stages[0]
-        assert isinstance(prep_spec, CuratorStageSpec)
-        assert prep_spec.slots_per_actor is None
-        assert prep_spec.over_provision_factor == 2.0
-
     def test_prep_stage_receives_windowing_fields(self) -> None:
         """VllmAsyncPrepConfig should receive windowing fields from CaptioningConfig."""
         cfg = _make_config()
@@ -130,14 +112,14 @@ class TestBuildersNumWorkersPerNode:
         assert stage._prep_config.keep_mp4 is False
 
     def test_build_stages_vllm_async_prep_is_first(self) -> None:
-        """vllm_async build_stages should produce Prep + Render + Caption (3 stages)."""
+        """``vllm_async`` ``build_stages`` produces exactly Prep + Caption (2 stages)."""
         cfg = _make_config()
         stages = build_captioning_stages(cfg)
-        assert len(stages) == 3
+        assert len(stages) == 2
         assert isinstance(stages[0], CuratorStageSpec)
         assert isinstance(stages[0].stage, VllmAsyncPrepStage)
         assert isinstance(stages[1], CuratorStageSpec)
-        assert isinstance(stages[1].stage, VllmAsyncPromptRenderStage)
+        assert isinstance(stages[1].stage, VllmAsyncCaptionStage)
 
     def test_build_stages_vllm_async_no_api_prep_stage(self) -> None:
         """vllm_async pipeline should NOT include ApiPrepStage."""
@@ -148,15 +130,15 @@ class TestBuildersNumWorkersPerNode:
             assert not isinstance(stage_obj, ApiPrepStage)
 
     def test_build_stages_vllm_async_with_previews(self) -> None:
-        """Enabling previews should produce Prep + Preview + Render + Caption (4 stages)."""
+        """Enabling previews produces Prep + Preview + Caption (3 stages)."""
         cfg = _make_config(generate_previews=True)
         stages = build_captioning_stages(cfg)
-        assert len(stages) == 4
+        assert len(stages) == 3
         assert isinstance(stages[0], CuratorStageSpec)
         assert isinstance(stages[0].stage, VllmAsyncPrepStage)
         assert isinstance(stages[1], PreviewStage)
         assert isinstance(stages[2], CuratorStageSpec)
-        assert isinstance(stages[2].stage, VllmAsyncPromptRenderStage)
+        assert isinstance(stages[2].stage, VllmAsyncCaptionStage)
 
     def test_prep_config_keep_mp4_from_generate_previews(self) -> None:
         """keep_mp4 should be True when generate_previews is enabled."""
