@@ -39,7 +39,7 @@ dependencies = [
     "ngcsdk",
     "pyopenssl",
     "pyyaml==6.0.2",
-    "ray[default,data,serve]==2.55.0",
+    "ray[default,data]==2.55.1",
     "requests==2.32.3",
     "rich==14.0.0",
     "tomli>=2.2.1",
