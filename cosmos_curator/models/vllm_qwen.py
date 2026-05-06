@@ -14,6 +14,7 @@
 # limitations under the License.
 """Qwen vLLM plugin."""
 
+import re
 import secrets
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
@@ -26,6 +27,26 @@ from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, 
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
+
+
+# Matches a leading Qwen3 chain-of-thought block ending in ``</think>``. The opening
+# tag is optional because some Qwen3 checkpoints emit only the closing tag.
+_QWEN3_REASONING_PATTERN = re.compile(r"\A(?:<think>)?.*?</think>\s*", re.DOTALL)
+
+
+def _strip_qwen3_reasoning(text: str) -> str:
+    """Strip a leading Qwen3 chain-of-thought ``<think>...</think>`` block, if any.
+
+    Qwen3 reasoning models emit a chain-of-thought before the answer by default.
+    Stripping at decode time gives us the answer payload only, mirroring how
+    ``vllm_cosmos_reason1_vl.py`` extracts ``<answer>``-tagged content from
+    Cosmos-Reason output. No-op when ``</think>`` is not present, so it is safe
+    to apply unconditionally (Qwen2.5-VL and any future non-reasoning Qwen3
+    checkpoint pass through unchanged).
+    """
+    if "</think>" not in text:
+        return text
+    return _QWEN3_REASONING_PATTERN.sub("", text, count=1)
 
 
 MAX_MODEL_LEN = 32768
@@ -308,6 +329,24 @@ class VllmQwen3VL(VllmQwen):
         message = make_message(prompt, use_image=config.use_image_input)
         data = frames if config.use_image_input else [(frames, metadata)]
         return make_prompt(message, data, processor, use_image=config.use_image_input)
+
+    @staticmethod
+    def decode(vllm_output: RequestOutput) -> str:
+        """Decode vLLM output, stripping any leading Qwen3 reasoning block.
+
+        Qwen3 reasoning models emit ``<think>...</think>`` before their answer by
+        default. This override removes that block so the stored caption is the
+        answer payload only. If generation hit ``max_tokens`` before ``</think>``
+        was emitted, the entire output is reasoning-only with no answer; return
+        empty so the caption pipeline marks the window as failed rather than
+        persist reasoning text as caption (matches vLLM's qwen3_reasoning_parser
+        behavior).
+        """
+        output = vllm_output.outputs[0]
+        text = str(output.text)
+        if output.finish_reason == "length" and "</think>" not in text:
+            return ""
+        return _strip_qwen3_reasoning(text)
 
 
 class VllmQwen3VL30B(VllmQwen3VL):

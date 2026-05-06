@@ -27,6 +27,7 @@ if conda_utils.is_running_in_env("unified"):
         VllmQwen,
         VllmQwen3VL,
         VllmQwen7B,
+        _strip_qwen3_reasoning,
         make_message,
         make_prompt,
     )
@@ -188,3 +189,117 @@ def test_make_prompt_image() -> None:
     assert "image" in result["multi_modal_data"]
     assert "video" not in result["multi_modal_data"]
     assert result["multi_modal_data"]["image"].shape == (1, 3, 32, 32)
+
+
+@pytest.mark.env("unified")
+@pytest.mark.parametrize(
+    ("raw_text", "expected"),
+    [
+        # Closing-tag-only output (the actual Qwen3.5-27B-FP8 default behavior we
+        # observe: the model streams reasoning content without an opening <think>
+        # tag, then emits </think> before the answer).
+        pytest.param(
+            (
+                "The user wants a description.\nLet me look at the frames.\n"
+                "</think>\n\nThe video opens with a snowy mountain."
+            ),
+            "The video opens with a snowy mountain.",
+            id="closing-tag-only-qwen3.5-default",
+        ),
+        # Explicit <think>...</think> wrapper (textbook reasoning format).
+        pytest.param(
+            "<think>chain of thought here</think>\n\nThe video shows mountains.",
+            "The video shows mountains.",
+            id="explicit-open-and-close-tags",
+        ),
+        # No reasoning tags at all (e.g. Qwen2.5-VL output passing through, or a
+        # future Qwen3 checkpoint that honors enable_thinking=False at the chat
+        # template layer).
+        pytest.param(
+            "The video begins with a scene set in a snowy, mountainous environment.",
+            "The video begins with a scene set in a snowy, mountainous environment.",
+            id="no-tags-passthrough",
+        ),
+        # count=1 behavior: an incidental "</think>" token that appears later in
+        # the answer (e.g. in a quoted code block) must NOT truncate the caption.
+        pytest.param(
+            "<think>reasoning</think>\n\nThe word </think> appears in the answer.",
+            "The word </think> appears in the answer.",
+            id="count=1-incidental-close-tag-in-answer",
+        ),
+        # Empty-after-strip: model emitted only a reasoning block and then
+        # terminated cleanly. The helper itself returns empty here; the decode()
+        # override leaves this path alone (no answer to extract).
+        pytest.param(
+            "<think>just reasoning, no answer</think>",
+            "",
+            id="empty-after-strip",
+        ),
+        # Empty input: degenerate but should not raise.
+        pytest.param(
+            "",
+            "",
+            id="empty-input",
+        ),
+        # Missing-</think> boundary: when the closing tag is absent, the helper
+        # returns text unchanged. Disambiguating "thinking off" vs "truncated
+        # mid-reasoning" requires finish_reason context, which lives in
+        # VllmQwen3VL.decode() rather than this pure-text helper.
+        pytest.param(
+            "Reasoning content with no closing tag because generation was truncated",
+            "Reasoning content with no closing tag because generation was truncated",
+            id="missing-close-tag-passthrough",
+        ),
+        # Multiline reasoning block: re.DOTALL is required for ``.`` to match
+        # across newlines. Regression guard.
+        pytest.param(
+            "<think>line one\nline two\nline three</think>\n\nFinal answer.",
+            "Final answer.",
+            id="multiline-reasoning-re.DOTALL-regression-guard",
+        ),
+    ],
+)
+def test_strip_qwen3_reasoning(raw_text: str, expected: str) -> None:
+    """Deterministic coverage for the Qwen3 chain-of-thought strip helper."""
+    assert _strip_qwen3_reasoning(raw_text) == expected
+
+
+@pytest.mark.env("unified")
+def test_qwen3vl_decode_returns_empty_on_truncated_reasoning() -> None:
+    """Truncation mid-reasoning (finish_reason='length' + no </think>) yields empty.
+
+    Aligns with vLLM's own qwen3_reasoning_parser semantics so the caption pipeline
+    can mark the window as failed (via VLLM_UNKNOWN_CAPTION fallthrough in
+    vllm_interface._make_window_result) rather than persisting reasoning text as
+    a successful caption.
+    """
+    raw_output = MagicMock()
+    raw_output.outputs[0].text = "The user wants a detailed breakdown. Let me think about this..."
+    raw_output.outputs[0].finish_reason = "length"
+
+    assert VllmQwen3VL.decode(raw_output) == ""
+
+
+@pytest.mark.env("unified")
+def test_qwen3vl_decode_passes_through_on_clean_finish_without_tags() -> None:
+    """Non-truncated output without ``</think>`` is passed through unchanged.
+
+    Covers the future case where ``enable_thinking=False`` is honored at the
+    chat-template layer and the model emits no reasoning at all. We must not
+    swallow that legitimate caption.
+    """
+    raw_output = MagicMock()
+    raw_output.outputs[0].text = "The video shows snowy mountains."
+    raw_output.outputs[0].finish_reason = "stop"
+
+    assert VllmQwen3VL.decode(raw_output) == "The video shows snowy mountains."
+
+
+@pytest.mark.env("unified")
+def test_qwen3vl_decode_strips_reasoning_on_clean_finish() -> None:
+    """The happy path: reasoning block before answer, finish_reason='stop'."""
+    raw_output = MagicMock()
+    raw_output.outputs[0].text = "<think>reasoning</think>\n\nThe video shows snowy mountains."
+    raw_output.outputs[0].finish_reason = "stop"
+
+    assert VllmQwen3VL.decode(raw_output) == "The video shows snowy mountains."

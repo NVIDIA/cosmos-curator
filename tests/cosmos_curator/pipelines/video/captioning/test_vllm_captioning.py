@@ -24,6 +24,8 @@ from scipy.spatial.distance import cosine
 
 from cosmos_curator.core.interfaces.pipeline_interface import run_pipeline
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
+from cosmos_curator.core.utils.model.model_utils import get_local_dir_for_weights_name
+from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.video.captioning.vllm_caption_stage import (
     VllmCaptionStage,
@@ -42,6 +44,7 @@ _THRESHOLDS = {
     "qwen": 0.9,
     "cosmos_r1": 0.75,
     "cosmos_r2": 0.7,
+    "qwen3_5_27b": 0.8,
 }
 _NUM_CLIPS = 1
 _VLLM_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
@@ -49,6 +52,14 @@ _VLLM_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
         "preprocess": True,
     },
 }
+# Per-variant cap on generated tokens. Reasoning variants (Qwen3.5+) need the
+# larger production-default headroom (8192) so the chain-of-thought plus the
+# answer fit; otherwise the window is marked failed.
+# We increase this to avoid flaky test failures.
+_SAMPLING_MAX_TOKENS: dict[str, int] = {
+    "qwen3_5_27b": 8192,
+}
+_DEFAULT_SAMPLING_MAX_TOKENS = 2048
 _WINDOW_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
     "qwen": {
         "sampling_fps": 2.0,
@@ -60,6 +71,10 @@ _WINDOW_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
     },
     "cosmos_r2": {
         "sampling_fps": 4.0,
+        "model_does_preprocess": True,
+    },
+    "qwen3_5_27b": {
+        "sampling_fps": 2.0,
         "model_does_preprocess": True,
     },
 }
@@ -139,6 +154,47 @@ _EXPECTED_CAPTIONS: dict[str, list[str]] = {
             "\n"
             "In sum, the video crafts a rich, atmospheric tale centered on resilience and mystery, using visual "
             "storytelling to draw viewers into a world where survival, wisdom, and inner strength converge."
+        ),
+    ],
+    "qwen3_5_27b": [
+        (
+            "The video presents a sequence of animated scenes that appear to be from a fantasy short film, "
+            "characterized by high-quality 3D rendering.\n"
+            "\n"
+            "**Visual Elements:**\n"
+            "\n"
+            "*   **00:00 - 00:04 (The Journey):** The video opens with a wide, atmospheric shot of a harsh, wintry "
+            "landscape. Jagged, snow-capped mountains loom in the background, obscured by thick, grey fog. In the "
+            "foreground, a young woman with short, reddish-brown hair walks through the deep snow. She is dressed "
+            "in earth-toned clothing—a brown tunic and a dark scarf wrapped around her lower face to protect "
+            "against the cold. She carries a long wooden staff over her shoulder, suggesting she is a traveler or "
+            "a warrior. Her arms bear visible tattoos. The lighting is flat and cool, emphasizing the freezing "
+            "temperature and isolation.\n"
+            '*   **00:04 - 00:06 (Title Card):** The screen fades to black, displaying the text "THE BLENDER '
+            'FOUNDATION presents" in a classic white serif font. This identifies the production company behind '
+            "the animation.\n"
+            "*   **00:07 - 00:09 (The Elder):** The scene cuts to a dimly lit interior, likely a cave or a rustic "
+            "hut. We see a close-up of an older man with a weathered face, a thick grey beard, and a headband "
+            "adorned with metal rings. He has distinctive piercings in his nose and cheeks. The lighting here is "
+            "warm and directional, resembling firelight, which contrasts sharply with the cold blue tones of the "
+            "opening scene. He appears to be speaking or listening intently.\n"
+            "*   **00:09 - 00:10 (The Reaction):** The camera cuts to a close-up of the young woman from the "
+            "first scene (Sintel). She is now inside the same warm environment. Her expression is one of concern, "
+            "worry, or perhaps sadness. Her mouth is slightly open as if she is about to speak or has just heard "
+            "something troubling. The warm light highlights the texture of her skin and hair.\n"
+            "\n"
+            "**Narrative Elements:**\n"
+            "\n"
+            "*   **Contrast of Environments:** The video establishes a strong narrative contrast between the "
+            "dangerous, cold outside world and the safe, warm interior. This suggests a journey where the "
+            "protagonist has sought refuge or is visiting someone important.\n"
+            "*   **Character Dynamics:** The juxtaposition of the young, determined traveler and the older, "
+            "wise-looking man suggests a mentor-student relationship or a significant encounter. The man's tribal "
+            "appearance (jewelry, piercings) hints at a specific culture or setting within the story.\n"
+            "*   **Emotional Arc:** The sequence moves from physical endurance (walking in the snow) to an "
+            "emotional beat. The final shot of the woman's worried face implies that the conversation or "
+            "situation inside is serious, raising questions about what she has found or what she is facing. The "
+            "narrative seems to pivot from an external adventure to an internal or interpersonal conflict."
         ),
     ],
     "cosmos_r2": [
@@ -225,15 +281,50 @@ def sample_captioning_task(sample_clip_data: bytes) -> SplitPipeTask:
     )
 
 
+_GOLDEN_CAPTION_PLACEHOLDER = "__PLACEHOLDER_CAPTURE_FROM_FIRST_RUN__"
+
+# Variants that ``cosmos_curate.core.managers.model_cli`` excludes from its
+# default download set (see ``_get_default_models``). For these variants the
+# weights must be downloaded explicitly before this test runs, e.g.::
+#
+#     pixi run -e model-download python -m cosmos_curate.core.managers.model_cli \
+#         download --models <variant>
+_VARIANTS_NOT_DOWNLOADED_BY_DEFAULT: frozenset[str] = frozenset({"qwen3_5_27b"})
+
+
+def _skip_if_weights_missing(model_variant: str) -> None:
+    """Skip cleanly when the variant's weights are not present locally.
+
+    ``AutoProcessor.from_pretrained`` falls back to treating a missing local
+    path as a Hugging Face repo id, which then fails ``validate_repo_id`` with
+    a noisy ``HFValidationError``. Guarding here gives a much clearer signal.
+    """
+    weights_dir = get_local_dir_for_weights_name(get_vllm_model_id(model_variant))
+    if weights_dir.is_dir():
+        return
+    hint = ""
+    if model_variant in _VARIANTS_NOT_DOWNLOADED_BY_DEFAULT:
+        hint = (
+            f" (variant {model_variant!r} is excluded from the default model-download set; "
+            f"run `pixi run -e model-download python -m cosmos_curate.core.managers.model_cli "
+            f"download --models {model_variant}`)"
+        )
+    pytest.skip(f"Model weights for {model_variant} not found at {weights_dir}{hint}")
+
+
 @pytest.mark.env("unified")
-@pytest.mark.parametrize("model_variant", ["qwen", "cosmos_r1", "cosmos_r2"])
+@pytest.mark.parametrize("model_variant", ["qwen", "cosmos_r1", "cosmos_r2", "qwen3_5_27b"])
 def test_vllm_caption_generation(
     sample_captioning_task: SplitPipeTask, sequential_runner: RunnerInterface, model_variant: str
 ) -> None:
     """Test the vLLM captioning result."""
+    _skip_if_weights_missing(model_variant)
     vllm_config = VllmConfig(
         model_variant=model_variant,
-        sampling_config=VllmSamplingConfig(temperature=0.0, max_tokens=2048),
+        sampling_config=VllmSamplingConfig(
+            temperature=0.0,
+            max_tokens=_SAMPLING_MAX_TOKENS.get(model_variant, _DEFAULT_SAMPLING_MAX_TOKENS),
+        ),
         **_VLLM_CONFIG_OVERRIDES.get(model_variant, {}),
     )
     window_config = WindowConfig(
@@ -267,8 +358,41 @@ def test_vllm_caption_generation(
             assert generated_caption.strip(), (
                 f"Clip {clip_idx} window {window_idx} should have non-empty {model_variant} caption"
             )
+            assert generated_caption != VLLM_UNKNOWN_CAPTION, (
+                f"Clip {clip_idx} window {window_idx} returned the {model_variant} unknown-caption sentinel"
+            )
+            assert window.caption_status == "success", (
+                f"Clip {clip_idx} window {window_idx} caption_status={window.caption_status!r} "
+                f"for {model_variant}, expected 'success'"
+            )
+            assert window.caption_failure_reason is None, (
+                f"Clip {clip_idx} window {window_idx} caption_failure_reason="
+                f"{window.caption_failure_reason!r} for {model_variant}, expected None"
+            )
+
+            assert model_variant in window.token_counts, (
+                f"Clip {clip_idx} window {window_idx} should have {model_variant} token_counts"
+            )
+            token_counts = window.token_counts[model_variant]
+            assert token_counts.prompt_tokens > 0, (
+                f"Clip {clip_idx} window {window_idx} {model_variant} prompt_tokens should be > 0"
+            )
+            assert token_counts.output_tokens > 0, (
+                f"Clip {clip_idx} window {window_idx} {model_variant} output_tokens should be > 0"
+            )
 
             expected_caption = expected_captions[window_idx]
+            if expected_caption == _GOLDEN_CAPTION_PLACEHOLDER:
+                # No golden caption recorded yet for this variant: skip the
+                # cosine-similarity check but keep the structural assertions above.
+                # Print the generated caption so a developer running the test with
+                # `-s` can paste it into _EXPECTED_CAPTIONS.
+                print(  # noqa: T201
+                    f"\n[golden-caption-capture] {model_variant} clip={clip_idx} "
+                    f"window={window_idx}:\n{generated_caption}\n"
+                )
+                continue
+
             similarity = cosine_similarity(generated_caption, expected_caption)
             threshold = _THRESHOLDS[model_variant]
             assert similarity >= threshold, (
