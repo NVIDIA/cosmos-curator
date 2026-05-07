@@ -79,7 +79,7 @@ class SAM3Model(ModelInterface):
         logger.info("Setting up SAM3 model")
         model_dir = model_utils.get_local_dir_for_weights_name(_SAM3_MODEL_ID)
         if not model_dir.exists():
-            msg = f"SAM3 weights not found at {model_dir}. Download via: cosmos-curator model download --model sam3"
+            msg = f"SAM3 weights not found at {model_dir}. Download via: cosmos-curator model download --models sam3"
             raise FileNotFoundError(msg)
 
         mem_before = torch.cuda.memory_allocated()

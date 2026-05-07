@@ -22,6 +22,7 @@ import pytest
 
 from cosmos_curator.core.managers.model_cli import (
     _download,
+    _get_default_models,
     _unpack_model_info,
     _upload,
     main,
@@ -40,12 +41,18 @@ MOCK_MODELS = {
         "version": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
         "filelist": None,
     },
+    "sam3": {
+        "model_id": "facebook/sam3",
+        "version": None,
+        "filelist": None,
+    },
     "aesthetic_scorer": {
         "model_id": "ttj/sac-logos-ava1-l14-linearMSE",
         "version": "1e77fa05081323d99725fc40a9bf9f88180490e7",
         "filelist": ["model.safetensors"],
     },
 }
+DEFAULT_EXCLUDED_MOCK_MODELS = {"sam3"}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -80,9 +87,18 @@ class TestSetupParsers:
         # Should have models argument with default value
         assert hasattr(args, "models")
         assert isinstance(args.models, str)
-        # Default should be comma-separated list of non-underscore-prefixed models
-        expected_default = ",".join(model for model in MOCK_MODELS if not model.startswith("_"))
+        # Default should skip models that require explicit opt-in.
+        expected_default = ",".join(
+            model for model in MOCK_MODELS if not model.startswith("_") and model not in DEFAULT_EXCLUDED_MOCK_MODELS
+        )
         assert args.models == expected_default
+
+    def test_default_models_exclude_gated_models(self) -> None:
+        """Test that gated models are available but not downloaded by default."""
+        default_models = _get_default_models()
+
+        assert "sam3" in MOCK_MODELS
+        assert "sam3" not in default_models
 
     def test_download_parser_accepts_custom_models(self) -> None:
         """Test that download parser accepts custom --models argument."""
