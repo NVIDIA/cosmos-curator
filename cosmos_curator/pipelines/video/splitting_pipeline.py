@@ -475,6 +475,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 FrameExtractionConfig(
                     target_fps=target_fps,
                     target_res=args.clip_extraction_target_res,
+                    decoder_mode=args.clip_extraction_decoder_mode,
                     cpus_per_worker=args.clip_extraction_cpus_per_worker,
                     perf_profile=args.perf_profile,
                 )
@@ -1413,6 +1414,12 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=float,
         default=3.0,
         help="Number of CPUs per worker allocated to clip frame extraction.",
+    )
+    parser.add_argument(
+        "--clip-extraction-decoder-mode",
+        choices=["extract_frames", "camera_sensor"],
+        default="extract_frames",
+        help="Decoder mode for clip frame extraction.",
     )
     parser.add_argument(
         "--aesthetic-threshold",
