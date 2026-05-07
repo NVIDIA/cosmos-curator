@@ -141,6 +141,11 @@ cosmos-curator --help
 
 Alternatively, you may execute `./devset.sh` to complete initial setup of environment **from within your virtual environment**.
 
+The `cosmos-curator` command is a host-side deployment CLI installed by the setup steps above. Use it on the host
+to build images, launch local Docker runs, submit Slurm jobs, and manage NVCF resources. Runtime container images are
+focused on pipeline execution and do not guarantee the `cosmos-curator` command or the `cosmos_curator.client` package
+inside the container. In-container commands should use `pixi run --as-is python -m cosmos_curator...`.
+
 ## Quick Start for Local Run
 
 **The overall workflow is as follows:**
