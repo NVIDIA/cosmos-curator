@@ -79,7 +79,7 @@ Stages specify `conda_env_name` property to run in specific environments, enabli
 
 **Merge Requests**:
 - Create using `glab mr create` targeting branch `nvidia/main`, assign to author, with `--remove-source-branch --squash-before-merge`
-- Summarize intent, list validation commands, note doc/submodule updates, link issues
+- Write MR descriptions for reviewers: summarize intent and behavior changes, call out impacted CLIs/pipelines/envs and non-obvious risks or follow-ups, and include issue links or manual validation only when known and useful beyond CI
 - Do NOT include "Generated with Claude Code" in descriptions
 - Use GitLab MCP server (if available) to retrieve CodeRabbit and Greptile review comments
 
