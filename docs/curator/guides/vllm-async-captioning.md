@@ -105,6 +105,16 @@ exception inside a stage-1 or stage-2 task propagates out of
 actor restart. Multi-actor parallelism cushions the blast radius,
 but other in-flight windows on the failing actor are forfeited.
 
+For persisted metadata, async vLLM implements a subset of the
+[normalized caption-outcome contract](../design/vllm-interface.md#caption-outcomes-and-metadata):
+it emits `caption_status` only as `success` or `error`, and sets
+`caption_failure_reason = "exception"` on error. It does not emit `truncated`,
+`blocked`, or `skipped`, and does not evaluate caption-quality flags.
+
+Actor-level render/generate failures are separate from per-window status
+assignment: they restart the actor rather than writing a distinct
+`caption_status` value for the failed in-actor copy.
+
 #### Actor-restart cleanup contract
 
 The eager in-actor cleanup in `_generate_and_assign`
@@ -162,7 +172,7 @@ autoscale, `> 0` = fixed count).
 
 ```bash
 cosmos-curator local launch --curator-path . -- pixi run --as-is python -m \
-    cosmos_curator.pipelines.video.splitting_pipeline \
+    cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/input \
     --output-clip-path /config/output \
     --captioning-algorithm vllm_async \

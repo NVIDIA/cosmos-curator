@@ -15,13 +15,13 @@ This guide walks you through adding a new vLLM model to cosmos-curator by implem
 
 ## Quick Start
 
-Adding a new model requires 4 files and ~260 lines of code:
+Adding a new model touches 4 implementation files plus tests and ~260 lines of code:
 
 1. **Create plugin**: `cosmos_curator/models/vllm_mymodel.py` (~150 lines)
 2. **Register plugin**: Add to `cosmos_curator/models/vllm_interface.py` (2 lines)
 3. **Add model ID**: Add to `cosmos_curator/models/vllm_model_ids.py` (1 line)
 4. **Add model info**: Add to `cosmos_curator/configs/all_models.json` (7 lines)
-4. **Test plugin**: `tests/models/test_vllm_mymodel.py` (~100 lines)
+5. **Test plugin**: `tests/models/test_vllm_mymodel.py` (~100 lines)
 
 **Time estimate:** 2-4 hours for a well-understood model
 
@@ -29,7 +29,8 @@ Adding a new model requires 4 files and ~260 lines of code:
 
 ## Plugin Interface Overview
 
-Every plugin inherits from `VllmPlugin` and implements 7 methods:
+Every plugin inherits from `VllmPlugin` and implements the 6 methods used by
+the current captioning flow:
 
 ```python
 class VllmPlugin(ABC):
@@ -43,12 +44,12 @@ class VllmPlugin(ABC):
         """Return HuggingFace model ID (inherited, no need to override)"""
     
     @classmethod
-    def model_path(cls) -> Path:
+    def model_path(cls, config: VllmConfig) -> Path:
         """Return local path to model weights (inherited, no need to override)"""
     
     @classmethod
     @abstractmethod
-    def processor(cls) -> AutoProcessor:
+    def processor(cls, config: VllmConfig) -> AutoProcessor:
         """Return HuggingFace processor for tokenization"""
     
     @classmethod
@@ -82,7 +83,7 @@ class VllmPlugin(ABC):
         """Extract caption string from vLLM output"""
 ```
 
-**Only need to implement 5 methods** - `model_id()` and `model_path()` are inherited.
+**Only need to implement 6 methods** - `model_id()` and `model_path()` are inherited.
 `make_llm_input()` must accept both `metadata` and `config`. Plugins that support
 both image and video should use `config.use_image_input` to choose the modality.
 
@@ -142,23 +143,24 @@ Return a HuggingFace `AutoProcessor` for your model:
 
 ```python
 @classmethod
-def processor(cls) -> AutoProcessor:
+def processor(cls, config: VllmConfig) -> AutoProcessor:
     """Return the AutoProcessor for the model."""
     processor = AutoProcessor.from_pretrained(
-        cls.model_path(),
+        cls.model_path(config),
         trust_remote_code=True,  # Set based on model requirements
     )
     return processor
 ```
 
 **Common patterns:**
-- Most models: `AutoProcessor.from_pretrained(cls.model_path())`
+- Most models: `AutoProcessor.from_pretrained(cls.model_path(config))`
 - Custom processor: Override specific components after loading
 - Tokenizer-only models: Return tokenizer wrapped as processor
 
 **Testing:**
 ```python
-processor = VllmMyModel.processor()
+config = VllmConfig(model_variant="mymodel")
+processor = VllmMyModel.processor(config)
 assert processor is not None
 tokens = processor.tokenizer("test prompt")
 assert len(tokens.input_ids) > 0
@@ -181,7 +183,7 @@ def model(cls, config: VllmConfig) -> LLM:
     }
     
     return LLM(
-        model=str(cls.model_path()),
+        model=str(cls.model_path(config)),
         quantization=quantization,
         tensor_parallel_size=config.num_gpus,
         max_model_len=32768,  # Model-specific
@@ -301,14 +303,15 @@ def make_llm_input(
 import torch
 frames = torch.rand(8, 3, 224, 224)  # 8 frames, RGB, 224x224
 prompt = "Describe this video"
-processor = VllmMyModel.processor()
+config = VllmConfig(model_variant="mymodel")
+processor = VllmMyModel.processor(config)
 
 inputs = VllmMyModel.make_llm_input(
     prompt,
     frames,
     {"fps": 1.0},
     processor,
-    VllmConfig(model_variant="mymodel"),
+    config,
 )
 
 # Verify structure
@@ -370,6 +373,12 @@ assert isinstance(caption, str)
 assert caption == "A person walking"
 ```
 
+`decode()` is intentionally narrow: it returns caption text only. The shared
+vLLM interface wraps the text with finish-reason and token-count metadata, the
+caption stage assigns `caption_status` and `caption_failure_reason`, and the
+metadata writer persists those fields. Plugin code should not write stage-level
+or writer-level metadata.
+
 ### Step 6: Implement `make_refined_llm_request()`
 
 Create a stage 2 refinement request that combines the stage 1 caption with a refinement prompt:
@@ -407,12 +416,17 @@ def make_refined_llm_request(
     # Get video frames or images from original request
     mm_data = request.inputs["multi_modal_data"]
     if "video" in mm_data:
-        video_frames = mm_data["video"]
+        video_value = mm_data["video"]
+        if isinstance(video_value, list) and video_value and isinstance(video_value[0], tuple):
+            video_frames, metadata = video_value[0]
+        else:
+            video_frames = video_value
+            metadata = {"fps": 1.0}
         # Reuse make_llm_input to create new inputs
         inputs = VllmMyModel.make_llm_input(
             final_prompt,
             video_frames,
-            {"fps": 1.0},
+            metadata,
             processor,
             VllmConfig(model_variant="mymodel"),
         )
@@ -452,14 +466,15 @@ stage1_request = VllmCaptionRequest(
     request_id="stage1-abc",
     inputs={
         "prompt_token_ids": [123, 456],
-        "multi_modal_data": {"video": torch.rand(8, 3, 224, 224)}
+        "multi_modal_data": {"video": [(torch.rand(8, 3, 224, 224), {"fps": 1.0})]}
     },
     caption="A person walking",
     stage2_prompt="Refine this caption",
 )
 
 # Create stage 2 request
-processor = VllmMyModel.processor()
+config = VllmConfig(model_variant="mymodel")
+processor = VllmMyModel.processor(config)
 stage2_request = VllmMyModel.make_refined_llm_request(
     stage1_request, processor, "Refine this caption"
 )
@@ -524,7 +539,12 @@ from vllm import RequestOutput
 from vllm.outputs import CompletionOutput
 
 from cosmos_curator.models.vllm_mymodel import VllmMyModel
-from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
+from cosmos_curator.pipelines.video.utils.data_model import (
+    VllmCaptionRequest,
+    VllmConfig,
+    VllmSamplingConfig,
+    WindowConfig,
+)
 
 
 def test_model_variant():
@@ -542,14 +562,16 @@ def test_model_id():
 @pytest.mark.skip(reason="Requires model weights downloaded")
 def test_model_path():
     """Test model path exists."""
-    model_path = VllmMyModel.model_path()
+    config = VllmConfig(model_variant="mymodel")
+    model_path = VllmMyModel.model_path(config)
     assert model_path.exists(), f"Model not found at {model_path}"
 
 
 @pytest.mark.skip(reason="Requires model weights downloaded")
 def test_processor():
     """Test processor can be loaded."""
-    processor = VllmMyModel.processor()
+    config = VllmConfig(model_variant="mymodel")
+    processor = VllmMyModel.processor(config)
     assert processor is not None
     # Try tokenizing
     tokens = processor.tokenizer("test prompt")
@@ -572,14 +594,15 @@ def test_make_llm_input():
 
     frames = torch.rand(8, 3, 224, 224)
     prompt = "Describe this video"
-    processor = VllmMyModel.processor()
+    config = VllmConfig(model_variant="mymodel")
+    processor = VllmMyModel.processor(config)
 
     inputs = VllmMyModel.make_llm_input(
         prompt,
         frames,
         {"fps": 1.0},
         processor,
-        VllmConfig(model_variant="mymodel"),
+        config,
     )
 
     # Verify structure
@@ -615,13 +638,14 @@ def test_make_refined_llm_request():
         request_id="stage1-test",
         inputs={
             "prompt_token_ids": [123, 456],
-            "multi_modal_data": {"video": torch.rand(8, 3, 224, 224)}
+            "multi_modal_data": {"video": [(torch.rand(8, 3, 224, 224), {"fps": 1.0})]}
         },
         caption="A person walking",
         stage2_prompt="Refine this",
     )
 
-    processor = VllmMyModel.processor()
+    config = VllmConfig(model_variant="mymodel")
+    processor = VllmMyModel.processor(config)
     stage2_request = VllmMyModel.make_refined_llm_request(
         stage1_request, processor, "Refine this"
     )
@@ -654,6 +678,7 @@ def test_mymodel_e2e_captioning():
     """End-to-end test for MyModel plugin."""
     from cosmos_curator.models.vllm_interface import (
         auto_processor,
+        make_metadata,
         make_model_inputs,
         sampling_params,
         vllm_caption,
@@ -664,13 +689,13 @@ def test_mymodel_e2e_captioning():
         model_variant="mymodel",
         num_gpus=1,
         batch_size=2,
-        max_output_tokens=128,
+        sampling_config=VllmSamplingConfig(max_tokens=128),
     )
 
     # Setup
     llm = vllm_model(config)
     processor = auto_processor(config)
-    samp_params = sampling_params(config)
+    samp_params = sampling_params(config.sampling_config)
 
     # Create test inputs
     frames = torch.rand(8, 3, 224, 224)
@@ -678,7 +703,7 @@ def test_mymodel_e2e_captioning():
     model_inputs = make_model_inputs([frames], metadata, config, processor, "Describe this video")
 
     # Test stage 1
-    captions = vllm_caption(
+    results = vllm_caption(
         model_inputs,
         llm,
         processor,
@@ -688,13 +713,15 @@ def test_mymodel_e2e_captioning():
         inflight_batching=True,
     )
 
-    assert len(captions) == 1
-    assert isinstance(captions[0], str)
-    assert captions[0] != "Unknown caption"
-    print(f"Stage 1 caption: {captions[0]}")
+    assert len(results) == 1
+    assert isinstance(results[0].text, str)
+    assert results[0].text.strip()
+    assert results[0].token_counts.prompt_tokens >= 0
+    assert results[0].token_counts.output_tokens >= 0
+    print(f"Stage 1 caption: {results[0].text}")
 
     # Test stage 2
-    captions_s2 = vllm_caption(
+    results_s2 = vllm_caption(
         model_inputs,
         llm,
         processor,
@@ -705,10 +732,11 @@ def test_mymodel_e2e_captioning():
         stage2_prompts=["Refine this caption"],
     )
 
-    assert len(captions_s2) == 1
-    assert isinstance(captions_s2[0], str)
-    assert captions_s2[0] != "Unknown caption"
-    print(f"Stage 2 caption: {captions_s2[0]}")
+    assert len(results_s2) == 1
+    assert isinstance(results_s2[0].text, str)
+    assert results_s2[0].text.strip()
+    assert results_s2[0].token_counts.prompt_tokens >= results[0].token_counts.prompt_tokens
+    print(f"Stage 2 caption: {results_s2[0].text}")
 ```
 
 ---
@@ -753,7 +781,7 @@ return {
 # For video models
 return {
     "prompt_token_ids": [...],
-    "multi_modal_data": {"video": tensor},  # vLLM expects "video"
+    "multi_modal_data": {"video": [(tensor, metadata)]},  # vLLM expects "video"
 }
 
 # For image models
@@ -871,7 +899,8 @@ def make_llm_input(
     Returns:
         Dictionary with keys:
         - "prompt_token_ids": List of token IDs
-        - "multi_modal_data": Dict with "video" key containing frames tensor
+        - "multi_modal_data": Dict with "video" key containing the model-specific video payload,
+          usually frames plus metadata
     
     """
 ```
@@ -910,7 +939,7 @@ class VllmMyModel13B(VllmMyModelBase):
     def model(cls, config: VllmConfig) -> LLM:
         # Override with different settings for larger model
         return LLM(
-            model=str(cls.model_path()),
+            model=str(cls.model_path(config)),
             max_model_len=65536,  # Larger context
             ...
         )
@@ -996,9 +1025,10 @@ Use this checklist to ensure your plugin is complete:
 3. Compare with a working plugin (Qwen or Nemotron)
 4. Verify `multi_modal_data` keys match what vLLM expects
 
-### Captions Are "Unknown caption"
+### Caption Results Are Empty or Error-Normalized
 
-**Error:** All captions return "Unknown caption"
+**Error:** Generated text is empty, or downstream metadata records
+`caption_status="error"`.
 
 **Solutions:**
 1. Check `decode()` implementation - ensure it returns string
@@ -1060,9 +1090,9 @@ class VllmVideoLLaMA(VllmPlugin):
         return "videollama"
 
     @classmethod
-    def processor(cls) -> AutoProcessor:
+    def processor(cls, config: VllmConfig) -> AutoProcessor:
         processor = AutoProcessor.from_pretrained(
-            cls.model_path(),
+            cls.model_path(config),
             trust_remote_code=True,
         )
         return processor
@@ -1072,7 +1102,7 @@ class VllmVideoLLaMA(VllmPlugin):
         quantization = "fp8" if config.fp8 else None
 
         return LLM(
-            model=str(cls.model_path()),
+            model=str(cls.model_path(config)),
             quantization=quantization,
             tensor_parallel_size=config.num_gpus,
             max_model_len=MAX_MODEL_LEN,

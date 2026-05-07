@@ -4,6 +4,7 @@
   - [Split-Annotate Pipeline](#split-annotate-pipeline)
     - [Split-Annotate Pipeline Stages](#split-annotate-pipeline-stages)
     - [Split-Annotate Pipeline Output Format](#split-annotate-pipeline-output-format)
+    - [Per-Clip Caption Metadata](#per-clip-caption-metadata)
     - [Split-Annotate Pipeline Configurable Options](#split-annotate-pipeline-configurable-options)
   - [Dedup Pipeline](#dedup-pipeline)
     - [Dedup Pipeline Output Format](#dedup-pipeline-output-format)
@@ -94,6 +95,49 @@ Today the split-annotate pipeline produces the following artifacts under the pat
 ├── summary.json                    # summary of the pipeline results
 ```
 
+### Per-Clip Caption Metadata
+
+Caption-related fields in `metas/v0/{clip-uuid}.json` follow the
+[normalized caption-outcome contract](../design/vllm-interface.md#caption-outcomes-and-metadata).
+
+At the clip level:
+
+- `has_caption`: `true` when at least one subject-caption window has
+  `caption_status` of `success` or `truncated`
+- `caption_quality_flags_enabled`: whether the per-window caption-quality flag
+  schema was enabled for this clip metadata artifact
+- `total_prompt_tokens`: sum of emitted prompt-token counts across caption windows
+- `total_output_tokens`: sum of emitted output-token counts across caption windows
+
+Each `windows[]` row includes:
+
+- `start_frame`, `end_frame`: frame range for the caption window
+- `caption_status`: normalized outcome (`success`, `truncated`, `blocked`,
+  `error`, `skipped`, or `null`)
+- `caption_failure_reason`: `exception`, `timeout`, or `null`; set only when
+  `caption_status == "error"`
+- `<model>_caption`: caption text for each configured caption model when text was
+  written
+- `<model>_prompt_tokens`, `<model>_output_tokens`: flat per-model token counts
+  for the window, when token counts were recorded
+- `<model>_enhanced_caption`: enhanced caption text when caption enhancement ran
+
+When `caption_quality_flags_enabled` is `true`, each `windows[]` row also includes
+the sync vLLM video quality annotations:
+
+- `flag_length_outlier`
+- `flag_repetition`
+- `flag_near_duplicate`
+
+Those flag values are `true`, `false`, or `null`. `null` means the schema is
+enabled but no flag value was evaluated for that window, such as a non-captioned
+or non-evaluable status. When `caption_quality_flags_enabled` is `false`, the
+three per-window `flag_*` keys are omitted. The flags are annotations only; they
+do not change caption status, trigger retries, block export, or enforce policy.
+
+`filtered_windows[]` has its own lightweight shape for filtering rationale and
+does not use the caption-quality flag fields.
+
 ### Split-Annotate Pipeline Configurable Options
 
 Below is a summary of the important options for the split-annotate pipeline. There are many more options available and can be seen from the help message:
@@ -146,6 +190,7 @@ In case you want the output to be in a different S3 bucket than the input, you c
 - `--no-generate-embeddings`: disables InterVideo2/Cosmos-Embed1 embedding generation; use `"generate_embeddings": false` in API endpoint.
 - `--embedding-algorithm`: specifies embedding model, available options are `cosmos-embed1-224p`, `cosmos-embed1-336p`, `cosmos-embed1-448p`, `internvideo2` (default), and `openai` (requires an OpenAI-compatible endpoint; see [Use an OpenAI-Compatible Endpoint for Embedding](../../client/end-user-guide.md#use-an-openai-compatible-endpoint-for-embedding)). The `cosmos-embed1-*` suffix selects the input resolution; 224p is faster with 256-dim vectors, while 336p/448p are slower but score higher on retrieval/classification benchmarks and produce 768-dim vectors.
 - `--no-generate-captions`: disables VLM captioning; use `"generate_captions": false` in API endpoint.
+- `--no-caption-quality-flags`: disables heuristic caption-quality flag annotations in per-clip metadata.
 - `--generate-previews`: enables web preview generation when captioning is enabled.
 - `--upload-clip-info-in-chunks`: enables metadata jsonl for a group of clips and disables per-clip embedding & metadata writes.
 - `--upload-cds-parquet`: enables generating parquet files for Milvus indexing.
@@ -156,7 +201,7 @@ In case you want the output to be in a different S3 bucket than the input, you c
 - `--motion-per-patch-min-256-threshold`: empirical threshold for minimal averge motion magnitude in any 256x256 patch.
 - `--aesthetic-threshold`: threshold for aesthetic filter, defaults to `None` which disables the filter; use a negative value like `-1` to achieve the "score-only" behavior.
 - `--captioning-window-size`: captioning window size, defaults to 256 frames.
-- `--captioning-max-output-tokens`: max output tokens for captioning, default to 512.
+- `--captioning-max-output-tokens`: max output tokens for captioning, default to 8192.
 
 **Options for Performance**
 

@@ -157,9 +157,9 @@ The blocks below are appended in this order:
 
 | Item | Details |
 |---|---|
-| Stages | Local vLLM: `VllmPrepStage` + `VllmCaptionStage`. API: `ApiPrepStage` + `GeminiCaptionStage` or `OpenAICaptionStage`. vLLM async: `VllmAsyncPrepStage` + `VllmAsyncPromptRenderStage` + `VllmAsyncCaptionStage`. |
+| Stages | Local vLLM: `VllmPrepStage` + `VllmCaptionStage`. API: `ApiPrepStage` + `GeminiCaptionStage` or `OpenAICaptionStage`. vLLM async: `VllmAsyncPrepStage` + `VllmAsyncCaptionStage`. |
 | Code | [`captioning/captioning_builders.py`](../../../cosmos_curator/pipelines/video/captioning/captioning_builders.py) |
-| Main flags | `--no-generate-captions`, `--captioning-algorithm`, `--captioning-window-size`, `--captioning-sampling-fps`, `--captioning-prompt-variant`, `--captioning-max-output-tokens` |
+| Main flags | `--no-generate-captions`, `--no-caption-quality-flags`, `--captioning-algorithm`, `--captioning-window-size`, `--captioning-sampling-fps`, `--captioning-prompt-variant`, `--captioning-max-output-tokens` |
 | Purpose | Creates windowed captions for each clip. Windowing keeps long clips manageable and gives downstream datasets per-window text. |
 | Output | Populates `clip.windows[*].caption` and caption status fields; the writer emits captions in per-clip metadata and `all_window_captions.json`. |
 | Backend notes | Supported algorithms include `qwen`, Qwen3 variants, `nemotron`, `cosmos_r1`, `cosmos_r2`, `gemini`, `openai`, and `vllm_async`. |

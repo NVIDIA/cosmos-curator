@@ -59,13 +59,13 @@ Each `metas/{output_id}.json` includes:
 - `source_path`: full input path of the image
 - `relative_path`: path relative to input root
 - `width`, `height`: dimensions captured during image processing, typically after prep resize when a prep stage ran
-- `has_caption`: whether a caption was generated
+- `has_caption`: `true` when `caption_status` is `success` or `truncated`
 - `is_filtered`: whether the image was rejected by semantic filtering or classifier filtering
 - `align_timestamp_ns`: sampled/reference timestamp in nanoseconds. Uses timestamps from `image_data` when provided; otherwise the pipeline uses synthetic timestamps.
 - `sensor_timestamp_ns`: sampled sensor timestamp in nanoseconds. Uses timestamps from `image_data` when provided; otherwise the pipeline uses synthetic timestamps.
-- `caption_status`: normalized caption outcome such as `success`, `truncated`, `error`, or `null` if captioning was skipped
-- `caption_failure_reason`: failure reason when `caption_status == "error"`, otherwise `null`
-- `token_counts`: per-model token usage keyed by model variant
+- `caption_status`: normalized caption outcome (`success`, `truncated`, `blocked`, `error`, `skipped`, or `null`) following the [normalized caption-outcome contract](../design/vllm-interface.md#caption-outcomes-and-metadata). `null` means no caption stage ran for this image row; `"skipped"` is a reserved status value and is distinct from `null`.
+- `caption_failure_reason`: `exception`, `timeout`, or `null`; set only when `caption_status == "error"`
+- `token_counts`: nested per-model token usage keyed by model variant, with `prompt_tokens` and `output_tokens` for each model
 - `filter_caption_status`: per-model status for semantic-filter or classifier caption calls, when those stages are enabled
 - `filter_caption_failure_reason`: failure reasons for filter/classifier caption calls, when present
 - `qwen_type_classification`: classifier labels inferred by the image classifier postprocessing stage
@@ -73,7 +73,7 @@ Each `metas/{output_id}.json` includes:
 - `qwen_rejection_reasons`: accumulated semantic/classifier rejection details
 - `embedding_keys`: embedding backends written for the image
 - `errors`: per-stage error payloads when something failed but the task still reached output
-- `caption`: present only when `has_caption` is true
+- `caption`: present only when `has_caption` is true, so `caption_status` is `success` or `truncated`
 
 `summary.json` includes aggregate counters such as:
 
