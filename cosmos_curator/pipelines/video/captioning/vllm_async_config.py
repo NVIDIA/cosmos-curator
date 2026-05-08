@@ -396,22 +396,47 @@ for _spec in _VLLM_ARG_SPECS:
         raise AttributeError(msg)
 
 
+def _normalize_prefix(prefix: str) -> tuple[str, str]:
+    """Return ``(flag_prefix, dest_prefix)`` for ``add_vllm_async_cli_args``.
+
+    ``flag_prefix`` is appended to ``--`` (e.g. ``"event-caption-"``);
+    ``dest_prefix`` is the matching argparse dest prefix (``event_caption_``).
+    Empty input yields empty outputs so default callers stay byte-identical.
+    """
+    if not prefix:
+        return "", ""
+    flag_prefix = prefix if prefix.endswith("-") else f"{prefix}-"
+    dest_prefix = flag_prefix.replace("-", "_")
+    return flag_prefix, dest_prefix
+
+
 def build_vllm_async_config(
     args: argparse.Namespace,
     sampling_config: VllmSamplingConfig,
+    *,
+    prefix: str = "",
 ) -> VllmAsyncConfig | None:
-    """Build ``VllmAsyncConfig`` from CLI args when ``caption_algo="vllm_async"``."""
-    if not getattr(args, "generate_captions", True):
-        return None
-    if args.captioning_algorithm.lower() != "vllm_async":
-        return None
+    """Build ``VllmAsyncConfig`` from CLI args when ``caption_algo="vllm_async"``.
 
-    model_variant = args.vllm_async_model_name
+    When called without a ``prefix`` the existing per-window splitting-pipeline
+    call site is byte-identical. ``prefix="event-caption-"`` looks up
+    ``args.event_caption_vllm_async_*`` for the per-event captioner instead;
+    in that case the ``captioning_algorithm`` guard is bypassed because the
+    per-event backend is selected via its own ``--event-caption-backend``.
+    """
+    _, dest_prefix = _normalize_prefix(prefix)
+    if not dest_prefix:
+        if not getattr(args, "generate_captions", True):
+            return None
+        if args.captioning_algorithm.lower() != "vllm_async":
+            return None
+
+    model_variant = getattr(args, f"{dest_prefix}vllm_async_model_name")
     model_overrides = _MODEL_DEFAULTS.get(model_variant, {})
 
     kwargs: dict[str, Any] = {"model_variant": model_variant}
     for spec in _VLLM_ARG_SPECS:
-        arg_name = f"vllm_async_{spec.field}"
+        arg_name = f"{dest_prefix}vllm_async_{spec.field}"
         cli_val = getattr(args, arg_name, None)
         # Empty strings on string-typed args mean "explicitly unset":
         # skip model overrides and let the attrs field default apply.
@@ -432,10 +457,18 @@ def build_vllm_async_config(
     return VllmAsyncConfig(**kwargs)
 
 
-def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Register all ``--vllm-async-*`` CLI arguments on *parser*."""
+def add_vllm_async_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
+    """Register all ``--vllm-async-*`` CLI arguments on *parser*.
+
+    ``prefix`` (e.g. ``"event-caption-"``) lets a second consumer (the
+    per-event captioner) register a parallel set of flags
+    ``--event-caption-vllm-async-*`` without colliding with the
+    per-window registration. Empty prefix preserves the existing call
+    site byte-for-byte.
+    """
+    flag_prefix, _ = _normalize_prefix(prefix)
     parser.add_argument(
-        "--vllm-async-model-name",
+        f"--{flag_prefix}vllm-async-model-name",
         type=str,
         default="qwen",
         help=(
@@ -445,7 +478,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-async-stage-batch-size",
+        f"--{flag_prefix}vllm-async-stage-batch-size",
         type=int,
         default=0,
         help=(
@@ -455,7 +488,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-async-max-concurrent-requests",
+        f"--{flag_prefix}vllm-async-max-concurrent-requests",
         type=int,
         default=0,
         help=(
@@ -467,7 +500,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-async-num-workers-per-node",
+        f"--{flag_prefix}vllm-async-num-workers-per-node",
         type=int,
         default=0,
         help=(
@@ -479,7 +512,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-async-stage2-caption",
+        f"--{flag_prefix}vllm-async-stage2-caption",
         action="store_true",
         default=False,
         help=(
@@ -489,7 +522,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-async-stage2-prompt-text",
+        f"--{flag_prefix}vllm-async-stage2-prompt-text",
         type=str,
         default=None,
         help=(
@@ -500,7 +533,7 @@ def add_vllm_async_cli_args(parser: argparse.ArgumentParser) -> None:
 
     # all VllmAsyncConfig-mapped args from specs
     for spec in _VLLM_ARG_SPECS:
-        flag = f"--vllm-async-{spec.field.replace('_', '-')}"
+        flag = f"--{flag_prefix}vllm-async-{spec.field.replace('_', '-')}"
         kwargs: dict[str, Any] = {"default": None, "help": spec.help}
         if spec.arg_type is None:
             kwargs["action"] = argparse.BooleanOptionalAction

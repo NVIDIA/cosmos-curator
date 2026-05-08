@@ -20,18 +20,27 @@ produce a structured list of "events" that reference SAM3 object IDs. Designed
 to be run after ``SAM3BBoxStage`` and independently of the default caption
 stage.
 
-Two backends are available:
+Four backends are available:
 
-* ``qwen`` (default) — local Qwen2.5-VL via vLLM. Requires a GPU and the
-  ``unified`` conda environment. Fully offline, no API key.
-* ``gemini`` — remote Gemini API. CPU-only stage, but requires a
-  ``gemini.api_key`` entry in the project config file and internet access.
+* ``qwen`` (default) — local Qwen2.5-VL via vLLM (sync). Single-GPU, no API
+  key. Variant menu is ``qwen | qwen3_vl_30b | qwen3_vl_30b_fp8``.
+* ``gemini`` — remote Gemini API. CPU-only stage, requires
+  ``gemini.api_key`` in the project config.
+* ``openai`` — any OpenAI-compatible chat-completion endpoint (e.g. vLLM
+  serving an OpenAI-compatible API). CPU-only stage, requires
+  ``openai.<endpoint_key>.api_key`` (default key ``caption``).
+* ``vllm_async`` — in-process ``AsyncLLM`` engine for any HF model id
+  supported by vLLM (including Qwen3-VL-235B-A22B-Instruct[-FP8] with
+  TP/DP). Requires GPUs equal to ``config.total_gpus``.
 
 Switch between them via the ``backend`` constructor argument (or
 ``--event-caption-backend`` on the pipeline CLIs).
 """
 
+import asyncio
+import base64
 import json
+import os
 import re
 from importlib import resources as importlib_resources
 from typing import TYPE_CHECKING, Any, Literal
@@ -45,21 +54,59 @@ from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
 from cosmos_curator.core.utils.model import conda_utils
 from cosmos_curator.models.qwen_vl import QWEN_VARIANTS_NEED_RAW_FRAMES, QwenUtils, QwenVL
-from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask
+from cosmos_curator.pipelines.common.api_caption_utils import (
+    create_openai_client_and_resolve_model,
+    normalize_openai_response_with_detail,
+    openai_error_result_from_exception,
+)
+from cosmos_curator.pipelines.common.api_stage_async_utils import destroy_api_clients
+from cosmos_curator.pipelines.video.captioning.vllm_async_config import VllmAsyncConfig
 
-# ``google-genai``, ``tenacity``, and ``vision_process`` (torchvision) only
-# live in the ``unified`` env; guard imports so this module loads elsewhere.
-if conda_utils.is_running_in_env("unified") or TYPE_CHECKING:
+# ``_VllmAsyncModel`` is a thin ``ModelInterface`` wrapper with no heavy deps,
+# so it must be importable from the driver (default env) where ``__init__``
+# runs. The vLLM-touching helpers stay inside the gated block below.
+from cosmos_curator.pipelines.video.captioning.vllm_async_stage import _VllmAsyncModel
+from cosmos_curator.pipelines.video.utils.data_model import CaptionOutcome, CaptionResult, Clip, SplitPipeTask
+
+# Type-checking imports for symbols used purely as annotations.  The
+# corresponding runtime imports live in the ``conda_utils.is_running_in_env``
+# block below so this module still loads in CPU-only environments.
+if TYPE_CHECKING:
+    from transformers import AutoProcessor
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+# Heavy ML / API SDKs only live in the ``unified`` env; guard imports so this
+# module loads elsewhere (e.g. CPU-only test collection environments).
+if conda_utils.is_running_in_env("unified"):
+    import numpy as np
+    import openai
     import tenacity
     from google import genai
     from google.genai import types as genai_types
+    from transformers import AutoProcessor
+    from vllm.v1.engine.async_llm import AsyncLLM
 
-    from cosmos_curator.pipelines.video.utils.decoder_utils import get_frame_count
-    from cosmos_curator.pipelines.video.utils.vision_process import fetch_video, read_video_cpu
+    from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_cleanup, gpu_stage_startup
+    from cosmos_curator.models.vllm_interface import sampling_params as build_sampling_params
+    from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
+    from cosmos_curator.pipelines.video.captioning.vllm_async_stage import (
+        _build_engine_args,
+        _build_render_payload,
+        resolve_model_path,
+    )
+    from cosmos_curator.pipelines.video.utils.decoder_utils import (
+        decode_video_cpu_frame_ids,
+        get_avg_frame_rate,
+        get_frame_count,
+    )
+    from cosmos_curator.pipelines.video.utils.vision_process import fetch_video, read_video_cpu, smart_nframes
     from cosmos_curator.pipelines.video.utils.windowing_utils import WindowFrameInfo
 
 
-Backend = Literal["qwen", "gemini"]
+Backend = Literal["qwen", "gemini", "openai", "vllm_async"]
+_BACKEND_VALUES: tuple[Backend, ...] = ("qwen", "gemini", "openai", "vllm_async")
+_OPENAI_ENDPOINT_KEYS: tuple[str, ...] = ("caption", "enhance", "filter", "classifier")
 
 
 _DEFAULT_PROMPT_RESOURCE = "traffic_surveillance.md"
@@ -162,7 +209,7 @@ class PerEventCaptionStage(CuratorStage):
     Supports two backends: local Qwen2.5-VL (default) and remote Gemini.
     """
 
-    def __init__(  # noqa: PLR0913  # flat config surface keeps CLI wiring straightforward
+    def __init__(  # noqa: PLR0913, PLR0915  # flat config surface keeps CLI wiring straightforward
         self,
         *,
         backend: Backend = "qwen",
@@ -205,6 +252,20 @@ class PerEventCaptionStage(CuratorStage):
         # to separate "queued vehicles" from "vehicles in contact", so disable
         # only if thinking is starving ``max_output_tokens``.
         gemini_thinking_budget: int = -1,
+        # --- OpenAI-compatible-only ---
+        openai_model_name: str = "auto",
+        openai_max_output_tokens: int = 8192,
+        openai_max_retries: int = 3,
+        openai_retry_delay_seconds: float = 1.0,
+        # Reuses an existing OpenAIConfig endpoint slot (no new schema field);
+        # users can point per-event at a separate endpoint via this knob.
+        openai_endpoint_key: str = "caption",
+        # --- vllm_async-only ---
+        # Whole-config object built upstream via build_vllm_async_config(...,
+        # prefix="event-caption-"). None when backend != "vllm_async".
+        vllm_async_config: VllmAsyncConfig | None = None,
+        vllm_async_sampling_fps: float = 2.0,
+        vllm_async_max_output_tokens: int = 4096,
         # --- Common ---
         verbose: bool = False,
         log_stats: bool = False,
@@ -212,7 +273,10 @@ class PerEventCaptionStage(CuratorStage):
         """Initialise the stage.
 
         Args:
-            backend: ``"qwen"`` (local GPU) or ``"gemini"`` (remote API).
+            backend: ``"qwen"`` (local single-GPU vLLM), ``"gemini"`` (remote
+                API), ``"openai"`` (any OpenAI-compatible chat-completion
+                endpoint), or ``"vllm_async"`` (in-process AsyncLLM engine
+                supporting TP/DP, including Qwen3-VL-235B[-FP8]).
             prompt_text: User prompt template; falls back to the bundled
                 traffic-surveillance default. The instances JSON block is
                 always appended at prompt-build time.
@@ -239,13 +303,31 @@ class PerEventCaptionStage(CuratorStage):
                 ``"high"`` is required to OCR ``#id`` overlay labels.
             gemini_thinking_budget: ``-1`` = dynamic, ``0`` = disabled, ``N``
                 = hard cap.
+            openai_model_name: Model name passed in OpenAI-compatible
+                chat-completion requests. ``"auto"`` queries ``/v1/models``
+                and picks the first entry.
+            openai_max_output_tokens: ``max_tokens`` for OpenAI requests.
+            openai_max_retries: Per-clip retry budget for transient errors.
+            openai_retry_delay_seconds: Fixed delay between retries.
+            openai_endpoint_key: Which ``openai.<key>`` block in the project
+                config supplies api_key/base_url. Defaults to ``"caption"``
+                (reuses the per-window captioner's endpoint).
+            vllm_async_config: Whole ``VllmAsyncConfig`` built upstream
+                (``build_vllm_async_config(args, sampling_config,
+                prefix="event-caption-")``). Required when
+                ``backend="vllm_async"``.
+            vllm_async_sampling_fps: Decode fps for the annotated mp4 before
+                feeding it to the AsyncLLM engine.
+            vllm_async_max_output_tokens: ``max_tokens`` for the per-event
+                AsyncLLM ``generate`` request (overrides the engine's
+                sampling-config max).
             verbose: Emit per-clip logs.
             log_stats: Record stage performance stats.
 
         """
         super().__init__()
-        if backend not in ("qwen", "gemini"):
-            msg = f"backend must be 'qwen' or 'gemini', got {backend!r}"
+        if backend not in _BACKEND_VALUES:
+            msg = f"backend must be one of {_BACKEND_VALUES}, got {backend!r}"
             raise ValueError(msg)
 
         self._timer = StageTimer(self)
@@ -285,6 +367,36 @@ class PerEventCaptionStage(CuratorStage):
         self._last_gemini_finish_reasons: list[str] = []
         self._last_gemini_usage_metadata: object | None = None
 
+        # OpenAI-compatible state.
+        if openai_endpoint_key not in _OPENAI_ENDPOINT_KEYS:
+            msg = f"openai_endpoint_key must be one of {_OPENAI_ENDPOINT_KEYS}, got {openai_endpoint_key!r}"
+            raise ValueError(msg)
+        self._openai_model_name = openai_model_name
+        self._openai_max_output_tokens = openai_max_output_tokens
+        self._openai_max_retries = max(1, openai_max_retries)
+        self._openai_retry_delay_seconds = openai_retry_delay_seconds
+        self._openai_endpoint_key = openai_endpoint_key
+        self._openai_client: openai.OpenAI | None = None
+        self._openai_async_client: Any | None = None
+        self._openai_runner: asyncio.Runner | None = None
+
+        # vllm_async state.
+        if backend == "vllm_async" and vllm_async_config is None:
+            msg = "vllm_async_config is required when backend='vllm_async'"
+            raise ValueError(msg)
+        self._vllm_async_config = vllm_async_config
+        self._vllm_async_sampling_fps = vllm_async_sampling_fps
+        self._vllm_async_max_output_tokens = vllm_async_max_output_tokens
+        self._vllm_async_engine: AsyncLLM | None = None
+        self._vllm_async_processor: AutoProcessor | None = None
+        self._vllm_async_sampling_params: SamplingParams | None = None
+        self._vllm_async_runner: asyncio.Runner | None = None
+        self._vllm_async_request_counter: int = 0
+        self._vllm_async_model_iface: _VllmAsyncModel | None = None
+        if backend == "vllm_async":
+            assert vllm_async_config is not None
+            self._vllm_async_model_iface = _VllmAsyncModel(vllm_async_config.model_variant)
+
         if self._backend == "gemini":
             from cosmos_curator.core.utils.config.config import load_config  # noqa: PLC0415
 
@@ -293,7 +405,7 @@ class PerEventCaptionStage(CuratorStage):
                 msg = "Gemini API key missing from config file (required by PerEventCaptionStage backend=gemini)."
                 raise RuntimeError(msg)
             self._gemini_api_key = config.gemini.api_key
-        else:
+        elif self._backend == "qwen":
             # Construct eagerly so the framework sees it via ``self.model``.
             self._qwen_model = QwenVL(
                 model_variant=self._qwen_variant,
@@ -303,19 +415,24 @@ class PerEventCaptionStage(CuratorStage):
 
     @property
     def resources(self) -> CuratorStageResource:
-        """Return resource requirements (GPU for Qwen, CPU for Gemini)."""
+        """Return resource requirements (GPU for Qwen / vllm_async, CPU for Gemini / OpenAI)."""
         if self._backend == "qwen":
             return CuratorStageResource(gpus=1.0)
+        if self._backend == "vllm_async":
+            assert self._vllm_async_config is not None
+            return CuratorStageResource(cpus=1.0, gpus=self._vllm_async_config.total_gpus)
         return CuratorStageResource(cpus=1.0)
 
     @property
     def conda_env_name(self) -> str:
-        """Run in the unified env (vllm + google-genai both live there)."""
+        """Run in the unified env (vllm + google-genai + openai all live there)."""
         return "unified"
 
     @property
     def model(self) -> ModelInterface | None:  # type: ignore[override]
-        """Expose the Qwen model so the framework downloads weights / drives setup()."""
+        """Expose the relevant ModelInterface so weights are auto-downloaded."""
+        if self._backend == "vllm_async":
+            return self._vllm_async_model_iface
         return self._qwen_model
 
     def stage_setup(self) -> None:
@@ -323,8 +440,10 @@ class PerEventCaptionStage(CuratorStage):
 
         ``super().stage_setup()`` invokes ``self.model.setup()`` when
         ``self.model`` is set — for the Qwen backend this constructs the
-        vLLM engine. Gemini exposes no model so the base call is a no-op
-        and we just create the client.
+        vLLM engine. Gemini and OpenAI expose no model so the base call is
+        a no-op and we just create the client. For ``vllm_async`` the
+        framework downloads weights via ``_VllmAsyncModel`` but engine init
+        happens here.
         """
         super().stage_setup()
         if self._backend == "qwen":
@@ -332,9 +451,13 @@ class PerEventCaptionStage(CuratorStage):
             self._qwen_utils = QwenUtils(model_variant=self._qwen_variant)
             self._qwen_utils.setup()
             self._apply_qwen_sampling_overrides()
-        else:
+        elif self._backend == "gemini":
             assert self._gemini_api_key is not None
             self._gemini_client = genai.Client(api_key=self._gemini_api_key)
+        elif self._backend == "openai":
+            self._setup_openai()
+        elif self._backend == "vllm_async":
+            self._setup_vllm_async()
 
     def _apply_qwen_sampling_overrides(self) -> None:
         """Mutate ``QwenVL.sampling_params`` in place to apply any overrides."""
@@ -556,6 +679,246 @@ class PerEventCaptionStage(CuratorStage):
         return _call()
 
     # ------------------------------------------------------------------
+    # OpenAI-compatible backend
+    # ------------------------------------------------------------------
+
+    def _setup_openai(self) -> None:
+        """Construct sync + async OpenAI clients from the project config."""
+        from cosmos_curator.core.utils.config.config import maybe_load_config  # noqa: PLC0415
+
+        config = maybe_load_config()
+        endpoint = (
+            getattr(config.openai, self._openai_endpoint_key, None)
+            if config is not None and config.openai is not None
+            else None
+        )
+        if endpoint is None or not endpoint.api_key:
+            msg = (
+                f"OpenAI {self._openai_endpoint_key} configuration not found. "
+                f"Provide openai.{self._openai_endpoint_key}.api_key in "
+                "~/.config/cosmos_curator/config.yaml (required by "
+                "PerEventCaptionStage backend=openai)."
+            )
+            raise RuntimeError(msg)
+
+        self._openai_client, self._openai_model_name = create_openai_client_and_resolve_model(
+            openai,
+            api_key=endpoint.api_key,
+            base_url=endpoint.base_url,
+            model_name=self._openai_model_name,
+            endpoint_label=f"OpenAI {self._openai_endpoint_key}",
+        )
+        client_kwargs: dict[str, Any] = {"api_key": endpoint.api_key}
+        if endpoint.base_url:
+            client_kwargs["base_url"] = endpoint.base_url
+        self._openai_async_client = openai.AsyncOpenAI(**client_kwargs)
+        self._openai_runner = asyncio.Runner()
+
+    async def _generate_openai_caption_async(
+        self,
+        clip_mp4_bytes: bytes,
+        prompt: str,
+    ) -> tuple[CaptionResult, str | None]:
+        """Generate a caption result for one clip via the async OpenAI client."""
+        client = self._openai_async_client
+        if client is None:
+            msg = "OpenAI async client not initialised; call stage_setup before generating captions."
+            raise RuntimeError(msg)
+
+        video_b64 = base64.b64encode(bytes(clip_mp4_bytes)).decode("utf-8")
+        content_parts: list[dict[str, Any]] = [
+            {
+                "type": "video_url",
+                "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
+            },
+            {"type": "text", "text": prompt},
+        ]
+        request_kwargs: dict[str, Any] = {
+            "model": self._openai_model_name,
+            "messages": [{"role": "user", "content": content_parts}],
+            "max_tokens": self._openai_max_output_tokens,
+        }
+
+        async def _call() -> object:
+            async for attempt in tenacity.AsyncRetrying(
+                stop=tenacity.stop_after_attempt(self._openai_max_retries),
+                wait=tenacity.wait_fixed(self._openai_retry_delay_seconds),
+                retry=tenacity.retry_if_not_exception_type(
+                    (openai.AuthenticationError, openai.NotFoundError, openai.BadRequestError),
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    return await client.chat.completions.create(**request_kwargs)
+            msg = "OpenAI async retry loop exited without a result."
+            raise RuntimeError(msg)
+
+        try:
+            response = await _call()
+        except Exception as exc:  # noqa: BLE001
+            timeout_error = getattr(openai, "APITimeoutError", None)
+            return openai_error_result_from_exception(exc, timeout_error_type=timeout_error)
+        return normalize_openai_response_with_detail(response)
+
+    def _call_openai(self, clip_mp4_bytes: bytes, prompt: str) -> str:
+        """Drive one OpenAI clip request synchronously and return caption text.
+
+        Raises ``RuntimeError`` when the API returns no usable caption text
+        (caller logs the failure on ``clip.errors``).
+        """
+        if self._openai_runner is None:
+            msg = "OpenAI runner not initialised; call stage_setup before generating captions."
+            raise RuntimeError(msg)
+        result, detail = self._openai_runner.run(self._generate_openai_caption_async(clip_mp4_bytes, prompt))
+        if result.outcome == CaptionOutcome.BLOCKED:
+            msg = "OpenAI request blocked by content filter."
+            raise RuntimeError(msg)
+        if result.text is None:
+            msg = detail or f"OpenAI request produced no caption text (outcome={result.outcome.value!r})."
+            raise RuntimeError(msg)
+        return result.text
+
+    # ------------------------------------------------------------------
+    # vllm_async backend
+    # ------------------------------------------------------------------
+
+    # Mirrors VllmAsyncCaptionStage._UNSET_VLLM_ENV_VARS — both vars are
+    # legacy sync-vLLM defaults that confuse the AsyncLLM engine.
+    _UNSET_VLLM_ENV_VARS: tuple[str, ...] = (
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+    )
+
+    def _configure_vllm_async_environment(self) -> None:
+        """Apply the minimal env-var hygiene needed by the AsyncLLM engine.
+
+        Lighter than ``VllmAsyncCaptionStage._configure_vllm_environment`` —
+        the per-event stage runs at most one engine.generate per clip and
+        does not need the full ``RuntimeEnv`` plumbing or per-actor logging
+        prefix machinery.
+        """
+        for var in self._UNSET_VLLM_ENV_VARS:
+            stale = os.environ.pop(var, None)
+            if stale is not None and self._verbose:
+                logger.info(f"[PerEventCaptionStage] removed stale env var {var}={stale}")
+        # Steer vLLM caches off potentially-slow NFS home directories.
+        os.environ.setdefault("VLLM_CACHE_ROOT", "/tmp/vllm")  # noqa: S108
+
+    def _setup_vllm_async(self) -> None:
+        """Construct the in-process AsyncLLM engine for per-clip generation."""
+        config = self._vllm_async_config
+        if config is None:
+            msg = "vllm_async_config not set; backend='vllm_async' requires a config."
+            raise RuntimeError(msg)
+
+        gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=True)
+        self._configure_vllm_async_environment()
+
+        model_id = get_vllm_model_id(config.model_variant)
+        model_path = resolve_model_path(model_id)
+        self._vllm_async_processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)  # type: ignore[no-untyped-call]
+
+        engine_args = _build_engine_args(config, model_path)
+        logger.info(
+            f"[PerEventCaptionStage] booting AsyncLLM engine "
+            f"variant={config.model_variant!r} num_gpus={config.num_gpus} "
+            f"data_parallel_size={config.data_parallel_size} "
+            f"distributed_executor_backend={config.distributed_executor_backend!r}"
+        )
+        self._vllm_async_engine = AsyncLLM.from_engine_args(engine_args)
+
+        params = build_sampling_params(config.sampling_config)
+        params.max_tokens = self._vllm_async_max_output_tokens
+        self._vllm_async_sampling_params = params
+        # Per-clip generate is sync-shaped from the framework's POV.
+        self._vllm_async_runner = asyncio.Runner()
+
+        gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
+
+    def _build_vllm_async_prompt(self, prompt: str) -> str:
+        """Render the chat-template prompt for one clip via the AutoProcessor."""
+        processor = self._vllm_async_processor
+        if processor is None:
+            msg = "vllm_async processor not initialised; call stage_setup first."
+            raise RuntimeError(msg)
+        messages: list[dict[str, str | list[dict[str, str]]]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video"},
+                    {"type": "text", "text": prompt.strip()},
+                ],
+            },
+        ]
+        prompt_text: str = processor.apply_chat_template(  # type: ignore[attr-defined]
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return prompt_text
+
+    def _decode_vllm_async_frames(self, clip_mp4_bytes: bytes) -> "np.ndarray[Any, np.dtype[np.uint8]]":
+        """Decode the annotated mp4 to a uint8 [T, H, W, 3] frame stack.
+
+        Mirrors ``VllmAsyncPrepStage._create_windows_and_decode`` for a
+        single window covering the whole clip.
+        """
+        total_native = get_frame_count(clip_mp4_bytes)
+        if total_native <= 0:
+            msg = "clip has 0 decodable frames"
+            raise RuntimeError(msg)
+
+        with buffer_as_memfd_path(clip_mp4_bytes, name="per-event-vllm-async-clip") as video_path:
+            native_fps = get_avg_frame_rate(video_path)
+            n_sampled = smart_nframes(self._vllm_async_sampling_fps, total_native, native_fps)
+            indices = np.linspace(0, total_native - 1, n_sampled, dtype=np.int32)
+            return decode_video_cpu_frame_ids(video_path, indices, num_threads=2)
+
+    async def _generate_vllm_async_caption(
+        self,
+        rendered_prompt: object,
+        request_id: str,
+    ) -> str:
+        """Drive a single ``engine.generate`` async iterator to completion."""
+        engine = self._vllm_async_engine
+        params = self._vllm_async_sampling_params
+        if engine is None or params is None:
+            msg = "vllm_async engine not initialised; call stage_setup first."
+            raise RuntimeError(msg)
+        final_output = None
+        async for output in engine.generate(
+            prompt=rendered_prompt,  # type: ignore[arg-type]
+            sampling_params=params,
+            request_id=request_id,
+        ):
+            final_output = output
+        if final_output is None or not final_output.outputs:
+            msg = "AsyncLLM engine returned no outputs."
+            raise RuntimeError(msg)
+        text = final_output.outputs[0].text
+        if not text or not text.strip():
+            msg = f"AsyncLLM engine returned empty caption (finish_reason={final_output.outputs[0].finish_reason!r})"
+            raise RuntimeError(msg)
+        return str(text).strip()
+
+    def _call_vllm_async(self, clip_mp4_bytes: bytes, prompt: str) -> str:
+        """Generate one per-event caption via the in-process AsyncLLM engine."""
+        if self._vllm_async_runner is None or self._vllm_async_engine is None:
+            msg = "vllm_async backend not initialised; call stage_setup first."
+            raise RuntimeError(msg)
+        config = self._vllm_async_config
+        assert config is not None
+
+        prompt_text = self._build_vllm_async_prompt(prompt)
+        frames = self._decode_vllm_async_frames(clip_mp4_bytes)
+        payload = _build_render_payload(prompt_text, frames, config.mm_processor_kwargs)
+        rendered_list = self._vllm_async_engine.renderer.render_cmpl([payload])
+        rendered_prompt = rendered_list[0]
+        self._vllm_async_request_counter += 1
+        request_id = f"per-event-{self._vllm_async_request_counter}"
+        return self._vllm_async_runner.run(self._generate_vllm_async_caption(rendered_prompt, request_id))
+
+    # ------------------------------------------------------------------
     # Qwen backend
     # ------------------------------------------------------------------
 
@@ -621,7 +984,7 @@ class PerEventCaptionStage(CuratorStage):
     # Common orchestration
     # ------------------------------------------------------------------
 
-    def _process_clip(self, clip: Clip) -> None:
+    def _process_clip(self, clip: Clip) -> None:  # noqa: C901  # 4-way backend dispatch + skip / retry guards
         if not clip.sam3_instances:
             if self._verbose:
                 logger.debug(f"[PerEventCaptionStage] clip {clip.uuid}: no SAM3 instances; skipping")
@@ -645,8 +1008,12 @@ class PerEventCaptionStage(CuratorStage):
         try:
             if self._backend == "qwen":
                 raw = self._call_qwen(mp4_bytes, prompt)
-            else:
+            elif self._backend == "gemini":
                 raw = self._call_gemini(mp4_bytes, prompt, str(clip.uuid))
+            elif self._backend == "openai":
+                raw = self._call_openai(mp4_bytes, prompt)
+            else:  # vllm_async
+                raw = self._call_vllm_async(mp4_bytes, prompt)
         except Exception as exc:  # noqa: BLE001
             clip.errors["per_event_caption"] = f"api_error: {exc!r}"
             logger.exception(f"[PerEventCaptionStage] clip {clip.uuid}: {self._backend} call failed")
@@ -694,6 +1061,38 @@ class PerEventCaptionStage(CuratorStage):
             "per_event_caption",
             "truncated_response" if truncated else "empty_or_unparseable_response",
         )
+
+    def destroy(self) -> None:
+        """Tear down per-backend clients / engines on actor stop.
+
+        Sync ``qwen`` and ``gemini`` paths hold no resources that need
+        explicit teardown beyond garbage collection. ``openai`` mirrors
+        ``OpenAICaptionStage.destroy``; ``vllm_async`` mirrors
+        ``VllmAsyncCaptionStage.destroy`` while keeping
+        ``gpu_stage_cleanup`` in a ``finally`` so GPU memory is reliably
+        released even if the engine shutdown raises.
+        """
+        if self._backend == "openai":
+            destroy_api_clients(
+                async_client=self._openai_async_client,
+                runner=self._openai_runner,
+                sync_client=self._openai_client,
+            )
+            self._openai_async_client = None
+            self._openai_runner = None
+            self._openai_client = None
+        elif self._backend == "vllm_async":
+            try:
+                if self._vllm_async_engine is not None:
+                    logger.info("[PerEventCaptionStage] destroy: shutting down AsyncLLM engine")
+                    self._vllm_async_engine.shutdown()  # type: ignore[no-untyped-call]
+                    self._vllm_async_engine = None
+                self._vllm_async_processor = None
+                if self._vllm_async_runner is not None:
+                    self._vllm_async_runner.close()
+                    self._vllm_async_runner = None
+            finally:
+                gpu_stage_cleanup(self.__class__.__name__)
 
     @nvtx.annotate("PerEventCaptionStage")  # type: ignore[untyped-decorator]
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask]:  # type: ignore[override]

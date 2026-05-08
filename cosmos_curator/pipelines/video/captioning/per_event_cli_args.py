@@ -25,6 +25,8 @@ import pathlib
 
 from loguru import logger
 
+from cosmos_curator.pipelines.video.captioning.vllm_async_config import add_vllm_async_cli_args
+
 
 def add_event_caption_args(
     parser: argparse.ArgumentParser,
@@ -76,11 +78,17 @@ def add_event_caption_args(
         "--event-caption-backend",
         type=str,
         default="qwen",
-        choices=["qwen", "gemini"],
+        choices=["qwen", "gemini", "openai", "vllm_async"],
         help=(
             "VLM backend: 'qwen' runs Qwen-VL locally on a GPU (default, no API key); "
             "'gemini' calls the remote Gemini API and requires a gemini.api_key entry "
-            "in the project config."
+            "in the project config; 'openai' calls any OpenAI-compatible chat-completion "
+            "endpoint configured under openai.<endpoint_key> in the project config "
+            "(--event-caption-openai-endpoint-key, default 'caption'); 'vllm_async' boots "
+            "an in-process AsyncLLM engine for any HF model id supported by vLLM "
+            "(including Qwen3-VL-235B-A22B-Instruct[-FP8] with TP/DP). "
+            "Per-event vllm_async flags are namespaced as --event-caption-vllm-async-* to "
+            "avoid colliding with the per-window captioner's --vllm-async-* flags."
         ),
     )
     parser.add_argument(
@@ -186,6 +194,61 @@ def add_event_caption_args(
             "(old default 4096) caused mid-event truncation; raise to 24000+ for dense clips."
         ),
     )
+    parser.add_argument(
+        "--event-caption-openai-model-name",
+        type=str,
+        default="auto",
+        help=(
+            "Model name passed in OpenAI-compatible chat-completion requests. "
+            "'auto' (default) queries /v1/models and picks the first entry."
+        ),
+    )
+    parser.add_argument(
+        "--event-caption-openai-max-output-tokens",
+        type=int,
+        default=8192,
+        help="max_tokens sent in OpenAI-compatible requests. Too small truncates dense clips.",
+    )
+    parser.add_argument(
+        "--event-caption-openai-max-retries",
+        type=int,
+        default=3,
+        help="Max retries per clip for transient OpenAI errors (5xx, timeouts).",
+    )
+    parser.add_argument(
+        "--event-caption-openai-retry-delay-seconds",
+        type=float,
+        default=1.0,
+        help="Fixed delay between OpenAI retry attempts.",
+    )
+    parser.add_argument(
+        "--event-caption-openai-endpoint-key",
+        type=str,
+        default="caption",
+        choices=("caption", "enhance", "filter", "classifier"),
+        help=(
+            "Which openai.<key> block in the project config to read api_key/base_url from. "
+            "Default 'caption' reuses the existing per-window captioner endpoint; pick a "
+            "different slot ('enhance', 'filter', 'classifier') to point per-event at a "
+            "separate endpoint without touching OpenAIConfig."
+        ),
+    )
+    parser.add_argument(
+        "--event-caption-vllm-async-sampling-fps",
+        type=float,
+        default=2.0,
+        help=(
+            "Sampling fps used to decode the annotated mp4 before feeding it to the "
+            "vllm_async engine. Higher = more vision tokens per clip."
+        ),
+    )
+    parser.add_argument(
+        "--event-caption-vllm-async-max-output-tokens",
+        type=int,
+        default=4096,
+        help="max_tokens for the per-event vllm_async generate request.",
+    )
+    add_vllm_async_cli_args(parser, prefix="event-caption-")
 
 
 def resolve_event_caption_prompt(args: argparse.Namespace) -> str | None:

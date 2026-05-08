@@ -70,6 +70,7 @@ from cosmos_curator.pipelines.video.captioning.per_event_cli_args import (
     resolve_event_caption_prompt,
 )
 from cosmos_curator.pipelines.video.captioning.vllm_async_config import (
+    VllmAsyncConfig,
     add_vllm_async_cli_args,
     build_vllm_async_config,
 )
@@ -834,6 +835,37 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
 
     # --- Per-event VLM captioning (optional) ---
     if args.event_captioning:
+        event_vllm_async_config: VllmAsyncConfig | None = None
+        if args.event_caption_backend == "vllm_async":
+            # Apply the same multi-GPU floor the per-window vllm_async path
+            # exposes. Mutates args in place because build_vllm_async_config
+            # reads num_gpus off the namespace; harmless because the same
+            # CLI args are not reused after this point.
+            event_variant = args.event_caption_vllm_async_model_name
+            current_num_gpus = args.event_caption_vllm_async_num_gpus or 1.0
+            clamped = _clamp_num_gpus_for_qwen3_235b(event_variant, int(current_num_gpus))
+            args.event_caption_vllm_async_num_gpus = float(clamped)
+
+            # Build a sampling config from the same global --vllm-sampling-*
+            # flags used by the per-window captioner so per-event vllm_async
+            # picks up the user's temperature / top_p / top_k overrides.
+            event_max_tokens: int | None = args.captioning_max_output_tokens
+            if event_max_tokens is not None and event_max_tokens < 0:
+                event_max_tokens = None
+            event_sampling_config = VllmSamplingConfig(
+                temperature=args.vllm_sampling_temperature,
+                top_p=args.vllm_sampling_top_p,
+                top_k=args.vllm_sampling_top_k,
+                repetition_penalty=args.vllm_sampling_repetition_penalty,
+                presence_penalty=args.vllm_sampling_presence_penalty,
+                frequency_penalty=args.vllm_sampling_frequency_penalty,
+                min_p=args.vllm_sampling_min_p,
+                min_tokens=args.vllm_sampling_min_tokens,
+                max_tokens=event_max_tokens,
+            )
+            event_vllm_async_config = build_vllm_async_config(
+                args, sampling_config=event_sampling_config, prefix="event-caption-"
+            )
         stages.append(
             PerEventCaptionStage(
                 backend=args.event_caption_backend,
@@ -849,6 +881,14 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 gemini_media_resolution=args.event_caption_gemini_media_resolution,
                 gemini_thinking_budget=args.event_caption_gemini_thinking_budget,
                 gemini_max_output_tokens=args.event_caption_gemini_max_output_tokens,
+                openai_model_name=args.event_caption_openai_model_name,
+                openai_max_output_tokens=args.event_caption_openai_max_output_tokens,
+                openai_max_retries=args.event_caption_openai_max_retries,
+                openai_retry_delay_seconds=args.event_caption_openai_retry_delay_seconds,
+                openai_endpoint_key=args.event_caption_openai_endpoint_key,
+                vllm_async_config=event_vllm_async_config,
+                vllm_async_sampling_fps=args.event_caption_vllm_async_sampling_fps,
+                vllm_async_max_output_tokens=args.event_caption_vllm_async_max_output_tokens,
                 verbose=args.verbose,
                 log_stats=args.perf_profile,
             )

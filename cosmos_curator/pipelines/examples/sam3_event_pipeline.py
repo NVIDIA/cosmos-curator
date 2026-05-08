@@ -59,6 +59,10 @@ from cosmos_curator.pipelines.video.captioning.per_event_cli_args import (
     add_event_caption_args,
     resolve_event_caption_prompt,
 )
+from cosmos_curator.pipelines.video.captioning.vllm_async_config import (
+    VllmAsyncConfig,
+    build_vllm_async_config,
+)
 from cosmos_curator.pipelines.video.tracking.cli_args import add_sam3_args
 from cosmos_curator.pipelines.video.tracking.sam3_bbox_stage import SAM3QualityConfig
 from cosmos_curator.pipelines.video.tracking.serialization import (
@@ -70,7 +74,13 @@ from cosmos_curator.pipelines.video.tracking.tracking_builders import (
     SAM3TrackingConfig,
     build_sam3_tracking_stages,
 )
-from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
+from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video, VllmSamplingConfig
+
+# Per-event vllm_async clamps to >=4 GPUs for both Qwen3-VL-235B variants. We
+# replicate just the warning here (the actual clamp helper lives in the
+# splitting pipeline; lifting it is out of scope for this example).
+_QWEN3_VL_235B_VARIANTS: frozenset[str] = frozenset({"qwen3_vl_235b", "qwen3_vl_235b_fp8"})
+_QWEN3_VL_235B_MIN_GPUS: int = 4
 
 _RECOMMENDED_MAX_CLIP_DURATION_S = 30.0
 
@@ -222,6 +232,23 @@ def _assemble_stages(args: argparse.Namespace) -> list[CuratorStage | CuratorSta
         )
     )
     if args.event_captioning:
+        event_vllm_async_config: VllmAsyncConfig | None = None
+        if args.event_caption_backend == "vllm_async":
+            variant = args.event_caption_vllm_async_model_name
+            num_gpus = args.event_caption_vllm_async_num_gpus or 1.0
+            if variant in _QWEN3_VL_235B_VARIANTS and num_gpus < _QWEN3_VL_235B_MIN_GPUS:
+                logger.warning(
+                    "Per-event vllm_async variant {!r} typically needs at least {} GPUs; "
+                    "got --event-caption-vllm-async-num-gpus={}. Increase the flag if the "
+                    "engine fails to fit weights.",
+                    variant,
+                    _QWEN3_VL_235B_MIN_GPUS,
+                    num_gpus,
+                )
+            event_sampling_config = VllmSamplingConfig()
+            event_vllm_async_config = build_vllm_async_config(
+                args, sampling_config=event_sampling_config, prefix="event-caption-"
+            )
         caption_stage = PerEventCaptionStage(
             backend=args.event_caption_backend,
             prompt_text=resolve_event_caption_prompt(args),
@@ -236,16 +263,33 @@ def _assemble_stages(args: argparse.Namespace) -> list[CuratorStage | CuratorSta
             gemini_media_resolution=args.event_caption_gemini_media_resolution,
             gemini_thinking_budget=args.event_caption_gemini_thinking_budget,
             gemini_max_output_tokens=args.event_caption_gemini_max_output_tokens,
+            openai_model_name=args.event_caption_openai_model_name,
+            openai_max_output_tokens=args.event_caption_openai_max_output_tokens,
+            openai_max_retries=args.event_caption_openai_max_retries,
+            openai_retry_delay_seconds=args.event_caption_openai_retry_delay_seconds,
+            openai_endpoint_key=args.event_caption_openai_endpoint_key,
+            vllm_async_config=event_vllm_async_config,
+            vllm_async_sampling_fps=args.event_caption_vllm_async_sampling_fps,
+            vllm_async_max_output_tokens=args.event_caption_vllm_async_max_output_tokens,
             verbose=args.verbose,
         )
-        # Pin Gemini to 1 worker x 1 slot so we don't exceed its per-minute
-        # quota; Qwen is local and runs at default concurrency.
-        if args.event_caption_backend == "gemini":
+        # Pin remote-API backends (Gemini, OpenAI) to 1 worker x 1 slot so we
+        # don't exceed per-minute quotas; the in-process backends (Qwen,
+        # vllm_async) run at default concurrency.
+        if args.event_caption_backend in ("gemini", "openai"):
             stages.append(
                 CuratorStageSpec(
                     caption_stage,
                     num_workers_per_node=1,
                     slots_per_actor=1,
+                )
+            )
+        elif args.event_caption_backend == "vllm_async":
+            # vllm_async owns its own GPUs and shouldn't fight SAM3 for them.
+            stages.append(
+                CuratorStageSpec(
+                    caption_stage,
+                    num_workers_per_node=1,
                 )
             )
         else:
