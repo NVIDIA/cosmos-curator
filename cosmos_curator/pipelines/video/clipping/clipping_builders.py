@@ -139,20 +139,17 @@ def build_fixed_stride_split_stages(config: FixedStrideSplitConfig) -> list[Cura
 def build_transcode_stages(config: TranscodeConfig) -> list[CuratorStage | CuratorStageSpec]:
     """Construct and return the clip transcoding stage."""
     return [
-        CuratorStageSpec(
-            ClipTranscodingStage(
-                num_cpus_per_worker=config.num_cpus_per_worker,
-                encoder=config.encoder,
-                encoder_threads=config.encoder_threads,
-                encode_batch_size=config.encode_batch_size,
-                use_hwaccel=config.use_hwaccel,
-                use_input_bit_rate=config.use_input_bit_rate,
-                num_clips_per_chunk=config.num_clips_per_chunk,
-                max_output_frames=config.max_output_frames,
-                verbose=config.verbose,
-                log_stats=config.perf_profile,
-            ),
-            over_provision_factor=2.0,
+        ClipTranscodingStage(
+            num_cpus_per_worker=config.num_cpus_per_worker,
+            encoder=config.encoder,
+            encoder_threads=config.encoder_threads,
+            encode_batch_size=config.encode_batch_size,
+            use_hwaccel=config.use_hwaccel,
+            use_input_bit_rate=config.use_input_bit_rate,
+            num_clips_per_chunk=config.num_clips_per_chunk,
+            max_output_frames=config.max_output_frames,
+            verbose=config.verbose,
+            log_stats=config.perf_profile,
         ),
     ]
 

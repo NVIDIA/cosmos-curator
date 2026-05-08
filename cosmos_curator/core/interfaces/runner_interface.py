@@ -98,7 +98,6 @@ class XennaRunner(RunnerInterface):
             max_queued_lower_bound=16,
             autoscaler_verbosity_level=VerbosityLevel.NONE,
             executor_verbosity_level=VerbosityLevel.NONE,
-            enable_backlog_aware_scaledown=True,
         )
 
     @classmethod
