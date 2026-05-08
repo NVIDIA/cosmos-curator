@@ -1,3 +1,37 @@
+// Minimal markdown renderer — supports headings, bold, bullet lists, and paragraphs.
+// Replaces the marked.min.js CDN dependency to avoid external network requests.
+function renderMarkdown(text) {
+    const lines = text.split('\n');
+    let html = '';
+    let inList = false;
+    for (const raw of lines) {
+        const line = raw.trimEnd();
+        const heading = line.match(/^(#{1,6})\s+(.+)$/);
+        if (heading) {
+            if (inList) { html += '</ul>'; inList = false; }
+            const level = heading[1].length;
+            html += `<h${level}>${inlineMd(heading[2])}</h${level}>`;
+        } else if (/^[-*]\s+/.test(line)) {
+            if (!inList) { html += '<ul>'; inList = true; }
+            html += `<li>${inlineMd(line.replace(/^[-*]\s+/, ''))}</li>`;
+        } else if (line === '') {
+            if (inList) { html += '</ul>'; inList = false; }
+        } else {
+            if (inList) { html += '</ul>'; inList = false; }
+            html += `<p>${inlineMd(line)}</p>`;
+        }
+    }
+    if (inList) html += '</ul>';
+    return html;
+}
+
+function inlineMd(text) {
+    return text
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/`(.+?)`/g, '<code>$1</code>');
+}
+
 async function fetchClipNames() {
     const response = await fetch('/list_clips');
     console.log('Fetching clip names via HTTP from:', 'http://localhost:8080/list_clips');
@@ -92,7 +126,7 @@ function createTimestampElement(startTime, endTime) {
     return container;
 }
 
-(async function() {
+(async function () {
     try {
         const content = document.getElementById('content');
         const clipNames = await fetchClipNames();
@@ -155,7 +189,7 @@ function createTimestampElement(startTime, endTime) {
             title.textContent = "Caption";
 
             const paragraph = document.createElement('div');
-            paragraph.innerHTML = marked.parse(captionText);
+            paragraph.innerHTML = renderMarkdown(captionText);
 
             captionContent.appendChild(title);
             captionContent.appendChild(paragraph);
