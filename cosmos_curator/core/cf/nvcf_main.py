@@ -22,6 +22,7 @@ import multiprocessing
 import os
 import pathlib
 import pickle
+import re
 import socket
 import subprocess
 import sys
@@ -70,6 +71,7 @@ _LOG_RDWR_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status.loc
 _PIPELINE_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline.lock"
 _PIPELINE_STATUS_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status"
 _FORCE_TERMINATE_REQUEST_ID = "12345678-1234-1234-1234-123456789abc"
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 _RAY_DASHBOARD = f"http://127.0.0.1:{os.getenv('RAY_DASHBOARD_PORT', '8265')}"
 _METRICS_PORT = 9002
@@ -97,6 +99,13 @@ def _cleanup_pipeline_lock_files() -> None:
 
 def _value_error(msg: str) -> None:
     raise ValueError(msg)
+
+
+def _validate_request_id(req_id: str) -> str:
+    if not _REQUEST_ID_PATTERN.fullmatch(req_id):
+        error_msg = "request_id must contain only letters, numbers, dots, underscores, or hyphens"
+        raise ValueError(error_msg)
+    return req_id
 
 
 def _setup_request(
@@ -149,19 +158,19 @@ def _get_request_status(req_id: str) -> str:
 
 
 def _get_progress_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"progress_{req_id}.json"
+    return pathlib.Path(tempfile.gettempdir()) / f"progress_{_validate_request_id(req_id)}.json"
 
 
 def _get_log_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"logs_{req_id}.txt"
+    return pathlib.Path(tempfile.gettempdir()) / f"logs_{_validate_request_id(req_id)}.txt"
 
 
 def _get_done_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"done_{req_id}.txt"
+    return pathlib.Path(tempfile.gettempdir()) / f"done_{_validate_request_id(req_id)}.txt"
 
 
 def _get_failed_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"failed_{req_id}.txt"
+    return pathlib.Path(tempfile.gettempdir()) / f"failed_{_validate_request_id(req_id)}.txt"
 
 
 # returns a dict (job_id/submission_id, (type, status, message))
@@ -409,7 +418,83 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
         buffer.seek(0)
         return buffer
 
-    async def dispatch(  # noqa: PLR0911
+    @staticmethod
+    def _validate_curator_request_id(
+        req_id: str | None, missing_message: str
+    ) -> tuple[str | None, JSONResponse | None]:
+        if req_id is None:
+            return None, JSONResponse(
+                status_code=400,
+                content={"error": missing_message},
+                media_type="application/json",
+            )
+        try:
+            return _validate_request_id(req_id), None
+        except ValueError as e:
+            return None, JSONResponse(status_code=400, content={"error": str(e)})
+
+    def _handle_termination_request(self, request: Request) -> Response:
+        req_id, error_response = self._validate_curator_request_id(
+            request.headers.get("CURATOR-NVCF-REQID"),
+            "Missing request id",
+        )
+        if error_response is not None:
+            return error_response
+        assert req_id is not None
+
+        logger.warning(f"Termination request for {req_id} received")
+        code = 200
+        status = "status"
+        try:
+            success, msg = _terminate_last_job(req_id)
+            if success:
+                msg = f"{req_id} terminated successfully"
+            else:
+                msg = f"{req_id} could not be terminated"
+                code = 412
+                status = "error"
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            code = 412
+            status = "error"
+        logger.info(f"Termination state of {req_id} : {msg}")
+        hdrs = {
+            "CURATOR-TERM-STATUS": msg,
+            "ACCESS-CONTROL-EXPOSE-HEADERS": "CURATOR-TERM-STATUS",
+        }
+        return JSONResponse(
+            status_code=code,
+            content={status: msg},
+            headers=hdrs,
+        )
+
+    def _handle_status_check(self, request: Request) -> Response:
+        req_id, error_response = self._validate_curator_request_id(
+            request.headers.get("CURATOR-NVCF-REQID"),
+            "Missing request ID in headers",
+        )
+        if error_response is not None:
+            return error_response
+        assert req_id is not None
+
+        logger.info(f"Received status check for request {req_id}")
+        progress_pct, log_lines = _read_progress_and_log_files(req_id)
+        status_str = _get_request_status(req_id)
+
+        logger.debug(
+            f"Progress for request {req_id}: {status_str=} {progress_pct}",
+        )
+        buffer = self._create_zip_file(req_id, progress_pct, log_lines)
+        zresponse = StreamingResponse(buffer, media_type="application/zip")
+        zresponse.headers["Content-Disposition"] = "attachment; filename=files.zip"
+        zresponse.headers["CURATOR-PIPELINE-STATUS"] = status_str
+        zresponse.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] = f"{progress_pct:.2f}"
+        zresponse.headers["access-control-expose-headers"] = (
+            "CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"
+        )
+        return zresponse
+
+    async def dispatch(
         self,
         request: Request,
         call_next: RequestResponseEndpoint,
@@ -426,67 +511,10 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
         """
         if request.url.path == "/v1/run_pipeline":
             if request.headers.get("CURATOR-REQ-TERMINATE", ""):
-                # Note, it can terminate only last request regardless of the request-id
-                req_id = request.headers.get("CURATOR-NVCF-REQID", None)
-                logger.warning(f"Termination request for {req_id} received")
-                code = 200
-                status = "status"
-                if req_id is not None:
-                    try:
-                        success, msg = _terminate_last_job(req_id)
-                        if success:
-                            msg = f"{req_id} terminated successfully"
-                        else:
-                            msg = f"{req_id} could not be terminated"
-                            code = 412
-                            status = "error"
-                    except Exception as e:  # noqa: BLE001
-                        msg = str(e)
-                        code = 412
-                        status = "error"
-                    logger.info(f"Termination state of {req_id} : {msg}")
-                    hdrs = {
-                        "CURATOR-TERM-STATUS": msg,
-                        "ACCESS-CONTROL-EXPOSE-HEADERS": "CURATOR-TERM-STATUS",
-                    }
-                    return JSONResponse(
-                        status_code=code,
-                        content={status: msg},
-                        headers=hdrs,
-                    )
-                logger.error("Cannot terminate when missing request id")
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Missing request id"},
-                    media_type="application/json",
-                )
+                return self._handle_termination_request(request)
             # status check request
             if request.headers.get("CURATOR-STATUS-CHECK", "") and not using_nvcf_status["get_req_sts"]:
-                req_id = request.headers.get("CURATOR-NVCF-REQID", None)
-                logger.info(f"Received status check for request {req_id}")
-                if req_id is None:
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": "Missing request ID in headers"},
-                    )
-                # read progress and log files
-                progress_pct, log_lines = _read_progress_and_log_files(req_id)
-                status_str = _get_request_status(req_id)
-
-                logger.debug(
-                    f"Progress for request {req_id}: {status_str=} {progress_pct}",
-                )
-                # create a zip file with logs in buffer
-                buffer = self._create_zip_file(req_id, progress_pct, log_lines)
-                # return the zip file as response
-                zresponse = StreamingResponse(buffer, media_type="application/zip")
-                zresponse.headers["Content-Disposition"] = "attachment; filename=files.zip"
-                zresponse.headers["CURATOR-PIPELINE-STATUS"] = status_str
-                zresponse.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] = f"{progress_pct:.2f}"
-                zresponse.headers["access-control-expose-headers"] = (
-                    "CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"
-                )
-                return zresponse
+                return self._handle_status_check(request)
 
             # real pipeline request
             if self._is_pipeline_busy():
@@ -571,6 +599,10 @@ def get_logs(request_id: str) -> JSONResponse:
             status_code=400,
             content={"error": "Missing request_id parameter"},
         )
+    try:
+        request_id = _validate_request_id(request_id)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
     try:
         progress_pct, log_lines = _read_progress_and_log_files(request_id)
@@ -606,6 +638,10 @@ def get_progress(request_id: str) -> JSONResponse:
             status_code=400,
             content={"error": "Missing request_id parameter"},
         )
+    try:
+        request_id = _validate_request_id(request_id)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
     try:
         progress_pct, _ = _read_progress_and_log_files(request_id)
@@ -702,6 +738,10 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         if request_id is None:
             logger.warning("NVCF-REQID is missing, generating fake request-id")
             request_id = str(uuid.uuid4())  # Generate a fake request-id
+        try:
+            request_id = _validate_request_id(request_id)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
 
         logger.info(f"Request ID: {request_id}")
         output_dir = nvcf_output_dir if using_nvcf_status["get_req_sts"] else None
@@ -861,7 +901,7 @@ def _run_in_process(
     for additional info
     """
     # Create the script dynamically
-    sfile = pathlib.Path(tempfile.gettempdir()) / f"{request_id}.py"
+    sfile = pathlib.Path(tempfile.gettempdir()) / f"{_validate_request_id(request_id)}.py"
     with sfile.open("w") as sf:
         sf.write(f"""
 import sys

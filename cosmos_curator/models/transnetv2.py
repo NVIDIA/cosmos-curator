@@ -562,7 +562,7 @@ class TransNetV2(ModelInterface):
         if not model_file.exists():
             error_msg = f"{model_file} not found!"
             raise FileNotFoundError(error_msg)
-        state_dict = torch.load(model_file.as_posix())
+        state_dict = torch.load(model_file.as_posix(), weights_only=True)
         self._model.load_state_dict(state_dict)
         self._model.eval().cuda()
 

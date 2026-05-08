@@ -353,6 +353,32 @@ class TestSubmitCurationJob:
         EXPECTED_SBATCH_CALL_COUNT = 1
         assert len(sbatch_calls) == EXPECTED_SBATCH_CALL_COUNT
 
+    def test_curator_submit_quotes_remote_paths(self, mock_connection: Mock, job_spec: SlurmJobSpec) -> None:
+        """Quote remote paths passed through shell commands."""
+        job_spec.remote_job_path = pathlib.Path("/remote/files/test job;touch bad")
+        conn = mock_connection.return_value
+
+        failed_result = Mock()
+        failed_result.exited = 1
+        unexpected_exit = invoke.exceptions.UnexpectedExit(result=failed_result)
+        success_result = Mock()
+        success_result.stdout = "Submitted batch job 12345"
+        conn.run.side_effect = [
+            Mock(),
+            unexpected_exit,
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            success_result,
+        ]
+
+        curator_submit(job_spec)
+
+        commands = [call_args.args[0] for call_args in conn.run.call_args_list]
+        assert "mkdir -p '/remote/files/test job;touch bad'" in commands
+        assert "sbatch '/remote/files/test job;touch bad/sbatch.sh'" in commands
+
 
 class TestMountSpec:
     """Test the mount spec class."""

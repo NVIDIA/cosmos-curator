@@ -377,7 +377,7 @@ def test_reduce_t5_model_weights_filters_encoder(monkeypatch: pytest.MonkeyPatch
             self.loaded += 1
             assert path == src
             assert map_location == "cpu"
-            assert weights_only is False
+            assert weights_only is True
             return {
                 "encoder.layer1": "enc",
                 "decoder.layer1": "dec",

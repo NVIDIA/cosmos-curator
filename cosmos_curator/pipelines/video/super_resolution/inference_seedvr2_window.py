@@ -274,7 +274,7 @@ def _write_video_streaming_from_segments_u8(
     overlap_frames = max(0, int(overlap_frames))
 
     def _load_u8(path: str) -> torch.Tensor:
-        t = torch.load(path, map_location="cpu")
+        t = torch.load(path, map_location="cpu", weights_only=True)
         if not torch.is_tensor(t):
             raise TypeError(f"Expected a torch Tensor in {path}, got {type(t)}")
         if t.dtype != torch.uint8:
@@ -602,8 +602,8 @@ def generation_loop(
 
         pos_path = _find_asset("pos_emb.pt")
         neg_path = _find_asset("neg_emb.pt")
-        text_pos_embeds = torch.load(str(pos_path), map_location="cpu")
-        text_neg_embeds = torch.load(str(neg_path), map_location="cpu")
+        text_pos_embeds = torch.load(str(pos_path), map_location="cpu", weights_only=True)
+        text_neg_embeds = torch.load(str(neg_path), map_location="cpu", weights_only=True)
         return {"texts_pos": [text_pos_embeds], "texts_neg": [text_neg_embeds]}
 
     positive_prompts_embeds = []

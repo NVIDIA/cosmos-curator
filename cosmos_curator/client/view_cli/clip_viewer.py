@@ -17,17 +17,20 @@
 
 import contextlib
 import json
+import posixpath
 import shutil
 import tempfile
 import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Annotated, ClassVar, override
+from urllib.parse import unquote, urlsplit
 
 from loguru import logger
 from typer import Option
 
 from cosmos_curator.client.utils.validations import validate_address, validate_in
+from cosmos_curator.core.utils.storage.zip_utils import safe_extract_zip
 
 
 class HttpServerHandler(SimpleHTTPRequestHandler):
@@ -102,12 +105,18 @@ class HttpServerHandler(SimpleHTTPRequestHandler):
             The absolute path to serve
 
         """
-        # If path starts with /, strip it
-        if path[0] == "/":
-            path = path[1:]
-        # If path starts with /clips or /metas, serve from base_dir
-        # Otherwise serve from web_dir (where index.html is)
-        abs_path = Path(self.base_dir) / path if path.startswith(("clips", "metas")) else Path(self.web_dir) / path
+        url_path = posixpath.normpath(unquote(urlsplit(path).path))
+        path_parts = [part for part in url_path.split("/") if part]
+
+        root = (
+            Path(self.base_dir).resolve() if path_parts[:1] in (["clips"], ["metas"]) else Path(self.web_dir).resolve()
+        )
+        abs_path = (root.joinpath(*path_parts) if path_parts else root).resolve()
+        try:
+            abs_path.relative_to(root)
+        except ValueError as exc:
+            msg = f"Refusing to serve path outside root: {path}"
+            raise PermissionError(msg) from exc
         logger.info(f"Serving {abs_path}")
         return str(abs_path)
 
@@ -148,6 +157,9 @@ class HttpServerHandler(SimpleHTTPRequestHandler):
                     logger.debug("Broken pipe during file transfer")
                 except ConnectionAbortedError:
                     logger.debug("Connection aborted during file transfer")
+                except PermissionError as e:
+                    logger.warning(f"Rejected file request: {e}")
+                    self.send_error(403, str(e))
         except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.exception(f"Error handling GET request: {e}")
             # If we can't even send the error, just ignore it
@@ -293,9 +305,9 @@ def clip_viewer(
         clip_path_temp = tempfile.mkdtemp()
         try:
             with zipfile.ZipFile(zip_file, "r") as zip_ref:
-                zip_ref.extractall(clip_path_temp)
+                safe_extract_zip(zip_ref, clip_path_temp)
             logger.info(f"Extracted zip file to {clip_path_temp}")
-        except (FileNotFoundError, zipfile.BadZipFile, PermissionError, OSError) as e:
+        except (FileNotFoundError, ValueError, zipfile.BadZipFile, PermissionError, OSError) as e:
             logger.exception(f"Failed to extract zip file: {e}")
             return
         clip_path = Path(clip_path_temp)

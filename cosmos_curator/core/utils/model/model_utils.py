@@ -656,7 +656,7 @@ def _reduce_t5_model_weights(destination: pathlib.Path) -> None:
     logger.info("Reducing T5 model weight size...")
 
     try:
-        model = torch.load(src, map_location="cpu", weights_only=False)
+        model = torch.load(src, map_location="cpu", weights_only=True)
 
         # Extract encoder weights
         encoder = collections.OrderedDict(

@@ -35,6 +35,7 @@ from cosmos_curator.core.cf import nvcf_main
 
 # HTTP status codes
 HTTP_OK = 200
+HTTP_BAD_REQUEST = 400
 HTTP_PRECONDITION_FAILED = 412
 HTTP_UNPROCESSABLE_ENTITY = 422
 HTTP_INTERNAL_SERVER_ERROR = 500
@@ -98,6 +99,11 @@ class TestHelperFunctions:
         """Test _value_error raises ValueError."""
         with pytest.raises(ValueError, match="test error"):
             nvcf_main._value_error("test error")
+
+    def test_request_id_rejects_path_separators(self) -> None:
+        """Reject request IDs before using them in temp-file paths."""
+        with pytest.raises(ValueError, match="request_id"):
+            nvcf_main._get_progress_file("../escape")
 
 
 class TestRequestStatus:
@@ -602,6 +608,33 @@ class TestFastAPIEndpoints:
                     assert response.status_code == HTTP_OK
                     assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
                     assert "CURATOR-PIPELINE-PERCENT-COMPLETE" in response.headers
+
+    @pytest.mark.parametrize(
+        ("method", "path", "request_kwargs"),
+        [
+            ("GET", "/v1/logs", {"params": {"request_id": "../escape"}}),
+            ("GET", "/v1/progress", {"params": {"request_id": "../escape"}}),
+            (
+                "POST",
+                "/v1/run_pipeline",
+                {"headers": {"CURATOR-STATUS-CHECK": "true", "CURATOR-NVCF-REQID": "../escape"}},
+            ),
+            (
+                "POST",
+                "/v1/run_pipeline",
+                {"headers": {"CURATOR-REQ-TERMINATE": "true", "CURATOR-NVCF-REQID": "../escape"}},
+            ),
+        ],
+    )
+    def test_request_id_entrypoints_reject_invalid_request_ids(
+        self, test_client: TestClient, method: str, path: str, request_kwargs: dict[str, object]
+    ) -> None:
+        """Test externally supplied request IDs are rejected at the HTTP boundary."""
+        with patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": False}):
+            response = test_client.request(method, path, **request_kwargs)
+
+            assert response.status_code == HTTP_BAD_REQUEST
+            assert "request_id" in response.json()["error"]
 
 
 class TestProcessExecution:

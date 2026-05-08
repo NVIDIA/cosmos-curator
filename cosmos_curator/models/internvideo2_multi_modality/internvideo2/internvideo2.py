@@ -765,7 +765,7 @@ def pretrain_internvideo2_6b_patch14_224(config):
 
     if config.vision_encoder.pretrained is not None:
         logger.info(f"Loading pretrained weights from {config.vision_encoder.pretrained}")
-        state_dict = torch.load(config.vision_encoder.pretrained, map_location="cpu")
+        state_dict = torch.load(config.vision_encoder.pretrained, map_location="cpu", weights_only=True)
         interpolate_pos_embed_internvideo2(state_dict, model, orig_t_size=8)
         msg = model.load_state_dict(state_dict, strict=False)
         logger.info(msg)

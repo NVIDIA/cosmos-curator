@@ -53,6 +53,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     get_files_relative,
     get_storage_client,
 )
+from cosmos_curator.core.utils.storage.zip_utils import safe_extract_zip
 from cosmos_curator.pipelines.video.read_write.summary_writers import (
     _write_all_window_captions,
 )
@@ -140,7 +141,7 @@ def _download_and_extract_zip_single_node(
 
     logger.info(f"Extracting {zip_path} …")
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
+        safe_extract_zip(zf, extract_dir)
     logger.info("Extraction completed.")
 
     # Heuristic: if the archive contains a single top-level directory, return
@@ -430,7 +431,7 @@ def _download_and_extract_zip_impl(presigned_url: str, base_tmp_dir: str) -> str
     logger.info("Extracting downloaded archive …")
     with zipfile.ZipFile(zip_path, "r") as zf:
         safe_members = [m for m in zf.namelist() if "__MACOSX" not in m]
-        zf.extractall(extract_dir, members=safe_members)
+        safe_extract_zip(zf, extract_dir, members=safe_members)
 
     # If the archive contains a single top-level directory, return that; else the extraction dir
     top_items = list(extract_dir.iterdir())
@@ -548,7 +549,7 @@ def _extract_zip_bytes(buf: bytes, dest_dir: str) -> None:
         tmp.write(buf)
         tmp_path = Path(tmp.name)
     with zipfile.ZipFile(tmp_path, "r") as zf:
-        zf.extractall(dest_dir)
+        safe_extract_zip(zf, dest_dir)
     tmp_path.unlink(missing_ok=True)
 
 

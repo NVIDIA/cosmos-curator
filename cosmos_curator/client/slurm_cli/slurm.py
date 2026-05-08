@@ -18,6 +18,7 @@ import logging
 import os
 import pwd
 import re
+import shlex
 import shutil
 import socket
 import tempfile
@@ -44,6 +45,10 @@ _PROM_SVC_DISC_SCRIPT_PATH = Path("prometheus_service_discovery.py")
 _START_RAY = environment.CONTAINER_PATHS_CODE_DIR / "cosmos_curator" / "scripts" / "onto_slurm.py"
 _MAX_FILE_MODE = 0o7777
 _HOME_DIR = Path(os.getenv("REMOTE_HOME_DIR", Path.home()))
+
+
+def _quote_remote_path(path: Path) -> str:
+    return shlex.quote(str(path))
 
 
 class ConnectionProtocol(Protocol):
@@ -407,7 +412,7 @@ def upload_text(connection: ConnectionProtocol, files: list[tuple[str, Path, int
             logger.debug("Uploading %s to %s", tmp_file, remote_path)
 
             connection.put(str(tmp_file), remote=str(remote_path))
-            connection.run(f"chmod {file_mode:o} {remote_path}")
+            connection.run(f"chmod {file_mode:o} {_quote_remote_path(remote_path)}")
 
 
 def remote_path_exists(connection: ConnectionProtocol, path: Path) -> bool:
@@ -423,7 +428,7 @@ def remote_path_exists(connection: ConnectionProtocol, path: Path) -> bool:
     """
     dir_exists = False
     try:
-        dir_exists = connection.run(f"test -e {path}", hide=True).ok
+        dir_exists = connection.run(f"test -e {_quote_remote_path(path)}", hide=True).ok
     except invoke.exceptions.UnexpectedExit as e:
         if e.result.exited != 1:  # test returns 1 when file doesn't exist
             # If exit code is something other than 1, there's another issue
@@ -441,8 +446,9 @@ def create_remote_path(connection: ConnectionProtocol, path: Path, mode: int = 0
         mode (int): The mode to set for the path
 
     """
-    connection.run(f"mkdir -p {path}")
-    connection.run(f"chmod {mode:o} {path}")
+    quoted_path = _quote_remote_path(path)
+    connection.run(f"mkdir -p {quoted_path}")
+    connection.run(f"chmod {mode:o} {quoted_path}")
 
 
 def create_remote_job_path(connection: ConnectionProtocol, job_spec: SlurmJobSpec) -> None:
@@ -516,7 +522,7 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
     ]
 
     upload_text(connection, remote_files)
-    out = connection.run(f"sbatch {remote_sbatch_path}")
+    out = connection.run(f"sbatch {_quote_remote_path(remote_sbatch_path)}")
     return _parse_job_id(out.stdout)
 
 
@@ -539,7 +545,10 @@ def remote_find_job_log_file(connection: ConnectionProtocol, log_dir: Path, job_
         error_message = f"Directory `{log_dir}` does not exist on {connection.host}"
         raise FileNotFoundError(error_message)
 
-    find_result = connection.run(f"find {log_dir} -name '*_{job_id}.log' -type f | head -n 1", hide=True)
+    find_pattern = shlex.quote(f"*_{job_id}.log")
+    find_result = connection.run(
+        f"find {_quote_remote_path(log_dir)} -name {find_pattern} -type f | head -n 1", hide=True
+    )
     if not find_result.stdout.strip():
         error_message = f"No log file found for job ID {job_id} in {log_dir}"
         raise FileNotFoundError(error_message)
@@ -555,7 +564,7 @@ def remote_tail(connection: ConnectionProtocol, file_path: Path) -> None:
         file_path: Path to the file to tail
 
     """
-    cmd: list[str] = ["tail", "-f", str(file_path)]
+    cmd: list[str] = ["tail", "-f", _quote_remote_path(file_path)]
     cmd_str = " ".join(cmd)
     logger.info("Running `%s`, press Ctrl+C to stop", cmd_str)
     connection.run(cmd_str)
