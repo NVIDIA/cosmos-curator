@@ -26,8 +26,7 @@
     - [Find Logs](#find-logs)
     - [Processing Large Video Sets in Batches](#processing-large-video-sets-in-batches)
     - [Developing on Slurm](#developing-on-slurm)
-      - [Add the source-code mount to the `$CONTAINER_MOUNTS`:](#add-the-source-code-mount-to-the-container_mounts)
-      - [Sync source code to the slurm cluster](#sync-source-code-to-the-slurm-cluster)
+      - [Interactive Slurm launcher](#interactive-slurm-launcher)
     - [Speeding up Model Load on Slurm](#speeding-up-model-load-on-slurm)
   - [Launch Pipelines on NVIDIA DGX Cloud](#launch-pipelines-on-nvidia-dgx-cloud)
   - [Launch Pipelines on K8s Cluster (coming soon)](#launch-pipelines-on-k8s-cluster-coming-soon)
@@ -733,39 +732,48 @@ pipeline checks for completed output metadata and skips already-processed videos
 
 ### Developing on Slurm
 
-If you plan to modify or create new pipelines on slurm, it is useful to mount the source code into the container so that you do not need to rebuild the container for every change.
+If you plan to modify or create new pipelines on Slurm, use the interactive launcher from an existing GPU allocation.
+It starts the container through `srun --container-image`, mounts your live checkout into the container, reuses a shared
+cache directory, and sets the common runtime environment variables needed by Slurm-backed Cosmos Curator pipelines.
 
-#### Add the source-code mount to the `$CONTAINER_MOUNTS`:
+#### Interactive Slurm launcher
 
-This will use the source code that is located at `"${SLURM_SOURCE_DIR}/cosmos_curator/"` on the cluster and will override the source that is inside the container.
+Use this path when your cluster supports Pyxis with `srun --container-image`. It is especially useful on clusters where
+direct `enroot start` is not supported from an interactive allocation.
 
-```bash
-source examples/slurm/source_me_source_code_mount.sh
-```
-
-#### Sync source code to the slurm cluster
-
-Again if you have defined `my-slurm-login-01.my-cluster.com` in your `/.ssh/config`, you can simply run
+From a full cluster checkout containing `cosmos_curator/`, `pixi.toml`, and `pixi.lock`, start an interactive GPU
+allocation first, then launch a shell in the container:
 
 ```bash
-./examples/slurm/sync_source_code.sh
+cosmos-curator slurm launch --curator-path . --interactive -- bash
 ```
 
-Otherwise replace `my-slurm-login-01.my-cluster.com` with your real login hostname in the following commands.
+This uses the default image path, workspace path, and cache path. Pass `--container-image`, `--workspace-path`, or
+`--cache-path` only when your cluster uses different locations.
+
+For slim images, the launcher installs the Pixi environments listed in the image's `COSMOS_CURATOR_SLIM_ENVS` before
+starting the shell. To reduce startup time during focused development, warm up only the environments you need:
 
 ```bash
-RCLONE_REMOTE=":sftp,host=my-slurm-login-01.my-cluster.com:"
-ssh my-slurm-login-01.my-cluster.com mkdir -p ${SLURM_SOURCE_DIR}/cosmos_curator/
-rclone copy -P ./cosmos_curator/ ${RCLONE_REMOTE}${SLURM_SOURCE_DIR}/cosmos_curator/
+cosmos-curator slurm launch \
+  --curator-path . \
+  --interactive \
+  --pixi-envs model-download,default,unified \
+  -- bash
 ```
 
-Note that:
+Inside the container, run commands with `pixi run --as-is` so Pixi uses the environments installed during startup:
 
 ```bash
-cosmos-curator slurm submit ...
+cd /opt/cosmos-curator
+pixi run --as-is -e unified python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
-will not sync code from your local machine to the cluster. You'll need to either edit code directly on the cluster, or call the above source-code sync-ing command(s) again.
+Environments not listed with `--pixi-envs` are not installed during startup; install them explicitly inside the
+container before using `pixi run --as-is -e <env> ...`.
+
+The [Interactive Slurm Development Guide](../curator/guides/slurm-interactive.md) documents a manual Enroot workflow for
+clusters where that setup is useful.
 
 ### Speeding up Model Load on Slurm
 

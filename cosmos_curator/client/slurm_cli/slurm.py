@@ -36,6 +36,7 @@ from invoke.context import Context
 from invoke.runners import Result as InvokeResult
 from typer import Argument, Option
 
+from cosmos_curator.client.slurm_cli.slurm_local import launch_cli
 from cosmos_curator.core.utils import environment
 
 logger = logging.getLogger(__name__)
@@ -799,6 +800,7 @@ slurm_cli = typer.Typer(
 )
 
 slurm_cli.command("submit", no_args_is_help=True)(submit_cli)
+slurm_cli.command("launch", no_args_is_help=True)(launch_cli)
 slurm_cli.command("job-log", no_args_is_help=True)(job_log_cli)
 
 

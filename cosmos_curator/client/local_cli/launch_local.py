@@ -45,6 +45,7 @@ from cosmos_curator.client.environment import (
     S3_PROFILE_PATH,
 )
 from cosmos_curator.client.image_cli.image_app import get_image_label
+from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND, command_contains, parse_extra_mounts
 
 cc_client_local = typer.Typer(
     help="Commands for building container image.",
@@ -71,8 +72,6 @@ class LaunchDocker:
     extra_volumes: list[str]  # each entry is HOST_PATH:CONTAINER_PATH
 
 
-_MIN_VOLUME_PARTS = 2
-_MAX_VOLUME_PARTS = 3
 # Stable while we use nvidia/cuda:*-devel-ubuntu*: those base images ship a
 # default `ubuntu:x:1000:1000` entry, so a host UID of 1000 already resolves
 # inside the container and synthesis would only override `ubuntu` with the
@@ -90,21 +89,7 @@ def _parse_extra_volumes(raw: str) -> list[str]:
         typer.BadParameter: If any entry is malformed.
 
     """
-    if not raw:
-        return []
-    volumes: list[str] = []
-    for raw_entry in raw.split(","):
-        stripped = raw_entry.strip()
-        if not stripped:
-            continue
-        parts = stripped.split(":")
-        if len(parts) < _MIN_VOLUME_PARTS or len(parts) > _MAX_VOLUME_PARTS:
-            msg = (
-                f"Invalid volume mount '{stripped}'. Expected HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE"
-            )
-            raise typer.BadParameter(msg)
-        volumes.append(stripped)
-    return volumes
+    return parse_extra_mounts(raw, description="volume mount")
 
 
 @cc_client_local.command(no_args_is_help=True)
@@ -403,8 +388,8 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     """Launch the command inside a local Docker container."""
     if not LOCAL_WORKSPACE_PATH.exists():
         Path(LOCAL_WORKSPACE_PATH).mkdir()
-    is_model_cli = "model_cli" in opts.command
-    is_postgres_cli = "postgres_cli" in opts.command
+    is_model_cli = command_contains(opts.command, "model_cli")
+    is_postgres_cli = command_contains(opts.command, "postgres_cli")
 
     gpus_string = f'"device={opts.gpus}"' if opts.gpus else "all"
 
@@ -481,13 +466,7 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     # Prepend slim-image environment warmup. When COSMOS_CURATOR_SLIM_ENVS is set
     # (slim images only), install the declared environments before running the user command.
     # With --pixi-path this is a fast no-op since environments are already present.
-    _SLIM_WARMUP = (
-        'if [ -n "$COSMOS_CURATOR_SLIM_ENVS" ]; then '
-        'echo "Installing pixi environments: $COSMOS_CURATOR_SLIM_ENVS" && '
-        "pixi install --frozen -e ${COSMOS_CURATOR_SLIM_ENVS//,/ -e }; "
-        "fi"
-    )
-    preamble_parts.append(_SLIM_WARMUP)
+    preamble_parts.append(SLIM_IMAGE_WARMUP_COMMAND)
     container_command = " && ".join(preamble_parts) + f" && {opts.command}"
 
     docker_command_to_print = " ".join([*docker_command, f'"{container_command}"'])
