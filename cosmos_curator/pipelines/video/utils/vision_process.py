@@ -22,17 +22,7 @@ from torchvision import transforms  # type: ignore[import-untyped]
 from torchvision.transforms import InterpolationMode, v2  # type: ignore[import-untyped]
 
 from cosmos_curator.pipelines.video.utils.decoder_utils import decode_video_cpu_frame_ids, get_avg_frame_rate
-
-
-class WindowFrameInfo:
-    """Container for frame window information, storing start and end frame indices.
-
-    This class represents a window of frames in a video, defined by its start and end frame positions.
-    """
-
-    start: int
-    end: int
-
+from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -129,7 +119,7 @@ def read_video_cpu(
         video_path: path to the video support "file://", "http://", "https://" and local path.
         fps: frames per second
         num_frames_to_use: number of frames to use
-        window_range: window range
+        window_range: inclusive frame windows to extract
 
     Returns:
         torch.Tensor: the video tensor with shape (T, C, H, W).
@@ -140,14 +130,14 @@ def read_video_cpu(
     idx_list = []
     frame_counts = []
     for window_frame_info in window_range:
-        total_frames = window_frame_info.end - window_frame_info.start
+        total_frames = window_frame_info.end - window_frame_info.start + 1
         if num_frames_to_use > 0 and num_frames_to_use < total_frames:
             total_frames = num_frames_to_use
-            end_frame_idx = window_frame_info.start + num_frames_to_use
+            end_frame_idx = window_frame_info.start + num_frames_to_use - 1
         else:
             end_frame_idx = window_frame_info.end
         nframes = smart_nframes(fps, total_frames=total_frames, video_fps=video_fps)
-        idx = torch.linspace(window_frame_info.start, end_frame_idx - 1, nframes).round().long().tolist()
+        idx = torch.linspace(window_frame_info.start, end_frame_idx, nframes).round().long().tolist()
         idx_list.extend(idx)
         frame_counts.append(nframes)
 

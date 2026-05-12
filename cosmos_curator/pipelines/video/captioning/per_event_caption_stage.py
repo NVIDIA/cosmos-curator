@@ -101,7 +101,7 @@ if conda_utils.is_running_in_env("unified"):
         get_frame_count,
     )
     from cosmos_curator.pipelines.video.utils.vision_process import fetch_video, read_video_cpu, smart_nframes
-    from cosmos_curator.pipelines.video.utils.windowing_utils import WindowFrameInfo
+    from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
 
 Backend = Literal["qwen", "gemini", "openai", "vllm_async"]
@@ -934,7 +934,7 @@ class PerEventCaptionStage(CuratorStage):
         if total_frames <= 0:
             msg = "clip has 0 decodable frames"
             raise RuntimeError(msg)
-        window_range = [WindowFrameInfo(start=0, end=total_frames)]
+        window_range = [WindowFrameInfo(start=0, end=total_frames - 1)]
         # Variants in ``QWEN_VARIANTS_NEED_RAW_FRAMES`` (Qwen3-VL family)
         # want raw uint8 TCHW + HF's own video processor; everything else
         # uses our 28-aligned float16 ``fetch_video`` path (bfloat16 crashes

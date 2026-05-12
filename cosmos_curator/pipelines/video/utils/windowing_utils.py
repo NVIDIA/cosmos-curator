@@ -16,7 +16,6 @@
 
 import subprocess
 
-import attrs
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -31,20 +30,10 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     WindowConfig,
 )
 from cosmos_curator.pipelines.video.utils.decoder_utils import DEFAULT_TRANSCODE_BITRATE_M, get_frame_count
+from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
 if conda_utils.is_running_in_env("unified"):
     from cosmos_curator.pipelines.video.utils.vision_process import fetch_video
-
-
-@attrs.define
-class WindowFrameInfo:
-    """Container for frame window information, storing start and end frame indices.
-
-    This class represents a window of frames in a video, defined by its start and end frame positions.
-    """
-
-    start: int
-    end: int
 
 
 WINDOW_MIN_FRAMES = 4
@@ -58,8 +47,9 @@ def compute_windows(total_frames: int, window_size: int = 128, remainder_thresho
         window_size: The size of each window in number of frames.
         remainder_threshold: The minimum number of frames required to create a new window from the remainder.
 
-    Yields:
-        Tuple of (start_frame, end_frame) representing each window.
+    Returns:
+        List of ``WindowFrameInfo`` items, each representing an inclusive
+        ``(start_frame, end_frame)`` window.
 
     """
     if not total_frames or total_frames < WINDOW_MIN_FRAMES:

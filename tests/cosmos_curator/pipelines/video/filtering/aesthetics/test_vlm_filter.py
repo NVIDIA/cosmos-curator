@@ -34,7 +34,7 @@ from cosmos_curator.pipelines.video.filtering.aesthetics.aesthetics_builders imp
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video  # type: ignore[import-untyped]
 
 # Fill in after running the classifier GPU test manually to lock in expected classifications.
-EXPECTED_CLASSIFICATIONS: list[str] = ["aerial_footage", "movie/film_scene", "nature_environment"]
+EXPECTED_CLASSIFICATIONS: list[str] = ["movie/film_scene", "nature_environment"]
 
 
 @pytest.fixture
