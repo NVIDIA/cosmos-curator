@@ -15,12 +15,14 @@
 
 """SensorGroup: top-level coordinator for aligned multi-sensor sampling."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from typing import Protocol
 
 from cosmos_curator.core.sensors.data.aligned_frame import AlignedFrame
 from cosmos_curator.core.sensors.data.sensor_data import SensorData
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+
+_MIN_SENSOR_OVERLAP_PARTICIPANTS = 2
 
 
 class Sensor(Protocol):  # pragma: no cover
@@ -45,6 +47,31 @@ class Sensor(Protocol):  # pragma: no cover
         ...
 
 
+def _sensor_overlap(
+    sensor_ranges: Mapping[str, tuple[int, int]],
+    frame_start_ns: int,
+    frame_end_ns: int,
+) -> float:
+    """Return the minimum per-sensor coverage fraction over the frame interval."""
+    if not sensor_ranges:
+        msg = "sensor_ranges must be non-empty"
+        raise ValueError(msg)
+
+    duration_ns = frame_end_ns - frame_start_ns
+    if duration_ns <= 0:
+        msg = f"frame interval duration must be positive, got {frame_start_ns=} {frame_end_ns=}"
+        raise ValueError(msg)
+
+    coverages: list[float] = []
+    for start_ns, end_ns in sensor_ranges.values():
+        overlap_start_ns = max(start_ns, frame_start_ns)
+        overlap_end_ns = min(end_ns, frame_end_ns)
+        covered_ns = max(0, overlap_end_ns - overlap_start_ns)
+        coverages.append(covered_ns / duration_ns)
+
+    return min(coverages)
+
+
 class SensorGroup:
     """Top-level coordinator for aligned multi-sensor sampling.
 
@@ -63,7 +90,10 @@ class SensorGroup:
         The same ``spec`` — including ``spec.policy`` — is passed to every
         sensor generator.  Each sensor enforces the tolerance independently
         via :func:`~cosmos_curator.core.sensors.sampling.sampler.sample_window_indices`.
-        A ``ValueError`` raised by any sensor propagates to the caller
+        When ``spec.policy.sensor_overlap`` is greater than zero, each
+        multi-sensor ``AlignedFrame`` must satisfy that minimum temporal
+        overlap fraction across participating sensor payloads. A ``ValueError``
+        raised by any sensor or policy check propagates to the caller
         unchanged.
     """
 
@@ -108,7 +138,8 @@ class SensorGroup:
             ``AlignedFrame`` for each window in ``spec.grid``.
 
         Raises:
-            ValueError: if any sensor's policy tolerance is exceeded.
+            ValueError: if any sensor's policy tolerance is exceeded, or if
+                the aligned frame overlap is below ``policy.sensor_overlap``.
 
         """
         generators = {name: sensor.sample(spec) for name, sensor in self._sensors.items()}
@@ -118,7 +149,27 @@ class SensorGroup:
                 data = next(gen)
                 if len(data.align_timestamps_ns) > 0:
                     sensor_data[name] = data
-            yield AlignedFrame(
+            frame = AlignedFrame(
                 align_timestamps_ns=window.timestamps_ns,
                 sensor_data=sensor_data,
             )
+            policy = spec.policy
+            if (
+                policy is not None
+                and policy.sensor_overlap > 0.0
+                and len(frame.sensor_data) >= _MIN_SENSOR_OVERLAP_PARTICIPANTS
+            ):
+                sensor_ranges = {
+                    sensor_id: (int(data.sensor_timestamps_ns[0]), int(data.sensor_timestamps_ns[-1]))
+                    for sensor_id, data in frame.sensor_data.items()
+                }
+                frame_start_ns = min(start_ns for start_ns, _end_ns in sensor_ranges.values())
+                frame_end_ns = max(end_ns for _start_ns, end_ns in sensor_ranges.values())
+                if frame_end_ns <= frame_start_ns:
+                    msg = f"frame interval duration must be positive, got {frame_start_ns=} {frame_end_ns=}"
+                    raise ValueError(msg)
+                overlap_score = _sensor_overlap(sensor_ranges, frame_start_ns, frame_end_ns)
+                if overlap_score < policy.sensor_overlap:
+                    msg = f"sensor_overlap {overlap_score:.6f} is below required threshold {policy.sensor_overlap:.6f}"
+                    raise ValueError(msg)
+            yield frame

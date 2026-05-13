@@ -66,6 +66,39 @@ class _FakeSensor:
             )
 
 
+class _FixedWindowSensor:
+    """Sensor that yields precomputed sensor timestamps for each grid window."""
+
+    def __init__(self, samples: list[npt.NDArray[np.int64]]) -> None:
+        self._samples = [np.array(sample, dtype=np.int64, copy=True) for sample in samples]
+        non_empty_samples = [sample for sample in self._samples if len(sample) > 0]
+        if non_empty_samples:
+            self._start_ns = min(int(sample[0]) for sample in non_empty_samples)
+            self._end_ns = max(int(sample[-1]) for sample in non_empty_samples)
+        else:
+            self._start_ns = 0
+            self._end_ns = 0
+
+    @property
+    def start_ns(self) -> int:
+        return self._start_ns
+
+    @property
+    def end_ns(self) -> int:
+        return self._end_ns
+
+    def sample(self, spec: SamplingSpec) -> Generator[_FakeSensorData, None, None]:
+        empty = np.empty(0, dtype=np.int64)
+        for window, sensor_timestamps_ns in zip(spec.grid, self._samples, strict=True):
+            if len(sensor_timestamps_ns) == 0:
+                yield _FakeSensorData(align_timestamps_ns=empty, sensor_timestamps_ns=empty)
+                continue
+            yield _FakeSensorData(
+                align_timestamps_ns=np.array(window.timestamps_ns, dtype=np.int64),
+                sensor_timestamps_ns=sensor_timestamps_ns,
+            )
+
+
 def _make_grid(timestamps_ns: npt.NDArray[np.int64], stride_ns: int, duration_ns: int) -> SamplingGrid:
     return SamplingGrid(
         start_ns=int(timestamps_ns[0]),
@@ -73,6 +106,38 @@ def _make_grid(timestamps_ns: npt.NDArray[np.int64], stride_ns: int, duration_ns
         timestamps_ns=timestamps_ns,
         stride_ns=stride_ns,
         duration_ns=duration_ns,
+    )
+
+
+def _make_single_window_grid() -> SamplingGrid:
+    return SamplingGrid(
+        start_ns=0,
+        exclusive_end_ns=200,
+        timestamps_ns=np.array([0, 100], dtype=np.int64),
+        stride_ns=200,
+        duration_ns=200,
+    )
+
+
+def _make_single_sample_grid() -> SamplingGrid:
+    return SamplingGrid(
+        start_ns=0,
+        exclusive_end_ns=100,
+        timestamps_ns=np.array([0], dtype=np.int64),
+        stride_ns=100,
+        duration_ns=100,
+    )
+
+
+def _make_fixed_group(
+    a_sensor_timestamps_ns: npt.NDArray[np.int64],
+    b_sensor_timestamps_ns: npt.NDArray[np.int64],
+) -> SensorGroup:
+    return SensorGroup(
+        {
+            "a": _FixedWindowSensor([a_sensor_timestamps_ns]),
+            "b": _FixedWindowSensor([b_sensor_timestamps_ns]),
+        }
     )
 
 
@@ -141,6 +206,96 @@ def test_policy_tolerance_exceeded_raises() -> None:
     group = SensorGroup({"a": _FakeSensor(sensor_ts)})
 
     with pytest.raises(ValueError, match="tolerance_ns"):
+        list(group.sample(spec))
+
+
+def test_sensor_overlap_fully_covered_yields_frame() -> None:
+    """Fully overlapping participating sensors satisfy a 1.0 overlap policy."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=SamplingPolicy(sensor_overlap=1.0))
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([0, 100], dtype=np.int64),
+    )
+
+    frames = list(group.sample(spec))
+
+    assert len(frames) == 1
+    assert "a" in frames[0].sensor_data
+    assert "b" in frames[0].sensor_data
+
+
+def test_sensor_overlap_half_coverage_below_threshold_raises() -> None:
+    """A sensor covering half the frame interval fails a higher overlap threshold."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=SamplingPolicy(sensor_overlap=0.8))
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([50, 100], dtype=np.int64),
+    )
+
+    with pytest.raises(ValueError, match="sensor_overlap"):
+        list(group.sample(spec))
+
+
+def test_sensor_overlap_half_coverage_above_threshold_yields_frame() -> None:
+    """A sensor covering half the frame interval satisfies a lower overlap threshold."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=SamplingPolicy(sensor_overlap=0.4))
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([50, 100], dtype=np.int64),
+    )
+
+    frames = list(group.sample(spec))
+
+    assert len(frames) == 1
+
+
+def test_sensor_overlap_zero_coverage_below_threshold_raises() -> None:
+    """A participating sensor with zero duration in the union interval fails overlap policy."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=SamplingPolicy(sensor_overlap=0.1))
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([200, 200], dtype=np.int64),
+    )
+
+    with pytest.raises(ValueError, match="sensor_overlap"):
+        list(group.sample(spec))
+
+
+def test_sensor_overlap_zero_policy_disables_check() -> None:
+    """sensor_overlap=0.0 does not enforce overlap."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=SamplingPolicy(sensor_overlap=0.0))
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([50, 100], dtype=np.int64),
+    )
+
+    frames = list(group.sample(spec))
+
+    assert len(frames) == 1
+
+
+def test_sensor_overlap_policy_none_disables_check() -> None:
+    """policy=None does not enforce overlap."""
+    spec = SamplingSpec(grid=_make_single_window_grid(), policy=None)
+    group = _make_fixed_group(
+        np.array([0, 100], dtype=np.int64),
+        np.array([50, 100], dtype=np.int64),
+    )
+
+    frames = list(group.sample(spec))
+
+    assert len(frames) == 1
+
+
+def test_sensor_overlap_invalid_frame_interval_raises() -> None:
+    """SensorGroup rejects overlap checks whose sampled spans have no duration."""
+    spec = SamplingSpec(grid=_make_single_sample_grid(), policy=SamplingPolicy(sensor_overlap=0.1))
+    group = _make_fixed_group(
+        np.array([0], dtype=np.int64),
+        np.array([0], dtype=np.int64),
+    )
+
+    with pytest.raises(ValueError, match="duration must be positive"):
         list(group.sample(spec))
 
 

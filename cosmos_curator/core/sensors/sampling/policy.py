@@ -25,8 +25,18 @@ class SamplingPolicy:
         tolerance_ns: the maximum allowed time delta between a reference
             timestamp and the chosen canonical sample (per-sensor or global;
             exact semantics are implementation-defined).
+        sensor_overlap: minimum required temporal overlap fraction across
+            participating sensors in multi-sensor aligned sampling. A value of
+            ``0.0`` disables the overlap check.
 
     """
 
     __hash__ = None  # type: ignore[assignment]
     tolerance_ns: int = attrs.field(default=0, validator=attrs.validators.ge(0))
+    sensor_overlap: float = attrs.field(
+        default=0.0,
+        validator=attrs.validators.and_(
+            attrs.validators.ge(0.0),
+            attrs.validators.le(1.0),
+        ),
+    )
