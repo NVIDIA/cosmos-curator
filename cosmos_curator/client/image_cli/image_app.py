@@ -81,7 +81,7 @@ def build(  # noqa: PLR0913
             ),
             rich_help_panel="conda_envs",
         ),
-    ] = "cuml,legacy-transformers,seedvr,transformers,unified",
+    ] = "cuml,legacy-transformers,sam3,seedvr,transformers,unified",
     use_local_xenna_build: Annotated[
         bool,
         Option(
