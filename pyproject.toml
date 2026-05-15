@@ -124,7 +124,7 @@ local = [
     "uvicorn",
     "webdataset==0.2.111",
     "fabric (>=3.2.2,<4.0.0)",
-    "cosmos-xenna==0.4.0",
+    "cosmos-xenna==0.4.1",
 ]
 
 [tool.setuptools.package-data]

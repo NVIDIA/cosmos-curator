@@ -87,8 +87,15 @@ class ArtificialTextFilterStage(CuratorStage):
             gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up when the actor is destroyed."""
+        """Release the PaddleOCR model before the actor exits.
+
+        When running on GPU we drop ``self._model`` first so the underlying CUDA
+        tensors become unreachable, then run the standard ``gpu_stage_cleanup`` to
+        return device memory to the driver. See ``InternVideo2EmbeddingStage.destroy``
+        for the rationale.
+        """
         if self._use_gpu:
+            self._model = None  # type: ignore[assignment]
             gpu_stage_cleanup(self.__class__.__name__)
 
     @property

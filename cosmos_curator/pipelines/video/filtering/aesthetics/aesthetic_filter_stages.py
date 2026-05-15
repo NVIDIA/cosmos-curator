@@ -104,7 +104,14 @@ class AestheticFilterStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up resources."""
+        """Release the GPU-resident CLIP aesthetic scorer before the actor exits.
+
+        Drops ``self._model`` so the underlying CLIP weights become unreachable, then
+        lets ``gpu_stage_cleanup`` run ``gc.collect() + torch.cuda.empty_cache()`` to
+        actually return the device memory. See ``InternVideo2EmbeddingStage.destroy``
+        for the full rationale on why nulling the reference is required.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @property

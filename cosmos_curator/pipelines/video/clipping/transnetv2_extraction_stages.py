@@ -109,7 +109,18 @@ class TransNetV2ClipExtractionStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up resources."""
+        """Release the GPU-resident TransNetV2 model before the actor exits.
+
+        Drops ``self._model`` first so the GPU tensors become unreachable, then lets
+        ``gpu_stage_cleanup`` run ``gc.collect() + torch.cuda.empty_cache()`` to return
+        the device memory to the CUDA driver. Without dropping the reference, the
+        cleanup is a no-op and the worker's CUDA context lingers as ghost device
+        memory after the actor exits - a problem because TransNetV2 shares the GPU
+        (0.25-GPU fraction) with other stages, including the vLLM caption workers
+        that need a clean GPU at startup. See ``InternVideo2EmbeddingStage.destroy``
+        for the full rationale.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @property

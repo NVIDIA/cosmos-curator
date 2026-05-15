@@ -90,7 +90,13 @@ class ImageCosmosEmbed1EmbeddingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Release GPU resources."""
+        """Release the GPU-resident Cosmos-Embed1 model before the actor exits.
+
+        Drops ``self._model`` first so its CUDA weights become unreachable, then runs
+        the standard ``gpu_stage_cleanup`` to return device memory to the driver. See
+        ``InternVideo2EmbeddingStage.destroy`` for the rationale.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @nvtx.annotate("ImageCosmosEmbed1EmbeddingStage")  # type: ignore[untyped-decorator]
@@ -174,7 +180,14 @@ class ImageInternVideo2EmbeddingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Release GPU resources."""
+        """Release the GPU-resident InternVideo2 model before the actor exits.
+
+        Drops ``self._model`` first so its CUDA weights become unreachable, then runs
+        the standard ``gpu_stage_cleanup`` to return device memory to the driver. See
+        ``InternVideo2EmbeddingStage.destroy`` (in the video embedding stages) for the
+        full rationale.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @nvtx.annotate("ImageInternVideo2EmbeddingStage")  # type: ignore[untyped-decorator]
@@ -257,7 +270,14 @@ class ImageCLIPEmbeddingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Release GPU resources."""
+        """Release the GPU-resident CLIP image embedding model before the actor exits.
+
+        Drops ``self._model`` first so its CUDA weights become unreachable, then runs
+        the standard ``gpu_stage_cleanup`` to return device memory to the driver. See
+        ``InternVideo2EmbeddingStage.destroy`` (in the video embedding stages) for the
+        full rationale.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @nvtx.annotate("ImageCLIPEmbeddingStage")  # type: ignore[untyped-decorator]

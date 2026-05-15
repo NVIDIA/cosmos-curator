@@ -781,6 +781,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     inflight_batching=args.vllm_use_inflight_batching,
                     enhance_config=enhance_config,
                     caption_quality_flags_enabled=caption_quality_flags_enabled,
+                    caption_setup_attempts=args.captioning_setup_attempts,
                     verbose=args.verbose,
                     perf_profile=args.perf_profile,
                 )
@@ -1903,6 +1904,17 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=int,
         default=8192,
         help="Max number of output tokens requested from captioning model",
+    )
+    parser.add_argument(
+        "--captioning-setup-attempts",
+        type=int,
+        default=1,
+        help=(
+            "Number of times the vLLM caption stage's setup() may be retried before the actor "
+            "pool gives up on a worker. Each retry re-spawns the actor (Ray reschedules), which "
+            "can dodge transient placement issues like a leaked CUDA context squatting on the "
+            "assigned GPU. Only the vLLM caption backend honors this; other backends ignore it."
+        ),
     )
     parser.add_argument(
         "--gemini-model-name",

@@ -229,7 +229,13 @@ class CosmosEmbed1EmbeddingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up resources."""
+        """Release the GPU-resident Cosmos-Embed1 model before the actor exits.
+
+        Drops ``self._model`` first so its CUDA weights become unreachable, then runs
+        the standard ``gpu_stage_cleanup`` to return device memory to the driver. See
+        ``InternVideo2EmbeddingStage.destroy`` for the full rationale.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @property

@@ -226,7 +226,24 @@ class InternVideo2EmbeddingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up resources."""
+        """Release the GPU-resident InternVideo2 model before the actor exits.
+
+        ``gpu_stage_cleanup`` already calls ``gc.collect() + torch.cuda.empty_cache()``,
+        but ``empty_cache()`` cannot release tensors that are still referenced. The
+        InternVideo2 backbone's weights are pinned by ``self._model`` (and its inner
+        ``_model``) for the lifetime of the actor, so without dropping that reference
+        first the cleanup is a no-op and the worker's CUDA context persists as ghost
+        device memory until the driver reclaims it - which can take long enough that
+        the next stage placed on the same physical GPU (typically the vLLM caption
+        worker) sees the residual and trips ``GpuNotCleanError``.
+
+        Dropping ``self._model`` here makes the freed weights eligible for collection
+        on the next ``gc.collect()`` inside ``gpu_stage_cleanup``, which is what
+        actually returns the bytes to the CUDA driver. Any in-flight ``process_data``
+        call still holds its own local reference to the model object, so this is safe
+        across the brief inline / fallback destroy race window.
+        """
+        self._model = None  # type: ignore[assignment]
         gpu_stage_cleanup(self.__class__.__name__)
 
     @property

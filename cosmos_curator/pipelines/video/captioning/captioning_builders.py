@@ -114,6 +114,11 @@ class CaptioningConfig:
     inflight_batching: bool = True
     enhance_config: EnhanceCaptionConfig | None = None
     caption_quality_flags_enabled: bool = True
+    # Number of times the caption stage's setup() may be attempted before the actor pool gives up
+    # on a given worker. Each attempt re-spawns the actor (Ray reschedules), which can dodge
+    # transient placement issues like a leaked CUDA context squatting on the assigned GPU.
+    # Only consumed by the vLLM caption backend today; non-vLLM backends ignore this.
+    caption_setup_attempts: int = attrs.field(default=1, validator=attrs.validators.ge(1))
     verbose: bool = False
     perf_profile: bool = False
 
@@ -209,7 +214,7 @@ def _build_captioning_caption_stage(config: CaptioningConfig) -> CuratorStage | 
                     inflight_batching=config.inflight_batching,
                     caption_quality_flags_enabled=config.caption_quality_flags_enabled,
                 ),
-                num_setup_attempts_python=None,
+                num_setup_attempts_python=config.caption_setup_attempts,
             )
         case GeminiConfig() as gcfg:
             return GeminiCaptionStage(

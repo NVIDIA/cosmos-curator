@@ -27,10 +27,14 @@ the tasks must have these attributes/methods:
 
 """
 
+import contextlib
+import gc
 import logging
+import time
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import nvtx  # type: ignore[import-untyped]
+import psutil
 import tenacity
 from loguru import logger
 
@@ -79,6 +83,15 @@ if conda_utils.is_running_in_env("unified"):
 
 
 T = TypeVar("T", bound=PipelineTask)
+
+# Minimum free-memory fraction the GPU must have at stage startup.
+# Set 0.98 so any non-trivial residual (>= ~3.7 GiB on a 184 GiB device) trips
+# ``GpuNotCleanError`` and forces a retry / re-placement instead of letting the
+# downstream vLLM init fail with a cryptic ``ValueError``. Sub-GiB driver
+# baseline still passes. If a future variant raises ``gpu_memory_utilization``
+# above ~0.95, this threshold itself becomes the looser of the two and you can
+# safely leave it; bump it only if you see false positives from healthy GPUs.
+_VLLM_REQUIRED_FREE_FRACTION = 0.98
 
 
 def _get_windows_from_tasks[T: PipelineTask](tasks: list[T]) -> tuple[list[Window], list[str]]:
@@ -493,28 +506,118 @@ class VllmCaptionStage(CuratorStage):
 
         # Instantiate vLLM Engine involves torch.compile which produces cache
         # To avoid conflict, do it once here
-        gpu_stage_startup(f"{self.__class__.__name__}-on-node", self.resources.gpus, pre_setup=True)
+        gpu_stage_startup(
+            f"{self.__class__.__name__}-on-node",
+            self.resources.gpus,
+            pre_setup=True,
+            expected_free_fraction=_VLLM_REQUIRED_FREE_FRACTION,
+        )
         self._llm = vllm_model(self._vllm_config)
         gpu_stage_startup(f"{self.__class__.__name__}-on-node", self.resources.gpus, pre_setup=False)
 
     def stage_setup(self) -> None:
         """Set up the model for processing."""
         if self._llm is None:
-            gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=True)
+            gpu_stage_startup(
+                self.__class__.__name__,
+                self.resources.gpus,
+                pre_setup=True,
+                expected_free_fraction=_VLLM_REQUIRED_FREE_FRACTION,
+            )
             self._llm = vllm_model(self._vllm_config)
         self._sampling_params = sampling_params(self._vllm_config.sampling_config)
         self._processor = auto_processor(self._vllm_config)
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
-        """Clean up GPU resources."""
+        """Release vLLM and GPU resources before the actor exits.
+
+        Invoked by ``StageWorker.shutdown`` while the actor still has a live Python
+        interpreter and the right conda env. The vLLM v1 ``EngineCore`` is a separate
+        subprocess: if we let ``ray.kill()`` SIGKILL the actor without first stopping
+        EngineCore, the orphan subprocess leaks its ~168 GiB CUDA context as a ghost
+        allocation that no later actor can dislodge (the leak persists until driver
+        reset). To prevent that we:
+
+          1. Send SIGTERM to all child processes (vLLM EngineCore + IPC helpers) and
+             wait briefly for graceful exit, then SIGKILL any holdouts. This unblocks
+             any in-flight RPC the processor thread may be wedged in.
+          2. Drop our Python references to the vLLM model so the wrapper's __del__
+             chain can run.
+          3. ``gc.collect()`` + ``torch.cuda.empty_cache()`` to release the worker
+             actor's own CUDA context.
+          4. Re-dump GPU info so the post-teardown memory state is visible in the log
+             (useful for diagnosing future leaks).
+
+        Safe to call when ``stage_setup`` did not complete or was never called.
+        """
+        start = time.monotonic()
+        self._terminate_vllm_subprocesses()
+        self._drop_vllm_refs()
         gpu_stage_cleanup(self.__class__.__name__)
+        elapsed = time.monotonic() - start
+        logger.info(f"VllmCaptionStage.destroy: completed in {elapsed:.1f}s")
+
+    def _terminate_vllm_subprocesses(self) -> None:
+        """SIGTERM-then-SIGKILL all child processes owned by this actor.
+
+        Targets vLLM v1's ``VLLM::EngineCore`` (the GPU-resident subprocess that holds
+        the model weights) and any helper Python workers it spawned. SIGTERM gives
+        vLLM a chance to call ``cudaDeviceReset`` and free its context; SIGKILL is the
+        fallback for processes that ignore SIGTERM. Ordering matters: we want context
+        released cleanly so no ghost memory is left on the GPU.
+        """
+        try:
+            me = psutil.Process()
+            children = me.children(recursive=True)
+        except psutil.NoSuchProcess:
+            return
+
+        if not children:
+            return
+
+        target_names = []
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                target_names.append(f"pid={child.pid} name={child.name()!r}")
+        logger.info(f"VllmCaptionStage.destroy: terminating {len(children)} child process(es): {target_names}")
+
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.terminate()
+
+        gone, alive = psutil.wait_procs(children, timeout=5.0)
+        for child in alive:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                logger.warning(
+                    f"VllmCaptionStage.destroy: pid={child.pid} name={child.name()!r} ignored SIGTERM after 5s; "
+                    "sending SIGKILL (may leak GPU memory)"
+                )
+                child.kill()
+        if alive:
+            psutil.wait_procs(alive, timeout=2.0)
+        logger.info(f"VllmCaptionStage.destroy: terminated {len(gone)} via SIGTERM, {len(alive)} required SIGKILL")
+
+    def _drop_vllm_refs(self) -> None:
+        """Release Python-side references to vLLM and force a GC pass.
+
+        vLLM's ``LLM`` wrapper does most of its native cleanup in ``__del__``. Setting
+        the attribute to None (rather than ``del``ing it) keeps the actor in a
+        re-setup-able state in case ``destroy()`` is ever called outside the
+        teardown path.
+        """
+        self._llm = None
+        self._sampling_params = None
+        self._processor = None
+        gc.collect()
 
     def _reset(self) -> None:
-        """Reset the vLLM model."""
-        del self._llm
-        del self._sampling_params
-        del self._processor
+        """Reset the vLLM model.
+
+        Used by the ``process_data`` retry path to recycle a vLLM engine that errored
+        mid-flight. Reuses the same teardown as the shutdown path so the recycled
+        actor doesn't leak GPU memory between attempts.
+        """
         self.destroy()
         self.stage_setup()
 
