@@ -28,7 +28,17 @@ from cosmos_curator.pipelines.video.preview.preview_stages import PreviewStage
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig, WindowConfig
 
 VLLM_CAPTION_ALGOS: frozenset[str] = frozenset(
-    {"nemotron", "qwen", "qwen3_5_27b", "qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
+    {
+        "nemotron",
+        "qwen",
+        "qwen3_5_27b",
+        "qwen3_6_27b",
+        "qwen3_6_27b_fp8",
+        "qwen3_vl_30b",
+        "qwen3_vl_30b_fp8",
+        "qwen3_vl_235b",
+        "qwen3_vl_235b_fp8",
+    }
     | {"cosmos_r1", "cosmos_r2"}
 )
 

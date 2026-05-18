@@ -35,7 +35,15 @@ def _get_default_models() -> list[str]:
         if model.startswith("_"):
             # internal temporary entries
             continue
-        if model in {"qwen3_5_27b", "qwen3_vl_30b", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}:
+        if model in {
+            "qwen3_5_27b",
+            "qwen3_6_27b",
+            "qwen3_6_27b_fp8",
+            "qwen3_vl_30b",
+            "qwen3_vl_30b_fp8",
+            "qwen3_vl_235b",
+            "qwen3_vl_235b_fp8",
+        }:
             # too large for new users
             continue
         if model in {"gpt_oss_20b"}:

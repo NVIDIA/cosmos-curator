@@ -158,6 +158,20 @@
         "precision": "FP8",
         "nvcf_model_id": "qwen3_5_27b"
     },
+    "qwen3_6_27b": {
+        "model_id": "Qwen/Qwen3.6-27B",
+        "version": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen3_6_27b"
+    },
+    "qwen3_6_27b_fp8": {
+        "model_id": "Qwen/Qwen3.6-27B-FP8",
+        "version": "e89b16ebf1988b3d6befa7de50abc2d76f26eb09",
+        "filelist": null,
+        "precision": "FP8",
+        "nvcf_model_id": "qwen3_6_27b_fp8"
+    },
     "seedvr2_3b": {
         "model_id": "ByteDance-Seed/SeedVR2-3B",
         "version": "37255ff8cccfb01071b87f635a5948ca8d53117c",

@@ -346,6 +346,8 @@ VllmAsyncCaptionConfig(
 | Model size | Recommended | Config |
 |------------|-------------|--------|
 | 7B (Qwen2.5-VL) | N-actors TP=1 | `--num-gpus 1` |
+| 27B FP8 (Qwen3.5-27B-FP8, Qwen3.6-27B-FP8) | N-actors TP=1 | `--num-gpus 1` (H100 80GB) |
+| 27B BF16 (Qwen3.6-27B) | N-actors TP=2 | `--num-gpus 2` (H100 80GB) or `--num-gpus 1` (H200 141GB) |
 | 30B (Qwen3-VL) | N-actors TP=1 or TP=2 | `--num-gpus 1` (H100 80GB) or `--num-gpus 2` |
 | 72B (Qwen2.5-VL-72B) | N-actors TP=2 | `--num-gpus 2` (FP8) |
 | 235B+ | TP=4 or TP=8 | `--num-gpus 4` or `--num-gpus 8` |

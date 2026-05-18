@@ -5,8 +5,8 @@
 Pipelines without captioning are fairly lightweight — video decode, filtering, and preprocessing are embarrassingly
 parallel and GPU-accelerated. Even transcoding, while not free, scales well. These stages are not the bottleneck.
 
-Captioning is. With the current default model (Qwen 2.5 VL), autoregressive inference already dominates pipeline
-wall-clock time. We are planning to move to larger models (e.g., Qwen 3.5-27B), which will only widen this gap.
+Captioning is. With the small default model (Qwen 2.5 VL), autoregressive inference already dominates pipeline
+wall-clock time. Adopting the larger 27B variants (`qwen3_5_27b`, `qwen3_6_27b_fp8`) only widens this gap.
 Therefore, the pipeline's theoretical throughput ceiling — its "speed of light" — is determined entirely by how fast the
 captioning model can produce output tokens. Optimizing anything else yields marginal returns.
 

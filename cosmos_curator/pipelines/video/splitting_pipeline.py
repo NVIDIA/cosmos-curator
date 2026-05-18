@@ -144,7 +144,15 @@ from cosmos_curator.pipelines.video.utils.video_pipe_input import (
 )
 
 QWEN2_CAPTION_ALGOS = {"qwen"}
-QWEN3_CAPTION_ALGOS = {"qwen3_5_27b", "qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
+QWEN3_CAPTION_ALGOS = {
+    "qwen3_5_27b",
+    "qwen3_6_27b",
+    "qwen3_6_27b_fp8",
+    "qwen3_vl_30b",
+    "qwen3_vl_30b_fp8",
+    "qwen3_vl_235b",
+    "qwen3_vl_235b_fp8",
+}
 COSMOS_REASON_ALGOS = {"cosmos_r1", "cosmos_r2"}
 ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai", "vllm_async"}
 MULTICAM_VIDEO_EXTENSIONS: set[str] = {".mp4"}
