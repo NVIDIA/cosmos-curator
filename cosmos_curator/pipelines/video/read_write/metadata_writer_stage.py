@@ -49,6 +49,7 @@ from cosmos_curator.core.utils.storage.writer_utils import (
     write_parquet,
     write_text,
 )
+from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.video.tracking.serialization import (
     sam3_events_envelope,
     sam3_instances_envelope,
@@ -56,11 +57,15 @@ from cosmos_curator.pipelines.video.tracking.serialization import (
 )
 from cosmos_curator.pipelines.video.utils.data_model import (
     CAPTION_OK_STATUSES,
+    CAPTION_QUALITY_FLAG_KEYS,
+    CaptionOutcome,
+    CaptionQualityStats,
     Clip,
     ClipStats,
     SplitPipeTask,
     Video,
     VideoMetadata,
+    Window,
 )
 
 
@@ -88,6 +93,7 @@ class ClipWriterStage(CuratorStage):
         generate_previews: bool,
         caption_models: list[str] | None = None,
         enhanced_caption_models: list[str] | None = None,
+        caption_quality_stats_enabled: bool = False,
         caption_quality_flags_enabled: bool = True,
         generate_cosmos_predict_dataset: bool = False,
         verbose: bool = False,
@@ -116,6 +122,7 @@ class ClipWriterStage(CuratorStage):
         self._generate_previews = generate_previews
         self._caption_models = caption_models
         self._enhanced_caption_models = enhanced_caption_models
+        self._caption_quality_stats_enabled = caption_quality_stats_enabled
         self._caption_quality_flags_enabled = caption_quality_flags_enabled
         self._generate_cosmos_predict_dataset = generate_cosmos_predict_dataset
         self._verbose = verbose
@@ -935,7 +942,58 @@ class ClipWriterStage(CuratorStage):
         clip_duration = clip.span[1] - clip.span[0]
         clip_stats.total_clip_duration += clip_duration
         clip_stats.max_clip_duration = max(clip_stats.max_clip_duration, clip_duration)
+        if not filtered and self._caption_quality_stats_enabled:
+            # Piggyback on the existing per-clip metadata path; do not rescan persisted metas/v0.
+            clip_stats.caption_quality_stats = self._make_clip_caption_quality_stats(clip)
         return clip_stats
+
+    def _make_clip_caption_quality_stats(self, clip: Clip) -> CaptionQualityStats:
+        stats = CaptionQualityStats()
+        # Final single-model eligibility is enforced by the summary writer; chunks record the active field locally.
+        active_caption_model = self._caption_models[0] if self._caption_models else ""
+
+        for window in clip.windows:
+            stats.caption_windows_checked += 1
+            status = window.caption_status if window.caption_status is not None else CaptionOutcome.SKIPPED.value
+            # Preserve unexpected runtime keys in chunk stats; summary parsing rejects non-v1 keys and omits the
+            # root artifact instead of crashing this stage.
+            stats.caption_status_counts[status] = stats.caption_status_counts.get(status, 0) + 1
+
+            if window.caption_failure_reason is not None:
+                stats.caption_failure_reason_counts[window.caption_failure_reason] = (
+                    stats.caption_failure_reason_counts.get(window.caption_failure_reason, 0) + 1
+                )
+            self._count_caption_quality_flags(stats, window)
+
+            if status not in CAPTION_OK_STATUSES:
+                continue
+
+            caption_text = window.caption.get(active_caption_model)
+            stripped = caption_text.strip() if caption_text is not None else ""
+            if stripped == "":
+                stats.empty_caption_count += 1
+            elif stripped == VLLM_UNKNOWN_CAPTION:
+                stats.sentinel_caption_count += 1
+        return stats
+
+    def _count_caption_quality_flags(self, stats: CaptionQualityStats, window: Window) -> None:
+        if not self._caption_quality_flags_enabled:
+            return
+
+        flag_values = {key: getattr(window, key) for key in CAPTION_QUALITY_FLAG_KEYS}
+        if all(value is not None for value in flag_values.values()):
+            stats.caption_quality_flags_evaluated_count += 1
+            for key, value in flag_values.items():
+                if value is True:
+                    stats.caption_quality_flag_counts[key] += 1
+
+    def _add_caption_quality_stats_to_video_data(self, data: dict[str, Any], video: Video) -> None:
+        if not self._caption_quality_stats_enabled:
+            return
+
+        # None means this chunk had no non-filtered clips; persist zeros so summary aggregation can prove completeness.
+        caption_quality_stats = video.clip_stats.caption_quality_stats or CaptionQualityStats()
+        data["caption_quality_stats"] = caption_quality_stats.to_dict(include_unknown_keys=True)
 
     def _add_cds_data_to_buffer(self, clip: Clip) -> None:
         if self._upload_cds_parquet:
@@ -1017,6 +1075,7 @@ class ClipWriterStage(CuratorStage):
             "all_windows": {},
             "all_windows_enhanced_caption": {},
         }
+        self._add_caption_quality_stats_to_video_data(data, video)
         for clip in video.clips:
             clip_uuid = str(clip.uuid)
             data["all_windows"][clip_uuid] = {}

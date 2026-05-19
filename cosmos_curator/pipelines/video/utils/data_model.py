@@ -20,7 +20,8 @@ import json
 import pathlib
 import sys
 from collections import deque
-from typing import TYPE_CHECKING, Any, Literal, Self
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 from uuid import UUID
 
 import attrs
@@ -141,9 +142,215 @@ class CaptionOutcome(enum.StrEnum):
 
 
 CAPTION_OK_STATUSES = {CaptionOutcome.SUCCESS, CaptionOutcome.TRUNCATED}
+CAPTION_STATUS_KEYS = tuple(outcome.value for outcome in CaptionOutcome)
 
 
 type CaptionFailureReason = Literal["exception", "timeout"]
+CAPTION_FAILURE_REASON_KEYS = ("exception", "timeout")
+CAPTION_QUALITY_FLAG_KEYS = ("flag_length_outlier", "flag_repetition", "flag_near_duplicate")
+
+
+def _zero_counts(keys: tuple[str, ...]) -> dict[str, int]:
+    return dict.fromkeys(keys, 0)
+
+
+def _merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        target[key] = target.get(key, 0) + value
+
+
+def _serialized_counts(
+    counts: dict[str, int], known_keys: tuple[str, ...], *, include_unknown_keys: bool
+) -> dict[str, int]:
+    data = {key: counts.get(key, 0) for key in known_keys}
+    if include_unknown_keys:
+        for key in sorted(set(counts) - set(known_keys)):
+            data[key] = counts[key]
+    return data
+
+
+def _count_value(data: Mapping[str, Any], key: str) -> int:
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        msg = f"{key} must be an integer"
+        raise TypeError(msg)
+    if value < 0:
+        msg = f"{key} must be non-negative"
+        raise ValueError(msg)
+    return value
+
+
+def _count_map(data: Mapping[str, Any], key: str, known_keys: tuple[str, ...]) -> dict[str, int]:
+    raw = data.get(key)
+    if not isinstance(raw, Mapping):
+        msg = f"{key} must be an object"
+        raise TypeError(msg)
+
+    unknown_keys = set(raw) - set(known_keys)
+    if unknown_keys:
+        unknown = ", ".join(sorted(str(item) for item in unknown_keys))
+        msg = f"{key} has unknown keys: {unknown}"
+        raise ValueError(msg)
+
+    missing_keys = set(known_keys) - set(raw)
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        msg = f"{key} is missing keys: {missing}"
+        raise ValueError(msg)
+
+    counts: dict[str, int] = {}
+    for known_key in known_keys:
+        value = raw[known_key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            msg = f"{key}.{known_key} must be an integer"
+            raise TypeError(msg)
+        if value < 0:
+            msg = f"{key}.{known_key} must be non-negative"
+            raise ValueError(msg)
+        counts[known_key] = value
+    return counts
+
+
+@attrs.define
+class CaptionQualityStats:
+    """Run-level caption structural-health counters."""
+
+    SCHEMA_VERSION: ClassVar[int] = 1
+    PIPELINE: ClassVar[str] = "split_video_pipeline"
+
+    caption_windows_checked: int = 0
+    caption_status_counts: dict[str, int] = attrs.Factory(lambda: _zero_counts(CAPTION_STATUS_KEYS))
+    caption_failure_reason_counts: dict[str, int] = attrs.Factory(lambda: _zero_counts(CAPTION_FAILURE_REASON_KEYS))
+    caption_quality_flags_evaluated_count: int = 0
+    caption_quality_flag_counts: dict[str, int] = attrs.Factory(lambda: _zero_counts(CAPTION_QUALITY_FLAG_KEYS))
+    empty_caption_count: int = 0
+    sentinel_caption_count: int = 0
+
+    @classmethod
+    def from_dict(cls, data: object) -> Self:
+        """Build stats from a serialized aggregate, validating v1 keys and counter shapes.
+
+        Chunk-embedded stats omit ``schema_version`` and ``pipeline``; root artifacts include them.
+        """
+        if not isinstance(data, Mapping):
+            msg = "caption_quality_stats must be an object"
+            raise TypeError(msg)
+
+        schema_version = data.get("schema_version")
+        if schema_version is not None and schema_version != cls.SCHEMA_VERSION:
+            msg = f"schema_version must be {cls.SCHEMA_VERSION}"
+            raise ValueError(msg)
+
+        pipeline = data.get("pipeline")
+        if pipeline is not None and pipeline != cls.PIPELINE:
+            msg = f"pipeline must be {cls.PIPELINE}"
+            raise ValueError(msg)
+
+        stats = cls(
+            caption_windows_checked=_count_value(data, "caption_windows_checked"),
+            caption_status_counts=_count_map(data, "caption_status_counts", CAPTION_STATUS_KEYS),
+            caption_failure_reason_counts=_count_map(
+                data,
+                "caption_failure_reason_counts",
+                CAPTION_FAILURE_REASON_KEYS,
+            ),
+            caption_quality_flags_evaluated_count=_count_value(data, "caption_quality_flags_evaluated_count"),
+            caption_quality_flag_counts=_count_map(
+                data,
+                "caption_quality_flag_counts",
+                CAPTION_QUALITY_FLAG_KEYS,
+            ),
+            empty_caption_count=_count_value(data, "empty_caption_count"),
+            sentinel_caption_count=_count_value(data, "sentinel_caption_count"),
+        )
+        errors = stats.validation_errors()
+        if errors:
+            msg = "; ".join(errors)
+            raise ValueError(msg)
+        return stats
+
+    def copy(self) -> Self:
+        """Return an independent copy of the aggregate."""
+        return type(self)(
+            caption_windows_checked=self.caption_windows_checked,
+            caption_status_counts=dict(self.caption_status_counts),
+            caption_failure_reason_counts=dict(self.caption_failure_reason_counts),
+            caption_quality_flags_evaluated_count=self.caption_quality_flags_evaluated_count,
+            caption_quality_flag_counts=dict(self.caption_quality_flag_counts),
+            empty_caption_count=self.empty_caption_count,
+            sentinel_caption_count=self.sentinel_caption_count,
+        )
+
+    def combine(self, other: Self) -> None:
+        """Merge another caption quality aggregate into this one."""
+        self.caption_windows_checked += other.caption_windows_checked
+        _merge_counts(self.caption_status_counts, other.caption_status_counts)
+        _merge_counts(self.caption_failure_reason_counts, other.caption_failure_reason_counts)
+        self.caption_quality_flags_evaluated_count += other.caption_quality_flags_evaluated_count
+        _merge_counts(self.caption_quality_flag_counts, other.caption_quality_flag_counts)
+        self.empty_caption_count += other.empty_caption_count
+        self.sentinel_caption_count += other.sentinel_caption_count
+
+    def _invariant_errors(self) -> list[str]:
+        errors: list[str] = []
+        if sum(self.caption_status_counts.values()) != self.caption_windows_checked:
+            errors.append("caption_status_counts must sum to caption_windows_checked")
+
+        error_count = self.caption_status_counts[CaptionOutcome.ERROR.value]
+        failure_reason_total = sum(self.caption_failure_reason_counts.values())
+        if failure_reason_total > error_count:
+            errors.append("caption_failure_reason_counts must not exceed error status count")
+
+        errors.extend(
+            f"caption_quality_flag_counts.{key} must not exceed evaluated count"
+            for key in CAPTION_QUALITY_FLAG_KEYS
+            if self.caption_quality_flag_counts[key] > self.caption_quality_flags_evaluated_count
+        )
+
+        ok_count = (
+            self.caption_status_counts[CaptionOutcome.SUCCESS.value]
+            + self.caption_status_counts[CaptionOutcome.TRUNCATED.value]
+        )
+        if self.empty_caption_count + self.sentinel_caption_count > ok_count:
+            errors.append("empty and sentinel counts must not exceed OK status count")
+
+        return errors
+
+    def validation_errors(self) -> list[str]:
+        """Return contract invariant failures for this aggregate."""
+        return self._invariant_errors()
+
+    def to_dict(self, *, include_schema: bool = False, include_unknown_keys: bool = False) -> dict[str, Any]:
+        """Serialize the aggregate using the v1 artifact field names."""
+        data: dict[str, Any] = {}
+        if include_schema:
+            data["schema_version"] = self.SCHEMA_VERSION
+            data["pipeline"] = self.PIPELINE
+
+        data.update(
+            {
+                "caption_windows_checked": self.caption_windows_checked,
+                "caption_status_counts": _serialized_counts(
+                    self.caption_status_counts,
+                    CAPTION_STATUS_KEYS,
+                    include_unknown_keys=include_unknown_keys,
+                ),
+                "caption_failure_reason_counts": _serialized_counts(
+                    self.caption_failure_reason_counts,
+                    CAPTION_FAILURE_REASON_KEYS,
+                    include_unknown_keys=include_unknown_keys,
+                ),
+                "caption_quality_flags_evaluated_count": self.caption_quality_flags_evaluated_count,
+                "caption_quality_flag_counts": _serialized_counts(
+                    self.caption_quality_flag_counts,
+                    CAPTION_QUALITY_FLAG_KEYS,
+                    include_unknown_keys=include_unknown_keys,
+                ),
+                "empty_caption_count": self.empty_caption_count,
+                "sentinel_caption_count": self.sentinel_caption_count,
+            }
+        )
+        return data
 
 
 @attrs.define
@@ -373,6 +580,7 @@ class ClipStats:
     max_clip_duration: float = 0.0
     total_prompt_tokens: int = 0
     total_output_tokens: int = 0
+    caption_quality_stats: CaptionQualityStats | None = None
 
     def combine(self, other: Self) -> None:
         """Combine two ClipStats objects.
@@ -396,6 +604,11 @@ class ClipStats:
         self.max_clip_duration = max(self.max_clip_duration, other.max_clip_duration)
         self.total_prompt_tokens += other.total_prompt_tokens
         self.total_output_tokens += other.total_output_tokens
+        if other.caption_quality_stats is not None:
+            if self.caption_quality_stats is None:
+                self.caption_quality_stats = other.caption_quality_stats.copy()
+            else:
+                self.caption_quality_stats.combine(other.caption_quality_stats)
 
 
 @attrs.define

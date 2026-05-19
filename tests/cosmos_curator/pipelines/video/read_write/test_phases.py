@@ -41,10 +41,11 @@ def test_remux_stage_absent_from_ingest_stages() -> None:
 
 
 def test_output_stage_forwards_caption_quality_flag() -> None:
-    """ClipWriterStage should receive caption quality flag config."""
+    """ClipWriterStage should receive caption quality config."""
     config = OutputConfig(
         output_path="/fake/output",
         input_path="/fake/input",
+        caption_quality_stats_enabled=True,
         caption_quality_flags_enabled=False,
     )
 
@@ -54,4 +55,5 @@ def test_output_stage_forwards_caption_quality_flag() -> None:
     stage_spec = stages[0]
     assert isinstance(stage_spec, CuratorStageSpec)
     assert isinstance(stage_spec.stage, ClipWriterStage)
+    assert stage_spec.stage._caption_quality_stats_enabled is True
     assert stage_spec.stage._caption_quality_flags_enabled is False

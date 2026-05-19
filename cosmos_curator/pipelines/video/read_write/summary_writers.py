@@ -40,12 +40,14 @@ from cosmos_curator.core.utils.storage.writer_utils import (
 )
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.utils.data_model import (
+    CaptionQualityStats,
     ShardPipeTask,
     SplitPipeTask,
 )
 
 _SUMMARIZE_NUM_WORKERS = 32
 _SUMMARIZE_NUM_CHUNKS = 128
+_CAPTION_QUALITY_STATS_FILENAME = "caption_quality_stats.json"
 
 
 @attrs.define
@@ -58,6 +60,108 @@ class ProcessedVideoMetadata:
 
     video_metadata: dict[str, Any] | None = None
     clip_chunks: list[dict[str, Any]] = attrs.Factory(list)
+
+
+@attrs.define(frozen=True)
+class CaptionQualityStatsWriteOptions:
+    """Options that gate caption quality stats emission."""
+
+    generate_captions: bool
+    caption_quality_stats_enabled: bool
+    caption_models: list[str]
+    multi_cam: bool
+
+
+def _aggregate_caption_quality_stats(
+    all_video_data: dict[str, ProcessedVideoMetadata],
+) -> tuple[CaptionQualityStats | None, str | None]:
+    """Aggregate caption stats from chunk metadata already read for summary writing."""
+    stats = CaptionQualityStats()
+    for input_video, data in all_video_data.items():
+        if data.video_metadata is None:
+            # Match summary.json: unprocessed inputs are represented as processed=false
+            # and contribute no clip or caption-window counters.
+            continue
+
+        num_clip_chunks = data.video_metadata.get("num_clip_chunks", 0)
+        if len(data.clip_chunks) != num_clip_chunks:
+            return None, f"{input_video} has missing clip chunk metadata"
+
+        for clip_chunk in data.clip_chunks:
+            chunk_stats = clip_chunk.get("caption_quality_stats")
+            if chunk_stats is None:
+                return None, f"{input_video} clip chunk is missing caption_quality_stats"
+            try:
+                stats.combine(CaptionQualityStats.from_dict(chunk_stats))
+            except (TypeError, ValueError) as exc:
+                return None, f"{input_video} clip chunk has invalid caption_quality_stats: {exc}"
+
+    errors = stats.validation_errors()
+    if errors:
+        return None, "; ".join(errors)
+    return stats, None
+
+
+def _clear_caption_quality_stats(output_path: str, client_output: storage_client.StorageClient | None) -> None:
+    def _delete_if_exists() -> None:
+        dest = get_full_path(output_path, _CAPTION_QUALITY_STATS_FILENAME)
+        if not path_exists(dest, client_output):
+            return
+
+        if isinstance(dest, storage_client.StoragePrefix):
+            assert client_output is not None
+            client_output.delete_object(dest)
+        else:
+            pathlib.Path(dest).unlink(missing_ok=True)
+
+    do_with_retries(_delete_if_exists)
+
+
+def _write_caption_quality_stats(
+    *,
+    output_path: str,
+    client_output: storage_client.StorageClient | None,
+    all_video_data: dict[str, ProcessedVideoMetadata],
+    options: CaptionQualityStatsWriteOptions,
+) -> None:
+    if not options.generate_captions or not options.caption_quality_stats_enabled:
+        _clear_caption_quality_stats(output_path, client_output)
+        return
+
+    if options.multi_cam:
+        logger.warning("Skipping caption_quality_stats.json: multi-camera caption quality aggregation is not supported")
+        _clear_caption_quality_stats(output_path, client_output)
+        return
+
+    if len(options.caption_models) != 1:
+        logger.warning(
+            "Skipping caption_quality_stats.json: expected exactly one caption model, got {}",
+            len(options.caption_models),
+        )
+        _clear_caption_quality_stats(output_path, client_output)
+        return
+
+    caption_quality_stats, error = _aggregate_caption_quality_stats(all_video_data)
+    if caption_quality_stats is None:
+        logger.warning(f"Skipping caption_quality_stats.json: {error}")
+        _clear_caption_quality_stats(output_path, client_output)
+        return
+
+    caption_quality_stats_dest = get_full_path(output_path, _CAPTION_QUALITY_STATS_FILENAME)
+
+    def _write_artifact() -> None:
+        write_json(
+            caption_quality_stats.to_dict(include_schema=True),
+            caption_quality_stats_dest,
+            "caption quality stats",
+            "all videos",
+            verbose=True,
+            client=client_output,
+            backup_and_overwrite=True,
+        )
+        logger.info(f"Wrote caption quality stats to {caption_quality_stats_dest}")
+
+    do_with_retries(_write_artifact)
 
 
 def _worker_read_video_metadata(  # noqa: C901
@@ -131,12 +235,16 @@ def _write_split_result_summary(  # noqa: PLR0913, C901
     video_bytes: int = 0,
     multi_cam: bool = False,
     num_remuxed_videos: int = 0,
+    generate_captions: bool = False,
+    caption_quality_stats_enabled: bool = True,
+    caption_models: list[str] | None = None,
 ) -> None:
     logger.info(f"Starting to summarize data in {output_path} ...")
     client_output = storage_utils.get_storage_client(
         output_path,
         profile_name=output_s3_profile_name,
         can_overwrite=True,
+        can_delete=True,
     )
 
     if not multi_cam:
@@ -261,6 +369,18 @@ def _write_split_result_summary(  # noqa: PLR0913, C901
 
     do_with_retries(func_write_summary)
 
+    _write_caption_quality_stats(
+        output_path=output_path,
+        client_output=client_output,
+        all_video_data=all_video_data,
+        options=CaptionQualityStatsWriteOptions(
+            generate_captions=generate_captions,
+            caption_quality_stats_enabled=caption_quality_stats_enabled,
+            caption_models=caption_models if caption_models is not None else [],
+            multi_cam=multi_cam,
+        ),
+    )
+
     if write_all_caption_json:
         _write_all_window_captions(
             output_path=output_path,
@@ -283,6 +403,9 @@ def write_split_summary(  # noqa: PLR0913
     pipeline_run_time: float = 0.0,
     write_all_caption_json: bool = True,
     multi_cam: bool = False,
+    generate_captions: bool = False,
+    caption_quality_stats_enabled: bool = True,
+    caption_models: list[str] | None = None,
 ) -> None:
     """Write summary of split pipeline results including job stats and performance metrics.
 
@@ -299,6 +422,9 @@ def write_split_summary(  # noqa: PLR0913
         pipeline_run_time: Total runtime of the pipeline in minutes.
         write_all_caption_json: Whether to write all caption JSON file.
         multi_cam: Whether the pipeline is running in multi-cam mode.
+        generate_captions: Whether subject caption generation was enabled.
+        caption_quality_stats_enabled: Whether to emit the run-level caption quality stats artifact.
+        caption_models: Configured subject caption fields.
 
     """
     # dump and write job summary
@@ -318,6 +444,9 @@ def write_split_summary(  # noqa: PLR0913
         video_bytes=video_bytes,
         multi_cam=multi_cam,
         num_remuxed_videos=num_remuxed,
+        generate_captions=generate_captions,
+        caption_quality_stats_enabled=caption_quality_stats_enabled,
+        caption_models=caption_models,
     )
     # dump and write performance stats
     if perf_profile:

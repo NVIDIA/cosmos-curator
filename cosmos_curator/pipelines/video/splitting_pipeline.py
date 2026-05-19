@@ -300,6 +300,8 @@ def write_summary(
         Total video length in hours.
 
     """
+    # Defensive: NVCF/API callers can build args without the parser; default to on.
+    caption_quality_stats_requested = getattr(args, "caption_quality_stats_enabled", True)
     write_split_summary(
         args.input_video_path,
         input_videos,
@@ -313,6 +315,9 @@ def write_summary(
         pipeline_run_time=pipeline_run_time,
         write_all_caption_json=args.write_all_caption_json,
         multi_cam=args.multi_cam,
+        generate_captions=args.generate_captions,
+        caption_quality_stats_enabled=caption_quality_stats_requested,
+        caption_models=[args.captioning_algorithm],
     )
 
     if args.perf_profile:
@@ -357,8 +362,11 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
 
     """
     stages: list[CuratorStage | CuratorStageSpec] = []
-    # Single CLI source: captioning and writer must observe the same enabled value.
+    # Keep caption-quality controls explicit; writer collection and summary emission use the same CLI request.
     caption_quality_flags_enabled = args.caption_quality_flags_enabled
+    # Defensive: NVCF/API callers can build args without the parser; default to on.
+    caption_quality_stats_requested = getattr(args, "caption_quality_stats_enabled", True)
+    caption_quality_stats_enabled = args.generate_captions and caption_quality_stats_requested and not args.multi_cam
 
     # --- Ingest (always) ---
     stages.extend(
@@ -926,6 +934,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 generate_previews=args.generate_previews,
                 caption_models=[args.captioning_algorithm],
                 enhanced_caption_models=[args.enhance_captions_lm_variant],
+                # V1 root aggregation reads flat per-video metadata; omit multi-camera session layout for now.
+                caption_quality_stats_enabled=caption_quality_stats_enabled,
                 caption_quality_flags_enabled=caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=args.generate_cosmos_predict_dataset,
                 num_workers_per_node=args.num_clip_writer_workers_per_node,
@@ -1149,6 +1159,13 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         action="store_false",
         default=True,
         help="Disable heuristic caption quality flag annotations for supported caption paths.",
+    )
+    parser.add_argument(
+        "--no-caption-quality-stats",
+        dest="caption_quality_stats_enabled",
+        action="store_false",
+        default=True,
+        help="Disable run-level caption_quality_stats.json emission for captioning runs.",
     )
     parser.add_argument(
         "--no-upload-clips",

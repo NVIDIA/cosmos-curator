@@ -159,10 +159,13 @@ The blocks below are appended in this order:
 |---|---|
 | Stages | Local vLLM: `VllmPrepStage` + `VllmCaptionStage`. API: `ApiPrepStage` + `GeminiCaptionStage` or `OpenAICaptionStage`. vLLM async: `VllmAsyncPrepStage` + `VllmAsyncCaptionStage`. |
 | Code | [`captioning/captioning_builders.py`](../../../cosmos_curator/pipelines/video/captioning/captioning_builders.py) |
-| Main flags | `--no-generate-captions`, `--no-caption-quality-flags`, `--captioning-algorithm`, `--captioning-window-size`, `--captioning-sampling-fps`, `--captioning-prompt-variant`, `--captioning-max-output-tokens` |
+| Main flags | `--no-generate-captions`, `--no-caption-quality-stats`, `--no-caption-quality-flags`, `--captioning-algorithm`, `--captioning-window-size`, `--captioning-sampling-fps`, `--captioning-prompt-variant`, `--captioning-max-output-tokens` |
 | Purpose | Creates windowed captions for each clip. Windowing keeps long clips manageable and gives downstream datasets per-window text. |
 | Output | Populates `clip.windows[*].caption` and caption status fields; the writer emits captions in per-clip metadata and `all_window_captions.json`. |
 | Backend notes | Supported algorithms include `qwen`, Qwen3 variants, `nemotron`, `cosmos_r1`, `cosmos_r2`, `gemini`, `openai`, and `vllm_async`. |
+
+Run-level aggregates of caption status and quality-flag fields are documented in
+[Caption Quality Stats](caption-quality-stats.md).
 
 ### Preview Generation
 
@@ -229,7 +232,7 @@ The blocks below are appended in this order:
 | Code | [`read_write/metadata_writer_stage.py`](../../../cosmos_curator/pipelines/video/read_write/metadata_writer_stage.py) |
 | Main flags | `--output-clip-path`, `--no-upload-clips`, `--upload-clip-info-in-chunks`, `--upload-clip-info-in-lance`, `--upload-cds-parquet`, `--dry-run`, `--num-clip-writer-workers-per-node` |
 | Purpose | Writes clips, metadata, embeddings, previews, SAM3 outputs, processed-video records, and summary files to local or cloud storage. |
-| Output | Standard output directories include `clips/`, `filtered_clips/`, `metas/v0/`, `metas_jsonl/v0/`, embedding directories such as `iv2_embd/`, `ce1_embd_<variant>/`, `openai_embd/`, `previews/`, `processed_videos/`, `sam3_*` directories, and `summary.json`. |
+| Output | Standard output directories include `clips/`, `filtered_clips/`, `metas/v0/`, `metas_jsonl/v0/`, embedding directories such as `iv2_embd/`, `ce1_embd_<variant>/`, `openai_embd/`, `previews/`, `processed_videos/`, `sam3_*` directories, `summary.json`, and, when caption generation is enabled and `--no-caption-quality-stats` is not set, `caption_quality_stats.json`. |
 
 ## Common Combinations
 

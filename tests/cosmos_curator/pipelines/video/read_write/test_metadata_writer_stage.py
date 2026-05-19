@@ -29,6 +29,7 @@ import pytest
 
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
 from cosmos_curator.core.utils.storage import storage_client, storage_utils
+from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import (
     ClipWriterStage,
     _archive_processed_sidecars,
@@ -843,6 +844,74 @@ def test_filtered_clips_cleaned_up_after_processing(tmp_path: Path) -> None:
     assert filtered_mp4.read_bytes() == b"filtered-bytes"
 
 
+def test_caption_quality_stats_excludes_filtered_clips(tmp_path: Path) -> None:
+    """Filtered clips are not included in caption quality aggregates."""
+    stage = _create_stage(
+        tmp_path / "out",
+        tmp_path / "in",
+        generate_embeddings=False,
+        upload_cds_parquet=False,
+        caption_quality_stats_enabled=True,
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+    kept_clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[Window(start_frame=0, end_frame=10, caption={"qwen": "kept"}, caption_status="success")],
+    )
+    filtered_clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(1.0, 2.0),
+        windows=[Window(start_frame=10, end_frame=20, caption={"qwen": "filtered"}, caption_status="success")],
+    )
+
+    clip_stats = stage._write_clip_metadata(kept_clip, video_meta)
+    clip_stats.combine(stage._write_clip_metadata(filtered_clip, video_meta, filtered=True))
+
+    assert clip_stats.caption_quality_stats is not None
+    assert clip_stats.caption_quality_stats.caption_windows_checked == 1
+    assert clip_stats.caption_quality_stats.caption_status_counts["success"] == 1
+
+
+def test_caption_quality_stats_disabled_omits_chunk_aggregate(tmp_path: Path) -> None:
+    """Disabled stats do not collect in ClipStats or serialize into chunk metadata."""
+    input_dir = tmp_path / "in"
+    output_dir = tmp_path / "out"
+    input_dir.mkdir()
+    stage = _create_stage(
+        output_dir,
+        input_dir,
+        generate_embeddings=False,
+        upload_cds_parquet=False,
+        caption_quality_stats_enabled=False,
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[Window(start_frame=0, end_frame=10, caption={"qwen": "caption"}, caption_status="success")],
+    )
+
+    clip_stats = stage._write_clip_metadata(clip, video_meta)
+    assert clip_stats.caption_quality_stats is None
+
+    video = Video(
+        input_video=input_dir / "v.mp4",
+        metadata=video_meta,
+        clips=[clip],
+        num_total_clips=1,
+        num_clip_chunks=1,
+        clip_stats=clip_stats,
+    )
+    stage._write_video_metadata(video)
+
+    chunk_path = output_dir / "processed_clip_chunks" / "v.mp4_0.json"
+    assert "caption_quality_stats" not in json.loads(chunk_path.read_text())
+
+
 def test_video_errors_written_to_error_path(tmp_path: Path) -> None:
     """Verify that videos with errors write to video_errors path and skip normal chunk metadata."""
     input_dir = tmp_path / "input"
@@ -962,6 +1031,130 @@ def test_make_clip_metadata_caption_quality_flags_disabled_shape(tmp_path: Path)
     assert "flag_length_outlier" not in row
     assert "flag_repetition" not in row
     assert "flag_near_duplicate" not in row
+
+
+def test_caption_quality_stats_counts_ok_missing_caption_as_empty(tmp_path: Path) -> None:
+    """OK-status windows with no active caption key are counted as empty."""
+    stage = _create_stage(tmp_path / "out", tmp_path / "in", caption_quality_stats_enabled=True)
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[Window(start_frame=0, end_frame=10, caption_status="success")],
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+
+    clip_stats = stage._write_clip_metadata(clip, video_meta)
+    assert clip_stats.caption_quality_stats is not None
+    stats = clip_stats.caption_quality_stats
+
+    assert stats.caption_windows_checked == 1
+    assert stats.caption_status_counts["success"] == 1
+    assert stats.empty_caption_count == 1
+    assert stats.sentinel_caption_count == 0
+
+
+def test_caption_quality_stats_unknown_status_does_not_crash(tmp_path: Path) -> None:
+    """Runtime status drift should not crash the writer stage."""
+    stage = _create_stage(tmp_path / "out", tmp_path / "in", caption_quality_stats_enabled=True)
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[Window(start_frame=0, end_frame=10, caption_status="partial")],
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+
+    clip_stats = stage._write_clip_metadata(clip, video_meta)
+
+    assert clip_stats.caption_quality_stats is not None
+    assert clip_stats.caption_quality_stats.caption_windows_checked == 1
+    assert clip_stats.caption_quality_stats.caption_status_counts["partial"] == 1
+    serialized = clip_stats.caption_quality_stats.to_dict(include_unknown_keys=True)
+    assert serialized["caption_status_counts"]["partial"] == 1
+
+
+def test_caption_quality_stats_unknown_failure_reason_does_not_crash(tmp_path: Path) -> None:
+    """Runtime failure-reason drift should not crash the writer stage."""
+    stage = _create_stage(tmp_path / "out", tmp_path / "in", caption_quality_stats_enabled=True)
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[Window(start_frame=0, end_frame=10, caption_status="error", caption_failure_reason="oom")],
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+
+    clip_stats = stage._write_clip_metadata(clip, video_meta)
+
+    assert clip_stats.caption_quality_stats is not None
+    assert clip_stats.caption_quality_stats.caption_windows_checked == 1
+    assert clip_stats.caption_quality_stats.caption_status_counts["error"] == 1
+    assert clip_stats.caption_quality_stats.caption_failure_reason_counts["oom"] == 1
+    serialized = clip_stats.caption_quality_stats.to_dict(include_unknown_keys=True)
+    assert serialized["caption_failure_reason_counts"]["oom"] == 1
+
+
+def test_caption_quality_stats_flags_disabled_keeps_status_and_health_counts(tmp_path: Path) -> None:
+    """Disabling heuristic flags leaves status, failure, empty, and sentinel counts intact."""
+    stage = _create_stage(
+        tmp_path / "out",
+        tmp_path / "in",
+        caption_quality_stats_enabled=True,
+        caption_quality_flags_enabled=False,
+    )
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="v.mp4",
+        span=(0.0, 1.0),
+        windows=[
+            Window(
+                start_frame=0,
+                end_frame=10,
+                caption_status="success",
+                flag_length_outlier=True,
+                flag_repetition=True,
+                flag_near_duplicate=True,
+            ),
+            Window(
+                start_frame=10,
+                end_frame=20,
+                caption={"qwen": VLLM_UNKNOWN_CAPTION},
+                caption_status="truncated",
+                flag_length_outlier=True,
+                flag_repetition=True,
+                flag_near_duplicate=True,
+            ),
+            Window(
+                start_frame=20,
+                end_frame=30,
+                caption_status="error",
+                caption_failure_reason="exception",
+                flag_length_outlier=True,
+                flag_repetition=True,
+                flag_near_duplicate=True,
+            ),
+        ],
+    )
+    video_meta = VideoMetadata(height=1080, width=1920, framerate=30.0, num_frames=30, duration=1.0, video_codec="h264")
+
+    clip_stats = stage._write_clip_metadata(clip, video_meta)
+    assert clip_stats.caption_quality_stats is not None
+    stats = clip_stats.caption_quality_stats
+
+    assert stats.caption_windows_checked == 3
+    assert stats.caption_status_counts["success"] == 1
+    assert stats.caption_status_counts["truncated"] == 1
+    assert stats.caption_status_counts["error"] == 1
+    assert stats.caption_failure_reason_counts["exception"] == 1
+    assert stats.empty_caption_count == 1
+    assert stats.sentinel_caption_count == 1
+    assert stats.caption_quality_flags_evaluated_count == 0
+    assert stats.caption_quality_flag_counts == {
+        "flag_length_outlier": 0,
+        "flag_repetition": 0,
+        "flag_near_duplicate": 0,
+    }
 
 
 def test_make_clip_metadata_emits_none_status_for_unprocessed_window(tmp_path: Path) -> None:

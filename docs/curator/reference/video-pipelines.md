@@ -93,6 +93,7 @@ Today the split-annotate pipeline produces the following artifacts under the pat
 │   ├── {input-video-relpath}.json
 ├── v0/all_window_captions.json     # aggregattion of all the captions generated for all the clips
 ├── summary.json                    # summary of the pipeline results
+├── caption_quality_stats.json      # caption structural-health counters; emitted for captioning unless disabled
 ```
 
 ### Per-Clip Caption Metadata
@@ -134,6 +135,9 @@ enabled but no flag value was evaluated for that window, such as a non-captioned
 or non-evaluable status. When `caption_quality_flags_enabled` is `false`, the
 three per-window `flag_*` keys are omitted. The flags are annotations only; they
 do not change caption status, trigger retries, block export, or enforce policy.
+
+Run-level aggregates of these per-window fields are documented in
+[Caption Quality Stats](caption-quality-stats.md).
 
 `filtered_windows[]` has its own lightweight shape for filtering rationale and
 does not use the caption-quality flag fields.
@@ -190,6 +194,7 @@ In case you want the output to be in a different S3 bucket than the input, you c
 - `--no-generate-embeddings`: disables InterVideo2/Cosmos-Embed1 embedding generation; use `"generate_embeddings": false` in API endpoint.
 - `--embedding-algorithm`: specifies embedding model, available options are `cosmos-embed1-224p`, `cosmos-embed1-336p`, `cosmos-embed1-448p`, `internvideo2` (default), and `openai` (requires an OpenAI-compatible endpoint; see [Use an OpenAI-Compatible Endpoint for Embedding](../../client/end-user-guide.md#use-an-openai-compatible-endpoint-for-embedding)). The `cosmos-embed1-*` suffix selects the input resolution; 224p is faster with 256-dim vectors, while 336p/448p are slower but score higher on retrieval/classification benchmarks and produce 768-dim vectors.
 - `--no-generate-captions`: disables VLM captioning; use `"generate_captions": false` in API endpoint.
+- `--no-caption-quality-stats`: disables the run-level `caption_quality_stats.json` artifact; use `"caption_quality_stats_enabled": false` in API endpoint.
 - `--no-caption-quality-flags`: disables heuristic caption-quality flag annotations in per-clip metadata.
 - `--generate-previews`: enables web preview generation when captioning is enabled.
 - `--upload-clip-info-in-chunks`: enables metadata jsonl for a group of clips and disables per-clip embedding & metadata writes.
