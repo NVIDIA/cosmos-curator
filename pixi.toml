@@ -227,7 +227,7 @@ transformers = ">=5.0.0"
 
 [environments]
 cuml = ["cuml", "tracing"]
-default = ["core", "tracing", "profiling"]
+default = ["core", "transformers", "tracing", "profiling"]
 legacy-transformers = ["core", "legacy-transformers", "tracing", "profiling"]
 model-download = ["model-download", "tracing"]
 paddle-ocr = ["core", "paddle-ocr", "tracing", "profiling"]

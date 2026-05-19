@@ -33,6 +33,7 @@ This directory collects documentation for the curator pipeline layer. It is orga
 - [Captioning Approaches](design/captioning-approaches.md) - comparison of captioning architectures.
 - [Multi-Camera Design](design/multicam.md) - multi-camera data model and implementation plan.
 - [Ray Data Design](design/ray-data.md) - Ray Data direction and implementation notes.
+- [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.
 - [Sensor Library Design](design/sensor-library.md) - sensor data model and API direction.
 - [Efficient Sparse Video Decode](design/sensor-library-efficient-video-decode.md) - efficient decode strategy for sampled video.
 - [Orca Agentic Curation](design/orca.md) - agentic orchestration direction for large-scale curation.

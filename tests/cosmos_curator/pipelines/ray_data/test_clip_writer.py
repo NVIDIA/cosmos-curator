@@ -86,3 +86,32 @@ def test_write_emits_mp4_and_json(tmp_path: Path) -> None:
         "total_prompt_tokens": 0,
         "total_output_tokens": 0,
     }
+
+
+@pytest.mark.env("cosmos-curator")
+def test_write_without_metadata_can_keep_clip_bytes(tmp_path: Path) -> None:
+    """Captioning path writes MP4 first, keeps bytes, and defers metadata JSON."""
+    clip_bytes = _FIXTURE_CLIP.read_bytes()
+    clip_uuid = "55f3cf21-ce64-587c-b73d-30834b728ff5"
+    source_video = "s3://bucket/raw/sample.mp4"
+    row = {
+        "video_path": source_video,
+        "video_size": 123456,
+        "duration_s": 600.0,
+        "clip_uuid": clip_uuid,
+        "clip_start_s": 350.0,
+        "clip_end_s": 360.0,
+        "clip_bytes": clip_bytes,
+        "width_source": 1280,
+        "height_source": 720,
+        "framerate_source": 29.97,
+    }
+
+    result = make_write_fn(str(tmp_path), write_metadata=False, keep_clip_bytes=True)(row)
+
+    assert (tmp_path / "clips" / f"{clip_uuid}.mp4").read_bytes() == clip_bytes
+    assert not (tmp_path / "metas" / "v0" / f"{clip_uuid}.json").exists()
+    assert result["clip_bytes"] == clip_bytes
+    assert result["clip_location"] == f"{tmp_path}/clips/{clip_uuid}.mp4"
+    assert result["width_source"] == 1280
+    assert result["num_bytes"] == len(clip_bytes)

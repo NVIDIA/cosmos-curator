@@ -24,6 +24,7 @@ from cosmos_curator.pipelines.ray_data._summary_writer import (
     _relative_path,
     _video_uuid,
     write_summary,
+    write_summary_from_rows,
 )
 
 
@@ -106,3 +107,53 @@ def test_write_summary_aggregates_across_videos(tmp_path: Path) -> None:
     b = summary["b.mp4"]
     assert b["num_total_clips"] == 1
     assert b["clips"] == ["b-1"]
+
+
+def test_write_summary_from_rows_aggregates_caption_stats(tmp_path: Path) -> None:
+    """Caption-aware clip rows emit Xenna-style token totals."""
+    rows = [
+        {
+            "video_path": "s3://bucket/raw/a.mp4",
+            "video_size": 1000,
+            "duration_s": 30.0,
+            "clip_uuid": "a-1",
+            "clip_start_s": 0.0,
+            "clip_end_s": 10.0,
+            "clip_location": str(tmp_path / "clips" / "a-1.mp4"),
+            "has_caption": True,
+            "num_caption_windows": 2,
+            "total_prompt_tokens": 30,
+            "total_output_tokens": 12,
+        },
+        {
+            "video_path": "s3://bucket/raw/a.mp4",
+            "video_size": 1000,
+            "duration_s": 30.0,
+            "clip_uuid": "a-2",
+            "clip_start_s": 10.0,
+            "clip_end_s": 20.0,
+            "clip_location": str(tmp_path / "clips" / "a-2.mp4"),
+            "has_caption": False,
+            "num_caption_windows": 0,
+            "total_prompt_tokens": 0,
+            "total_output_tokens": 0,
+        },
+    ]
+
+    num_clips = write_summary_from_rows(
+        rows,
+        input_video_path="s3://bucket/raw",
+        output_path=str(tmp_path),
+        num_input_videos=1,
+        pipeline_run_time_minutes=0.5,
+    )
+
+    assert num_clips == 2
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["total_num_clips_with_caption"] == 1
+    assert summary["total_num_caption_windows"] == 2
+    assert summary["total_prompt_tokens"] == 30
+    assert summary["total_output_tokens"] == 12
+    assert summary["output_tokens_per_s"] == 0.4
+    assert summary["a.mp4"]["num_clips_with_caption"] == 1
+    assert summary["a.mp4"]["num_caption_windows"] == 2

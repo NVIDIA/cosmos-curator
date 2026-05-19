@@ -27,7 +27,12 @@ from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
 from cosmos_curator.pipelines.video.utils.decoder_utils import extract_video_metadata
 
 
-def make_write_fn(output_dir: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def make_write_fn(
+    output_dir: str,
+    *,
+    write_metadata: bool = True,
+    keep_clip_bytes: bool = False,
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Create a ``map`` function that writes a clip and its metadata to storage.
 
     Each clip produces two artifacts under *output_dir*:
@@ -42,6 +47,12 @@ def make_write_fn(output_dir: str) -> Callable[[dict[str, Any]], dict[str, Any]]
     Args:
         output_dir: Base output directory (local path, ``s3://...``, or
             ``az://...``).
+        write_metadata: When ``True``, write the current splitting-only
+            per-clip metadata JSON immediately. Captioning paths set this to
+            ``False`` and write final metadata after caption windows are known.
+        keep_clip_bytes: When ``True``, include ``clip_bytes`` in the returned
+            row so a downstream caption-window stage can decode it. Splitting-only
+            paths leave this ``False`` so rows stay small before summary aggregation.
 
     Returns:
         A function suitable for ``ray.data.Dataset.map``.
@@ -83,9 +94,10 @@ def make_write_fn(output_dir: str) -> Callable[[dict[str, Any]], dict[str, Any]]
             "total_prompt_tokens": 0,
             "total_output_tokens": 0,
         }
-        writer.write_str_to(f"metas/v0/{clip_uuid}.json", json.dumps(metadata, indent=4))
+        if write_metadata:
+            writer.write_str_to(f"metas/v0/{clip_uuid}.json", json.dumps(metadata, indent=4))
 
-        return {
+        output_row: dict[str, Any] = {
             "video_path": row["video_path"],
             "video_size": row["video_size"],
             "duration_s": row["duration_s"],
@@ -94,5 +106,22 @@ def make_write_fn(output_dir: str) -> Callable[[dict[str, Any]], dict[str, Any]]
             "clip_end_s": row["clip_end_s"],
             "clip_location": clip_location,
         }
+        if not write_metadata or keep_clip_bytes:
+            output_row.update(
+                {
+                    "width_source": row["width_source"],
+                    "height_source": row["height_source"],
+                    "framerate_source": row["framerate_source"],
+                    "width": clip_metadata.width,
+                    "height": clip_metadata.height,
+                    "framerate": clip_metadata.fps,
+                    "num_frames": clip_metadata.num_frames,
+                    "video_codec": clip_metadata.video_codec,
+                    "num_bytes": len(clip_bytes),
+                }
+            )
+        if keep_clip_bytes:
+            output_row["clip_bytes"] = clip_bytes
+        return output_row
 
     return _write

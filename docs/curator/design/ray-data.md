@@ -210,19 +210,14 @@ ds = ds.map_batches(GPT2Predictor, batch_size=1, batch_format="pyarrow", num_gpu
                     compute=ActorPoolStrategy(size=1))
 ```
 
-### vLLM captioning via Ray Serve
+### vLLM captioning via Ray Data LLM
 
-In-process vLLM inference inside a `map_batches` actor has a drain tail: each call waits for `max(generation_times)`
-across the batch, so clips with shorter captions sit idle while the longest completes. With synchronous batch
-boundaries, the GPU spends increasing time on fewer active requests as a batch drains.
+The first Ray Data captioning path uses `ray.data.llm` to own the vLLM engine actors, GPU scheduling, and continuous
+batching. The pipeline still reuses the existing Xenna/Qwen frame preparation and adapts the resulting vLLM inputs into
+Ray Data rows.
 
-The direction for per-clip GPU captioning is to host vLLM behind a **Ray Serve deployment** and submit per-clip
-requests asynchronously from Ray Data workers. vLLM's continuous batching keeps the engine saturated: when one request
-finishes, the next one in the Serve queue slots in. Drain tails across different Ray Data tasks interleave naturally
-at the engine, so no single task's slow clip blocks the GPU on work for other tasks.
-
-This pattern applies regardless of whether the surrounding pipeline uses `map` + list columns or `flat_map`. Each
-worker submits its clips (whether a per-video list or a per-clip row) concurrently to Serve and awaits completion.
+See [Ray Data Captioning Design](ray-data-captioning.md) for the detailed architecture, tradeoffs, and known technical
+debt.
 
 ### Long-term outlook
 
@@ -261,7 +256,7 @@ as a `map_batches` kwarg. This is the same `PixiRuntimeEnv` already used by the 
 - [x] Ray Data video splitting pipeline MVP (fixed-stride split + transcode + write + per-clip JSON metadata)
 - [x] `summary.json` output for the splitting pipeline (driver-side aggregation via `take_all()`;
   avoids the `groupby` shuffle's per-node CPU reservation in the streaming DAG)
-- [ ] Ray Data captioning via Ray Serve + vLLM
+- [x] Ray Data captioning via Ray Data LLM + vLLM
 - [ ] Ray Data versions of remaining production pipelines (embedding, filtering)
 - [ ] Per-clip transcode failure reporting: surface failed clips with error info in per-video metadata and
   `summary.json` instead of silently dropping them
