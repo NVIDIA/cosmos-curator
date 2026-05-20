@@ -26,7 +26,7 @@ from loguru import logger
 
 from cosmos_curator.core.utils.infra.tracing import TracedSpan
 
-_START_UP_RETRIES = 6
+_START_UP_RETRIES = 12
 _START_UP_RETRY_INTERVAL_S = 90
 
 

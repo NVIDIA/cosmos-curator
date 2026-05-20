@@ -92,13 +92,24 @@ if conda_utils.is_running_in_env("unified"):
 T = TypeVar("T", bound=PipelineTask)
 
 # Minimum free-memory fraction the GPU must have at stage startup.
-# Set 0.98 so any non-trivial residual (>= ~3.7 GiB on a 184 GiB device) trips
-# ``GpuNotCleanError`` and forces a retry / re-placement instead of letting the
-# downstream vLLM init fail with a cryptic ``ValueError``. Sub-GiB driver
-# baseline still passes. If a future variant raises ``gpu_memory_utilization``
-# above ~0.95, this threshold itself becomes the looser of the two and you can
-# safely leave it; bump it only if you see false positives from healthy GPUs.
-_VLLM_REQUIRED_FREE_FRACTION = 0.98
+# Set 0.95 so up to ~9 GiB of residual on a 184 GiB GB200 (or ~4 GiB on an
+# 80 GiB H100) is tolerated before ``GpuNotCleanError`` is raised. Was 0.98,
+# but field experience showed lingering vLLM EngineCore teardown leaves
+# ~6-8 GiB resident for several minutes after SIGKILL, which exhausted the
+# retry budget on the same placement and caused otherwise-usable GPUs to be
+# dropped from the autoscaler pool. This threshold is still well above
+# ``gpu_memory_utilization`` (0.85 for Qwen variants), so any GPU we admit
+# here still has comfortable headroom for the downstream vLLM allocator.
+_VLLM_REQUIRED_FREE_FRACTION = 0.95
+
+# How long ``destroy()`` waits for vLLM child processes to exit after SIGTERM
+# before escalating to SIGKILL. 30 s gives vLLM v1 enough time to release the
+# model weights and call its own shutdown path even when interrupted during a
+# long model-load or torch.compile pass.
+# The cost of the larger window is bounded: it only applies to workers that
+# ignored SIGTERM. If we exceed a SIGTERM timeout, we may leak GPU memory when
+# SIGKILL is sent.
+_VLLM_SIGTERM_GRACE_S = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -615,6 +626,11 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         vLLM a chance to call ``cudaDeviceReset`` and free its context; SIGKILL is the
         fallback for processes that ignore SIGTERM. Ordering matters: we want context
         released cleanly so no ghost memory is left on the GPU.
+
+        The SIGTERM grace is ``_VLLM_SIGTERM_GRACE_S`` (30 s by default). See the
+        constant's comment for the rationale; the short version is "long enough for
+        EngineCore to finish a mid-load shutdown so the CUDA context is dropped before
+        ``nvidia-persistenced`` pins it as a permanent orphan."
         """
         try:
             me = psutil.Process()
@@ -635,12 +651,12 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 child.terminate()
 
-        gone, alive = psutil.wait_procs(children, timeout=5.0)
+        gone, alive = psutil.wait_procs(children, timeout=_VLLM_SIGTERM_GRACE_S)
         for child in alive:
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 logger.warning(
-                    f"VllmCaptionStage.destroy: pid={child.pid} name={child.name()!r} ignored SIGTERM after 5s; "
-                    "sending SIGKILL (may leak GPU memory)"
+                    f"VllmCaptionStage.destroy: pid={child.pid} name={child.name()!r} ignored SIGTERM "
+                    f"after {_VLLM_SIGTERM_GRACE_S:.0f}s; sending SIGKILL (may leak GPU memory)"
                 )
                 child.kill()
         if alive:
