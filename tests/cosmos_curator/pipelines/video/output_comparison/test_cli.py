@@ -42,10 +42,13 @@ def test_cli_writes_report_and_returns_zero_for_matching_summaries(
     assert exit_code == 0
     assert report["passed"] is True
     assert report["summary_comparison"]["videos_in_both"] == 1
-    assert stdout == (
-        "PASSED split output comparison\n"
-        "videos in both: 1, only in A: 0, only in B: 0, issues: 0\n"
-        f"report: {report_path}\n"
+    _assert_stdout_with_runtime(
+        stdout,
+        expected_lines=[
+            "PASSED split output comparison",
+            "videos in both: 1, only in A: 0, only in B: 0, issues: 0",
+        ],
+        report_path=str(report_path),
     )
 
 
@@ -66,17 +69,25 @@ def test_cli_writes_report_and_returns_nonzero_for_failed_comparison(
     assert exit_code == 1
     assert report["passed"] is False
     assert report["issues"][0]["code"] == "summary_field_mismatch"
-    assert stdout == (
-        "FAILED split output comparison\n"
-        "videos in both: 1, only in A: 0, only in B: 0, issues: 1\n"
-        "first issues:\n"
-        "- summary_field_mismatch: Summary field differs between output A and output B "
-        "(field=total_num_clips_passed)\n"
-        f"report: {report_path}\n"
+    _assert_stdout_with_runtime(
+        stdout,
+        expected_lines=[
+            "FAILED split output comparison",
+            "videos in both: 1, only in A: 0, only in B: 0, issues: 1",
+            "first issues:",
+            (
+                "- summary_field_mismatch: Summary field differs between output A and output B "
+                "(field=total_num_clips_passed)"
+            ),
+        ],
+        report_path=str(report_path),
     )
 
 
-def test_cli_load_failure_names_output_path_error_and_field(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_load_failure_names_output_path_error_and_field(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """CLI and report output make summary schema load failures easy to locate."""
     output_a = tmp_path / "output-a"
     output_b = tmp_path / "output-b"
@@ -96,14 +107,99 @@ def test_cli_load_failure_names_output_path_error_and_field(tmp_path: Path, caps
     assert report["issues"][0]["message"] == expected_message
     assert report["issues"][0]["output"] == "a"
     assert report["issues"][0]["field"] == "num_processed_videos"
-    assert stdout == (
-        "FAILED split output comparison\n"
-        "videos in both: 0, only in A: 0, only in B: 0, issues: 1\n"
-        "first issues:\n"
-        f"- summary_load_failed: {expected_message} (field=num_processed_videos, "
-        "error_type=MissingSummaryFieldError)\n"
-        f"report: {report_path}\n"
+    _assert_stdout_with_runtime(
+        stdout,
+        expected_lines=[
+            "FAILED split output comparison",
+            "videos in both: 0, only in A: 0, only in B: 0, issues: 1",
+            "first issues:",
+            (
+                f"- summary_load_failed: {expected_message} (field=num_processed_videos, "
+                "error_type=MissingSummaryFieldError)"
+            ),
+        ],
+        report_path=str(report_path),
     )
+
+
+def test_cli_forwards_video_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI ``--limit`` scopes video-level feature comparison."""
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "comparison.json"
+
+    def fake_compare_split_outputs(  # noqa: PLR0913
+        output_a: object,
+        output_b: object,
+        *,
+        profile_name: str | None = None,
+        token_count_abs_tolerance: float = 0,
+        token_count_rel_tolerance: float = 0,
+        video_limit: int | None = None,
+        selected_video_key: str | None = None,
+    ) -> ComparisonReport:
+        _ = profile_name, token_count_abs_tolerance, token_count_rel_tolerance
+        captured["args"] = (output_a, output_b)
+        captured["video_limit"] = video_limit
+        captured["selected_video_key"] = selected_video_key
+        return ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.cli.compare_split_outputs",
+        fake_compare_split_outputs,
+    )
+
+    exit_code = main(["output-a", "output-b", "--report-path", str(report_path), "--limit", "2"])
+
+    assert exit_code == 0
+    assert captured["args"] == ("output-a", "output-b")
+    assert captured["video_limit"] == 2
+    assert captured["selected_video_key"] is None
+    assert json.loads(report_path.read_text(encoding="utf-8"))["passed"] is True
+    assert "PASSED split output comparison" in capsys.readouterr().out
+
+
+def test_cli_forwards_video_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI ``--video-key`` scopes video-level feature comparison to one summary key."""
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "comparison.json"
+
+    def fake_compare_split_outputs(  # noqa: PLR0913
+        output_a: object,
+        output_b: object,
+        *,
+        profile_name: str | None = None,
+        token_count_abs_tolerance: float = 0,
+        token_count_rel_tolerance: float = 0,
+        video_limit: int | None = None,
+        selected_video_key: str | None = None,
+    ) -> ComparisonReport:
+        _ = profile_name, token_count_abs_tolerance, token_count_rel_tolerance
+        captured["args"] = (output_a, output_b)
+        captured["video_limit"] = video_limit
+        captured["selected_video_key"] = selected_video_key
+        return ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.cli.compare_split_outputs",
+        fake_compare_split_outputs,
+    )
+
+    exit_code = main(["output-a", "output-b", "--report-path", str(report_path), "--video-key", "NBA/video.mp4"])
+
+    assert exit_code == 0
+    assert captured["args"] == ("output-a", "output-b")
+    assert captured["video_limit"] is None
+    assert captured["selected_video_key"] == "NBA/video.mp4"
+    assert json.loads(report_path.read_text(encoding="utf-8"))["passed"] is True
+    assert "PASSED split output comparison" in capsys.readouterr().out
 
 
 def test_format_stdout_summary_truncates_issues_and_formats_video_suffix() -> None:
@@ -128,6 +224,18 @@ def test_format_stdout_summary_truncates_issues_and_formats_video_suffix() -> No
     )
 
 
+def test_format_stdout_summary_includes_runtime_when_provided() -> None:
+    """Stdout summary includes comparison runtime when the CLI records it."""
+    report = ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
+
+    assert _format_stdout_summary(report, "report.json", comparison_runtime_seconds=1.234) == (
+        "PASSED split output comparison\n"
+        "videos in both: 0, only in A: 0, only in B: 0, issues: 0\n"
+        "comparison runtime: 1.23s\n"
+        "report: report.json\n"
+    )
+
+
 def test_format_stdout_summary_surfaces_error_type_from_issue_details() -> None:
     """Stdout summary distinguishes load-failure causes by surfacing error_type from details."""
     issues = [
@@ -141,3 +249,11 @@ def test_format_stdout_summary_surfaces_error_type_from_issue_details() -> None:
     assert "- summary_load_failed: Failed to load output A summary at /path/a/summary.json: " in stdout
     assert "(error_type=FileNotFoundError)" in stdout
     assert "(error_type=JSONDecodeError)" in stdout
+
+
+def _assert_stdout_with_runtime(stdout: str, *, expected_lines: list[str], report_path: str) -> None:
+    lines = stdout.splitlines()
+    assert lines[:-2] == expected_lines
+    assert lines[-2].startswith("comparison runtime: ")
+    assert lines[-2].endswith("s")
+    assert lines[-1] == f"report: {report_path}"

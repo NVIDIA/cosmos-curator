@@ -22,13 +22,14 @@ import attrs
 import pytest
 
 from cosmos_curator.pipelines.video.output_comparison.comparison import compare_split_outputs
-from cosmos_curator.pipelines.video.output_comparison.report import ComparisonReport, Issue, SummaryComparison
-from cosmos_curator.pipelines.video.output_comparison.summary_policy import DEFAULT_SUMMARY_POLICY
-from cosmos_curator.pipelines.video.output_comparison.summary_rules import (
-    SummaryComparisonContext,
-    SummaryRuleResult,
-    rules_for_policy,
+from cosmos_curator.pipelines.video.output_comparison.report import (
+    ComparisonReport,
+    FeatureComparison,
+    Issue,
+    SummaryComparison,
 )
+from cosmos_curator.pipelines.video.output_comparison.summary_policy import DEFAULT_SUMMARY_POLICY
+from cosmos_curator.pipelines.video.output_comparison.video_planning import VideoComparisonResult
 
 from .conftest import summary, video_summary, write_summary
 
@@ -43,15 +44,6 @@ def _issue_codes(report: dict[str, Any]) -> list[str]:
 
 def _issue_for(report: dict[str, Any], code: str, field: str) -> dict[str, Any]:
     return next(issue for issue in report["issues"] if issue["code"] == code and issue["field"] == field)
-
-
-class _CountingRule:
-    def __init__(self, exact_count: int) -> None:
-        self._exact_count = exact_count
-
-    def compare(self, context: SummaryComparisonContext) -> SummaryRuleResult:
-        assert context.videos_in_both == ("video.mp4",)
-        return SummaryRuleResult(exact_top_level_fields_compared=self._exact_count)
 
 
 def test_comparison_report_passed_is_derived_from_issues() -> None:
@@ -94,6 +86,21 @@ def test_issue_summary_load_failed_builds_structured_issue() -> None:
     }
 
 
+def test_issue_from_json_dict_round_trips_structured_issue() -> None:
+    """Issue JSON decoding mirrors the canonical issue encoder."""
+    issue = Issue(
+        code="caption_clip_set_mismatch",
+        message="clip mismatch",
+        details={"clips_only_in_a": ["clip-a"]},
+        output="a",
+        feature="captions",
+        video="video.mp4",
+        clip="clip-a",
+    )
+
+    assert Issue.from_json_dict(issue.to_json_dict()) == issue
+
+
 def test_matching_summary_accounting_passes(tmp_path: Path) -> None:
     """Matching summary accounting produces a passing report with comparison counts."""
     output_a = tmp_path / "output-a"
@@ -116,51 +123,87 @@ def test_matching_summary_accounting_passes(tmp_path: Path) -> None:
         "exact_top_level_fields_compared": len(DEFAULT_SUMMARY_POLICY.exact_top_level_fields),
         "token_fields_compared": len(DEFAULT_SUMMARY_POLICY.token_fields),
         "per_video_fields_compared": (
-            1 + len(DEFAULT_SUMMARY_POLICY.common_video_fields) + len(DEFAULT_SUMMARY_POLICY.processed_video_fields)
+            1
+            + len(DEFAULT_SUMMARY_POLICY.common_video_fields)
+            + len(DEFAULT_SUMMARY_POLICY.processed_video_fields)
+            + len(DEFAULT_SUMMARY_POLICY.clip_list_fields)
         ),
     }
 
 
-def test_compare_split_outputs_accepts_custom_rules_and_adds_rule_counts(tmp_path: Path) -> None:
-    """Public comparison API runs injected rules and accumulates their count updates."""
+def test_compare_split_outputs_mutual_exclusion(tmp_path: Path) -> None:
+    """Public comparison API rejects mutually exclusive feature selectors."""
+    with pytest.raises(ValueError, match="video_limit and selected_video_key are mutually exclusive"):
+        compare_split_outputs(
+            tmp_path / "output-a",
+            tmp_path / "output-b",
+            video_limit=1,
+            selected_video_key="video.mp4",
+        )
+
+
+@pytest.mark.parametrize(
+    ("selector_kwargs", "expected_video_limit", "expected_selected_video_key"),
+    [
+        pytest.param({}, None, None, id="no-selector"),
+        pytest.param({"video_limit": 3}, 3, None, id="limit"),
+        pytest.param({"selected_video_key": "video.mp4"}, None, "video.mp4", id="selected-video-key"),
+    ],
+)
+def test_compare_split_outputs_merges_feature_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    selector_kwargs: dict[str, int | str],
+    expected_video_limit: int | None,
+    expected_selected_video_key: str | None,
+) -> None:
+    """Public comparison API combines summary and feature comparison results."""
     output_a = tmp_path / "output-a"
     output_b = tmp_path / "output-b"
     write_summary(output_a, summary())
     write_summary(output_b, summary())
+    captured: dict[str, object] = {}
 
-    report = _json_report(compare_split_outputs(output_a, output_b, rules=[_CountingRule(2), _CountingRule(3)]))
+    def fake_compare_features(  # noqa: PLR0913
+        output_a_arg: object,
+        output_b_arg: object,
+        summary_a_arg: object,
+        summary_b_arg: object,
+        *,
+        profile_name: str,
+        video_limit: int | None,
+        selected_video_key: str | None,
+    ) -> VideoComparisonResult:
+        captured["args"] = (output_a_arg, output_b_arg, summary_a_arg, summary_b_arg)
+        captured["profile_name"] = profile_name
+        captured["video_limit"] = video_limit
+        captured["selected_video_key"] = selected_video_key
+        return VideoComparisonResult(
+            issues=(Issue(code="fake_feature_issue", message="Fake feature issue"),),
+            feature_comparisons={"fake": FeatureComparison(status="failed", metrics={"rows": 1})},
+        )
 
-    assert report["passed"] is True
-    assert report["issues"] == []
-    assert report["summary_comparison"] == {
-        "videos_in_both": 1,
-        "videos_only_in_a": [],
-        "videos_only_in_b": [],
-        "exact_top_level_fields_compared": 5,
-        "token_fields_compared": 0,
-        "per_video_fields_compared": 0,
-    }
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.comparison.compare_features",
+        fake_compare_features,
+    )
 
+    report = _json_report(
+        compare_split_outputs(
+            output_a,
+            output_b,
+            profile_name="profile-a",
+            **selector_kwargs,
+        )
+    )
 
-def test_compare_split_outputs_accepts_empty_rules(tmp_path: Path) -> None:
-    """An explicit empty rule sequence skips default summary rules."""
-    output_a = tmp_path / "output-a"
-    output_b = tmp_path / "output-b"
-    write_summary(output_a, summary(total_num_clips_passed=2))
-    write_summary(output_b, summary(total_num_clips_passed=1))
-
-    report = _json_report(compare_split_outputs(output_a, output_b, rules=[]))
-
-    assert report["passed"] is True
-    assert report["issues"] == []
-    assert report["summary_comparison"] == {
-        "videos_in_both": 1,
-        "videos_only_in_a": [],
-        "videos_only_in_b": [],
-        "exact_top_level_fields_compared": 0,
-        "token_fields_compared": 0,
-        "per_video_fields_compared": 0,
-    }
+    assert captured["args"][0:2] == (output_a, output_b)
+    assert captured["profile_name"] == "profile-a"
+    assert captured["video_limit"] == expected_video_limit
+    assert captured["selected_video_key"] == expected_selected_video_key
+    assert report["passed"] is False
+    assert report["issues"] == [{"code": "fake_feature_issue", "message": "Fake feature issue"}]
+    assert report["feature_comparisons"]["fake"] == {"status": "failed", "metrics": {"rows": 1}}
 
 
 def test_missing_summary_produces_structured_failure(tmp_path: Path) -> None:
@@ -408,7 +451,7 @@ def test_custom_tolerant_policy_field_requires_numeric_value(tmp_path: Path) -> 
     )
 
     with pytest.raises(TypeError, match=r"summary field 'custom_total' must be numeric for token comparison"):
-        compare_split_outputs(output_a, output_b, rules=rules_for_policy(policy))
+        compare_split_outputs(output_a, output_b, summary_policy=policy)
 
 
 def test_nonnumeric_token_totals_produce_load_failure(tmp_path: Path) -> None:
@@ -663,7 +706,7 @@ def test_custom_clip_list_policy_fields_are_compared(tmp_path: Path) -> None:
     )
     policy = attrs.evolve(DEFAULT_SUMMARY_POLICY, clip_list_fields=("kept_clips",))
 
-    report = _json_report(compare_split_outputs(output_a, output_b, rules=rules_for_policy(policy)))
+    report = _json_report(compare_split_outputs(output_a, output_b, summary_policy=policy))
 
     assert report["passed"] is False
     assert _issue_for(report, "clip_uuid_set_mismatch", "kept_clips") == {
@@ -701,4 +744,4 @@ def test_custom_clip_list_policy_field_requires_list_value(tmp_path: Path) -> No
     policy = attrs.evolve(DEFAULT_SUMMARY_POLICY, clip_list_fields=("kept_clips",))
 
     with pytest.raises(TypeError, match=r"summary field 'kept_clips' must be a list for clip UUID comparison"):
-        compare_split_outputs(output_a, output_b, rules=rules_for_policy(policy))
+        compare_split_outputs(output_a, output_b, summary_policy=policy)

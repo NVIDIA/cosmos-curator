@@ -15,12 +15,12 @@
 """Report helpers for output comparison."""
 
 import json
-from collections.abc import Sequence
-from typing import Self, cast
+from collections.abc import Mapping, Sequence
+from typing import Literal, Self, cast
 
 import attrs
 
-from cosmos_curator.pipelines.video.output_comparison.json_types import JsonDictObject, json_string_list
+from cosmos_curator.pipelines.video.output_comparison.json_types import JsonDictObject, JsonValue, json_string_list
 
 
 @attrs.define(frozen=True)
@@ -31,8 +31,10 @@ class Issue:
     message: str
     details: JsonDictObject | None = None
     output: str | None = None
+    feature: str | None = None
     field: str | None = None
     video: str | None = None
+    clip: str | None = None
 
     @classmethod
     def summary_load_failed(
@@ -62,6 +64,23 @@ class Issue:
         """Convert the issue to a JSON-compatible dictionary."""
         return cast("JsonDictObject", attrs.asdict(self, filter=lambda _attribute, value: value is not None))
 
+    @classmethod
+    def from_json_dict(cls, row: JsonValue) -> Self:
+        """Build an issue from a JSON-compatible dictionary."""
+        if not isinstance(row, dict):
+            error_msg = "issue row must be an object"
+            raise TypeError(error_msg)
+        return cls(
+            code=_required_str(row, "code"),
+            message=_required_str(row, "message"),
+            details=cast("JsonDictObject | None", row.get("details")),
+            output=_optional_str(row, "output"),
+            feature=_optional_str(row, "feature"),
+            field=_optional_str(row, "field"),
+            video=_optional_str(row, "video"),
+            clip=_optional_str(row, "clip"),
+        )
+
 
 @attrs.define(frozen=True)
 class SummaryComparison:
@@ -82,6 +101,21 @@ class SummaryComparison:
         return cast("JsonDictObject", summary_comparison)
 
 
+type FeatureComparisonStatus = Literal["skipped", "passed", "failed"]
+
+
+@attrs.define(frozen=True)
+class FeatureComparison:
+    """Feature comparison status and metrics."""
+
+    status: FeatureComparisonStatus
+    metrics: JsonDictObject = attrs.field(factory=dict)
+
+    def to_json_dict(self) -> JsonDictObject:
+        """Convert feature comparison data to a JSON-compatible dictionary."""
+        return {"status": self.status, "metrics": self.metrics}
+
+
 @attrs.define(frozen=True)
 class ComparisonReport:
     """Typed comparison report returned by the public comparison API."""
@@ -90,6 +124,7 @@ class ComparisonReport:
     output_b: str
     summary_comparison: SummaryComparison
     issues: tuple[Issue, ...]
+    feature_comparisons: Mapping[str, FeatureComparison] = attrs.field(factory=dict)
 
     @classmethod
     def from_issues(
@@ -98,6 +133,7 @@ class ComparisonReport:
         output_b: str,
         summary_comparison: SummaryComparison,
         issues: Sequence[Issue],
+        feature_comparisons: Mapping[str, FeatureComparison] | None = None,
     ) -> Self:
         """Build a report from comparison issues."""
         return cls(
@@ -105,6 +141,7 @@ class ComparisonReport:
             output_b=output_b,
             summary_comparison=summary_comparison,
             issues=tuple(issues),
+            feature_comparisons=feature_comparisons or {},
         )
 
     @property
@@ -121,6 +158,9 @@ class ComparisonReport:
                 "output_a": self.output_a,
                 "output_b": self.output_b,
                 "summary_comparison": self.summary_comparison.to_json_dict(),
+                "feature_comparisons": {
+                    name: comparison.to_json_dict() for name, comparison in sorted(self.feature_comparisons.items())
+                },
                 "issues": [issue.to_json_dict() for issue in self.issues],
             },
         )
@@ -137,3 +177,19 @@ def report_to_json(report: ComparisonReport) -> str:
 
     """
     return json.dumps(report.to_json_dict(), indent=2, sort_keys=True)
+
+
+def _required_str(row: Mapping[str, JsonValue], field: str) -> str:
+    value = row[field]
+    if not isinstance(value, str):
+        error_msg = f"issue row field {field!r} must be a string"
+        raise TypeError(error_msg)
+    return value
+
+
+def _optional_str(row: Mapping[str, JsonValue], field: str) -> str | None:
+    value = row.get(field)
+    if value is None or isinstance(value, str):
+        return value
+    error_msg = f"issue row field {field!r} must be a string when present"
+    raise TypeError(error_msg)

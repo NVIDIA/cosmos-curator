@@ -16,7 +16,13 @@
 
 import json
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def video_summary(
@@ -41,8 +47,8 @@ def video_summary(
         "num_clips_passed": 2,
         "num_clips_transcoded": 2,
         "num_clips_with_embeddings": 2,
-        "num_clips_with_caption": 2,
-        "num_caption_windows": 4,
+        "num_clips_with_caption": 0,
+        "num_caption_windows": 0,
         "num_clips_with_webp": 2,
         "clips": clips if clips is not None else ["clip-a", "clip-b"],
         "filtered_clips": filtered_clips if filtered_clips is not None else ["clip-filtered"],
@@ -69,8 +75,8 @@ def summary(**overrides: object) -> dict[str, Any]:
         "total_num_clips_passed": 2,
         "total_num_clips_transcoded": 2,
         "total_num_clips_with_embeddings": 2,
-        "total_num_clips_with_caption": 2,
-        "total_num_caption_windows": 4,
+        "total_num_clips_with_caption": 0,
+        "total_num_caption_windows": 0,
         "total_num_clips_with_webp": 2,
         "total_prompt_tokens": 100,
         "total_output_tokens": 50,
@@ -84,3 +90,38 @@ def write_summary(output_root: Path, summary: dict[str, Any]) -> None:
     """Write a summary JSON file under an output root."""
     output_root.mkdir()
     (output_root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def fake_ray_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run Ray Data executor tests through an in-process dataset."""
+
+    class FakeDataset:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self.rows = rows
+
+        def map(self, fn: object, **kwargs: object) -> "FakeDataset":
+            _ = kwargs
+            constructor_kwargs = kwargs.get("fn_constructor_kwargs", {})
+            if isinstance(fn, type):
+                worker = fn(**constructor_kwargs)  # type: ignore[arg-type]
+                self.rows = [worker(row) for row in self.rows]
+            else:
+                map_fn = cast("Callable[[dict[str, object]], dict[str, object]]", fn)
+                self.rows = [map_fn(row) for row in self.rows]
+            return self
+
+        def iter_rows(self) -> list[dict[str, object]]:
+            return self.rows
+
+    monkeypatch.setattr("ray.data.from_items", lambda rows: FakeDataset(rows))
+    monkeypatch.setattr("ray.is_initialized", lambda: True)
+    monkeypatch.setattr("ray.nodes", lambda: [{"NodeID": "node-1"}])
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.compare_features.TaskPoolStrategy",
+        lambda size: SimpleNamespace(size=size),
+    )
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.compare_features.ActorPoolStrategy",
+        lambda size: SimpleNamespace(size=size),
+    )
