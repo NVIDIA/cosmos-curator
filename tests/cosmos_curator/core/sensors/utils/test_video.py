@@ -394,61 +394,6 @@ def test_make_index_and_metadata_from_header_can_disable_fallback() -> None:
     full_demux.assert_not_called()
 
 
-def test_make_index_and_metadata_forwards_client_params_to_open_data_source() -> None:
-    """Video indexing should follow the sensor package client_params pattern for remote sources."""
-    expected_client_params = {"transport_params": {"client": object()}}
-    captured: dict[str, object] = {}
-    video_stream = SimpleNamespace(
-        time_base=Fraction(1, 30),
-        average_rate=Fraction(30, 1),
-        width=16,
-        height=16,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
-    )
-    container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
-    demux_result = (
-        [0, 10],
-        [100, 100],
-        [0, 1],
-        [True, False],
-        [False, False],
-    )
-
-    def fake_open_data_source(
-        data: object,
-        mode: str = "rb",
-        client_params: dict[str, object] | None = None,
-    ) -> object:
-        captured["data"] = data
-        captured["mode"] = mode
-        captured["client_params"] = client_params
-        return nullcontext(io.BytesIO(b""))
-
-    with (
-        patch(
-            "cosmos_curator.core.sensors.utils.video.open_data_source",
-            side_effect=fake_open_data_source,
-        ),
-        patch(
-            "cosmos_curator.core.sensors.utils.video.open_video_container",
-            return_value=nullcontext((container, video_stream)),
-        ),
-        patch(
-            "cosmos_curator.core.sensors.utils.video._get_video_index_full_demux",
-            return_value=demux_result,
-        ),
-    ):
-        make_index_and_metadata(
-            "s3://bucket/video.mp4",
-            index_method=VideoIndexCreationMethod.FULL_DEMUX,
-            client_params=expected_client_params,
-        )
-
-    assert captured["data"] == "s3://bucket/video.mp4"
-    assert captured["mode"] == "rb"
-    assert captured["client_params"] is expected_client_params
-
-
 def test_make_index_and_metadata_raises_on_unsupported_index_method() -> None:
     """make_index_and_metadata should reject unsupported index methods explicitly."""
     video_stream = SimpleNamespace(time_base=Fraction(1, 30))
@@ -466,6 +411,27 @@ def test_make_index_and_metadata_raises_on_unsupported_index_method() -> None:
         pytest.raises(ValueError, match="unsupported index_method"),
     ):
         make_index_and_metadata(b"", index_method="bogus")  # type: ignore[arg-type]
+
+
+def test_make_index_and_metadata_path_vs_stream_equivalence(
+    synthetic_video: io.BytesIO,
+    tmp_path: Path,
+) -> None:
+    """A ``Path`` source and a ``BufferedIOBase`` source produce equal indices.
+
+    Exercises the new file-like ``DataSource`` arm: the same MP4 bytes are
+    fed through :class:`pathlib.Path` and through :class:`io.BytesIO` and
+    must yield byte-identical :class:`VideoIndex` and :class:`VideoMetadata`.
+    """
+    video_path = tmp_path / "path_vs_stream.mp4"
+    video_path.write_bytes(synthetic_video.getvalue())
+
+    path_index, path_metadata = make_index_and_metadata(video_path)
+    stream = io.BytesIO(synthetic_video.getvalue())
+    stream_index, stream_metadata = make_index_and_metadata(stream)
+
+    assert path_index == stream_index
+    assert path_metadata == stream_metadata
 
 
 def test_video_index_eq_returns_false_for_different_lengths() -> None:
@@ -957,9 +923,9 @@ def test_cpu_video_decoder_open_owns_stream_but_open_video_container_does_not(
     captured_stream: io.BufferedReader | None = None
     real_open_file = open_file
 
-    def _capturing_open_file(src: object, mode: str = "rb", client_params: dict[str, object] | None = None) -> object:
+    def _capturing_open_file(src: object, mode: str = "rb") -> object:
         nonlocal captured_stream
-        stream = real_open_file(src, mode=mode, client_params=client_params)
+        stream = real_open_file(src, mode=mode)  # type: ignore[arg-type]
         if hasattr(stream, "closed"):
             captured_stream = stream  # type: ignore[assignment]
         return stream

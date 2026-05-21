@@ -16,7 +16,6 @@
 """Sensor wrapper for timestamped still images."""
 
 from collections.abc import Generator, Sequence
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -55,16 +54,13 @@ class ImageSensor:
         self,
         sources: Sequence[DataSource],
         sensor_timestamps_ns: npt.NDArray[np.int64] | None = None,
-        *,
-        client_params: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize with image sources, optional sensor timestamps, and optional storage client params."""
+        """Initialize with image sources and optional sensor timestamps."""
         if len(sources) == 0:
             msg = "sources must be non-empty"
             raise ValueError(msg)
 
         self._sources = list(sources)
-        self._client_params = client_params
         self._provided_sensor_timestamps_ns = sensor_timestamps_ns
         self._sensor_timestamps_ns: npt.NDArray[np.int64] | None = None
         self._empty_image_data: ImageData | None = None
@@ -142,12 +138,18 @@ class ImageSensor:
 
     def _load_frame(self, idx: int) -> tuple[npt.NDArray[np.uint8], ImageMetadata]:
         """Read and decode one image frame."""
-        with (
-            open_data_source(self._sources[idx], client_params=self._client_params) as stream,
-            PILImage.open(stream) as image,
-        ):
-            rgb_image = image.convert("RGB")
-            frame = np.array(rgb_image, dtype=np.uint8)
-            fmt = image.format.lower() if image.format is not None else None
+        with open_data_source(self._sources[idx]) as stream:
+            # PIL.Image.open reads from the stream's current position; the
+            # sensor library's DataSource contract for io.BufferedIOBase is
+            # "use absolute offsets starting from 0", so we position the
+            # stream at the data origin before handing it to PIL. For
+            # owned ``Path`` / ``bytes`` sources this is a no-op (open_data_source
+            # produces a fresh stream at position 0).
+            if stream.seekable():
+                stream.seek(0)
+            with PILImage.open(stream) as image:
+                rgb_image = image.convert("RGB")
+                frame = np.array(rgb_image, dtype=np.uint8)
+                fmt = image.format.lower() if image.format is not None else None
         metadata = ImageMetadata(height=int(frame.shape[0]), width=int(frame.shape[1]), image_format=fmt)
         return frame, metadata

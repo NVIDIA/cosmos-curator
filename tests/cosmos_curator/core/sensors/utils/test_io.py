@@ -19,7 +19,6 @@ from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
 
 from cosmos_curator.core.sensors.utils.io import open_data_source, open_file
@@ -28,54 +27,42 @@ from cosmos_curator.core.sensors.utils.io import open_data_source, open_file
 @pytest.mark.parametrize(
     ("input_data", "expected_type", "raises"),
     [
-        # Path and str open the file for reading (BinaryIO / BufferedReader)
         (
             Path("dummy.mp4"),
             io.BufferedReader,
             nullcontext(),
         ),
+        (b"video data", io.BytesIO, nullcontext()),
+        (io.BytesIO(b"stream data"), io.BytesIO, nullcontext()),
+        # Error cases: ``str`` URIs / ``int`` / ``list`` are no longer in DataSource.
         (
             "dummy.mp4",
-            io.BufferedReader,
-            nullcontext(),
+            None,
+            pytest.raises(ValueError),  # noqa: PT011
         ),
-        (b"video data", io.BytesIO, nullcontext()),  # bytes input
-        (io.BytesIO(b"stream data"), io.BytesIO, nullcontext()),  # existing BytesIO
-        # Error cases
         (
             123,
             None,
-            pytest.raises(ValueError),  # noqa: PT011, Integer input should raise ValueError
+            pytest.raises(ValueError),  # noqa: PT011
         ),
         (
             [],
             None,
-            pytest.raises(ValueError),  # noqa: PT011, List input should raise ValueError
+            pytest.raises(ValueError),  # noqa: PT011
         ),
     ],
 )
 def test_open_file(
-    input_data: Path | str | bytes | io.BytesIO | io.BufferedReader | int | list[Any],
+    input_data: Path | bytes | io.BytesIO | str | int | list[Any],
     expected_type: type | tuple[type, ...] | None,
     raises: AbstractContextManager[Any],
     tmp_path: Path,
 ) -> None:
-    """Test the _make_video_stream function with various input types.
-
-    Args:
-        input_data: The input data to test
-        expected_type: The expected type of the returned stream
-        raises: Either nullcontext() for success cases or pytest.raises() for error cases
-        tmp_path: Pytest fixture providing a temporary directory
-
-    """
-    if isinstance(input_data, (Path, str)):
-        # Create a temporary file for Path test case
+    """Open the supported ``DataSource`` shapes and reject everything else."""
+    if isinstance(input_data, Path):
         test_file = tmp_path / "dummy.mp4"
         test_file.write_bytes(b"test data")
-        # Cast input data back to the the original type so that
-        # make_video_stream is properly exercised
-        input_data = input_data.__class__(test_file)
+        input_data = test_file
 
     with raises:
         result = open_file(input_data)  # type: ignore[arg-type]
@@ -90,88 +77,54 @@ def test_open_file(
         result.close()
 
 
-def test_open_file_raises_on_unsupported_uri_scheme() -> None:
-    """Unsupported URI schemes should raise a clear ValueError instead of looking like local paths."""
-    with pytest.raises(ValueError, match="unsupported URI scheme"):
-        open_file("gs://bucket/video.mp4")
+def test_open_file_rejects_non_readable_buffered_stream() -> None:
+    """``open_file`` should reject a ``BufferedIOBase`` that is not readable."""
+
+    class _NonReadable(io.BytesIO):
+        def readable(self) -> bool:
+            return False
+
+    with pytest.raises(ValueError, match="buffered binary streams must be readable"):
+        open_file(_NonReadable(b"abcdef"))
 
 
-def test_open_file_uses_smart_open_for_supported_cloud_uris(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Supported cloud URIs should delegate to smart_open with caller-provided client params."""
-    calls: list[tuple[str, str, dict[str, Any]]] = []
-    fake_stream = io.BytesIO(b"cloud-bytes")
+def test_open_file_rejects_non_seekable_buffered_stream() -> None:
+    """``open_file`` should reject a ``BufferedIOBase`` that is not seekable."""
 
-    def fake_smart_open(path: str, mode: str, **client_params: object) -> io.BytesIO:
-        calls.append((path, mode, client_params))
-        fake_stream.seek(0)
-        return fake_stream
+    class _NonSeekable(io.BytesIO):
+        def seekable(self) -> bool:
+            return False
 
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.io.smart_open.open", fake_smart_open)
-
-    result = open_file("s3://bucket/video.mp4", mode="rb", client_params={"transport_params": {"client": object()}})
-
-    assert result is fake_stream
-    assert calls[0][0] == "s3://bucket/video.mp4"
-    assert calls[0][1] == "rb"
-    assert "transport_params" in calls[0][2]
+    with pytest.raises(ValueError, match="buffered binary streams must be seekable"):
+        open_file(_NonSeekable(b"abcdef"))
 
 
-@pytest.mark.parametrize("uri", ["s3://bucket/video.mp4", "az://container/video.mp4"])
-def test_open_file_requires_client_params_for_supported_cloud_uris(uri: str) -> None:
-    """Supported cloud URIs should fail clearly when client_params are omitted."""
-    with pytest.raises(ValueError, match="client_params is required"):
-        open_file(uri)
+def test_open_data_source_yields_buffered_stream_without_seek_or_restore() -> None:
+    """Borrowed buffered streams must be used as-is.
 
-
-def test_open_file_rejects_ndarray_with_non_uint8_dtype() -> None:
-    """Ndarray data sources should be accepted only when their bytes are already uint8."""
-    with pytest.raises(ValueError, match="ndarray data sources must have dtype uint8"):
-        open_file(np.array([1, 2, 3], dtype=np.int16))
-
-
-def test_open_file_accepts_uint8_ndarray_data_sources() -> None:
-    """Uint8 ndarray data sources should be copied into a BytesIO stream without dtype coercion."""
-    array = np.array([1, 2, 3, 4], dtype=np.uint8)
-
-    result = open_file(array)
-
-    assert isinstance(result, io.BytesIO)
-    assert result.read() == b"\x01\x02\x03\x04"
-
-
-def test_open_data_source_rewinds_and_restores_seekable_borrowed_stream() -> None:
-    """Borrowed seekable streams should be rewound on entry and restored on exit."""
+    The library does not ``seek(0)`` on entry and does not restore the
+    caller's position on exit. The caller observes the stream wherever the
+    library (and its inner consumers) left it.
+    """
     stream = io.BytesIO(b"abcdef")
     stream.seek(3)
 
     with open_data_source(stream, mode="rb") as opened:
         assert opened is stream
-        assert opened.tell() == 0
-        assert opened.read(2) == b"ab"
+        # No seek(0) on entry — the caller's position is preserved.
+        assert opened.tell() == 3
+        assert opened.read(2) == b"de"
+        # Position drifts as the consumer reads.
+        assert opened.tell() == 5
 
-    assert stream.tell() == 3
+    # No restore on exit — the stream's position is wherever the library
+    # left it (after the consumer's last read).
+    assert stream.tell() == 5
     assert not stream.closed
 
 
-def test_open_data_source_restores_seekable_borrowed_stream_after_exception() -> None:
-    """Borrowed seekable streams should restore their original position even if the caller raises."""
-    stream = io.BytesIO(b"abcdef")
-    stream.seek(4)
-
-    def _raise_inside_context() -> None:
-        with open_data_source(stream, mode="rb") as opened:
-            assert opened.tell() == 0
-            msg = "boom"
-            raise RuntimeError(msg)
-
-    with pytest.raises(RuntimeError, match="boom"):
-        _raise_inside_context()
-
-    assert stream.tell() == 4
-
-
-def test_open_data_source_rejects_nonseekable_borrowed_stream() -> None:
-    """Borrowed binary streams must be seekable because the library may reopen them."""
+def test_open_data_source_rejects_non_seekable_borrowed_stream() -> None:
+    """Borrowed binary streams must be seekable because PyAV / PIL do absolute seeks."""
 
     class _NonSeekableBytesIO(io.BytesIO):
         def seekable(self) -> bool:
@@ -180,7 +133,23 @@ def test_open_data_source_rejects_nonseekable_borrowed_stream() -> None:
     stream = _NonSeekableBytesIO(b"abcdef")
 
     with (
-        pytest.raises(ValueError, match="borrowed binary streams must be seekable"),
+        pytest.raises(ValueError, match="buffered binary streams must be seekable"),
+        open_data_source(stream, mode="rb"),
+    ):
+        pass
+
+
+def test_open_data_source_rejects_non_readable_borrowed_stream() -> None:
+    """Borrowed binary streams must be readable."""
+
+    class _NonReadableBytesIO(io.BytesIO):
+        def readable(self) -> bool:
+            return False
+
+    stream = _NonReadableBytesIO(b"abcdef")
+
+    with (
+        pytest.raises(ValueError, match="buffered binary streams must be readable"),
         open_data_source(stream, mode="rb"),
     ):
         pass

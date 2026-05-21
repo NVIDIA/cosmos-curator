@@ -72,7 +72,11 @@ class CameraSensor:
         """Initialize the camera sensor.
 
         Args:
-            source: the source of the video data
+            source: Video data source. See
+                :data:`cosmos_curator.core.sensors.types.types.DataSource`.
+                Cloud-backed inputs must be wrapped as a
+                :class:`io.BufferedIOBase` by the caller (e.g. via
+                ``smart_open.open(uri, "rb")``).
             stream_idx: The index of the video stream to use (default: 0).
             decode_config: Backend configuration for frame decoding. Use
                 :class:`~cosmos_curator.core.sensors.utils.video.CpuVideoDecodeConfig`

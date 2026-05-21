@@ -41,6 +41,8 @@ Run:
 import argparse
 import sys
 import time
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -53,8 +55,16 @@ from tqdm import tqdm
 from cosmos_curator.core.sensors.data.camera_data import CameraData
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.scripts._cli_cloud import (
+    CloudCliError,
+    add_cloud_credential_args,
+    is_cloud_uri,
+    open_cloud_source,
+    validate_source,
+)
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
-from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
+from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
+from cosmos_curator.core.sensors.utils.io import open_data_source
 from cosmos_curator.core.sensors.utils.video import (
     CpuVideoDecodeConfig,
     make_decode_plan,
@@ -62,15 +72,65 @@ from cosmos_curator.core.sensors.utils.video import (
     open_video_container,
 )
 
+# A factory that produces a fresh ``DataSource`` context per call. Used so each
+# library entry-point (CameraSensor, make_index_and_metadata, _verify_segment) gets
+# its own stream rather than aliasing one shared BinaryIO, which the new sensor
+# library contract forbids (concurrent / overlapping use is unsupported).
+SourceFactory = Callable[[], AbstractContextManager[DataSource]]
+
 
 def _add_source_args(parser: argparse.ArgumentParser) -> None:
     """Attach common source / VideoIndex arguments to *parser*."""
-    parser.add_argument("--source", type=Path, required=True, help="Local video file (MP4, MKV, …)")
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="Video source: local file path, or s3:// / az:// URI.",
+    )
     parser.add_argument(
         "--full-demux-index",
         action="store_true",
         help="Build VideoIndex via full demux instead of container header (slower, for validation).",
     )
+    add_cloud_credential_args(parser)
+
+
+def _resolve_source(args: argparse.Namespace) -> tuple[str, SourceFactory]:
+    """Validate ``args.source`` and return a (label, source-factory) pair.
+
+    The factory is a thunk returning a context manager that yields a fresh
+    :class:`DataSource` each time: a :class:`Path` for local files, a fresh
+    seekable :class:`BinaryIO` for cloud URIs. Exits with status 1 on invalid
+    source / credential errors.
+    """
+    source_str: str = args.source
+    try:
+        validate_source(source_str)
+    except CloudCliError as e:
+        sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+
+    if is_cloud_uri(source_str):
+        s3_profile_name = args.s3_profile_name
+        azure_profile_name = args.azure_profile_name
+
+        @contextmanager
+        def factory() -> Generator[DataSource, None, None]:
+            with open_cloud_source(
+                source_str,
+                s3_profile_name=s3_profile_name,
+                azure_profile_name=azure_profile_name,
+            ) as stream:
+                yield cast("DataSource", stream)
+
+        return source_str, factory
+
+    local_path = Path(source_str)
+
+    @contextmanager
+    def local_factory() -> Generator[DataSource, None, None]:
+        yield local_path
+
+    return source_str, local_factory
 
 
 def _add_threading_args(
@@ -110,18 +170,15 @@ def _add_threading_args(
 
 def cmd_sol(args: argparse.Namespace) -> None:
     """Speed-of-light: decode every frame with PyAV and discard immediately."""
-    source: Path = args.source
-    if not source.is_file():
-        sys.stderr.write(f"error: not a file: {source}\n")
-        sys.exit(1)
+    source_label, open_source = _resolve_source(args)
 
-    # --- Build VideoIndex ---
     index_method = (
         VideoIndexCreationMethod.FULL_DEMUX if args.full_demux_index else VideoIndexCreationMethod.FROM_HEADER
     )
-    print(f"source : {source}")
+    print(f"source : {source_label}")
     print("building VideoIndex ...")
-    index, metadata = make_index_and_metadata(source, index_method=index_method)
+    with open_source() as data:
+        index, metadata = make_index_and_metadata(data, index_method=index_method)
     duration_s = (index.pts_ns[-1] - index.pts_ns[0]) / 1e9
     print(
         f"  {len(index)} frames  |  {duration_s:.2f} s  |  {float(metadata.avg_frame_rate):.3f} fps"
@@ -133,11 +190,13 @@ def cmd_sol(args: argparse.Namespace) -> None:
     thread_type = av.codec.context.ThreadType[args.thread_type]
     print(f"\nthread_type={thread_type.name}  thread_count={args.thread_count or 'auto'}")
 
-    # --- Decode all frames, discard immediately ---
     decoded = 0
 
-    with av.open(str(source)) as container:
-        stream = container.streams.video[0]
+    with (
+        open_source() as data,
+        open_data_source(data, mode="rb") as raw_stream,
+        open_video_container(cast("Any", raw_stream)) as (container, stream),
+    ):
         stream.thread_type = thread_type
         stream.thread_count = args.thread_count
 
@@ -190,17 +249,15 @@ def cmd_kf_chunked(args: argparse.Namespace) -> None:  # noqa: PLR0915
     should be similar to sol.  The overhead visible here is the cost of N
     seeks and buffer flushes (one per keyframe/GOP).
     """
-    source: Path = args.source
-    if not source.is_file():
-        sys.stderr.write(f"error: not a file: {source}\n")
-        sys.exit(1)
+    source_label, open_source = _resolve_source(args)
 
     index_method = (
         VideoIndexCreationMethod.FULL_DEMUX if args.full_demux_index else VideoIndexCreationMethod.FROM_HEADER
     )
-    print(f"source : {source}")
+    print(f"source : {source_label}")
     print("building VideoIndex ...")
-    index, metadata = make_index_and_metadata(source, index_method=index_method)
+    with open_source() as data:
+        index, metadata = make_index_and_metadata(data, index_method=index_method)
     duration_s = (index.pts_ns[-1] - index.pts_ns[0]) / 1e9
     n_gops = len(index.kf_pts_ns)
     print(
@@ -229,8 +286,9 @@ def cmd_kf_chunked(args: argparse.Namespace) -> None:  # noqa: PLR0915
     seen_pts: set[int] = set()
 
     with (
-        source.open("rb") as raw_stream,
-        open_video_container(raw_stream) as (container, stream),
+        open_source() as data,
+        open_data_source(data, mode="rb") as raw_stream,
+        open_video_container(cast("Any", raw_stream)) as (container, stream),
         tqdm(total=len(index), unit="frame", desc="kf-chunked") as pbar,
     ):
         stream.thread_type = thread_type
@@ -288,7 +346,10 @@ def cmd_kf_chunked(args: argparse.Namespace) -> None:  # noqa: PLR0915
     print(f"  {fps:.1f} fps  |  {speed:.2f}x realtime")
 
 
-def _verify_segment(source: Path, camera_data: CameraData) -> list[str]:
+def _verify_segment(
+    open_source: SourceFactory,
+    camera_data: CameraData,
+) -> list[str]:
     """Independently decode each frame via raw PyAV and compare pixel-by-pixel.
 
     For each frame in *camera_data*, seeks to the exact stream PTS stored in
@@ -302,8 +363,11 @@ def _verify_segment(source: Path, camera_data: CameraData) -> list[str]:
     pts_to_frame_idx = _group_frame_indices_by_pts(camera_data)
     pts_to_find = set(pts_to_frame_idx)
 
-    with av.open(str(source)) as container:
-        stream = container.streams.video[0]
+    with (
+        open_source() as data,
+        open_data_source(data, mode="rb") as raw_stream,
+        open_video_container(cast("Any", raw_stream)) as (container, stream),
+    ):
         stream.thread_type = "AUTO"
         stream.thread_count = 0
         container.seek(int(camera_data.pts_stream[0]), stream=stream)
@@ -383,10 +447,7 @@ def cmd_sensor(args: argparse.Namespace) -> None:  # noqa: PLR0915
     exactly once.  Raises ValueError if the total decoded frame count does not
     match the VideoIndex timestamp count.
     """
-    source: Path = args.source
-    if not source.is_file():
-        sys.stderr.write(f"error: not a file: {source}\n")
-        sys.exit(1)
+    source_label, open_source = _resolve_source(args)
 
     segment_ns = int(args.segment_duration * 1_000_000_000)
     default_decode_config = CpuVideoDecodeConfig()
@@ -398,62 +459,74 @@ def cmd_sensor(args: argparse.Namespace) -> None:  # noqa: PLR0915
     index_method = (
         VideoIndexCreationMethod.FULL_DEMUX if args.full_demux_index else VideoIndexCreationMethod.FROM_HEADER
     )
-    print(f"source           : {source}")
+    print(f"source           : {source_label}")
     print("building CameraSensor ...")
-    sensor = CameraSensor(source, index_method=index_method, decode_config=decode_config)
-    index = sensor.video_index
-    video_meta = sensor.video_metadata
 
-    video_duration_s = (index.pts_ns[-1] - index.pts_ns[0]) / 1e9
-    n_gops = len(index.kf_pts_ns)
-    print(
-        f"  {len(index)} frames  |  {video_duration_s:.2f} s  |  {float(video_meta.avg_frame_rate):.3f} fps"
-        f"  |  {video_meta.width}x{video_meta.height}  |  {video_meta.bit_rate_bps // 1000} kbps"
-        f"  |  codec={video_meta.codec_name} {video_meta.codec_profile}  |  max_bframes={video_meta.codec_max_bframes}"
-        f"  |  pix_fmt={video_meta.pix_fmt}  |  {n_gops} GOPs"
-    )
-    print(f"\nsegment-duration : {args.segment_duration:.1f} s  ({segment_ns} ns)")
-    print(f"threading        : type={decode_config.thread_type}  count={decode_config.thread_count}")
+    # The CameraSensor and its .sample(...) iteration must share one underlying
+    # data source; after the refactor we keep one stream open for the whole loop.
+    # _verify_segment opens its own independent stream per call to avoid
+    # concurrent reuse of the sensor's stream.
+    with open_source() as sensor_data:
+        sensor = CameraSensor(
+            sensor_data,
+            index_method=index_method,
+            decode_config=decode_config,
+        )
+        index = sensor.video_index
+        video_meta = sensor.video_metadata
 
-    # Build sampling grid from the video's own timestamps so each grid point maps to
-    # exactly the frame that exists at that time (zero delta, no rounding).
-    # A sentinel one nanosecond past the last frame ensures it falls within the
-    # half-open interval [grid[0], grid[-1]) that sample_window_indices applies
-    # to the final segment — otherwise the last frame of the video would be dropped.
-    sentinel = int(index.pts_ns[-1]) + 1
+        video_duration_s = (index.pts_ns[-1] - index.pts_ns[0]) / 1e9
+        n_gops = len(index.kf_pts_ns)
+        print(
+            f"  {len(index)} frames  |  {video_duration_s:.2f} s  |  {float(video_meta.avg_frame_rate):.3f} fps"
+            f"  |  {video_meta.width}x{video_meta.height}  |  {video_meta.bit_rate_bps // 1000} kbps"
+            f"  |  codec={video_meta.codec_name} {video_meta.codec_profile}"
+            f"  |  max_bframes={video_meta.codec_max_bframes}"
+            f"  |  pix_fmt={video_meta.pix_fmt}  |  {n_gops} GOPs"
+        )
+        print(f"\nsegment-duration : {args.segment_duration:.1f} s  ({segment_ns} ns)")
+        print(f"threading        : type={decode_config.thread_type}  count={decode_config.thread_count}")
 
-    # stride_ns == duration_ns → non-overlapping segments, no gaps.
-    sampling_grid = SamplingGrid(
-        start_ns=int(index.pts_ns[0]),
-        exclusive_end_ns=sentinel,
-        timestamps_ns=index.pts_ns,
-        stride_ns=segment_ns,
-        duration_ns=segment_ns,
-    )
-    spec = SamplingSpec(grid=sampling_grid)
+        # Build sampling grid from the video's own timestamps so each grid point maps to
+        # exactly the frame that exists at that time (zero delta, no rounding).
+        # A sentinel one nanosecond past the last frame ensures it falls within the
+        # half-open interval [grid[0], grid[-1]) that sample_window_indices applies
+        # to the final segment — otherwise the last frame of the video would be dropped.
+        sentinel = int(index.pts_ns[-1]) + 1
 
-    n_segments = sum(1 for _ in sampling_grid)
-    print(f"  {n_segments} segments")
+        # stride_ns == duration_ns → non-overlapping segments, no gaps.
+        sampling_grid = SamplingGrid(
+            start_ns=int(index.pts_ns[0]),
+            exclusive_end_ns=sentinel,
+            timestamps_ns=index.pts_ns,
+            stride_ns=segment_ns,
+            duration_ns=segment_ns,
+        )
+        spec = SamplingSpec(grid=sampling_grid)
 
-    stats: dict[str, float] = {}
-    decoded = 0
-    verify_errors = 0
-    t_verify = 0.0
-    t_wall = time.perf_counter()
+        n_segments = sum(1 for _ in sampling_grid)
+        print(f"  {n_segments} segments")
 
-    with tqdm(total=len(index), unit="frame", desc="sensor") as pbar:
-        for camera_data in sensor.sample(spec, stats=stats):
-            n = len(camera_data.frames)
-            decoded += n
-            pbar.update(n)
-            if args.verify:
-                t_v0 = time.perf_counter()
-                for err in _verify_segment(source, camera_data):
-                    print(f"  VERIFY ERROR: {err}", file=sys.stderr)
-                    verify_errors += 1
-                t_verify += time.perf_counter() - t_v0
+        stats: dict[str, float] = {}
+        decoded = 0
+        verify_errors = 0
+        t_verify = 0.0
+        t_wall = time.perf_counter()
 
-    elapsed = time.perf_counter() - t_wall
+        with tqdm(total=len(index), unit="frame", desc="sensor") as pbar:
+            for camera_data in sensor.sample(spec, stats=stats):
+                n = len(camera_data.frames)
+                decoded += n
+                pbar.update(n)
+                if args.verify:
+                    t_v0 = time.perf_counter()
+                    for err in _verify_segment(open_source, camera_data):
+                        print(f"  VERIFY ERROR: {err}", file=sys.stderr)
+                        verify_errors += 1
+                    t_verify += time.perf_counter() - t_v0
+
+        elapsed = time.perf_counter() - t_wall
+
     elapsed_decode = elapsed - t_verify  # Exclude verification time from decode metrics
 
     if decoded != len(index):
@@ -492,7 +565,6 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.required = True
 
-    # --- sol: speed-of-light ---
     sol_parser = subparsers.add_parser(
         "sol",
         help="Speed-of-light: raw PyAV decode, frames discarded immediately.",
@@ -502,7 +574,6 @@ def main() -> None:
     _add_threading_args(sol_parser)
     sol_parser.set_defaults(func=cmd_sol)
 
-    # --- kf-chunked: keyframe-chunked ---
     kf_chunked_parser = subparsers.add_parser(
         "kf-chunked",
         help="Keyframe-chunked decode: seek+flush per GOP, all frames decoded and discarded.",
@@ -512,7 +583,6 @@ def main() -> None:
     _add_threading_args(kf_chunked_parser)
     kf_chunked_parser.set_defaults(func=cmd_kf_chunked)
 
-    # --- sensor: CameraSensor-based ---
     sensor_parser = subparsers.add_parser(
         "sensor",
         help="CameraSensor decode: exercises the full production path over a duration window.",

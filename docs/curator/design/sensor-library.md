@@ -478,13 +478,37 @@ error rather than being silently coerced downstream.
 
 ### DataSource contract
 
-Sensors may open or rewind their input source multiple times across metadata
-loading, indexing, and sampling. Path-like sources and owned byte buffers are
-safe for this usage.
+`DataSource` is `Path | bytes | io.BufferedIOBase` (see
+`cosmos_curator/core/sensors/types/types.py`). The library is intentionally
+backend-agnostic: it does **not** accept URIs and does **not** import any cloud
+client. Callers wrap any non-local backend as a `BinaryIO` themselves and pass
+it in as the `io.BufferedIOBase` arm.
 
-Borrowed binary streams passed as a data source must be **seekable**. A
-non-seekable borrowed stream cannot be rewound to the beginning for later
-passes, so it is not a supported input to this library.
+- **`Path`**: a local filesystem path. The library opens it in `"rb"` mode and
+  owns the resulting handle for the duration of the call (closes it on exit).
+  Sensors may open or rewind their input source multiple times across metadata
+  loading, indexing, and sampling without any caller cooperation.
+
+- **`bytes`**: an owned byte buffer. Wrapped in a fresh `io.BytesIO` per call,
+  so multi-phase sensors (e.g. `CameraSensor` index build + `.sample()`) reuse
+  the same bytes safely.
+
+- **`io.BufferedIOBase`**: a caller-owned, **readable** and **seekable** binary
+  stream. The library treats it as an absolute-offset random-access buffer:
+  each public sensor entry point positions the stream at offset 0 before
+  handing it to PyAV / PIL and the underlying decoder performs absolute seeks
+  within the stream as it pleases. The library makes no promises about the
+  stream's position before, during, or after use, and does **not** restore the
+  caller's position on exit. Concurrent / overlapping use of one stream by
+  multiple readers (e.g. driving two sensors over the same `BinaryIO`
+  simultaneously) is unsupported. If the caller's "real data" lives at a
+  non-zero offset within a larger buffer, wrap it in a slicing adapter that
+  presents absolute offset 0 as the data origin.
+
+Non-readable or non-seekable buffered streams are rejected with a clear
+`ValueError` at `open_data_source`. Single-pass network streams (e.g. raw
+`urllib.urlopen` responses, `boto3 StreamingBody`) must be buffered into a
+seekable stream or downloaded to a `Path` / `bytes` first.
 
 ## Components
 
@@ -509,6 +533,31 @@ passes, so it is not a supported input to this library.
   validity plus optional covariance, velocity, fix type, satellite count,
   accuracy, dilution of precision, host/UTC timestamps, and sequence fields.
   See `docs/curator/design/sensor-library-gps-data.md`.
+- **Cloud sources**: The sensor library does **not** accept URIs. Callers feed
+  data from S3, Azure Blob, GCS, or any other remote store by opening their
+  own seekable `BinaryIO` (e.g. via `smart_open.open(uri, "rb",
+  transport_params=...)`, `boto3.client("s3").get_object(...)["Body"]` buffered
+  through `io.BytesIO`, or the equivalent for Azure / GCS) and passing it as
+  the `io.BufferedIOBase` arm of `DataSource`. Header-only indexing
+  (`make_index_and_metadata(..., FROM_HEADER)`) continues to work over any
+  seekable cloud-backed stream because PyAV uses absolute seeks in the AVIO
+  layer. A minimal caller-side pattern using `smart_open`:
+
+  ```python
+  import smart_open
+  from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
+
+  with smart_open.open("s3://bucket/clip.mp4", "rb", transport_params={"client": boto3_s3}) as stream:
+      sensor = CameraSensor(stream)
+      for batch in sensor.sample(spec):
+          ...
+  ```
+
+  See
+  [`docs/curator/guides/sensor-library-cloud-storage.md`](../guides/sensor-library-cloud-storage.md)
+  for usage (`BinaryIO` wrapping patterns for S3 / Azure, code example) and
+  [`docs/curator/design/sensor-library-cloud-storage.md`](sensor-library-cloud-storage.md)
+  for measured numbers, parity validation, and current limitations.
 
 ## Module Layout
 

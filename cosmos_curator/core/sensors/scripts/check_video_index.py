@@ -17,15 +17,22 @@
 import argparse
 import pathlib
 import sys
-from typing import Any
+from collections.abc import Generator
+from contextlib import contextmanager
+from typing import Any, BinaryIO
 
-import boto3
 import numpy as np
 import numpy.typing as npt
-from botocore.exceptions import BotoCoreError, NoCredentialsError, ProfileNotFound
 
 from cosmos_curator.core.sensors.data.video import VideoIndex
-from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
+from cosmos_curator.core.sensors.scripts._cli_cloud import (
+    CloudCliError,
+    add_cloud_credential_args,
+    is_cloud_uri,
+    open_cloud_source,
+    validate_source,
+)
+from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.video import _HeaderIndexUnavailableError, make_index_and_metadata
 
 PASS_EXIT_CODE = 0
@@ -36,59 +43,11 @@ VIDEO_REQUIREMENTS_DOCS_URL = (
     "https://github.com/nvidia-cosmos/cosmos-curate/blob/main/docs/curator/design/"
     "sensor-library-efficient-video-decode.md#from_header-vs-full_demux"
 )
-_S3_CREDENTIALS_HINT = (
-    "Use --s3-profile-name to select an AWS profile, or configure standard AWS credentials "
-    "with AWS_PROFILE, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, ~/.aws/credentials, or an IAM role."
-)
 
 
-class CliError(Exception):
-    """Actionable user-facing CLI failure."""
-
-
-def _is_s3_uri(source: str) -> bool:
-    return source.startswith("s3://")
-
-
-def _validate_source(source: str) -> None:
-    if _is_s3_uri(source):
-        return
-    if "://" in source:
-        msg = f"unsupported source URI {source!r}; use a local file path or an s3:// URI"
-        raise CliError(msg)
-    if not pathlib.Path(source).is_file():
-        msg = f"source is not a file: {source}"
-        raise CliError(msg)
-
-
-def _make_client_params(source: str, s3_profile_name: str | None) -> dict[str, Any] | None:
-    if not _is_s3_uri(source):
-        return None
-
-    try:
-        session = boto3.Session(profile_name=s3_profile_name) if s3_profile_name else boto3.Session()
-        credentials = session.get_credentials()
-    except (BotoCoreError, ProfileNotFound) as e:
-        msg = f"could not configure S3 access for {source!r}: {e}\n{_S3_CREDENTIALS_HINT}"
-        raise CliError(msg) from e
-    except Exception as e:
-        msg = f"could not configure S3 access for {source!r}: {e}"
-        raise CliError(msg) from e
-
-    if credentials is None:
-        msg = f"could not configure S3 access for {source!r}: {NoCredentialsError()}\n{_S3_CREDENTIALS_HINT}"
-        raise CliError(msg)
-
-    try:
-        client = session.client("s3")
-    except (BotoCoreError, ProfileNotFound) as e:
-        msg = f"could not configure S3 access for {source!r}: {e}\n{_S3_CREDENTIALS_HINT}"
-        raise CliError(msg) from e
-    except Exception as e:
-        msg = f"could not configure S3 access for {source!r}: {e}"
-        raise CliError(msg) from e
-
-    return {"transport_params": {"client": client}}
+# Re-exported for backwards compatibility with existing callers/tests that import
+# CliError from this module.
+CliError = CloudCliError
 
 
 def _format_scalar(value: object) -> str:
@@ -173,30 +132,56 @@ Mismatch detail (for advanced users):
 """
 
 
+@contextmanager
+def _open_source(
+    source: str,
+    *,
+    s3_profile_name: str | None,
+    azure_profile_name: str,
+) -> Generator[pathlib.Path | BinaryIO, None, None]:
+    """Yield a per-phase source — a :class:`Path` locally, a fresh :class:`BinaryIO` for cloud URIs.
+
+    Used per phase (FROM_HEADER then FULL_DEMUX) so each phase gets its own
+    cloud stream, matching the previous smart_open-per-call behaviour.
+    """
+    if is_cloud_uri(source):
+        with open_cloud_source(
+            source,
+            s3_profile_name=s3_profile_name,
+            azure_profile_name=azure_profile_name,
+        ) as stream:
+            yield stream
+    else:
+        yield pathlib.Path(source)
+
+
 def _check_video_index(
     source: str,
     *,
     stream_idx: int,
     video_format: str | None,
-    client_params: dict[str, Any] | None,
+    s3_profile_name: str | None,
+    azure_profile_name: str,
 ) -> tuple[bool, list[str]]:
     try:
-        header_index, _ = make_index_and_metadata(
-            source,
-            stream_idx=stream_idx,
-            video_format=video_format,
-            index_method=VideoIndexCreationMethod.FROM_HEADER,
-            client_params=client_params,
-            allow_header_fallback=False,
-        )
+        with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
+            data: DataSource = src if isinstance(src, pathlib.Path) else _as_data_source(src)
+            header_index, _ = make_index_and_metadata(
+                data,
+                stream_idx=stream_idx,
+                video_format=video_format,
+                index_method=VideoIndexCreationMethod.FROM_HEADER,
+                allow_header_fallback=False,
+            )
     except _HeaderIndexUnavailableError as e:
-        full_index, _ = make_index_and_metadata(
-            source,
-            stream_idx=stream_idx,
-            video_format=video_format,
-            index_method=VideoIndexCreationMethod.FULL_DEMUX,
-            client_params=client_params,
-        )
+        with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
+            data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
+            full_index, _ = make_index_and_metadata(
+                data,
+                stream_idx=stream_idx,
+                video_format=video_format,
+                index_method=VideoIndexCreationMethod.FULL_DEMUX,
+            )
         return False, [
             f"Header index could not be read from the file: {e}.",
             f"Full demux found {len(full_index)} packets.",
@@ -204,17 +189,29 @@ def _check_video_index(
             f"Full demux found {len(full_index.display_pts_ns)} displayable packets.",
         ]
 
-    full_index, _ = make_index_and_metadata(
-        source,
-        stream_idx=stream_idx,
-        video_format=video_format,
-        index_method=VideoIndexCreationMethod.FULL_DEMUX,
-        client_params=client_params,
-    )
+    with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
+        data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
+        full_index, _ = make_index_and_metadata(
+            data,
+            stream_idx=stream_idx,
+            video_format=video_format,
+            index_method=VideoIndexCreationMethod.FULL_DEMUX,
+        )
 
     if header_index == full_index:
         return True, []
     return False, make_mismatch_details(header_index, full_index)
+
+
+def _as_data_source(stream: BinaryIO) -> DataSource:
+    """Cast a ``BinaryIO`` produced by ``open_cloud_source`` to a ``DataSource``.
+
+    ``smart_open``'s S3 / Azure readers expose seekable binary streams that
+    inherit from :class:`io.BufferedIOBase`, so they satisfy the
+    ``BufferedIOBase`` arm of :data:`DataSource` at runtime even though
+    static typing only sees ``BinaryIO``.
+    """
+    return stream  # type: ignore[return-value]
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -223,16 +220,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         epilog="Exit codes: 0 = index consistent; 1 = mismatch detected; 2 = input, configuration, or runtime error.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--source", required=True, help="Local path or s3:// URI to the MP4 file.")
+    parser.add_argument("--source", required=True, help="Local path, s3:// URI, or az:// URI to the MP4 file.")
     parser.add_argument("--stream-idx", type=int, default=0, help="Video stream index.")
     parser.add_argument(
         "--video-format", default=None, help="Optional container format hint passed to the video loader."
     )
-    parser.add_argument(
-        "--s3-profile-name",
-        default=None,
-        help="Optional AWS profile name used for s3:// sources. If omitted, boto3's default credential chain is used.",
-    )
+    add_cloud_credential_args(parser)
     return parser.parse_args(argv)
 
 
@@ -241,15 +234,15 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     try:
-        _validate_source(args.source)
-        client_params = _make_client_params(args.source, args.s3_profile_name)
+        validate_source(args.source)
         ok, details = _check_video_index(
             args.source,
             stream_idx=args.stream_idx,
             video_format=args.video_format,
-            client_params=client_params,
+            s3_profile_name=args.s3_profile_name,
+            azure_profile_name=args.azure_profile_name,
         )
-    except CliError as e:
+    except CloudCliError as e:
         sys.stderr.write(f"error: {e}\n")
         return ERROR_EXIT_CODE
     except Exception as e:  # noqa: BLE001

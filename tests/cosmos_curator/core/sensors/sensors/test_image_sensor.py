@@ -15,6 +15,7 @@
 
 """Tests for ``ImageSensor``."""
 
+import io
 import pathlib
 from collections.abc import Iterator
 
@@ -23,7 +24,6 @@ import numpy.typing as npt
 import pytest
 from PIL import Image as PILImage
 
-import cosmos_curator.core.sensors.utils.io as io_module
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid, SamplingWindow
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors import image_sensor as image_sensor_module
@@ -289,36 +289,34 @@ def test_image_sensor_empty_image_data_is_cached(tmp_path: pathlib.Path) -> None
     assert sensor._get_empty_image_data() is sensor._get_empty_image_data()
 
 
-def test_image_sensor_remote_uri_requires_client_params() -> None:
-    """An s3:// URI source with no client_params should raise ValueError on load."""
-    sensor = ImageSensor(["s3://bucket/image.png"])
-
-    with pytest.raises(ValueError, match="client_params is required"):
-        next(sensor.sample(_StaticSpec([np.array([0], dtype=np.int64)], policy=None)))
-
-
-def test_image_sensor_remote_uri_threads_client_params(
-    monkeypatch: pytest.MonkeyPatch,
+def test_image_sensor_path_and_stream_sources_produce_equivalent_output(
     tmp_path: pathlib.Path,
 ) -> None:
-    """client_params should be forwarded to open_file when loading a remote URI."""
+    """A sensor built from a Path and one built from a BytesIO of the same bytes match.
+
+    Verifies the new file-like ``DataSource`` arm by feeding the same image
+    via a :class:`pathlib.Path` and via a fresh :class:`io.BytesIO` and
+    asserting the sampled output is byte-identical.
+    """
     image_path = tmp_path / "img.png"
-    _write_image(image_path, (10, 20, 30))
-    expected_params = {"transport_params": {"client": object()}}
-    captured: dict[str, object] = {}
-    real_open_file = io_module.open_file
+    _write_image(image_path, (123, 45, 200))
+    raw_bytes = image_path.read_bytes()
 
-    def _patched_open_file(src: object, mode: str = "rb", client_params: object = None) -> object:
-        captured["src"] = src
-        captured["client_params"] = client_params
-        if isinstance(src, str) and src.startswith("s3://"):
-            return real_open_file(image_path, mode)
-        return real_open_file(src, mode, client_params)  # type: ignore[arg-type]
+    path_sensor = ImageSensor([image_path], sensor_timestamps_ns=np.array([10], dtype=np.int64))
+    stream_sensor = ImageSensor([io.BytesIO(raw_bytes)], sensor_timestamps_ns=np.array([10], dtype=np.int64))
 
-    monkeypatch.setattr(io_module, "open_file", _patched_open_file)
+    grid = SamplingGrid(
+        start_ns=10,
+        exclusive_end_ns=11,
+        timestamps_ns=np.array([10], dtype=np.int64),
+        stride_ns=1,
+        duration_ns=1,
+    )
 
-    sensor = ImageSensor(["s3://bucket/image.png"], client_params=expected_params)
-    next(sensor.sample(_StaticSpec([np.array([0], dtype=np.int64)], policy=None)))
+    path_sample = next(path_sensor.sample(SamplingSpec(grid=grid)))
+    stream_sample = next(stream_sensor.sample(SamplingSpec(grid=grid)))
 
-    assert captured["src"] == "s3://bucket/image.png"
-    assert captured["client_params"] is expected_params
+    np.testing.assert_array_equal(path_sample.frames, stream_sample.frames)
+    np.testing.assert_array_equal(path_sample.sensor_timestamps_ns, stream_sample.sensor_timestamps_ns)
+    np.testing.assert_array_equal(path_sample.align_timestamps_ns, stream_sample.align_timestamps_ns)
+    assert path_sample.metadata == stream_sample.metadata

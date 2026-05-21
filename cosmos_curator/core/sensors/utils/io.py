@@ -18,99 +18,83 @@ import io
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
-
-import numpy as np
-import smart_open  # type: ignore[import-untyped]
-from smart_open.utils import FileLikeProxy  # type: ignore[import-untyped]
+from typing import BinaryIO, Literal, cast
 
 from cosmos_curator.core.sensors.types.types import DataSource
 
 
-def open_file(
-    src: DataSource, mode: Literal["rb", "wb"] = "rb", client_params: dict[str, Any] | None = None
-) -> BinaryIO | FileLikeProxy:
+def open_file(src: DataSource, mode: Literal["rb", "wb"] = "rb") -> BinaryIO:
     """Convert *src* to a readable or writable file-like object.
 
-    Return type is :class:`~typing.BinaryIO` or :class:`~smart_open.utils.FileLikeProxy`.
-    All current return paths are compatible with ``with`` statements, so callers
-    may use ``with open_file(...) as stream: ...`` when they own the returned
-    handle and want it closed promptly.
-
-    If *src* is an Azure or S3 URI, pass *client_params* for the client.
-
-    If *src* is already a caller-owned buffered binary stream, this function returns it
-    unchanged. Callers that use ``with`` and need borrow-only semantics should
-    use :func:`open_data_source` instead. In general, prefer
-    :func:`open_data_source` when ownership or automatic cleanup semantics matter.
+    The sensor library is backend-agnostic: it does not accept URIs and does
+    not import any cloud client. Callers that want to feed data from a remote
+    backend wrap the remote stream as a ``BinaryIO`` (e.g. via
+    ``smart_open.open(uri, "rb")``) and pass that file-like in as
+    ``io.BufferedIOBase``.
 
     Arguments:
-        src: Local path, URI, raw bytes, or an existing buffered binary stream.
+        src: Local path, raw bytes, or an existing buffered binary stream.
         mode: File open mode (default ``"rb"``).  Use ``"wb"`` for binary writes.
             Must be a read or write mode (e.g. ``"rb"``, ``"wb"``).
-        client_params: Extra arguments for ``smart_open`` when *src* is a cloud URI.
 
     Returns:
-        A BinaryIO or FileLikeProxy object. Callers are responsible for closing
-        the returned handle when appropriate.
+        A ``BinaryIO`` object. For ``Path`` and ``bytes`` inputs the library
+        owns the returned handle; callers are responsible for closing it
+        (typically via a ``with`` statement). For
+        :class:`io.BufferedIOBase` inputs the caller retains ownership and
+        the stream is returned unchanged — the library performs no
+        ``seek(0)`` on entry and does not restore the caller's position on
+        exit. The stream must be readable and seekable; concurrent use by
+        multiple readers is unsupported.
 
     """
     src_obj: object = src
     match src_obj:
-        case str() as src_str:
-            if src_str.startswith(("s3://", "az://")):
-                if client_params is None:
-                    msg = "client_params is required when src is an s3 or azure path"
-                    raise ValueError(msg)
-                return smart_open.open(src_str, mode, **client_params)
-            if "://" in src_str:
-                msg = f"unsupported URI scheme in {src_str!r}; only s3:// and az:// are supported"
-                raise ValueError(msg)
-            return Path(src_str).open(mode)
         case Path() as path:
             return path.open(mode)
         case bytes() as src_bytes:
             return io.BytesIO(src_bytes)
-        case np.ndarray() as src_array:
-            if src_array.dtype != np.uint8:
-                msg = f"ndarray data sources must have dtype uint8, got {src_array.dtype}"
-                raise ValueError(msg)
-            return io.BytesIO(np.ascontiguousarray(src_array).tobytes())
         case io.BufferedIOBase() as src_stream:
             # ``io.BytesIO``, ``io.BufferedReader``, etc. ``typing.BinaryIO`` is not an isinstance
-            # target at runtime, so we use the stdlib binary buffered base class.
-            return src_stream
+            # target at runtime, so we use the stdlib binary buffered base class. The
+            # ``cast`` is structural: ``BufferedIOBase`` already supplies every method on
+            # the ``BinaryIO`` Protocol surface used by PyAV / PIL.
+            if not src_stream.readable():
+                msg = "buffered binary streams must be readable"
+                raise ValueError(msg)
+            if not src_stream.seekable():
+                msg = "buffered binary streams must be seekable"
+                raise ValueError(msg)
+            return cast("BinaryIO", src_stream)
         case _:
             error_msg = f"Invalid src type: {type(src)}"
             raise ValueError(error_msg)
 
 
 @contextmanager
-def open_data_source(
-    src: DataSource, mode: Literal["rb", "wb"] = "rb", client_params: dict[str, Any] | None = None
-) -> Generator[BinaryIO | FileLikeProxy, None, None]:
-    """Open owned sources, or temporarily borrow caller-owned binary streams.
+def open_data_source(src: DataSource, mode: Literal["rb", "wb"] = "rb") -> Generator[BinaryIO, None, None]:
+    """Yield a binary stream for ``src``, owning or borrowing as appropriate.
 
-    For ``Path``/``str``/``bytes``/``ndarray`` inputs, this delegates to
-    :func:`open_file` and closes the created stream on exit.
+    For ``Path`` and ``bytes`` inputs, delegates to :func:`open_file` and
+    closes the created stream on exit.
 
-    For caller-owned buffered binary streams, ownership is retained by the caller.
-    Seekable streams are rewound on entry and restored to their original
-    position on exit so repeated opens behave like a fresh read. Non-seekable
-    borrowed streams are unsupported because sensor code may reopen the source
-    multiple times across indexing, metadata loading, and sampling.
+    For caller-owned :class:`io.BufferedIOBase` inputs, ownership is retained
+    by the caller. The stream must be readable and seekable. The library
+    uses it as-is: no ``seek(0)`` on entry, no position restore on exit. The
+    underlying decoder (PyAV / PIL) performs absolute seeks within the
+    stream as it pleases. Concurrent use of the same stream by multiple
+    readers (including reuse across overlapping sensor calls) is
+    unsupported.
     """
     if isinstance(src, io.BufferedIOBase):
-        if not src.seekable():
-            msg = "borrowed binary streams must be seekable"
+        if not src.readable():
+            msg = "buffered binary streams must be readable"
             raise ValueError(msg)
-        position = src.tell()
-        src.seek(0)
-        try:
-            yield src
-        finally:
-            src.seek(position)
+        if not src.seekable():
+            msg = "buffered binary streams must be seekable"
+            raise ValueError(msg)
+        yield cast("BinaryIO", src)
         return
 
-    with open_file(src, mode=mode, client_params=client_params) as stream:
+    with open_file(src, mode=mode) as stream:
         yield stream

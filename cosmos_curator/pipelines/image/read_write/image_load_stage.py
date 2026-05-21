@@ -16,15 +16,18 @@
 """Image load stage: read image from path or S3 into task encoded_data."""
 
 import pathlib
+from typing import BinaryIO, cast
 
 import numpy as np
 import nvtx  # type: ignore[import-untyped]
+import smart_open  # type: ignore[import-untyped]
 from loguru import logger
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.image_sensor import ImageSensor
+from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.core.utils.storage import storage_client, storage_utils
@@ -59,6 +62,7 @@ class ImageLoadStage(CuratorStage):
         self._log_stats = log_stats
         self._client: storage_client.StorageClient | None = None
         self._image_sensor: ImageSensor | None = None
+        self._sensor_source_streams: list[BinaryIO | None] = []
         self._start_ns_by_relative_path: dict[str, int] = {}
 
     @property
@@ -71,6 +75,23 @@ class ImageLoadStage(CuratorStage):
         self._client = storage_utils.get_storage_client(self._input_path, profile_name=self._input_s3_profile_name)
         self._ensure_image_sensor()
 
+    def destroy(self) -> None:
+        """Close any remote ``BinaryIO`` streams opened during ``stage_setup``.
+
+        Local ``Path`` sources do not have an owned stream (the sensor opens
+        them lazily per call) and appear as ``None`` in
+        ``self._sensor_source_streams``, so we skip them here.
+        """
+        for stream in self._sensor_source_streams:
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to close image source stream: {e}")
+        self._sensor_source_streams = []
+        self._image_sensor = None
+
     def _ensure_image_sensor(self) -> None:
         """Initialize a shared collection-level ``ImageSensor`` for this worker."""
         if self._image_sensor is not None:
@@ -81,18 +102,59 @@ class ImageLoadStage(CuratorStage):
             msg = f"No input images found under {self._input_path}"
             raise ValueError(msg)
 
-        raw_sources = [storage_utils.get_full_path(self._input_path, rel) for rel in relative_paths]
-        sources = [s if isinstance(s, pathlib.Path) else str(s) for s in raw_sources]
-        client_params = storage_utils.get_smart_open_client_params(self._client) if self._client is not None else None
-        sensor_timestamps_ns = np.arange(len(sources), dtype=np.int64)
-        self._image_sensor = ImageSensor(
-            sources,
-            sensor_timestamps_ns=sensor_timestamps_ns,
-            client_params=client_params,
-        )
+        raw_sources: list[pathlib.Path | str] = []
+        for rel in relative_paths:
+            full = storage_utils.get_full_path(self._input_path, rel)
+            raw_sources.append(full if isinstance(full, pathlib.Path) else str(full))
+        sensor_sources, owned_streams = self._build_sensor_sources(raw_sources)
+        self._sensor_source_streams = owned_streams
+        sensor_timestamps_ns = np.arange(len(sensor_sources), dtype=np.int64)
+        self._image_sensor = ImageSensor(sensor_sources, sensor_timestamps_ns=sensor_timestamps_ns)
         self._start_ns_by_relative_path = {
             rel: int(sensor_timestamps_ns[idx]) for idx, rel in enumerate(relative_paths)
         }
+
+    def _build_sensor_sources(
+        self,
+        raw_sources: list[pathlib.Path | str],
+    ) -> tuple[list[DataSource], list[BinaryIO | None]]:
+        """Materialise each ``raw_source`` as a sensor-library ``DataSource``.
+
+        Local files pass through as :class:`pathlib.Path` so the sensor opens
+        them lazily (and per call) via the standard local path. Remote sources
+        are eagerly opened to a seekable ``BinaryIO`` via ``smart_open`` using
+        the storage client's transport parameters; the sensor library then
+        consumes each stream as a borrowed :class:`io.BufferedIOBase`.
+
+        Eagerly opening per source (instead of per task) trades worker memory
+        and HTTP connection slots for amortised connection setup: each remote
+        image keeps one ``smart_open`` HTTP family alive for the worker's
+        lifetime, and :meth:`ImageSensor._load_frame` seeks to 0 before every
+        PIL read so reuse is safe across tasks. The owned streams are tracked
+        in ``self._sensor_source_streams`` and closed in :meth:`destroy`. A
+        follow-up could refactor the shared-sensor model to open lazily per
+        task if the number of remote sources per worker becomes a problem.
+        """
+        sensor_sources: list[DataSource] = []
+        owned_streams: list[BinaryIO | None] = []
+        for raw in raw_sources:
+            if isinstance(raw, pathlib.Path):
+                sensor_sources.append(raw)
+                owned_streams.append(None)
+            else:
+                stream = self._open_remote_source(raw)
+                sensor_sources.append(cast("DataSource", stream))
+                owned_streams.append(stream)
+        return sensor_sources, owned_streams
+
+    def _open_remote_source(self, uri: str) -> BinaryIO:
+        """Open a remote URI as a seekable :class:`BinaryIO` for the sensor."""
+        if self._client is None:
+            msg = f"Storage client is required to open remote source: {uri}"
+            raise ValueError(msg)
+        transport_params = storage_utils.get_smart_open_client_params(self._client)
+        stream = smart_open.open(uri, "rb", **transport_params)
+        return cast("BinaryIO", stream)
 
     def _load_image_bytes(self, image: Image) -> bool:
         """Load image bytes from path or S3 into image.encoded_data.

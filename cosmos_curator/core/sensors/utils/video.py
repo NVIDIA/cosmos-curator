@@ -168,7 +168,10 @@ class CpuVideoDecoder:
         ``time_base`` through ``decoder.time_base``.
 
         Args:
-            source: Video data source to decode.
+            source: Video data source to decode. See
+                :data:`cosmos_curator.core.sensors.types.types.DataSource`.
+                Cloud-backed inputs must be wrapped as a
+                :class:`io.BufferedIOBase` by the caller.
             stream_idx: PyAV index of the video stream to decode, usually 0.
             config: Optional CPU decoder configuration. Defaults to
                 :class:`CpuVideoDecodeConfig` with FFmpeg-controlled threading.
@@ -188,7 +191,7 @@ class CpuVideoDecoder:
         """
         with (
             open_data_source(source, mode="rb") as stream,
-            open_video_container(cast("BinaryIO", stream), stream_idx=stream_idx) as (container, video_stream),
+            open_video_container(stream, stream_idx=stream_idx) as (container, video_stream),
         ):
             yield cls(container, video_stream, config, stats)
 
@@ -434,7 +437,7 @@ class GpuVideoDecoder:
         """Open a decoder session that owns the underlying video source."""
         with (
             open_data_source(source, mode="rb") as stream,
-            open_video_container(cast("BinaryIO", stream), stream_idx=stream_idx) as (container, video_stream),
+            open_video_container(stream, stream_idx=stream_idx) as (container, video_stream),
         ):
             yield cls(container, video_stream, config, stats)
 
@@ -519,6 +522,16 @@ def open_video_container(
                     ts = float(packet.pts) * video_stream.time_base
 
     """
+    # PyAV's ``av.open`` reads from the stream's current position rather than
+    # from absolute 0. The sensor library's DataSource contract for
+    # ``io.BufferedIOBase`` inputs is "use absolute offsets starting from 0";
+    # we realise that here by seeking to 0 before handing the stream to PyAV.
+    # ``open_data_source`` itself remains a thin pass-through (no seek / no
+    # restore); positioning at the container origin is the responsibility of
+    # the consumer wrapper (this function, for video, or the image sensor's
+    # load helper for PIL).
+    if stream.seekable():
+        stream.seek(0)
     with av.open(stream, format=video_format) as container:
         container = cast("InputContainer", container)
         video_stream = container.streams.video[stream_idx]
@@ -586,12 +599,11 @@ def _get_video_index_from_header(
     return offset, size, pts, is_keyframe, is_discard
 
 
-def make_index_and_metadata(  # noqa: PLR0913
+def make_index_and_metadata(
     data: DataSource,
     stream_idx: int = 0,
     video_format: str | None = None,
     index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.FROM_HEADER,
-    client_params: dict[str, Any] | None = None,
     allow_header_fallback: bool = True,  # noqa: FBT001, FBT002
 ) -> tuple[VideoIndex, VideoMetadata]:
     """Build a :class:`VideoIndex` and :class:`VideoMetadata` from a video source.
@@ -605,13 +617,15 @@ def make_index_and_metadata(  # noqa: PLR0913
     increasing for B-frame video — it is a per-packet lookup, not a scan order.
 
     Args:
-        data: video data source (file path or bytes).
+        data: Video data source. See
+            :data:`cosmos_curator.core.sensors.types.types.DataSource`.
+            Cloud-backed inputs must be wrapped as a
+            :class:`io.BufferedIOBase` by the caller.
         stream_idx: index of the video stream to use (default: 0).
         video_format: container format hint (default: ``None``; let libav detect).
         index_method: how to collect per-packet metadata.  ``FROM_HEADER`` (default)
             reads from the container index (fast).  ``FULL_DEMUX`` scans every
             packet (slow; for tests or rare validation).
-        client_params: Extra arguments for ``smart_open`` when ``data`` is a cloud URI.
         allow_header_fallback: If ``True`` and ``FROM_HEADER`` is unavailable,
             transparently fall back to ``FULL_DEMUX``. If ``False``, raise the
             header-index error instead. Diagnostics should set this to ``False``
@@ -628,8 +642,8 @@ def make_index_and_metadata(  # noqa: PLR0913
 
     """
     with (
-        open_data_source(data, mode="rb", client_params=client_params) as stream,
-        open_video_container(cast("BinaryIO", stream), stream_idx=stream_idx, video_format=video_format) as (
+        open_data_source(data, mode="rb") as stream,
+        open_video_container(stream, stream_idx=stream_idx, video_format=video_format) as (
             container,
             video_stream,
         ),

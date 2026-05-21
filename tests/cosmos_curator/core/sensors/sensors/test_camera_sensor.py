@@ -346,6 +346,7 @@ def test_camera_sensor_uses_only_displayable_frames(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -370,6 +371,7 @@ def test_camera_sensor_uses_only_displayable_frames(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(time_base=index.time_base, decode_fn=_decode_with_capture)
@@ -416,6 +418,7 @@ def test_camera_sensor_rejects_stream_with_only_discard_packets(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -446,6 +449,7 @@ def test_camera_sensor_passes_window_to_sample_window_indices(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         # Silence unused parameter warnings.
         del source, stream_idx, index_method
@@ -456,6 +460,7 @@ def test_camera_sensor_passes_window_to_sample_window_indices(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         # Silence unused parameter warnings.
         del source, stream_idx, config, stats
@@ -516,6 +521,7 @@ def test_camera_sensor_expands_repeated_picks_into_aligned_rows(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -530,6 +536,7 @@ def test_camera_sensor_expands_repeated_picks_into_aligned_rows(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(time_base=index.time_base, decode_fn=_decode_with_capture)
@@ -590,6 +597,7 @@ def test_camera_sensor_populates_decoder_motion_vectors(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -599,6 +607,7 @@ def test_camera_sensor_populates_decoder_motion_vectors(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -655,6 +664,7 @@ def test_camera_sensor_returns_empty_when_window_has_no_displayable_matches(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -668,6 +678,7 @@ def test_camera_sensor_returns_empty_when_window_has_no_displayable_matches(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(time_base=index.time_base, decode_fn=_decode_with_capture)
@@ -722,6 +733,7 @@ def test_camera_sensor_propagates_extrinsics_to_sampled_batches(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -731,6 +743,7 @@ def test_camera_sensor_propagates_extrinsics_to_sampled_batches(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -783,6 +796,7 @@ def test_camera_sensor_defaults_extrinsics_to_none(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -792,6 +806,7 @@ def test_camera_sensor_defaults_extrinsics_to_none(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -845,6 +860,7 @@ def test_camera_sensor_preserves_provided_intrinsics(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -854,6 +870,7 @@ def test_camera_sensor_preserves_provided_intrinsics(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -906,6 +923,7 @@ def test_camera_sensor_defaults_intrinsics_to_none(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -915,6 +933,7 @@ def test_camera_sensor_defaults_intrinsics_to_none(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -968,6 +987,7 @@ def test_camera_sensor_empty_batches_preserve_extrinsics(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -987,6 +1007,7 @@ def test_camera_sensor_empty_batches_preserve_extrinsics(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -1033,6 +1054,7 @@ def test_camera_sensor_empty_batches_preserve_intrinsics(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -1052,6 +1074,7 @@ def test_camera_sensor_empty_batches_preserve_intrinsics(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -1097,6 +1120,7 @@ def test_camera_sensor_propagates_sampling_policy_failures(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -1106,6 +1130,7 @@ def test_camera_sensor_propagates_sampling_policy_failures(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -1162,6 +1187,7 @@ def test_camera_sensor_uses_display_pts_stream_sidecar_alignment(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -1171,6 +1197,7 @@ def test_camera_sensor_uses_display_pts_stream_sidecar_alignment(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         del source, stream_idx, config, stats
         return _FakeDecoder(
@@ -1225,6 +1252,7 @@ def test_camera_sensor_public_properties(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -1262,6 +1290,7 @@ def test_camera_sensor_sample_supports_gpu_decode_config(
         source: object,
         stream_idx: int = 0,
         index_method: object = None,
+        **_kwargs: object,
     ) -> tuple[VideoIndex, VideoMetadata]:
         del source, stream_idx, index_method
         return index, metadata
@@ -1271,6 +1300,7 @@ def test_camera_sensor_sample_supports_gpu_decode_config(
         stream_idx: int = 0,
         config: object = None,
         stats: object = None,
+        **_kwargs: object,
     ) -> _FakeDecoder:
         gpu_open_calls.append((source, stream_idx, config, stats))
         return _FakeDecoder(
