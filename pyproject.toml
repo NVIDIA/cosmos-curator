@@ -137,6 +137,10 @@ local = [
     "configs/*.json",
     "models/configs/*.json",
 ]
+"cosmos_curator.client.view_cli" = [
+    "clip_viewer_webdocs/*",
+    "clip_viewer_webdocs/images/*",
+]
 
 [tool.coverage.run]
 omit = [

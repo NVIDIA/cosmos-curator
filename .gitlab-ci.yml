@@ -393,6 +393,48 @@ unit_tests:
     max: 2
     when: always
 
+client_wheel_smoke:
+  stage: test
+  needs: []
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules: *pre_post_merge_rules
+  script:
+    - *setup_ci_builder_env
+    - poetry build -f wheel --no-interaction
+    - |
+      tmpdir="$(mktemp -d)"
+      trap 'rm -rf "$tmpdir"' EXIT
+      python -m venv --system-site-packages "$tmpdir/venv"
+      "$tmpdir/venv/bin/python" -m pip install --no-deps dist/cosmos_curator-*.whl
+      cd /tmp
+      "$tmpdir/venv/bin/cosmos-curator" --help
+      "$tmpdir/venv/bin/python" - <<'PY'
+      from pathlib import Path
+
+      from cosmos_curator.client.view_cli import clip_viewer
+      from cosmos_curator.core.utils.storage.zip_utils import safe_extract_zip
+
+      web_dir = Path(clip_viewer.__file__).parent / "clip_viewer_webdocs"
+      missing_assets = [
+          asset
+          for asset in (
+              web_dir / "index.html",
+              web_dir / "script.js",
+              web_dir / "style.css",
+              web_dir / "images" / "nvidia-logo.webp",
+          )
+          if not asset.is_file()
+      ]
+      if missing_assets:
+          raise SystemExit(f"Missing clip viewer assets: {missing_assets}")
+
+      print(f"Wheel smoke test imported {safe_extract_zip.__module__}")
+      PY
+
 .build_curator_arch:
   stage: build
   parallel:
