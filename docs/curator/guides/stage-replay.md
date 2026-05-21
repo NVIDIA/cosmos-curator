@@ -293,7 +293,7 @@ grep -r "class \w*Stage(CuratorStage)" cosmos_curator/pipelines/
 **Common stage names:**
 - **Captioning**: `VllmPrepStage`, `VllmCaptionStage`, `ApiPrepStage`, `GeminiCaptionStage`, `OpenAICaptionStage`, `EnhanceCaptionStage`
 - **Filtering**: `MotionVectorDecodeStage`, `MotionFilterStage`, `AestheticsFilterStage`
-- **I/O**: `ClipWriterStage`, `RemuxStage`
+- **I/O**: `VideoDownloader`, `ClipWriterStage`
 - **Processing**: `TranscodeStage`, `SegmentStage`, `NormalizeStage`
 
 ### Method 3: Check Saved Task Directories

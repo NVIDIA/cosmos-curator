@@ -155,8 +155,8 @@ class TestTracedSpanDelegation:
     def test_set_attribute_delegates_to_real_span(self) -> None:
         """set_attribute must forward key and value to the real span."""
         mock_span = MagicMock()
-        TracedSpan(mock_span).set_attribute("stage.name", "RemuxStage")
-        mock_span.set_attribute.assert_called_once_with("stage.name", "RemuxStage")
+        TracedSpan(mock_span).set_attribute("stage.name", "VideoDownloader")
+        mock_span.set_attribute.assert_called_once_with("stage.name", "VideoDownloader")
 
     def test_set_attributes_delegates_each_pair(self) -> None:
         """set_attributes must call set_attribute for each key-value pair."""
@@ -384,8 +384,8 @@ class TestArtifactNaming:
 
     def test_artifact_id_format(self) -> None:
         """artifact_id includes stage name, call_id, and process tag."""
-        aid = artifact_id("RemuxStage", "setup_1")
-        assert aid.startswith("RemuxStage_setup_1_")
+        aid = artifact_id("VideoDownloader", "setup_1")
+        assert aid.startswith("VideoDownloader_setup_1_")
         # Must contain the PID somewhere after the prefix.
         assert str(os.getpid()) in aid
 

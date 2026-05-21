@@ -202,9 +202,9 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 
 ### Phase 4: Cleanup and optimization
 
-- [ ] **4a. Remove deprecated `remux_to_mp4` stage**
+- [x] **4a. Remove deprecated remux stage class**
     - Already marked for removal by 2026-04-30
-    - Removes another FFmpeg subprocess callsite
+    - Removes obsolete stage API; inline remux remains in `VideoDownloader`
 
 - [ ] **4b. Slim down system apt dependencies**
     - Audit which apt packages are still needed without the FFmpeg source build

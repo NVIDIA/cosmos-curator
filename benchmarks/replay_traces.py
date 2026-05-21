@@ -117,7 +117,7 @@ Usage examples
 
     # Filter by span name
     python -m benchmarks.replay_traces ./profiles/traces/ \
-        --replay-to http://localhost:4318 --filter-name RemuxStage
+        --replay-to http://localhost:4318 --filter-name VideoDownloader
 
     # HTTP 400 request body too large: use a smaller export batch
     python -m benchmarks.replay_traces ./profiles/traces/ \

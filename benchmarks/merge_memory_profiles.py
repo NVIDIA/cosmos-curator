@@ -49,7 +49,7 @@ File naming convention (parsed from filenames)::
     <StageName>_<label>_<call_count>_<hostname>_<pid>.bin
 
 Examples:
-        RemuxStage_setup_on_node_1_node03_5819.bin
+        VideoDownloader_process_data_1_node03_5819.bin
         ClipTranscodingStage_process_data_3_node03_10552.bin
         _root_main_1_node03_118.bin
 

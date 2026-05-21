@@ -12,30 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Remuxing stages for video pipelines."""
+"""Remux helpers for video pipelines."""
 
 import subprocess
 import tempfile
-from math import ceil
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
-import nvtx  # type: ignore[import-untyped]
 from loguru import logger
 
-from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
-from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.pipelines.video.utils.data_model import (
-    SplitPipeTask,
-    Video,
-)
+from cosmos_curator.pipelines.video.utils.data_model import Video
 
 REMUX_FORMATS = {"mpegts"}
-_REMUX_STAGE_DEPRECATION_MSG = (
-    "RemuxStage is deprecated and will be removed on 2026-04-30. Remuxing is now handled inline by VideoDownloader."
-)
 
 
 def remux_to_mp4(encoded_data: bytes | npt.NDArray[np.uint8], threads: int = 1) -> npt.NDArray[np.uint8]:
@@ -146,64 +136,3 @@ def remux_if_needed(video: Video, threads: int) -> bool:
     # Without .store(), .release() clears the only copy -> ValueError downstream.
     # video.encoded_data.release()  # noqa: ERA001
     return False
-
-
-class RemuxStage(CuratorStage):
-    """Remuxing stage for video pipelines, no-op if the video is already in the correct format.
-
-    .. deprecated::
-        RemuxStage is deprecated and will be removed on 2026-04-30.
-        Remuxing is now handled inline by VideoDownloader.
-    """
-
-    def __init__(
-        self,
-        *,
-        verbose: bool = False,
-        log_stats: bool = False,
-    ) -> None:
-        """Initialize RemuxStage.
-
-        Args:
-            verbose: Whether to print verbose logs.
-            log_stats: Whether to log performance statistics.
-
-        """
-        self._timer = StageTimer(self)
-        self._verbose = verbose
-        self._log_stats = log_stats
-        self._deprecation_warned = False
-        logger.warning(_REMUX_STAGE_DEPRECATION_MSG)
-
-    @property
-    def resources(self) -> CuratorStageResource:
-        """Get the resource requirements for this stage.
-
-        Returns:
-            Resource configuration for the stage.
-
-        """
-        return CuratorStageResource(cpus=1)
-
-    @nvtx.annotate("RemuxStage")  # type: ignore[untyped-decorator]
-    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:
-        """Remux the video if it is not in the correct format."""
-        if not self._deprecation_warned:
-            logger.warning(_REMUX_STAGE_DEPRECATION_MSG)
-            self._deprecation_warned = True
-        for task in tasks:
-            self._timer.reinit(self, task.get_major_size())
-
-            with self._timer.time_process():
-                for video in task.videos:
-                    try:
-                        remux_if_needed(video, threads=ceil(self.resources.cpus))
-                    except Exception as e:  # noqa: BLE001
-                        video.errors["remux"] = str(e)
-                        logger.exception(f"Failed to remux video {video.input_video}")
-
-            if self._log_stats:
-                stage_name, stage_perf_stats = self._timer.log_stats()
-                task.stage_perf[stage_name] = stage_perf_stats
-
-        return tasks

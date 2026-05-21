@@ -17,27 +17,9 @@
 from cosmos_curator.core.interfaces.stage_interface import CuratorStageSpec
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.read_write.read_write_builders import (
-    IngestConfig,
     OutputConfig,
-    build_ingest_stages,
     build_output_stages,
 )
-from cosmos_curator.pipelines.video.read_write.remux_stages import RemuxStage
-
-
-def test_remux_stage_absent_from_ingest_stages() -> None:
-    """RemuxStage must not appear in build_ingest_stages().
-
-    RemuxStage was folded into VideoDownloader; leaving it in the stage list
-    would run remux twice and waste a dedicated worker pool.
-    """
-    config = IngestConfig(input_path="/fake/path")
-    stages = build_ingest_stages(config)
-
-    assert len(stages) == 1, "build_ingest_stages should return exactly one stage (VideoDownloader)"
-    # Unwrap CuratorStageSpec to catch RemuxStage whether bare or wrapped
-    inner_stages = [s.stage if isinstance(s, CuratorStageSpec) else s for s in stages]
-    assert not any(isinstance(s, RemuxStage) for s in inner_stages), "RemuxStage must not be in ingest stages"
 
 
 def test_output_stage_forwards_caption_quality_flag() -> None:

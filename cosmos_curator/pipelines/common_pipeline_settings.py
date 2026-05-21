@@ -368,7 +368,7 @@ class CommonPipelineSettings:
         metadata=cli(
             help=(
                 "Comma-separated list of scope names to exclude from CPU profiling. "
-                "Scope names are stage class names (e.g. VideoDownloader, RemuxStage) "
+                "Scope names are stage class names (e.g. VideoDownloader, ClipWriterStage) "
                 "or '_root' for the driver process."
             ),
             default="_root",
@@ -379,7 +379,7 @@ class CommonPipelineSettings:
         metadata=cli(
             help=(
                 "Comma-separated list of scope names to exclude from memory profiling. "
-                "Scope names are stage class names (e.g. VideoDownloader, RemuxStage) "
+                "Scope names are stage class names (e.g. VideoDownloader, ClipWriterStage) "
                 "or '_root' for the driver process. "
                 "Note: memray may conflict with pyinstrument on long-lived driver processes; "
                 "pass '_root' to avoid this."
@@ -392,7 +392,7 @@ class CommonPipelineSettings:
         metadata=cli(
             help=(
                 "Comma-separated list of scope names to exclude from GPU profiling. "
-                "Scope names are stage class names (e.g. VideoDownloader, RemuxStage) "
+                "Scope names are stage class names (e.g. VideoDownloader, ClipWriterStage) "
                 "or '_root' for the driver process. "
                 "Default: '_root' (driver process typically has no CUDA context)."
             ),

@@ -7,6 +7,10 @@
 - Qwen3.6-27B (BF16 and FP8) support for video and image captioning, registered as
   `qwen3_6_27b` and `qwen3_6_27b_fp8` variants.
 
+### Removed
+
+- Remove deprecated `RemuxStage` class; remuxing remains handled inline by `VideoDownloader`.
+
 ## [1.4.0]
 
 ### Released

@@ -12,27 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Test remuxing stages for video pipelines."""
-
-# ruff: noqa: ARG002 ok to pass unused arguments for testing, mocks may not be used, but the args are needed
+"""Test remux helpers for video pipelines."""
 
 import io
 from fractions import Fraction
 from typing import cast
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock
 
 import av
 import numpy as np
 import pytest
 
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
-from cosmos_curator.core.utils.data.lazy_data import LazyData
 from cosmos_curator.pipelines.video.read_write.remux_stages import (
-    RemuxStage,
     remux_if_needed,
     remux_to_mp4,
 )
-from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask, Video
+from cosmos_curator.pipelines.video.utils.data_model import Video
 
 
 def _make_synthetic_video(format_name: str) -> io.BytesIO:
@@ -254,188 +250,6 @@ def test_remux_if_needed_preserves_video_content(synthetic_mpegts_video: io.Byte
         assert result_frame_count == original_frame_count
         assert result_width == original_width
         assert result_height == original_height
-
-
-@pytest.mark.env("cosmos-curator")
-def test_remux_stage_integration(synthetic_mpegts_video: io.BytesIO) -> None:
-    """Test RemuxStage end-to-end with real video data."""
-    # Arrange
-    stage = RemuxStage()
-
-    original_data = bytes_to_numpy(synthetic_mpegts_video.getvalue())
-    video = Video(encoded_data=original_data, input_video="test.ts")
-    video.populate_metadata()
-
-    task = Mock(spec=SplitPipeTask)
-    task.videos = [video]
-    task.get_major_size.return_value = original_data.nbytes
-    task.stage_perf = {}
-
-    tasks = [task]
-
-    # Verify starts as non-MP4
-    assert video.metadata is not None
-    assert video.metadata.format_name is not None
-    assert "mp4" not in video.metadata.format_name.lower()
-
-    # Act
-    result = stage.process_data(tasks)
-
-    # Assert
-    assert result == tasks
-    assert not np.array_equal(video.encoded_data.resolve(), original_data)  # Should be remuxed
-    resolved = video.encoded_data.resolve()
-    assert resolved is not None
-
-    # Verify result is MP4
-    result_stream = io.BytesIO(resolved.tobytes())
-    with av.open(result_stream) as container:
-        assert "mp4" in container.format.name.lower()
-
-
-class TestRemuxStage:
-    """Test the RemuxStage class."""
-
-    @pytest.mark.env("cosmos-curator")
-    def test_init(self) -> None:
-        """Test RemuxStage initialization."""
-        # Test that RemuxStage can be initialized with default parameters
-        stage = RemuxStage()
-        assert stage is not None
-
-        # Test that RemuxStage can be initialized with custom parameters
-        stage = RemuxStage(verbose=True, log_stats=True)
-        assert stage is not None
-
-    @pytest.mark.env("cosmos-curator")
-    def test_resources(self) -> None:
-        """Test that RemuxStage returns correct resource requirements."""
-        stage = RemuxStage()
-        resources = stage.resources
-        assert resources.cpus == 1
-
-    @pytest.mark.env("cosmos-curator")
-    @patch("cosmos_curator.pipelines.video.read_write.remux_stages.remux_if_needed")
-    def test_process_data_success(self, mock_remux_if_needed: MagicMock) -> None:
-        """Test successful processing of tasks."""
-        # Arrange
-        stage = RemuxStage()
-
-        # Create mock tasks
-        task1 = Mock(spec=SplitPipeTask)
-        task1.video = Mock(spec=Video)
-        task1.videos = [task1.video]
-        task1.get_major_size.return_value = 1000
-        task1.stage_perf = {}
-
-        task2 = Mock(spec=SplitPipeTask)
-        task2.video = Mock(spec=Video)
-        task2.videos = [task2.video]
-        task2.get_major_size.return_value = 2000
-        task2.stage_perf = {}
-
-        tasks = [task1, task2]
-
-        # Act
-        result = stage.process_data(tasks)
-
-        # Assert
-        assert result == tasks
-
-    @pytest.mark.env("cosmos-curator")
-    @patch("cosmos_curator.pipelines.video.read_write.remux_stages.remux_if_needed")
-    def test_process_data_with_logging(self, mock_remux_if_needed: MagicMock) -> None:
-        """Test processing with performance logging enabled."""
-        # Arrange
-        stage = RemuxStage(log_stats=True)
-
-        # Create mock task
-        task = Mock(spec=SplitPipeTask)
-        task.video = Mock(spec=Video)
-        task.videos = [task.video]
-        task.get_major_size.return_value = 1000
-        task.stage_perf = {}
-
-        tasks = [task]
-
-        # Act
-        result = stage.process_data(tasks)
-
-        # Assert
-        assert result == tasks
-        # Verify that stage_perf was populated (timer should add entries)
-        assert len(task.stage_perf) > 0
-
-    @pytest.mark.env("cosmos-curator")
-    @patch("cosmos_curator.pipelines.video.read_write.remux_stages.remux_if_needed")
-    def test_process_data_empty_list(self, mock_remux_if_needed: MagicMock) -> None:
-        """Test processing with empty task list."""
-        # Arrange
-        stage = RemuxStage()
-        tasks: list[SplitPipeTask] = []
-
-        # Act
-        result = stage.process_data(tasks)
-
-        # Assert
-        assert result == []
-        mock_remux_if_needed.assert_not_called()
-
-    @pytest.mark.env("cosmos-curator")
-    @patch("cosmos_curator.pipelines.video.read_write.remux_stages.remux_to_mp4")
-    def test_process_data_error_handling(self, mock_remux_to_mp4: MagicMock) -> None:
-        """Test that remux errors are handled gracefully and don't stop pipeline."""
-        # Arrange
-        stage = RemuxStage()
-
-        failing_data = bytes_to_numpy(b"failing_video_data")
-
-        # Create mock tasks - one that will fail, one that will succeed
-        failing_task = Mock(spec=SplitPipeTask)
-        failing_task.videos = [failing_task.video]
-        failing_task.video.input_video = "failing_video.ts"
-        failing_task.video.encoded_data = LazyData(value=failing_data, nbytes=failing_data.nbytes)
-        failing_task.video.metadata = Mock()
-        failing_task.video.metadata.format_name = "mpegts"  # Needs remuxing
-        failing_task.video.errors = {}
-        failing_task.get_major_size.return_value = 1000
-        failing_task.stage_perf = {}
-
-        good_data = bytes_to_numpy(b"good_video_data")
-
-        succeeding_task = Mock(spec=SplitPipeTask)
-        succeeding_task.videos = [succeeding_task.video]
-        succeeding_task.video.input_video = "good_video.mp4"
-        succeeding_task.video.encoded_data = LazyData(value=good_data, nbytes=good_data.nbytes)
-        succeeding_task.video.metadata = Mock()
-        succeeding_task.video.metadata.format_name = "mov,mp4,m4a,3gp,3g2,mj2"  # Already MP4
-        succeeding_task.video.errors = {}
-        succeeding_task.get_major_size.return_value = 2000
-        succeeding_task.stage_perf = {}
-
-        tasks = [failing_task, succeeding_task]
-
-        # Mock remux_to_mp4 to fail for the first video
-        mock_remux_to_mp4.side_effect = RuntimeError("ffmpeg failed")
-
-        # Act
-        result = stage.process_data(tasks)
-
-        # Assert
-        assert result == tasks  # Both tasks should be returned
-
-        # Failing task should have error set in video.errors
-        assert "remux" in failing_task.video.errors
-        assert isinstance(failing_task.video.errors["remux"], str)
-
-        # Succeeding task should not be affected
-        assert succeeding_task.video.errors == {}
-
-        # remux_to_mp4 should only be called for the failing task (the succeeding one is already MP4)
-        mock_remux_to_mp4.assert_called_once()
-        call_args = mock_remux_to_mp4.call_args
-        assert np.array_equal(call_args[0][0], failing_data)
-        assert call_args[1]["threads"] == 1
 
 
 def test_remux_if_needed_invalidates_timestamps(monkeypatch: pytest.MonkeyPatch) -> None:
