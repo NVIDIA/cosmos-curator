@@ -148,12 +148,11 @@ This project uses the following development tools:
 2. **mypy**: For static type checking
 3. **poetry**: For dependency management
 
-Before submitting any changes, run the following checks from the repository root:
+Before submitting any changes, format Python files and run the checks from the repository root:
 
 ```bash
-ruff format --check
-ruff check
-mypy
+pixi run format
+pixi run lint
 ```
 
 ## Building the Client package

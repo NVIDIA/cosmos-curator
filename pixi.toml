@@ -74,6 +74,33 @@ torchvision = "==0.26.0"
 uvicorn = "*"
 webdataset = "*" # conda-forge package pulls in pytorch
 
+[feature.dev]
+channels = ["conda-forge"]
+
+[feature.dev.dependencies]
+mypy = "==1.19.0"
+ruff = "==0.14.9"
+
+[feature.dev.pypi-dependencies]
+fabric = "==3.2.2"
+invoke = "==3.0.3"
+openai = "*"
+pandas-stubs = "*"
+types-aiofiles = "*"
+types-boto3 = "*"
+types-psutil = "*"
+types-psycopg2 = "*"
+types-pyyaml = "*"
+types-requests = "*"
+types-six = "*"
+types-tabulate = "*"
+types-toml = "*"
+types-tqdm = "*"
+
+[feature.dev.tasks]
+format = "ruff format"
+lint = "ruff format --check && ruff check && mypy --pretty"
+
 [feature.core.target.linux-aarch64.dependencies]
 # Add CUDA toolchain packages on aarch64 -- these are automatic dependencies on linux-64.
 cuda-nvvm-tools = "13.0.*"
@@ -228,6 +255,7 @@ transformers = ">=5.0.0"
 [environments]
 cuml = ["cuml", "tracing"]
 default = ["core", "transformers", "tracing", "profiling"]
+dev = ["core", "transformers", "tracing", "profiling", "dev"]
 legacy-transformers = ["core", "legacy-transformers", "tracing", "profiling"]
 model-download = ["model-download", "tracing"]
 paddle-ocr = ["core", "paddle-ocr", "tracing", "profiling"]

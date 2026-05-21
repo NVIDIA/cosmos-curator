@@ -210,6 +210,7 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
     "cosmos_curator.models.internvideo2_multi_modality.*",
+    "cosmos_curator.pipelines.video.super_resolution.inference_seedvr2_window",
     "cosmos_curator.pipelines.video.utils.*",
     "cudf.*",
     "cuml.*",
