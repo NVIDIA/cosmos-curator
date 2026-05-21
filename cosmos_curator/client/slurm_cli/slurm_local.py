@@ -12,18 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Interactive Slurm launcher backed by srun/Pyxis."""
+"""Shared helpers for Slurm container commands backed by srun/Pyxis."""
 
 import logging
 import os
 import shlex
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
 
-from typer import Argument, BadParameter, Option
+from typer import BadParameter
 
 from cosmos_curator.client.environment import (
     CONTAINER_PATHS_CODE_DIR,
@@ -32,10 +30,9 @@ from cosmos_curator.client.environment import (
     LOCAL_AWS_CREDENTIALS_FILE,
     LOCAL_AZURE_CREDENTIALS_FILE,
     LOCAL_COSMOS_CURATOR_CONFIG_FILE,
-    LOCAL_WORKSPACE_PATH,
     SLURM_RAY_ENV_VAR_NAME,
 )
-from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND, command_contains, parse_extra_mounts
+from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND, command_contains
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +45,6 @@ _DEFAULT_CONTAINER_IMAGE = "~/container_images/cosmos-curator+1.0.0.sqsh"
 _DEFAULT_CONDA_OVERRIDE_CUDA = "13.0.2"
 _SOURCE_DIRNAMES = ("cosmos_curator", "tools")
 _SOURCE_FILENAMES = ("pixi.toml", "pixi.lock", "pyproject.toml", "pytest.ini", ".coveragerc")
-_SLURM_ALLOCATION_ENV_VARS = ("SLURM_JOB_ID", "SLURM_JOBID")
 _SLURM_ENV_VARS_TO_FORWARD = (
     "SLURM_JOB_ID",
     "SLURM_JOBID",
@@ -61,8 +57,8 @@ _SLURM_ENV_VARS_TO_FORWARD = (
 
 
 @dataclass
-class LaunchSlurmLocal:
-    """Configuration for launching a command inside an interactive Slurm allocation."""
+class SlurmContainerRuntime:
+    """Shared container runtime configuration for Slurm commands."""
 
     container_image: str
     curator_path: Path | None
@@ -73,11 +69,17 @@ class LaunchSlurmLocal:
     mount_azure_creds: bool
     extra_mounts: list[str]
     environment: list[str]
-    require_slurm_allocation: bool
     conda_override_cuda: str | None
     pixi_envs: list[str] | None
-    overlap: bool
-    interactive: bool
+
+
+@dataclass
+class SrunCommand:
+    """Concrete srun command plus the environment it should inherit."""
+
+    command: list[str]
+    environment: dict[str, str]
+    container_env_keys: list[str]
 
 
 def _parse_environment(raw: str | None) -> list[str]:
@@ -134,7 +136,7 @@ def _get_cache_mount(cache_path: Path) -> str:
     return _mount_string(cache.resolve(), _CACHE_MOUNT_PATH)
 
 
-def _get_credential_mounts(opts: LaunchSlurmLocal) -> list[str]:
+def _get_credential_mounts(opts: SlurmContainerRuntime) -> list[str]:
     mounts: list[str] = []
     if opts.mount_s3_creds:
         if LOCAL_AWS_CREDENTIALS_FILE.exists():
@@ -173,7 +175,7 @@ def _get_config_mounts(*, is_model_cli: bool) -> list[str]:
     return []
 
 
-def _get_srun_mounts(opts: LaunchSlurmLocal) -> list[str]:
+def _get_srun_mounts(opts: SlurmContainerRuntime) -> list[str]:
     return [
         _get_workspace_mount(opts.workspace_path),
         _get_cache_mount(opts.cache_path),
@@ -243,7 +245,7 @@ def _get_source_link_command() -> str:
 
 
 def _get_srun_environment(
-    opts: LaunchSlurmLocal, *, include_slurm_env: bool = True
+    opts: SlurmContainerRuntime, *, include_slurm_env: bool = True
 ) -> tuple[dict[str, str], list[str]]:
     env = os.environ.copy()
     container_env = {
@@ -275,7 +277,7 @@ def _get_srun_environment(
         container_env_keys.append("COSMOS_CURATOR_SLIM_ENVS")
 
     if include_slurm_env:
-        container_env_keys.extend(env_var for env_var in _SLURM_ENV_VARS_TO_FORWARD if env_var in env)
+        container_env_keys.extend(_SLURM_ENV_VARS_TO_FORWARD)
     return env, _dedupe(container_env_keys)
 
 
@@ -286,194 +288,45 @@ def _resolve_container_image(container_image: str) -> str:
     return container_image
 
 
-def _verify_slurm_allocation(opts: LaunchSlurmLocal) -> None:
-    if not opts.require_slurm_allocation:
-        return
-    if any(env_var in os.environ for env_var in _SLURM_ALLOCATION_ENV_VARS):
-        return
-    logger.error(
-        "This command is intended to run inside an interactive Slurm allocation. "
-        "Use --no-require-slurm-allocation to override this guard."
-    )
-    sys.exit(1)
+def _get_container_entrypoint_command() -> str:
+    code_dir = shlex.quote(str(CONTAINER_PATHS_CODE_DIR))
+    return f'{_get_source_link_command()} && cd {code_dir} && {SLIM_IMAGE_WARMUP_COMMAND} && exec "$@"'
 
 
-def _launch_with_srun(opts: LaunchSlurmLocal) -> None:
+def _build_srun_command(
+    opts: SlurmContainerRuntime,
+    *,
+    slurm_args: list[str] | None = None,
+    container_mounts: list[str] | None = None,
+    pty: bool = False,
+) -> SrunCommand:
     if not opts.command:
         msg = "A command must be provided"
         raise ValueError(msg)
 
-    _verify_slurm_allocation(opts)
-
     subprocess_env, container_env_keys = _get_srun_environment(opts)
-    container_command = (
-        f"cd {shlex.quote(str(CONTAINER_PATHS_CODE_DIR))} && "
-        f"{_get_source_link_command()} && "
-        f'{SLIM_IMAGE_WARMUP_COMMAND} && exec "$@"'
-    )
-    srun_command = [
-        "srun",
-        "--mpi=none",
-    ]
-    if opts.overlap:
-        srun_command.append("--overlap")
-    if opts.interactive:
+    srun_command = ["srun"]
+    if pty:
         srun_command.append("--pty")
+    if slurm_args is not None:
+        srun_command.extend(slurm_args)
 
     srun_command.extend(
         [
-            "--nodes=1",
-            "--ntasks=1",
             "--container-writable",
             "--no-container-mount-home",
             "--no-container-remap-root",
             "--container-image",
             _resolve_container_image(opts.container_image),
             "--container-mounts",
-            ",".join(_get_srun_mounts(opts)),
+            ",".join(container_mounts if container_mounts is not None else _get_srun_mounts(opts)),
             "--container-env",
             ",".join(container_env_keys),
             "bash",
             "-c",
-            container_command,
+            _get_container_entrypoint_command(),
             "_",
             *opts.command,
         ]
     )
-    logger.info("Slurm command:\n%s", shlex.join(srun_command))
-
-    result = subprocess.call(srun_command, shell=False, env=subprocess_env)  # noqa: S603
-    if result != 0:
-        logger.error("Failed to run command via srun")
-        sys.exit(1)
-
-
-def launch_cli(  # noqa: PLR0913
-    *,
-    command: Annotated[list[str], Argument(help="The command to run", rich_help_panel="common")],
-    container_image: Annotated[
-        str,
-        Option(
-            "--container-image",
-            help="Path to the .sqsh image for srun/Pyxis.",
-            rich_help_panel="container",
-        ),
-    ] = _DEFAULT_CONTAINER_IMAGE,
-    curator_path: Annotated[
-        Path | None,
-        Option(
-            help="Path to the cosmos-curator repo directory; set to mount live curator code into the container.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = None,
-    workspace_path: Annotated[
-        Path,
-        Option(
-            help="Host workspace directory to mount as /config inside the container.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = LOCAL_WORKSPACE_PATH,
-    cache_path: Annotated[
-        Path,
-        Option(
-            help="Host cache directory to mount as /cache for Pixi/rattler, uv, Torch, Triton, pip, and CUDA caches.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = _DEFAULT_CACHE_PATH,
-    mount_s3_creds: Annotated[
-        bool,
-        Option(
-            "--mount-s3-creds/--no-mount-s3-creds",
-            help="Mount the host AWS credentials file into the container when present.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = True,
-    mount_azure_creds: Annotated[
-        bool,
-        Option(
-            "--mount-azure-creds/--no-mount-azure-creds",
-            help="Mount the host Azure credentials file into the container when present.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = False,
-    extra_mounts: Annotated[
-        str,
-        Option(
-            "--extra-mounts",
-            "--extra-volumes",
-            help=(
-                "Comma-separated extra container mounts in HOST_PATH:CONTAINER_PATH format, "
-                "for example /data/models:/config/models,/data/videos:/workspace/input"
-            ),
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = "",
-    environment: Annotated[
-        str | None,
-        Option(
-            help="Comma-separated list of additional environment variables to set in the container.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = None,
-    require_slurm_allocation: Annotated[
-        bool,
-        Option(
-            "--require-slurm-allocation/--no-require-slurm-allocation",
-            help="Require SLURM_JOB_ID or SLURM_JOBID to be present before starting srun.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = True,
-    conda_override_cuda: Annotated[
-        str | None,
-        Option(
-            help="Set CONDA_OVERRIDE_CUDA during Pixi warmup. Use an empty value to omit it.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = _DEFAULT_CONDA_OVERRIDE_CUDA,
-    pixi_envs: Annotated[
-        str | None,
-        Option(
-            "--pixi-envs",
-            help=(
-                "Comma-separated Pixi environments to install during slim-image warmup, overriding "
-                "COSMOS_CURATOR_SLIM_ENVS from the image."
-            ),
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = None,
-    overlap: Annotated[
-        bool,
-        Option(
-            "--overlap/--no-overlap",
-            help="Pass --overlap to srun so nested launches from an srun --pty shell can reuse the allocation.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = True,
-    interactive: Annotated[
-        bool,
-        Option(
-            "--interactive/--no-interactive",
-            help="Pass --pty to srun for interactive commands such as bash.",
-            rich_help_panel="interactive-slurm",
-        ),
-    ] = False,
-) -> None:
-    """Launch a command with srun/Pyxis inside an existing interactive Slurm allocation."""
-    cuda_override = conda_override_cuda if conda_override_cuda else None
-    opts = LaunchSlurmLocal(
-        container_image=container_image,
-        curator_path=curator_path,
-        command=command,
-        workspace_path=workspace_path,
-        cache_path=cache_path,
-        mount_s3_creds=mount_s3_creds,
-        mount_azure_creds=mount_azure_creds,
-        extra_mounts=parse_extra_mounts(extra_mounts, description="extra mount"),
-        environment=_parse_environment(environment),
-        require_slurm_allocation=require_slurm_allocation,
-        conda_override_cuda=cuda_override,
-        pixi_envs=_parse_pixi_envs(pixi_envs),
-        overlap=overlap,
-        interactive=interactive,
-    )
-    _launch_with_srun(opts)
+    return SrunCommand(command=srun_command, environment=subprocess_env, container_env_keys=container_env_keys)

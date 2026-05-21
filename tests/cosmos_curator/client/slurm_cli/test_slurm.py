@@ -22,7 +22,9 @@ from unittest.mock import Mock, patch
 
 import invoke
 import pytest
+from typer.testing import CliRunner
 
+from cosmos_curator.client.cli import cosmos_curator
 from cosmos_curator.client.slurm_cli.slurm import (
     _SLURM_ACCOUNT_ENV_VAR,
     _START_RAY,
@@ -41,6 +43,7 @@ from cosmos_curator.scripts.onto_slurm import SlurmEnv
 
 MODULE_NAME = "cosmos_curator.client.slurm_cli.slurm"
 GRES = "gpu:8"
+runner = CliRunner()
 
 
 def _create_repo(root: pathlib.Path) -> pathlib.Path:
@@ -62,7 +65,7 @@ def _create_repo(root: pathlib.Path) -> pathlib.Path:
 )
 @patch(f"{MODULE_NAME}.curator_submit")
 def test_submit_cmd(mock_curator_submit: Mock, command: list[str], raises: AbstractContextManager[Any]) -> None:
-    """Test that the launch command executes without errors."""
+    """Test that the submit command executes without errors."""
     with raises:
         submit_cli(
             command=command,
@@ -155,10 +158,33 @@ def test_render_sbatch_script_with_qos() -> None:
     assert "#SBATCH --qos=normal" in sbatch_script
 
 
-def test_submit_uses_launch_defaults_for_container_runtime(
+def test_render_sbatch_script_with_gpu_options() -> None:
+    """Test that GPU-centered Slurm options are rendered into the sbatch script when provided."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gpus="8",
+        exclusive=True,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        log_dir=pathlib.Path("/logs"),
+    )
+
+    sbatch_script = _render_sbatch_script(job_spec)
+    assert "#SBATCH --gpus=8" in sbatch_script
+    assert "#SBATCH --gres" not in sbatch_script
+
+
+def test_submit_uses_shared_defaults_for_container_runtime(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The batch submit path should inherit the interactive launch container defaults."""
+    """The batch submit path should inherit the shared Slurm container defaults."""
     repo = _create_repo(tmp_path)
     workspace = tmp_path / "workspace"
     cache = tmp_path / "cache"
@@ -400,6 +426,91 @@ def test_submit_blank_optional_slurm_directives_are_omitted(tmp_path: pathlib.Pa
     assert job_spec.qos is None
     assert "#SBATCH -p" not in sbatch_script
     assert "#SBATCH --qos" not in sbatch_script
+
+
+def test_submit_accepts_slurm_style_short_options(tmp_path: pathlib.Path) -> None:
+    """Submit users can use familiar Slurm allocation aliases."""
+    with patch(f"{MODULE_NAME}.curator_submit", return_value="12345") as mock_curator_submit:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "submit",
+                "-A",
+                "test_account",
+                "-p",
+                "batch",
+                "-q",
+                "normal",
+                "-G",
+                "8",
+                "-J",
+                "batch_job",
+                "-N",
+                "2",
+                "-t",
+                "01:00:00",
+                "--container-image",
+                "test_image",
+                "--workspace-path",
+                str(tmp_path / "workspace"),
+                "--cache-path",
+                str(tmp_path / "cache"),
+                "--remote-files-path",
+                str(tmp_path / "job_files"),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Job submitted with ID: 12345" in result.output
+    mock_curator_submit.assert_called_once()
+    job_spec: SlurmJobSpec = mock_curator_submit.call_args.args[0]
+    assert job_spec.account == "test_account"
+    assert job_spec.partition == "batch"
+    assert job_spec.qos == "normal"
+    assert job_spec.gpus == "8"
+    assert job_spec.job_name == "batch_job"
+    assert job_spec.num_nodes == 2
+    assert job_spec.time_limit == "01:00:00"
+
+    sbatch_script = _render_sbatch_script(job_spec)
+    assert "#SBATCH --gpus=8" in sbatch_script
+
+
+def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
+    """Submit should not ask Slurm for GPUs through two incompatible option styles."""
+    with patch(f"{MODULE_NAME}.curator_submit") as mock_curator_submit:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "submit",
+                "--gres",
+                "gpu:8",
+                "-G",
+                "8",
+                "--container-image",
+                "test_image",
+                "--workspace-path",
+                str(tmp_path / "workspace"),
+                "--cache-path",
+                str(tmp_path / "cache"),
+                "--remote-files-path",
+                str(tmp_path / "job_files"),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "--gres and --gpus cannot be used together" in result.output
+    mock_curator_submit.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -785,16 +896,16 @@ class TestContainerSpec:
             assert container_spec.environment == environment
 
 
-class TestLaunch:
-    """Test the launch function."""
+class TestSubmit:
+    """Test the submit function."""
 
     @pytest.fixture
     def mock_curator_submit(self, mocker: Mock) -> Any:  # noqa: ANN401
-        """Test that the launch function launches the correct job."""
+        """Mock Slurm job submission."""
         return mocker.patch(f"{MODULE_NAME}.curator_submit")
 
-    def test_launch(self, mock_curator_submit: Mock) -> None:
-        """Test that the launch function launches the correct job."""
+    def test_submit(self, mock_curator_submit: Mock) -> None:
+        """Test that the submit function launches the correct job."""
         submit_cli(
             command=[str(_START_RAY), "arg1", "arg2"],
             login_node="login_node",
@@ -808,8 +919,8 @@ class TestLaunch:
         )
         mock_curator_submit.assert_called_once()
 
-    def test_launch_container_mounts(self, mock_curator_submit: Mock) -> None:
-        """Test that the launch function launches the correct job with container mounts."""
+    def test_submit_container_mounts(self, mock_curator_submit: Mock) -> None:
+        """Test that the submit function launches the correct job with container mounts."""
         submit_cli(
             command=[str(_START_RAY), "arg1", "arg2"],
             login_node="login_node",
@@ -824,8 +935,8 @@ class TestLaunch:
         )
         mock_curator_submit.assert_called_once()
 
-    def test_launch_environment(self, mock_curator_submit: Mock) -> None:
-        """Test that the launch function launches the correct job with environment variables."""
+    def test_submit_environment(self, mock_curator_submit: Mock) -> None:
+        """Test that the submit function launches the correct job with environment variables."""
         submit_cli(
             command=[str(_START_RAY), "arg1", "arg2"],
             login_node="login_node",
@@ -840,8 +951,8 @@ class TestLaunch:
         )
         mock_curator_submit.assert_called_once()
 
-    def test_launch_invalid_mounts(self, mock_curator_submit: Mock) -> None:
-        """Test that the launch function raises an error if the container mounts are invalid."""
+    def test_submit_invalid_mounts(self, mock_curator_submit: Mock) -> None:
+        """Test that the submit function raises an error if the container mounts are invalid."""
         with pytest.raises(ValueError, match=r"(?i).*must have at least 2 or colon separated parts.*"):
             submit_cli(
                 command=[str(_START_RAY), "arg1", "arg2"],
@@ -866,7 +977,7 @@ class TestLaunch:
             ("END", None, None, True),  # Only mail_type without user - should raise error
         ],
     )
-    def test_launch_with_mail_options(
+    def test_submit_with_mail_options(
         self,
         mock_curator_submit: Mock,
         mail_type: str | None,
@@ -875,7 +986,7 @@ class TestLaunch:
         *,
         should_raise: bool,
     ) -> None:
-        """Test that mail options are correctly handled in the launch function."""
+        """Test that mail options are correctly handled in the submit function."""
         ctx = (
             pytest.raises(ValueError, match="If --mail-type is provided, --mail-user must also be provided")
             if should_raise
@@ -909,7 +1020,7 @@ class TestLaunch:
             assert job_spec.mail_user == mail_user
             assert job_spec.mail_type == expected_mail_type
 
-    def test_launch_with_qos(self, mock_curator_submit: Mock) -> None:
+    def test_submit_with_qos(self, mock_curator_submit: Mock) -> None:
         """Test that the submit command forwards QoS into the job spec."""
         submit_cli(
             command=[str(_START_RAY), "arg1", "arg2"],

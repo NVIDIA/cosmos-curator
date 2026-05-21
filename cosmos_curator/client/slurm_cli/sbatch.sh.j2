@@ -31,6 +31,9 @@
 {% if gres %}
 #SBATCH --gres={{gres}}
 {% endif %}
+{% if gpus %}
+#SBATCH --gpus={{gpus}}
+{% endif %}
 {% if qos %}
 #SBATCH --qos={{qos}}
 {% endif %}

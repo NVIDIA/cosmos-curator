@@ -26,7 +26,7 @@
     - [Find Logs](#find-logs)
     - [Processing Large Video Sets in Batches](#processing-large-video-sets-in-batches)
     - [Developing on Slurm](#developing-on-slurm)
-      - [Interactive Slurm launcher](#interactive-slurm-launcher)
+      - [Interactive Slurm shell](#interactive-slurm-shell)
     - [Speeding up Model Load on Slurm](#speeding-up-model-load-on-slurm)
   - [Launch Pipelines on NVIDIA DGX Cloud](#launch-pipelines-on-nvidia-dgx-cloud)
   - [Launch Pipelines on K8s Cluster (coming soon)](#launch-pipelines-on-k8s-cluster-coming-soon)
@@ -152,7 +152,7 @@ inside the container. In-container commands should use `pixi run --as-is python 
 1. Download model weights from Hugging Face
 1. Launch a pipeline
    - locally using local-docker launcher - **focus of this section**
-   - on a slurm cluster using slurm launcher
+   - on a slurm cluster using the Slurm submit and shell commands
    - on [NVIDIA Cloud Functions (NVCF)](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html) by reaching out to NVIDIA Cosmos Curator team.
    - on Kubernetes cluster (coming soon)
 
@@ -628,19 +628,21 @@ export SBATCH_ACCOUNT=my_slurm_account
 cosmos-curator slurm submit -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
 
-Add only the remaining cluster-specific scheduling options your site requires, for example partition, QoS, GRES, or node
-count:
+Add only the remaining cluster-specific scheduling options your site requires, for example partition, QoS, GPUs, or node
+count. The Slurm-style short aliases are also supported for common allocation options:
 
 ```bash
 cosmos-curator slurm submit \
-  --account my_slurm_account \
-  --partition my_slurm_gpu_partition \
-  --qos my_slurm_qos \
-  --gres=my_slurm_cluster_gres \
-  --num-nodes 1 \
-  --job-name "hello-world" \
+  -A my_slurm_account \
+  -p my_slurm_gpu_partition \
+  -q my_slurm_qos \
+  -G 8 \
+  --nodes 1 \
+  -J "hello-world" \
   -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
 ```
+
+Use `-G 8` for the common GPU request form. `--gres=gpu:8` is also supported; the two options are mutually exclusive.
 
 When submitting from outside the Slurm login host, add `--login-node` and `--username` as needed. Container mount paths
 are still validated on the cluster, so pass `--container-image`, `--workspace-path`, `--cache-path`, `--curator-path`,
@@ -684,12 +686,12 @@ You can optionally receive email notifications about your SLURM jobs using the `
 
 ```bash
 cosmos-curator slurm submit \
-  --account my_slurm_account \
-  --partition my_slurm_gpu_partition \
-  --qos my_slurm_qos \
-  --gres=my_slurm_cluster_gres \
-  --num-nodes 1 \
-  --job-name "hello-world" \
+  -A my_slurm_account \
+  -p my_slurm_gpu_partition \
+  -q my_slurm_qos \
+  -G 8 \
+  --nodes 1 \
+  -J "hello-world" \
   --mail-user your.email@example.com \
   --mail-type END,FAIL \
   -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
@@ -753,12 +755,12 @@ NUM_BATCHES=1000
 for i in $(seq 0 $((NUM_BATCHES - 1))); do
   MANIFEST=$(printf "s3://bucket/manifests/batch_%04d.json" "$i")
   cosmos-curator slurm submit \
-    --account my_slurm_account \
-    --partition my_slurm_gpu_partition \
-    --qos my_slurm_qos \
-    --gres=gpu:8 \
-    --num-nodes 1 \
-    --job-name "split-batch-${i}" \
+    -A my_slurm_account \
+    -p my_slurm_gpu_partition \
+    -q my_slurm_qos \
+    -G 8 \
+    --nodes 1 \
+    -J "split-batch-${i}" \
     -- pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
       --input-video-path s3://bucket/videos \
       --input-video-list-json-path "$MANIFEST" \
@@ -776,34 +778,49 @@ pipeline checks for completed output metadata and skips already-processed videos
 
 ### Developing on Slurm
 
-If you plan to modify or create new pipelines on Slurm, use the interactive launcher from an existing GPU allocation.
-It starts the container through `srun --container-image`, mounts your live checkout into the container, reuses a shared
-cache directory, and sets the common runtime environment variables needed by Slurm-backed Cosmos Curator pipelines.
+If you plan to modify or create new pipelines on Slurm, use the interactive shell. It allocates a Slurm node with
+`srun --pty`, starts the container through `srun --container-image`, mounts your live checkout into the container,
+reuses a shared cache directory, and sets the common runtime environment variables needed by Slurm-backed Cosmos Curator
+pipelines.
 
-#### Interactive Slurm launcher
+#### Interactive Slurm shell
 
 Use this path when your cluster supports Pyxis with `srun --container-image`. It is especially useful on clusters where
-direct `enroot start` is not supported from an interactive allocation.
+direct `enroot start` is not supported.
 
-From a full cluster checkout containing `cosmos_curator/`, `pixi.toml`, and `pixi.lock`, start an interactive GPU
-allocation first, then launch a shell in the container:
+From a full cluster checkout containing `cosmos_curator/`, `pixi.toml`, and `pixi.lock`, start a shell in a GPU
+allocation and container in one step:
 
 ```bash
-cosmos-curator slurm launch --curator-path . --interactive -- bash
+cosmos-curator slurm shell --curator-path .
 ```
 
 This uses the default image path, workspace path, and cache path. Pass `--container-image`, `--workspace-path`, or
-`--cache-path` only when your cluster uses different locations.
+`--cache-path` only when your cluster uses different locations. If you are running from a local desktop instead of the
+Slurm login node, add `--login-node` and `--username` as needed, and pass an explicit `--curator-path` value that is
+valid on the cluster. Credential and config mounts also use cluster-visible paths; override them with
+`--container-mounts` or disable credential mounts when your login node paths differ.
 
-For slim images, the launcher installs the Pixi environments listed in the image's `COSMOS_CURATOR_SLIM_ENVS` before
-starting the shell. To reduce startup time during focused development, warm up only the environments you need:
+Use `-G 8` for the common GPU request form. `--gres=gpu:8` is also supported; the two options are mutually exclusive.
+For example, on an 8-GPU node:
 
 ```bash
-cosmos-curator slurm launch \
+cosmos-curator slurm shell --curator-path . -G 8
+```
+
+To run a specific command instead of opening `bash`, put it after `--`:
+
+```bash
+cosmos-curator slurm shell --curator-path . -- pixi run --as-is python -m cosmos_curator.pipelines.examples.hello_world_pipeline
+```
+
+For slim images, the shell command installs the Pixi environments listed in the image's `COSMOS_CURATOR_SLIM_ENVS`.
+To reduce startup time during focused development, warm up only the environments you need:
+
+```bash
+cosmos-curator slurm shell \
   --curator-path . \
-  --interactive \
   --pixi-envs model-download,default,unified \
-  -- bash
 ```
 
 Inside the container, run commands with `pixi run --as-is` so Pixi uses the environments installed during startup:
@@ -827,7 +844,7 @@ Model loading can sometimes be sped up by adding
 --copy-weights-to /raid/scratch/models
 ```
 
-to the launch command. This is because of the way that the transformers library loads safetensors from disk. Its method is efficient for local disk, but can be very slow if the model weights are stored on NFS or Lustre.
+to the pipeline command. This is because of the way that the transformers library loads safetensors from disk. Its method is efficient for local disk, but can be very slow if the model weights are stored on NFS or Lustre.
 
 This is only useful if there is enough space on the local nodes to store the model weights.
 
