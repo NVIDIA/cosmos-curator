@@ -506,13 +506,6 @@ client_wheel_smoke:
   tags:
     - ${RUNNER_TAG}
   rules: *pre_post_merge_and_web_rules
-  # Pull pre-built cosmos-xenna wheels (amd64 + arm64) from the lint-stage
-  # build_xenna_wheels matrix when the 'use-local-xenna-build' MR label is
-  # set. `optional: true` keeps these jobs runnable without the label.
-  needs:
-    - job: build_xenna_wheels
-      optional: true
-      artifacts: true
   id_tokens:
     VAULT_JWT_TOKEN:
       aud: ${VAULT_ADDR}

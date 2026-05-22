@@ -17,8 +17,10 @@
 These are used to help automate docker building/pushing/running.
 """
 
+import atexit
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 
@@ -85,9 +87,20 @@ def generate_dockerfile(  # noqa: PLR0913
     if verbose:
         logger.info(f"Generated Dockerfile content:\n{contents}")
 
-    # Write the rendered Dockerfile to disk
+    # Write the rendered Dockerfile to disk.
+    # IMPORTANT: when no explicit path is provided we MUST create a unique
+    # per-invocation file. Multiple `cosmos-curator image build` runs can be
+    # active on the same host concurrently (e.g. parallel CI jobs on a
+    # shell-executor runner building slim + non-slim variants of the same
+    # commit). A shared /tmp/Dockerfile led to one job overwriting the other's
+    # rendered template, causing the wrong variant to be pushed under the
+    # opposite tag (notably: slim content getting tagged as non-slim).
     if not dockerfile_output_path:
-        dockerfile_output_path = pathlib.Path(tempfile.gettempdir()) / "Dockerfile"  # Default output
+        unique_dir = pathlib.Path(tempfile.mkdtemp(prefix="cosmos-curator-image-"))
+        # Register cleanup at interpreter shutdown to avoid # accumulating
+        # /tmp/cosmos-curator-image-* directories across builds.
+        atexit.register(shutil.rmtree, unique_dir, ignore_errors=True)
+        dockerfile_output_path = unique_dir / "Dockerfile"
     dockerfile_output_path.write_text(contents)
     logger.info(f"Dockerfile written to: {dockerfile_output_path}")
     return dockerfile_output_path
