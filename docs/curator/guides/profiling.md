@@ -277,6 +277,24 @@ The `.bin` capture file is still valid because memray flushes data
 continuously.  The error is caught and stats/flamegraph generation
 proceeds normally.
 
+**Native symbol lookup:** Native traces may cause memray report readers
+to resolve C/C++ symbols.  On machines with `DEBUGINFOD_URLS` set,
+missing local debug symbols can trigger network-backed debuginfod
+lookups during `memray._memray.compute_statistics()` or flamegraph
+generation.  We have seen this primarily in pytest/dev runs, where it
+can look like the profiling test suite is hanging.  Pytest clears
+`DEBUGINFOD_URLS` globally for this repository so memray tests do not
+block on remote debug-symbol downloads.
+
+Normal Curator profiling runs preserve the caller's environment.  If a
+direct memray CLI run appears stuck in statistics or flamegraph
+generation, run it with debuginfod disabled:
+
+```bash
+DEBUGINFOD_URLS= memray stats path/to/profile.bin
+DEBUGINFOD_URLS= memray flamegraph path/to/profile.bin
+```
+
 **Output per call:**
 
 - **Stats summary** to stdout (total allocations, peak, top sites).
@@ -729,7 +747,9 @@ python benchmarks/merge_memory_profiles.py /path/to/profiles/memory/ --generate-
   interactive exploration.
 - **Memory profiles**: Open `.html` flamegraphs in any browser, or
   use `memray flamegraph <file>.bin` / `memray stats <file>.bin`
-  for offline analysis.  Use `benchmarks/merge_memory_profiles.py`
+  for offline analysis.  If the memray command appears stuck while
+  resolving native frames, retry with `DEBUGINFOD_URLS=` to disable
+  remote debuginfod symbol lookup.  Use `benchmarks/merge_memory_profiles.py`
   to produce a summary table across all captures (see
   [Summarizing Memory Profiles](#summarizing-memory-profiles)).
 - **GPU profiles**: Open `.json` files in

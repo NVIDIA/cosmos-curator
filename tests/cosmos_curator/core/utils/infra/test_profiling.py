@@ -54,6 +54,7 @@ Test setup:
 """
 
 import argparse
+import os
 import pathlib
 import time
 from collections.abc import Generator
@@ -210,6 +211,10 @@ class TestMemoryProfilingBackend:
 
         assert backend._mem_disabled is True
         monkeypatch.setattr("memray.Tracker", original_tracker)
+
+    def test_pytest_disables_debuginfod_urls(self) -> None:
+        """Pytest disables debuginfod so memray tests do not block on remote symbol lookup."""
+        assert os.environ["DEBUGINFOD_URLS"] == ""
 
 
 class TestProfilingStateOrchestration:

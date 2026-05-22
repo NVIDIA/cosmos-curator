@@ -118,6 +118,17 @@ cosmos-curator local launch --curator-path . -- \
     --profile-cpu --profile-memory --verbose
 ```
 
+Memray native-trace report generation can also ask debuginfod for
+missing native debug symbols when `DEBUGINFOD_URLS` is set.  This can
+make runs appear stuck while memray builds statistics or
+flamegraphs, so the test suite clears `DEBUGINFOD_URLS` globally.  For
+manual memray CLI debugging, use `DEBUGINFOD_URLS=` if execution
+appears stuck in native symbol lookup:
+
+```bash
+DEBUGINFOD_URLS= memray stats path/to/profile.bin
+```
+
 ### GPU Profiling (torch.profiler)
 
 Wraps each stage's `stage_setup_on_node()`, `stage_setup()`, and
