@@ -201,7 +201,7 @@ rotary-embedding-torch = "*"
 cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (unified env; fixes vs vulnerable 5.8.x)
 cvcuda-cu13 = "*" # not available on conda-forge
 PyNvVideoCodec = "*" # not available on conda-forge
-vllm = "==0.20.1" # not available on conda-forge
+vllm = "==0.21.0" # not available on conda-forge
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
