@@ -17,12 +17,9 @@
 
 import asyncio
 import json
-import logging
-import os
 import sys
 import types
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,11 +30,11 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage, vL
 from cosmos_curator.pipelines.ray_data import _vllm_caption as _captioner
 from cosmos_curator.pipelines.ray_data._vllm_caption import (
     _add_ray_llm_columns,
-    _apply_ray_assigned_cuda_visible_devices,
     _arrow_data_column_to_rows,
     _assemble_ray_multimodal_data,
     _install_vllm_engine_stage_shim,
     _patch_vllm_inputs_data_namespace,
+    make_default_vllm_config,
     make_normalize_caption_output_fn,
     sampling_params_dict,
     write_captioned_metadata_and_summary,
@@ -85,6 +82,16 @@ def test_sampling_params_dict_uses_vllm_sampling_config_defaults() -> None:
     assert params["max_tokens"] == 42
     assert params["temperature"] == 0.2
     assert params["top_p"] == VllmSamplingConfig().top_p
+
+
+def test_default_vllm_config_uses_benchmark_batch_size() -> None:
+    """Ray Data Qwen defaults use the best batch size from H100/GB200 sweeps."""
+    config = make_default_vllm_config()
+
+    assert config.model_variant == "qwen"
+    assert config.preprocess is False
+    assert config.num_gpus == 1
+    assert config.batch_size == 32
 
 
 def test_ray_llm_columns_are_arrow_native_and_reassemble_for_vllm_actor() -> None:
@@ -240,57 +247,7 @@ def test_add_ray_llm_columns_serializes_non_contiguous_frames() -> None:
 
 
 def test_build_processor_uses_qwen_ray_data_scheduler_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The private processor keeps the established Qwen Ray Data scheduler defaults."""
-
-    @dataclass
-    class FakeProcessorConfig:
-        model_source: str
-        batch_size: int
-        max_concurrent_batches: int
-        concurrency: tuple[int, int]
-        runtime_env: object
-        experimental: dict[str, object]
-        should_continue_on_error: bool
-        chat_template_stage: bool
-        tokenize_stage: bool
-        detokenize_stage: bool
-        prepare_image_stage: bool
-        prepare_multimodal_stage: bool
-        engine_kwargs: dict[str, object]
-
-    captured_configs: list[FakeProcessorConfig] = []
-
-    def fake_build_processor(config: FakeProcessorConfig) -> Callable[[ray.data.Dataset], ray.data.Dataset]:
-        captured_configs.append(config)
-        return lambda ds: ds
-
-    fake_llm_module = types.ModuleType("ray.data.llm")
-    fake_llm_module.build_processor = fake_build_processor
-    fake_llm_module.vLLMEngineProcessorConfig = FakeProcessorConfig
-    monkeypatch.setitem(sys.modules, "ray.data.llm", fake_llm_module)
-    monkeypatch.setattr(_captioner, "_install_vllm_engine_stage_shim", lambda _processor: None)
-    monkeypatch.setattr(_captioner, "_ray_vllm_max_tasks_in_flight_per_actor", lambda: 16)
-    monkeypatch.setattr(_captioner, "PixiRuntimeEnv", lambda name: {"pixi": name})
-
-    processor = _captioner._build_processor(
-        model_source="/models/qwen",
-        caption_workers=2,
-        vllm_config=VllmConfig(model_variant="qwen", batch_size=4),
-    )
-
-    assert callable(processor)
-    config = captured_configs[0]
-    assert config.engine_kwargs["max_num_batched_tokens"] == 32768
-    assert config.engine_kwargs["max_num_seqs"] == 64
-    assert config.max_concurrent_batches == 16
-    assert config.experimental == {"max_tasks_in_flight_per_actor": 16}
-    assert config.concurrency == (2, 2)
-
-
-def test_build_processor_derives_ray_batch_size_from_vllm_max_num_seqs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Benchmark tuning knobs should express vLLM capacity and derive Ray batching."""
+    """The private processor leaves Ray/vLLM scheduler knobs at their defaults."""
     captured_configs: list[dict[str, object]] = []
 
     def fake_build_processor(config: dict[str, object]) -> Callable[[ray.data.Dataset], ray.data.Dataset]:
@@ -302,14 +259,12 @@ def test_build_processor_derives_ray_batch_size_from_vllm_max_num_seqs(
     fake_llm_module.vLLMEngineProcessorConfig = lambda **kwargs: kwargs
     monkeypatch.setitem(sys.modules, "ray.data.llm", fake_llm_module)
     monkeypatch.setattr(_captioner, "_install_vllm_engine_stage_shim", lambda _processor: None)
-    monkeypatch.setattr(_captioner, "_ray_vllm_max_tasks_in_flight_per_actor", lambda: 16)
-    monkeypatch.setattr(_captioner, "PixiRuntimeEnv", lambda name: {"pixi": name})
+    monkeypatch.setattr(_captioner, "ray_data_gpu_runtime_env", lambda name: {"pixi": name, "gpu": True})
 
     processor = _captioner._build_processor(
         model_source="/models/qwen",
         caption_workers=2,
         vllm_config=VllmConfig(model_variant="qwen", batch_size=4),
-        max_num_seqs=384,
     )
 
     assert callable(processor)
@@ -317,10 +272,25 @@ def test_build_processor_derives_ray_batch_size_from_vllm_max_num_seqs(
     engine_kwargs = config["engine_kwargs"]
     assert isinstance(engine_kwargs, dict)
     assert engine_kwargs["max_num_batched_tokens"] == 32768
-    assert engine_kwargs["max_num_seqs"] == 384
-    assert config["batch_size"] == 24
-    assert config["max_concurrent_batches"] == 16
-    assert config["experimental"] == {"max_tasks_in_flight_per_actor": 16}
+    assert "max_concurrent_batches" not in config
+    assert "experimental" not in config
+    assert config["batch_size"] == 4
+    assert config["concurrency"] == (1, 2)
+    assert config["runtime_env"] == {"pixi": "unified", "gpu": True}
+
+
+def test_max_caption_workers_uses_gpu_ceiling() -> None:
+    """Caption actor pool max should reflect the fixed cluster GPU capacity."""
+    assert _captioner._max_caption_workers(total_visible_gpus=0, num_gpus_per_worker=1) == 0
+    assert _captioner._max_caption_workers(total_visible_gpus=1, num_gpus_per_worker=1) == 1
+    assert _captioner._max_caption_workers(total_visible_gpus=1, num_gpus_per_worker=2) == 0
+    assert _captioner._max_caption_workers(total_visible_gpus=8, num_gpus_per_worker=2) == 4
+
+
+def test_max_caption_workers_rejects_non_positive_worker_gpu_count() -> None:
+    """The vLLM GPU requirement must be positive."""
+    with pytest.raises(ValueError, match="num_gpus_per_worker must be positive"):
+        _captioner._max_caption_workers(total_visible_gpus=8, num_gpus_per_worker=0)
 
 
 def test_assemble_ray_multimodal_data_rejects_bad_payload_size() -> None:
@@ -359,36 +329,6 @@ def test_vllm_inputs_namespace_patch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake_inputs.data.TextPrompt is TextPrompt
     assert fake_inputs.data.TokensPrompt is TokensPrompt
     assert sys.modules["vllm.inputs.data"] is fake_inputs.data
-
-
-def test_caption_actor_sets_cuda_visible_devices_from_ray(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The caption actor masks vLLM subprocesses to its assigned Ray GPU."""
-    monkeypatch.setattr(_captioner.ray, "get_gpu_ids", lambda: [1.0])
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-
-    _apply_ray_assigned_cuda_visible_devices()
-
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == "1"
-
-
-def test_caption_actor_logs_cuda_masking_impact_when_ray_gpu_lookup_fails(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Ray GPU lookup failures should explain their effect on vLLM subprocess masking."""
-
-    def raise_ray_gpu_lookup_error() -> list[object]:
-        msg = "ray GPU lookup failed"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(_captioner.ray, "get_gpu_ids", raise_ray_gpu_lookup_error)
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    caplog.set_level(logging.WARNING, logger=_captioner.logger.name)
-
-    _apply_ray_assigned_cuda_visible_devices()
-
-    assert "CUDA_VISIBLE_DEVICES will not be set for vLLM engine subprocesses" in caplog.text
-    assert "ray GPU lookup failed" in caplog.text
-    assert "CUDA_VISIBLE_DEVICES" not in os.environ
 
 
 def test_normalize_caption_output_infers_statuses() -> None:
@@ -526,7 +466,6 @@ def test_caption_window_rows_runs_window_generation_once(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(_captioner, "make_caption_window_rows_fn", fake_make_caption_window_rows_fn)
     monkeypatch.setattr(_captioner, "_build_processor", fake_build_processor)
-    monkeypatch.setattr(_captioner, "_ray_vllm_max_tasks_in_flight_per_actor", lambda: 16)
     monkeypatch.setattr(_captioner, "PixiRuntimeEnv", lambda _name: {})
 
     ds = ray.data.from_items([_base_window_row(clip_uuid="clip-1")])
@@ -535,11 +474,10 @@ def test_caption_window_rows_runs_window_generation_once(monkeypatch: pytest.Mon
         ds,
         model_source="unused",
         caption_workers=1,
-        vllm_max_num_seqs=128,
     ).take_all()
 
     assert calls_path.read_text(encoding="utf-8").splitlines() == ["clip-1"]
-    assert captured_batch_size == [8]
+    assert captured_batch_size == [32]
     assert len(rows) == 1
     assert sorted(window["caption_skip"] for window in rows[0]["caption_windows"]) == [False, True]
 

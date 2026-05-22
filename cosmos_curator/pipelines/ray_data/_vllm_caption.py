@@ -26,8 +26,6 @@ and dtype columns until the Ray vLLM engine actor rebuilds the nested
 import asyncio
 import json
 import logging
-import math
-import os
 import sys
 import time
 import types
@@ -42,7 +40,7 @@ import pyarrow as pa
 import ray
 
 from cosmos_curator.core.utils.model.model_utils import get_local_dir_for_weights_name
-from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv
+from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv, ray_data_gpu_runtime_env
 from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.pipelines.ray_data._summary_writer import write_summary_from_rows
@@ -76,8 +74,8 @@ class _RayDataLlmProcessor(Protocol):
 
 
 def make_default_vllm_config() -> VllmConfig:
-    """Build the first-version Qwen config to match the Xenna default path."""
-    return VllmConfig(model_variant=_MODEL_VARIANT, preprocess=False, num_gpus=1)
+    """Build the Ray Data Qwen config."""
+    return VllmConfig(model_variant=_MODEL_VARIANT, preprocess=False, num_gpus=1, batch_size=32)
 
 
 def make_default_window_config() -> WindowConfig:
@@ -95,9 +93,14 @@ def qwen_model_source() -> str:
     return str(get_local_dir_for_weights_name(qwen_model_id()))
 
 
-def visible_caption_workers() -> int:
-    """Return the fixed caption worker budget from visible Ray GPU resources."""
-    return int(ray.cluster_resources().get("GPU", 0))  # type: ignore[no-untyped-call]
+def _max_caption_workers(total_visible_gpus: int, num_gpus_per_worker: int) -> int:
+    """Return the maximum vLLM replicas this fixed Ray cluster can run."""
+    if num_gpus_per_worker <= 0:
+        msg = f"num_gpus_per_worker must be positive, got {num_gpus_per_worker}"
+        raise ValueError(msg)
+    if total_visible_gpus <= 0:
+        return 0
+    return total_visible_gpus // num_gpus_per_worker
 
 
 def sampling_params_dict(config: VllmSamplingConfig | None = None) -> dict[str, Any]:
@@ -123,31 +126,6 @@ def _patch_vllm_inputs_data_namespace() -> None:
     data_module.__dict__["TokensPrompt"] = vllm_inputs_module.TokensPrompt
     sys.modules["vllm.inputs.data"] = data_module
     vllm_inputs_module.data = data_module
-
-
-def _format_gpu_id(gpu_id: object) -> str:
-    """Format Ray GPU IDs for ``CUDA_VISIBLE_DEVICES``."""
-    if isinstance(gpu_id, float) and gpu_id.is_integer():
-        return str(int(gpu_id))
-    return str(gpu_id)
-
-
-def _apply_ray_assigned_cuda_visible_devices() -> None:
-    """Restore per-actor CUDA masking before vLLM spawns engine processes."""
-    try:
-        gpu_ids = ray.get_gpu_ids()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "Unable to read Ray-assigned GPU IDs; CUDA_VISIBLE_DEVICES will not be set for vLLM engine subprocesses",
-            exc_info=True,
-        )
-        return
-    if not gpu_ids:
-        return
-
-    cuda_visible_devices = ",".join(_format_gpu_id(gpu_id) for gpu_id in gpu_ids)
-    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    logger.info("Set CUDA_VISIBLE_DEVICES=%s from ray.get_gpu_ids()", cuda_visible_devices)
 
 
 def _to_numpy_tensor(value: object) -> npt.NDArray[np.generic]:
@@ -283,7 +261,6 @@ def _install_vllm_engine_stage_shim(processor: object) -> None:  # noqa: C901
 
     class ArrowFramePayloadEngineStageUDF(vLLMEngineStageUDF):  # type: ignore[misc, valid-type]
         def __init__(self, *args: object, **kwargs: object) -> None:
-            _apply_ray_assigned_cuda_visible_devices()
             _patch_vllm_inputs_data_namespace()
             super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
@@ -370,40 +347,6 @@ def _install_vllm_engine_stage_shim(processor: object) -> None:  # noqa: C901
 
     stage.fn = ArrowFramePayloadEngineStageUDF
     stage.map_batches_kwargs["batch_format"] = "pyarrow"
-
-
-def _ray_vllm_max_tasks_in_flight_per_actor() -> int:
-    """Return Ray Data's default vLLM task overlap per actor."""
-    from ray.llm._internal.batch.processor.base import DEFAULT_MAX_TASKS_IN_FLIGHT  # noqa: PLC0415
-
-    return int(DEFAULT_MAX_TASKS_IN_FLIGHT)
-
-
-def _resolve_ray_vllm_scheduler_settings(
-    vllm_config: VllmConfig,
-    *,
-    max_num_seqs: int | None = None,
-    max_tasks_in_flight_per_actor: int | None = None,
-) -> tuple[VllmConfig, int, int]:
-    """Derive Ray batch sizing from the requested vLLM scheduler capacity."""
-    max_tasks_in_flight = (
-        _ray_vllm_max_tasks_in_flight_per_actor()
-        if max_tasks_in_flight_per_actor is None
-        else max_tasks_in_flight_per_actor
-    )
-    if max_tasks_in_flight <= 0:
-        msg = f"max_tasks_in_flight_per_actor must be positive, got {max_tasks_in_flight}"
-        raise ValueError(msg)
-
-    resolved_max_num_seqs = max_num_seqs
-    if resolved_max_num_seqs is None:
-        resolved_max_num_seqs = vllm_config.batch_size * max_tasks_in_flight
-    if resolved_max_num_seqs <= 0:
-        msg = f"max_num_seqs must be positive, got {resolved_max_num_seqs}"
-        raise ValueError(msg)
-
-    batch_size = math.ceil(resolved_max_num_seqs / max_tasks_in_flight)
-    return attrs.evolve(vllm_config, batch_size=batch_size), max_tasks_in_flight, resolved_max_num_seqs
 
 
 def make_caption_window_rows_fn(
@@ -534,21 +477,16 @@ def _auto_processor(vllm_config: VllmConfig) -> object:
     return _PROCESSOR_CACHE[cache_key]
 
 
-def caption_window_rows(  # noqa: PLR0913
+def caption_window_rows(
     ds: ray.data.Dataset,
     *,
     model_source: str,
     caption_workers: int,
-    vllm_max_num_seqs: int | None = None,
     vllm_config: VllmConfig | None = None,
     window_config: WindowConfig | None = None,
 ) -> ray.data.Dataset:
     """Add Qwen captions to MP4 clip rows and return one row per clip."""
     resolved_vllm_config = vllm_config or make_default_vllm_config()
-    resolved_vllm_config, max_tasks_in_flight, resolved_max_num_seqs = _resolve_ray_vllm_scheduler_settings(
-        resolved_vllm_config,
-        max_num_seqs=vllm_max_num_seqs,
-    )
     resolved_window_config = window_config or make_default_window_config()
 
     if caption_workers <= 0:
@@ -569,8 +507,6 @@ def caption_window_rows(  # noqa: PLR0913
         model_source=model_source,
         caption_workers=caption_workers,
         vllm_config=resolved_vllm_config,
-        max_tasks_in_flight_per_actor=max_tasks_in_flight,
-        max_num_seqs=resolved_max_num_seqs,
     )
     return processor(clip_ds).map(
         make_normalize_caption_clip_output_fn(resolved_vllm_config.sampling_config),
@@ -583,16 +519,9 @@ def _build_processor(
     model_source: str,
     caption_workers: int,
     vllm_config: VllmConfig,
-    max_tasks_in_flight_per_actor: int | None = None,
-    max_num_seqs: int | None = None,
 ) -> Callable[[ray.data.Dataset], ray.data.Dataset]:
     from ray.data.llm import build_processor, vLLMEngineProcessorConfig  # noqa: PLC0415
 
-    resolved_vllm_config, max_tasks_in_flight, resolved_max_num_seqs = _resolve_ray_vllm_scheduler_settings(
-        vllm_config,
-        max_num_seqs=max_num_seqs,
-        max_tasks_in_flight_per_actor=max_tasks_in_flight_per_actor,
-    )
     engine_kwargs: dict[str, Any] = {
         # Mirrors cosmos_curator.models.vllm_qwen.VllmQwen.model without importing
         # vLLM-backed classes on the driver.
@@ -600,19 +529,18 @@ def _build_processor(
         "max_model_len": 32768,
         "gpu_memory_utilization": 0.85,
         "mm_processor_kwargs": {
-            "do_resize": resolved_vllm_config.preprocess,
-            "do_rescale": resolved_vllm_config.preprocess,
-            "do_normalize": resolved_vllm_config.preprocess,
+            "do_resize": vllm_config.preprocess,
+            "do_rescale": vllm_config.preprocess,
+            "do_normalize": vllm_config.preprocess,
         },
-        "mm_processor_cache_gb": 0.0 if resolved_vllm_config.disable_mmcache else 4.0,
+        "mm_processor_cache_gb": 0.0 if vllm_config.disable_mmcache else 4.0,
         "max_num_batched_tokens": 32768,
-        "max_num_seqs": resolved_max_num_seqs,
-        "tensor_parallel_size": resolved_vllm_config.num_gpus,
+        "tensor_parallel_size": vllm_config.num_gpus,
         "trust_remote_code": False,
         "compilation_config": {"cudagraph_mode": "piecewise"},
-        "performance_mode": resolved_vllm_config.performance_mode,
+        "performance_mode": vllm_config.performance_mode,
     }
-    if resolved_vllm_config.fp8:
+    if vllm_config.fp8:
         engine_kwargs["quantization"] = "fp8"
 
     processor = build_processor(
@@ -620,11 +548,9 @@ def _build_processor(
             "Any",
             vLLMEngineProcessorConfig(
                 model_source=model_source,
-                batch_size=resolved_vllm_config.batch_size,
-                max_concurrent_batches=max_tasks_in_flight,
-                concurrency=(caption_workers, caption_workers),
-                runtime_env=PixiRuntimeEnv("unified"),
-                experimental={"max_tasks_in_flight_per_actor": max_tasks_in_flight},
+                batch_size=vllm_config.batch_size,
+                concurrency=(1, caption_workers),
+                runtime_env=ray_data_gpu_runtime_env("unified"),
                 should_continue_on_error=True,
                 chat_template_stage=False,
                 tokenize_stage=False,

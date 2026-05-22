@@ -36,6 +36,11 @@ _TRANSNETV2_MODEL_ID: Final = "Sn4kehead/TransNetV2"
 _TRANSNETV2_MODEL_WEIGHTS: Final = "transnetv2-pytorch-weights.pth"
 
 
+def transnetv2_model_id_names() -> list[str]:
+    """Return model IDs required by TransNetV2."""
+    return [_TRANSNETV2_MODEL_ID]
+
+
 class _TransNetV2(nn.Module):
     def __init__(  # noqa: PLR0913
         self,
@@ -552,7 +557,7 @@ class TransNetV2(ModelInterface):
             A list of model ID names.
 
         """
-        return [_TRANSNETV2_MODEL_ID]
+        return transnetv2_model_id_names()
 
     def setup(self) -> None:
         """Set up the TransNetV2 model interface."""

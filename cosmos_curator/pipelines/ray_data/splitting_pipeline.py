@@ -15,8 +15,9 @@
 
 r"""Ray Data video splitting pipeline.
 
-Downloads videos, splits them into fixed-stride clips, transcodes each clip
-with FFmpeg, and writes the results to local or remote storage.
+Downloads videos, splits them into TransNetV2 or fixed-stride clips,
+transcodes each clip with FFmpeg, and writes the results to local or remote
+storage.
 
 Usage::
 
@@ -27,26 +28,37 @@ Usage::
 
 import argparse
 import logging
+import math
+from typing import Any, cast
 
+import attrs
 import ray
-from ray.data import TaskPoolStrategy
+from ray.data import ActorPoolStrategy, TaskPoolStrategy
 
 from cosmos_curator.core.interfaces.pipeline_interface import download_models
 from cosmos_curator.core.utils.environment import MODEL_WEIGHTS_PREFIX
 from cosmos_curator.core.utils.ffmpeg_utils import assert_ffmpeg_supports_h264
+from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.core.utils.storage.storage_utils import get_files_relative, get_full_path, get_storage_client
 from cosmos_curator.pipelines.ray_data._clip_transcoder import make_transcode_fn
 from cosmos_curator.pipelines.ray_data._clip_writer import make_write_fn
 from cosmos_curator.pipelines.ray_data._fixed_stride_splitter import make_split_fn
 from cosmos_curator.pipelines.ray_data._summary_writer import write_summary
+from cosmos_curator.pipelines.ray_data._transnetv2_splitter import (
+    TransNetV2Splitter,
+    transnetv2_model_ids,
+    validate_transnetv2_length_bounds,
+)
 from cosmos_curator.pipelines.ray_data._video_reader import read_video
 from cosmos_curator.pipelines.ray_data._vllm_caption import (
+    _max_caption_workers,
     caption_window_rows,
+    make_default_vllm_config,
     qwen_model_id,
     qwen_model_source,
-    visible_caption_workers,
     write_captioned_metadata_and_summary,
 )
+from cosmos_curator.pipelines.video.utils.data_model import VllmConfig
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +110,175 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _finite_float(value: str) -> float:
+    """Parse a finite floating-point CLI value."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        msg = f"{value!r} is not a float"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if not math.isfinite(parsed):
+        msg = f"{value!r} must be finite"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+def _probability(value: str) -> float:
+    """Parse a probability in the inclusive range [0, 1]."""
+    parsed = _finite_float(value)
+    if not 0.0 <= parsed <= 1.0:
+        msg = f"{value!r} must be between 0 and 1"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    """Parse a positive floating-point CLI value."""
+    parsed = _finite_float(value)
+    if parsed <= 0.0:
+        msg = f"{value!r} must be positive"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+def _as_positive_int(value: object, name: str) -> int:
+    """Coerce a direct namespace value to a positive integer."""
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float) and value.is_integer():
+        parsed = int(value)
+    elif isinstance(value, str):
+        parsed = _positive_int(value)
+    else:
+        msg = f"{name} must be an integer, got {value!r}"
+        raise ValueError(msg)
+    if parsed <= 0:
+        msg = f"{name} must be positive, got {value!r}"
+        raise ValueError(msg)
+    return parsed
+
+
+def _as_positive_float(value: object, name: str) -> float:
+    """Coerce a direct namespace value to a positive finite float."""
+    if isinstance(value, int | float):
+        parsed = float(value)
+    elif isinstance(value, str):
+        parsed = _positive_float(value)
+    else:
+        msg = f"{name} must be a float, got {value!r}"
+        raise TypeError(msg)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        msg = f"{name} must be positive, got {value!r}"
+        raise ValueError(msg)
+    return parsed
+
+
+def _required_model_ids(args: argparse.Namespace, *, generate_captions: bool) -> list[str]:
+    """Return model IDs required for the selected Ray Data pipeline."""
+    model_ids: list[str] = []
+    if getattr(args, "splitting_algorithm", "transnetv2") == "transnetv2":
+        model_ids.extend(transnetv2_model_ids())
+    if generate_captions:
+        model_ids.append(qwen_model_id())
+    return list(dict.fromkeys(model_ids))
+
+
+def _validate_transnetv2_cluster_resources(args: argparse.Namespace, *, total_visible_gpus: int) -> None:
+    """Fail fast when the selected TransNetV2 stage cannot be scheduled."""
+    if getattr(args, "splitting_algorithm", "transnetv2") != "transnetv2":
+        return
+    decode_cpus = _as_positive_int(
+        args.transnetv2_frame_decode_cpus_per_worker,
+        "transnetv2_frame_decode_cpus_per_worker",
+    )
+    gpus_per_worker = _as_positive_float(args.transnetv2_gpus_per_worker, "transnetv2_gpus_per_worker")
+    if float(total_visible_gpus) < gpus_per_worker:
+        msg = (
+            "TransNetV2 splitting requires visible GPUs. "
+            "Use --splitting-algorithm fixed-stride or lower --transnetv2-gpus-per-worker."
+        )
+        raise ValueError(msg)
+
+    ray_nodes = cast("list[dict[str, Any]]", ray.nodes())  # type: ignore[no-untyped-call]
+    for node in ray_nodes:
+        if not node.get("Alive", False):
+            continue
+        resources = node.get("Resources", {})
+        if not isinstance(resources, dict):
+            continue
+        node_cpus = float(resources.get("CPU", 0.0))
+        node_gpus = float(resources.get("GPU", 0.0))
+        if node_cpus >= decode_cpus and node_gpus >= gpus_per_worker:
+            return
+
+    msg = (
+        "TransNetV2 splitting requires at least one live Ray node with "
+        f"{decode_cpus} CPU(s) and {gpus_per_worker:g} GPU(s) available for one worker. "
+        "Lower --transnetv2-frame-decode-cpus-per-worker or --transnetv2-gpus-per-worker, "
+        "or use --splitting-algorithm fixed-stride."
+    )
+    raise ValueError(msg)
+
+
+def _caption_vllm_config(args: argparse.Namespace) -> VllmConfig | None:
+    """Return a caption vLLM config only when the CLI overrides model defaults."""
+    caption_batch_size = getattr(args, "caption_batch_size", None)
+    if caption_batch_size is None:
+        return None
+    return attrs.evolve(make_default_vllm_config(), batch_size=caption_batch_size)
+
+
+def _caption_workers_from_downloaded_gpus(total_visible_gpus: int, vllm_config: VllmConfig | None) -> int:
+    """Return the caption actor ceiling from the GPU count discovered during model download."""
+    worker_config = vllm_config or make_default_vllm_config()
+    return _max_caption_workers(total_visible_gpus, worker_config.num_gpus)
+
+
+def _apply_split_stage(ds: ray.data.Dataset, args: argparse.Namespace, *, download_slots: int) -> ray.data.Dataset:
+    """Apply the selected span-generation stage to the video dataset."""
+    splitting_algorithm = getattr(args, "splitting_algorithm", "transnetv2")
+    if splitting_algorithm == "fixed-stride":
+        return ds.map(
+            make_split_fn(
+                clip_len_s=args.fixed_stride_split_duration,
+                clip_stride_s=args.fixed_stride_split_duration,
+                min_clip_length_s=args.fixed_stride_min_clip_length_s,
+                limit_clips=args.limit_clips,
+            ),
+            num_cpus=0.25,
+            compute=TaskPoolStrategy(size=download_slots),
+        )
+
+    if splitting_algorithm == "transnetv2":
+        decode_cpus = _as_positive_int(
+            args.transnetv2_frame_decode_cpus_per_worker,
+            "transnetv2_frame_decode_cpus_per_worker",
+        )
+        transnetv2_kwargs: dict[str, Any] = {
+            "threshold": args.transnetv2_threshold,
+            "min_length_s": args.transnetv2_min_length_s,
+            "min_length_frames": args.transnetv2_min_length_frames,
+            "max_length_s": args.transnetv2_max_length_s,
+            "max_length_mode": args.transnetv2_max_length_mode,
+            "crop_s": args.transnetv2_crop_s,
+            "num_decode_cpus_per_worker": decode_cpus,
+            "limit_clips": args.limit_clips,
+        }
+        transnetv2_fn = cast("Any", TransNetV2Splitter)
+        return ds.map(
+            transnetv2_fn,
+            fn_constructor_kwargs=transnetv2_kwargs,
+            num_cpus=decode_cpus,
+            num_gpus=args.transnetv2_gpus_per_worker,
+            compute=ActorPoolStrategy(min_size=1, max_size=download_slots, initial_size=1),
+            runtime_env=ray_data_gpu_runtime_env("unified"),
+            scheduling_strategy="DEFAULT",
+        )
+
+    msg = f"Unknown splitting algorithm: {splitting_algorithm}"
+    raise ValueError(msg)
+
+
 def run(args: argparse.Namespace) -> int:
     """Build and execute the splitting pipeline.
 
@@ -108,13 +289,19 @@ def run(args: argparse.Namespace) -> int:
         Number of clips written.
 
     """
+    if getattr(args, "splitting_algorithm", "transnetv2") == "transnetv2":
+        validate_transnetv2_length_bounds(args.transnetv2_min_length_s, args.transnetv2_max_length_s)
+
     assert_ffmpeg_supports_h264()
 
     generate_captions = getattr(args, "generate_captions", True)
+    model_ids = _required_model_ids(args, generate_captions=generate_captions)
+    num_gpus_available = 0
+    if model_ids:
+        num_gpus_available = int(download_models(model_ids, args.model_weights_path))
+
     caption_model_source: str | None = None
     if generate_captions:
-        model_id = qwen_model_id()
-        download_models([model_id], args.model_weights_path)
         caption_model_source = qwen_model_source()
 
     if not ray.is_initialized():
@@ -127,6 +314,8 @@ def run(args: argparse.Namespace) -> int:
         logger.warning("No videos found in %s", args.input_video_path)
         return 0
     logger.info("Found %d input video(s)", len(video_paths))
+
+    _validate_transnetv2_cluster_resources(args, total_visible_gpus=num_gpus_available)
 
     # Seed dataset — one row per video.
     ds: ray.data.Dataset = ray.data.from_items([{"video_path": vp} for vp in video_paths])
@@ -147,18 +336,8 @@ def run(args: argparse.Namespace) -> int:
         compute=TaskPoolStrategy(size=download_slots),
     )
 
-    # Stage 2: Compute clip spans (1:1, no fan-out). Matching resources +
-    # compute strategy keeps this fused with read_video.
-    ds = ds.map(
-        make_split_fn(
-            clip_len_s=args.fixed_stride_split_duration,
-            clip_stride_s=args.fixed_stride_split_duration,
-            min_clip_length_s=args.fixed_stride_min_clip_length_s,
-            limit_clips=args.limit_clips,
-        ),
-        num_cpus=0.25,
-        compute=TaskPoolStrategy(size=download_slots),
-    )
+    # Stage 2: Compute clip spans (1:1, no fan-out).
+    ds = _apply_split_stage(ds, args, download_slots=download_slots)
 
     # Stage 3: Transcode + fan-out (1:N — one video in, N clips out).
     ds = ds.flat_map(
@@ -182,11 +361,12 @@ def run(args: argparse.Namespace) -> int:
         if caption_model_source is None:
             msg = "caption_model_source must be set when generate_captions is True"
             raise RuntimeError(msg)
+        vllm_config = _caption_vllm_config(args)
         ds = caption_window_rows(
             ds,
             model_source=caption_model_source,
-            caption_workers=visible_caption_workers(),
-            vllm_max_num_seqs=getattr(args, "vllm_max_num_seqs", 64),
+            caption_workers=_caption_workers_from_downloaded_gpus(num_gpus_available, vllm_config),
+            vllm_config=vllm_config,
         )
 
         num_clips = write_captioned_metadata_and_summary(
@@ -233,6 +413,13 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:
     )
     # --- Splitting ---
     parser.add_argument(
+        "--splitting-algorithm",
+        type=str,
+        default="transnetv2",
+        choices=["fixed-stride", "transnetv2"],
+        help="Splitting algorithm to use on full videos.",
+    )
+    parser.add_argument(
         "--fixed-stride-split-duration",
         type=int,
         default=10,
@@ -251,6 +438,76 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:
         help="Limit number of clips from each input video to process.",
     )
     parser.add_argument(
+        "--transnetv2-threshold",
+        type=_probability,
+        default=0.4,
+        help=(
+            "TransNetV2 probability threshold above which a frame is classified as a shot transition. "
+            "Default is 0.4, which prioritizes recall over precision."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-min-length-s",
+        type=float,
+        default=2.0,
+        help=(
+            "Minimum length of clips (in seconds) for TransNetV2 splitting stage. "
+            "If specified, will remove any scenes below this length."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-min-length-frames",
+        type=_positive_int,
+        default=48,
+        help=(
+            "Minimum length of clips (in frames) for TransNetV2 splitting stage. "
+            "If specified, will remove any scenes below this length."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-max-length-s",
+        type=float,
+        default=60.0,
+        help=(
+            "Maximum length of clips (in seconds) for TransNetV2 splitting stage. "
+            "If specified, will deal with the scene by the `max_length_mode` specified."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-max-length-mode",
+        type=str,
+        default="stride",
+        choices=["truncate", "stride"],
+        help=(
+            "Maximum length mode for TransNetV2 splitting stage. "
+            "If `truncate`, will truncate the scene to `max_length_s`. "
+            "If `stride`, will generate a number of max_length_s scenes until the end of the scene. "
+            "If the end scene is less than `min_length_s`, it will drop the last scene."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-crop-s",
+        type=float,
+        default=0.5,
+        help=(
+            "Crop size for TransNetV2 splitting stage. If specified, will crop each scene at start and end. "
+            "E.g. 0.25 will crop ~250ms from start, and ~250ms from end frame (reducing all clips by ~0.5 seconds). "
+            "If cropped scenes result in zero-length scenes, these will be filtered."
+        ),
+    )
+    parser.add_argument(
+        "--transnetv2-frame-decode-cpus-per-worker",
+        type=_positive_int,
+        default=3,
+        help="Number of CPU threads per worker for video frame decoding when using ffmpeg_cpu mode.",
+    )
+    parser.add_argument(
+        "--transnetv2-gpus-per-worker",
+        type=_positive_float,
+        default=0.25,
+        help="Number of GPUs per worker for TransNetV2 splitting stage.",
+    )
+    parser.add_argument(
         "--no-generate-captions",
         dest="generate_captions",
         action="store_false",
@@ -267,14 +524,10 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--vllm-max-num-seqs",
+        "--caption-batch-size",
         type=_positive_int,
-        default=64,
-        help=(
-            "Advanced vLLM tuning: maximum active sequences per vLLM engine. Ray Data batch size is derived "
-            "from this value and Ray's default per-actor in-flight task count. The default works well on "
-            "A100/H100/B200 in benchmark runs; GB200 benchmark runs benefited from higher values."
-        ),
+        default=None,
+        help="Ray Data caption batch size in clip rows. Defaults to the selected caption model config.",
     )
     parser.add_argument(
         "--progress",

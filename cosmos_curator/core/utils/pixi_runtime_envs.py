@@ -16,6 +16,14 @@
 
 from ray.runtime_env import RuntimeEnv
 
+_RAY_DATA_GPU_ENV_VARS = {
+    # TODO: Remove this once the base image stops setting
+    # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 for Xenna. Ray skips
+    # CUDA_VISIBLE_DEVICES masking when this inverted flag is truthy, so "0"
+    # restores Ray's normal per-actor GPU visibility for Ray Data stages.
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
+}
+
 
 class PixiRuntimeEnv(RuntimeEnv):
     """RuntimeEnv that launches Python inside a Pixi environment.
@@ -42,3 +50,10 @@ class PixiRuntimeEnv(RuntimeEnv):
             env_vars=copied_env_vars,
             py_executable=f"pixi run --as-is -e {env_name} python" if env_name else None,
         )
+
+
+def ray_data_gpu_runtime_env(env_name: str, env_vars: dict[str, str] | None = None) -> PixiRuntimeEnv:
+    """Create a Pixi runtime env for Ray Data GPU stages with Ray GPU masking enabled."""
+    copied_env_vars = {} if env_vars is None else dict(env_vars)
+    copied_env_vars.update(_RAY_DATA_GPU_ENV_VARS)
+    return PixiRuntimeEnv(env_name, env_vars=copied_env_vars)
