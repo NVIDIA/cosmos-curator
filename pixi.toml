@@ -83,6 +83,7 @@ pytest-mock = "*"
 ruff = "==0.14.9"
 
 [feature.dev.pypi-dependencies]
+cosmos-curator = { path = ".", editable = true }
 fabric = "==3.2.2"
 invoke = "==3.0.3"
 openai = "*"

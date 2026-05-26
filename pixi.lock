@@ -1836,6 +1836,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: .
       - pypi: https://files.pythonhosted.org/packages/03/15/e56f351cf6ef1cfea58e6ac226a7318ed1deb2218c4b3cc9bd9e4b786c5a/google_api_core-2.30.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/05/7f/798705f5296a58ca505d600456748d1be48078eac8a7050d8a98bc9edb89/decorator-5.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/06/a2/c01db32be2ae7d6a1689972f3c492b149ee4e164b12fdfd9f64b50888215/types_pyyaml-6.0.12.20260518-py3-none-any.whl
@@ -1892,6 +1893,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/65/92/a5100f7185a800a5d29f8d14041f61475b9de465ffcc0f3b9fba606e4505/msgpack-1.1.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/6a/bd/d91c5e39f490a49df14320f4e8c80161cfcce09f1e2cde1edd16a551abb3/frozenlist-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/73/b8/a0e2790ae249d6f38c9f66de7a211621a7ab2650217bcd04e1262f578a56/pyopenssl-26.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/75/a6/a0a304dc33b49145b21f4808d763822111e67d1c3a32b524a1baf947b6e1/platformdirs-4.9.6-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7a/da/323a01c349bd5fb01bb6652e314d9bb218cee630a736bdb810ad50e4013f/yarl-1.24.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/7c/20/b122d4626976acb81132036d2ad1bb35a1a8775fceb837ec30964622516a/proto_plus-1.28.0-py3-none-any.whl
@@ -2261,6 +2263,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: .
       - pypi: https://files.pythonhosted.org/packages/00/c0/637721f3cd5bb8bd16105a1a08efd781fc12f449931bdb3a4d0cfd63fa55/av-17.0.0-cp311-abi3-manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/03/15/e56f351cf6ef1cfea58e6ac226a7318ed1deb2218c4b3cc9bd9e4b786c5a/google_api_core-2.30.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/05/7f/798705f5296a58ca505d600456748d1be48078eac8a7050d8a98bc9edb89/decorator-5.3.1-py3-none-any.whl
@@ -2313,6 +2316,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/67/84/c9ecc5828cb0b3695856c07c0a6817a99d51e2473400f705275a2b3d9239/aiohttp-3.13.5-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/6e/5e/d319c6e997b50c155ac5a8cb12f5173d5b42677510e886d250d50264949d/grpcio-1.80.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl
+      - pypi: https://files.pythonhosted.org/packages/73/b8/a0e2790ae249d6f38c9f66de7a211621a7ab2650217bcd04e1262f578a56/pyopenssl-26.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/75/a6/a0a304dc33b49145b21f4808d763822111e67d1c3a32b524a1baf947b6e1/platformdirs-4.9.6-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7a/aa/e5e969d50e57ef3ae41c6996626381afe3c9933d1924844d326f05240596/memray-1.19.3-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/7c/20/b122d4626976acb81132036d2ad1bb35a1a8775fceb837ec30964622516a/proto_plus-1.28.0-py3-none-any.whl
@@ -19085,6 +19089,80 @@ packages:
   license: Apache-2.0
   size: 15391
   timestamp: 1770221571236
+- pypi: .
+  name: cosmos-curator
+  requires_dist:
+  - attrs
+  - click<8.3.0
+  - fabric>=3.2.2,<4.0.0
+  - huggingface-hub
+  - jinja2
+  - loguru
+  - mcap>=1.3.1,<2.0.0
+  - multidict>=6.6.3,<7
+  - ngcsdk
+  - pyopenssl
+  - pyyaml>=6.0.2,<7
+  - ray[default,data]==2.55.1
+  - requests>=2.32.3,<3
+  - rich>=14.0.0,<16
+  - tomli>=2.2.1
+  - tqdm>=4.67.1,<5
+  - typer>=0.21.0
+  - urllib3>=1.26.18,<3
+  - aiofiles ; extra == 'local'
+  - astral ; extra == 'local'
+  - attrs ; extra == 'local'
+  - av==17.0.0 ; extra == 'local'
+  - awscli ; extra == 'local'
+  - awscli-plugin-endpoint ; extra == 'local'
+  - azure-identity==1.22.0 ; extra == 'local'
+  - azure-storage-blob==12.26.0b1 ; extra == 'local'
+  - boto3 ; extra == 'local'
+  - cattrs ; extra == 'local'
+  - click<8.3.0 ; extra == 'local'
+  - easydict ; extra == 'local'
+  - fastapi ; extra == 'local'
+  - gpustat ; extra == 'local'
+  - google-genai>=1.48.0 ; extra == 'local'
+  - huggingface-hub ; extra == 'local'
+  - jinja2 ; extra == 'local'
+  - kubernetes>=28.0 ; extra == 'local'
+  - loguru ; extra == 'local'
+  - ngcsdk ; extra == 'local'
+  - numpy>2,<2.3 ; extra == 'local'
+  - nvtx==0.2.11 ; extra == 'local'
+  - openai ; extra == 'local'
+  - opencv-python-headless ; extra == 'local'
+  - pandas>=3,<3.1 ; extra == 'local'
+  - pillow>=12.2.0 ; extra == 'local'
+  - prometheus-client==0.21.1 ; extra == 'local'
+  - psutil==7.0.0 ; extra == 'local'
+  - psycopg2-binary ; extra == 'local'
+  - pyarrow ; extra == 'local'
+  - pylance>=0.39.0 ; extra == 'local'
+  - nvidia-ml-py ; extra == 'local'
+  - pyproj ; extra == 'local'
+  - requests==2.32.3 ; extra == 'local'
+  - rich==14.0.0 ; extra == 'local'
+  - scikit-image ; extra == 'local'
+  - scipy ; extra == 'local'
+  - setuptools==80.7.1 ; extra == 'local'
+  - sqlalchemy ; extra == 'local'
+  - tabulate ; extra == 'local'
+  - tenacity ; extra == 'local'
+  - timezonefinder ; extra == 'local'
+  - toml ; extra == 'local'
+  - torch ; extra == 'local'
+  - torchvision ; extra == 'local'
+  - tqdm==4.67.1 ; extra == 'local'
+  - transformers<5.0 ; extra == 'local'
+  - typer[all]>=0.21.0 ; extra == 'local'
+  - uvicorn ; extra == 'local'
+  - webdataset==0.2.111 ; extra == 'local'
+  - fabric>=3.2.2,<4.0.0 ; extra == 'local'
+  - cosmos-xenna==0.4.2 ; extra == 'local'
+  requires_python: '>=3.12,<3.13'
 - pypi: https://files.pythonhosted.org/packages/00/c0/637721f3cd5bb8bd16105a1a08efd781fc12f449931bdb3a4d0cfd63fa55/av-17.0.0-cp311-abi3-manylinux_2_28_aarch64.whl
   name: av
   version: 17.0.0
@@ -21334,6 +21412,19 @@ packages:
   - opentelemetry-exporter-otlp>=1.26.0 ; extra == 'otel'
   - opentelemetry-semantic-conventions-ai>=0.4.1 ; extra == 'otel'
   requires_python: '>=3.10,<3.15'
+- pypi: https://files.pythonhosted.org/packages/73/b8/a0e2790ae249d6f38c9f66de7a211621a7ab2650217bcd04e1262f578a56/pyopenssl-26.2.0-py3-none-any.whl
+  name: pyopenssl
+  version: 26.2.0
+  sha256: 4f9d971bc5298b8bc1fab282803da04bf000c755d4ad9d99b52de2569ca19a70
+  requires_dist:
+  - cryptography>=46.0.0,<49
+  - typing-extensions>=4.9 ; python_full_version >= '3.8' and python_full_version < '3.13'
+  - pytest-rerunfailures ; extra == 'test'
+  - pretend ; extra == 'test'
+  - pytest>=3.0.1 ; extra == 'test'
+  - sphinx!=5.2.0,!=5.2.0.post0,!=7.2.5 ; extra == 'docs'
+  - sphinx-rtd-theme ; extra == 'docs'
+  requires_python: '>=3.8'
 - pypi: https://files.pythonhosted.org/packages/74/ed/6bb8d05b9f731f749fee5c6f5ca63e981143c826a5985877330507bd13b7/tiktoken-0.13.0-cp312-cp312-manylinux_2_28_aarch64.whl
   name: tiktoken
   version: 0.13.0
