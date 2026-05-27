@@ -17,19 +17,19 @@
 This module is longer than the score comparison math because it owns the full
 feature lifecycle for Ray Data execution:
 
-1. ``ScoreFeatureComparator`` builds one clip feature plan named ``scores`` that
-   uses the shared ``ClipArtifactsLoadWorker``. The reducer fans that plan back
-   out into separate report entries for ``aesthetic_score`` and
-   ``motion_score``.
+1. ``ScoreFeatureComparator`` builds one clip feature plan for either
+   ``aesthetic_score`` or ``motion_score``. When both score features are
+   enabled, the generic feature pipeline groups their matching
+   ``ClipArtifactsLoadWorker`` inputs so metadata is still loaded once per clip.
 2. ``ScoreClipCompareResult`` is the compact JSON-compatible row shape emitted
    by the per-clip compare stage. Ray Data rows cross worker boundaries as
    dictionaries, so the module keeps explicit encode/decode validation close to
    the feature.
 3. ``compare_score_clip_artifacts`` normalizes loaded metadata into score
    observations, records missing/invalid score fields, and compares only valid
-   numeric values with the configured per-feature tolerances.
-4. ``reduce_score_clip_results`` aggregates clip rows into feature-level issues,
-   status, and metrics for the final comparison report.
+   numeric values with the configured tolerances for that score feature.
+4. ``reduce_score_clip_results`` aggregates one score feature's clip rows into
+   feature-level issues, status, and metrics for the final comparison report.
 
 The small core comparison is intentionally surrounded by structured reporting
 logic so partial runs are actionable: a run may have motion scores, aesthetic
@@ -48,7 +48,6 @@ from cosmos_curator.pipelines.video.output_comparison.feature_plan import (
     FeatureComparisonContext,
     FeatureComparisonPlan,
     FeatureComparisonResult,
-    FeatureComparisonResults,
     ResolvedFeaturePlan,
 )
 from cosmos_curator.pipelines.video.output_comparison.json_types import JsonDictObject, JsonValue
@@ -77,24 +76,27 @@ def _non_negative_finite_tolerance(_instance: object, attribute: "attrs.Attribut
         raise ValueError(error_msg)
 
 
-@attrs.define(frozen=True)
-class ScoreComparisonPolicy:
-    """Policy for per-clip score comparison."""
+def _score_feature_name_validator(_instance: object, attribute: "attrs.Attribute[str]", value: str) -> None:
+    try:
+        _validate_score_feature_name(value)
+    except ValueError as exc:
+        error_msg = f"{attribute.name} must be one of {sorted(SCORE_FEATURE_NAMES)}"
+        raise ValueError(error_msg) from exc
 
-    metadata_version: str = "v0"
-    motion_abs_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
-    motion_rel_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
-    aesthetic_abs_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
-    aesthetic_rel_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
 
-    def tolerances_for(self, feature_name: str) -> tuple[float, float]:
-        """Return absolute and relative tolerances for one score feature."""
-        if feature_name == MOTION_SCORE_FEATURE_NAME:
-            return self.motion_abs_tolerance, self.motion_rel_tolerance
-        if feature_name == AESTHETIC_SCORE_FEATURE_NAME:
-            return self.aesthetic_abs_tolerance, self.aesthetic_rel_tolerance
+def _validate_score_feature_name(feature_name: str) -> None:
+    if feature_name not in SCORE_FEATURE_NAMES:
         error_msg = f"unknown score feature: {feature_name}"
         raise ValueError(error_msg)
+
+
+@attrs.define(frozen=True)
+class ScoreComparisonPolicy:
+    """Policy for one per-clip score feature comparison."""
+
+    metadata_version: str = "v0"
+    abs_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
+    rel_tolerance: float = attrs.field(default=1e-6, validator=_non_negative_finite_tolerance)
 
 
 DEFAULT_SCORE_POLICY = ScoreComparisonPolicy()
@@ -118,15 +120,12 @@ class ScoreComparisonCounts:
     clips_compared: int = 0
     fields_compared: int = 0
 
-    def to_json_dict(
-        self, *, feature_name: str | None = None, policy: ScoreComparisonPolicy | None = None
-    ) -> JsonDictObject:
+    def to_json_dict(self, *, policy: ScoreComparisonPolicy | None = None) -> JsonDictObject:
         """Convert counters and optional policy settings to JSON-compatible metrics."""
         metrics = cast("JsonDictObject", attrs.asdict(self))
-        if feature_name is not None and policy is not None:
-            abs_tolerance, rel_tolerance = policy.tolerances_for(feature_name)
-            metrics["score_abs_tolerance"] = abs_tolerance
-            metrics["score_rel_tolerance"] = rel_tolerance
+        if policy is not None:
+            metrics["score_abs_tolerance"] = policy.abs_tolerance
+            metrics["score_rel_tolerance"] = policy.rel_tolerance
         return metrics
 
     @classmethod
@@ -147,7 +146,7 @@ class ScoreClipCompareResult:
     video_key: str
     clip_id: str
     issues: tuple[Issue, ...]
-    counts_by_feature: Mapping[str, ScoreComparisonCounts]
+    counts: ScoreComparisonCounts
 
     def to_json_dict(self) -> JsonDictObject:
         """Convert the result to a JSON-compatible Ray Data row."""
@@ -155,50 +154,45 @@ class ScoreClipCompareResult:
             "video_key": self.video_key,
             "clip_id": self.clip_id,
             "issues": [issue.to_json_dict() for issue in self.issues],
-            "counts_by_feature": {
-                feature_name: counts.to_json_dict() for feature_name, counts in sorted(self.counts_by_feature.items())
-            },
+            "counts": self.counts.to_json_dict(),
         }
 
     @classmethod
     def from_json_dict(cls, row: Mapping[str, JsonValue]) -> Self:
         """Build a compact score comparison result from a Ray Data row."""
         issues_value = row["issues"]
-        counts_by_feature_value = row["counts_by_feature"]
+        counts_value = row["counts"]
         if not isinstance(issues_value, list):
             error_msg = "score clip result row field 'issues' must be a list"
             raise TypeError(error_msg)
-        if not isinstance(counts_by_feature_value, dict):
-            error_msg = "score clip result row field 'counts_by_feature' must be an object"
+        if not isinstance(counts_value, dict):
+            error_msg = "score clip result row field 'counts' must be an object"
             raise TypeError(error_msg)
         return cls(
             video_key=_required_str(row, "video_key"),
             clip_id=_required_str(row, "clip_id"),
             issues=tuple(Issue.from_json_dict(issue) for issue in issues_value),
-            counts_by_feature={
-                feature_name: ScoreComparisonCounts.from_json_dict(_required_mapping(counts_value))
-                for feature_name, counts_value in counts_by_feature_value.items()
-                if isinstance(feature_name, str)
-            },
+            counts=ScoreComparisonCounts.from_json_dict(counts_value),
         )
 
 
 @attrs.define(frozen=True)
 class ScoreFeatureComparator:
-    """Compare per-clip motion and aesthetic scores using loaded metadata."""
+    """Compare one per-clip score feature using loaded metadata."""
 
+    feature_name: str = attrs.field(validator=_score_feature_name_validator)
     policy: ScoreComparisonPolicy = DEFAULT_SCORE_POLICY
 
     @property
     def name(self) -> str:
         """Return the planner name used for logging."""
-        return "scores"
+        return self.feature_name
 
     def build_plan(self, context: FeatureComparisonContext) -> FeatureComparisonPlan:
-        """Build one shared clip plan for all score feature comparisons."""
+        """Build a clip plan for this score feature comparison."""
         clip_specs = build_clip_comparison_specs(context.specs)
         if not clip_specs:
-            return ResolvedFeaturePlan(self.name, _empty_score_feature_results(self.policy))
+            return ResolvedFeaturePlan(self.name, _empty_score_feature_result(self.policy))
         return ClipFeaturePlan(
             feature_name=self.name,
             clip_specs=clip_specs,
@@ -209,16 +203,20 @@ class ScoreFeatureComparator:
             },
             compare_row=cast("Callable[[Mapping[str, JsonValue]], JsonDictObject]", self._compare_clip_row),
             reduce_rows=cast(
-                "Callable[[Sequence[Mapping[str, JsonValue]]], FeatureComparisonResults]",
+                "Callable[[Sequence[Mapping[str, JsonValue]]], FeatureComparisonResult]",
                 self._reduce_clip_rows,
             ),
         )
 
     def _compare_clip_row(self, row: Mapping[str, JsonValue]) -> JsonDictObject:
         """Compare one loaded clip artifact row."""
-        return compare_score_clip_artifacts(LoadedClipArtifacts.from_json_dict(row), self.policy).to_json_dict()
+        return compare_score_clip_artifacts(
+            LoadedClipArtifacts.from_json_dict(row),
+            self.feature_name,
+            self.policy,
+        ).to_json_dict()
 
-    def _reduce_clip_rows(self, rows: Sequence[Mapping[str, JsonValue]]) -> FeatureComparisonResults:
+    def _reduce_clip_rows(self, rows: Sequence[Mapping[str, JsonValue]]) -> FeatureComparisonResult:
         """Reduce compact per-clip score rows into feature results."""
         return reduce_score_clip_results(
             tuple(
@@ -227,69 +225,63 @@ class ScoreFeatureComparator:
                     key=lambda result: (result.video_key, result.clip_id),
                 )
             ),
+            feature_name=self.feature_name,
             policy=self.policy,
         )
 
 
 def compare_score_clip_artifacts(
     artifacts: LoadedClipArtifacts,
+    feature_name: str,
     policy: ScoreComparisonPolicy,
 ) -> ScoreClipCompareResult:
     """Compare score metadata for one loaded clip artifact row."""
+    _validate_score_feature_name(feature_name)
     observations_a = _score_observations(artifacts.metadata_a)
     observations_b = _score_observations(artifacts.metadata_b)
-    issues: list[Issue] = []
-    counts_by_feature: dict[str, ScoreComparisonCounts] = {}
-    for feature_name in SCORE_FEATURE_NAMES:
-        feature_issues, feature_counts = _compare_score_feature(
-            artifacts,
-            feature_name,
-            observations_a[feature_name],
-            observations_b[feature_name],
-            policy=policy,
-        )
-        issues.extend(feature_issues)
-        counts_by_feature[feature_name] = feature_counts
+    issues, counts = _compare_score_feature(
+        artifacts,
+        feature_name,
+        observations_a[feature_name],
+        observations_b[feature_name],
+        policy=policy,
+    )
     return ScoreClipCompareResult(
         video_key=artifacts.spec.video_key,
         clip_id=artifacts.spec.clip_id,
         issues=tuple(issues),
-        counts_by_feature=counts_by_feature,
+        counts=counts,
     )
 
 
 def reduce_score_clip_results(
     clip_results: Sequence[ScoreClipCompareResult],
     *,
+    feature_name: str,
     policy: ScoreComparisonPolicy,
-) -> dict[str, FeatureComparisonResult]:
-    """Reduce score clip comparison rows into one result per score feature."""
-    reduced_results: dict[str, FeatureComparisonResult] = {}
-    for feature_name in SCORE_FEATURE_NAMES:
-        counts = _sum_counts(result.counts_by_feature[feature_name] for result in clip_results)
-        issues = tuple(issue for result in clip_results for issue in result.issues if issue.feature == feature_name)
-        status = _score_status(counts, issues)
-        reduced_results[feature_name] = FeatureComparisonResult(
-            issues=issues,
-            comparison=FeatureComparison(
-                status=status,
-                metrics=counts.to_json_dict(feature_name=feature_name, policy=policy),
-            ),
-        )
-    return reduced_results
+) -> FeatureComparisonResult:
+    """Reduce one score feature's clip comparison rows into a feature result."""
+    _validate_score_feature_name(feature_name)
+    counts = _sum_counts(result.counts for result in clip_results)
+    issues = tuple(issue for result in clip_results for issue in result.issues)
+    status = _score_status(counts, issues)
+    return FeatureComparisonResult(
+        issues=issues,
+        comparison=FeatureComparison(
+            status=status,
+            metrics=counts.to_json_dict(policy=policy),
+        ),
+    )
 
 
-def _empty_score_feature_results(policy: ScoreComparisonPolicy) -> dict[str, FeatureComparisonResult]:
-    return {
-        feature_name: FeatureComparisonResult(
-            issues=(),
-            comparison=FeatureComparison(
-                status="skipped",
-                metrics=ScoreComparisonCounts().to_json_dict(feature_name=feature_name, policy=policy),
-            ),
-        )
-        for feature_name in SCORE_FEATURE_NAMES
-    }
+def _empty_score_feature_result(policy: ScoreComparisonPolicy) -> FeatureComparisonResult:
+    return FeatureComparisonResult(
+        issues=(),
+        comparison=FeatureComparison(
+            status="skipped",
+            metrics=ScoreComparisonCounts().to_json_dict(policy=policy),
+        ),
+    )
 
 
 def _compare_score_feature(
@@ -507,6 +499,8 @@ def _score_value_issues(
 ) -> tuple[list[Issue], int]:
     issues: list[Issue] = []
     fields_compared = 0
+    abs_tolerance = policy.abs_tolerance
+    rel_tolerance = policy.rel_tolerance
     for field in _SCORE_FIELDS_BY_FEATURE[feature_name]:
         if field in observation_a.invalid_fields or field in observation_b.invalid_fields:
             continue
@@ -517,7 +511,6 @@ def _score_value_issues(
         fields_compared += 1
         abs_delta = abs(value_a - value_b)
         rel_delta = _relative_delta(value_a, value_b, abs_delta)
-        abs_tolerance, rel_tolerance = policy.tolerances_for(feature_name)
         if isclose(value_a, value_b, rel_tol=rel_tolerance, abs_tol=abs_tolerance):
             continue
         issues.append(
@@ -593,13 +586,6 @@ def _relative_delta(value_a: float, value_b: float, abs_delta: float) -> float:
     if denominator == 0:
         return 0.0
     return abs_delta / denominator
-
-
-def _required_mapping(value: JsonValue) -> Mapping[str, JsonValue]:
-    if not isinstance(value, dict):
-        error_msg = "score clip result count entry must be an object"
-        raise TypeError(error_msg)
-    return value
 
 
 def _required_int(row: Mapping[str, JsonValue], field: str) -> int:

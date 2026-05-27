@@ -27,7 +27,6 @@ import ray
 from loguru import logger
 from ray.data import ActorPoolStrategy, TaskPoolStrategy
 
-from cosmos_curator.pipelines.video.output_comparison.caption_comparator import CaptionFeatureComparator
 from cosmos_curator.pipelines.video.output_comparison.feature_plan import (
     ClipFeaturePlan,
     FeatureComparisonContext,
@@ -39,10 +38,6 @@ from cosmos_curator.pipelines.video.output_comparison.feature_plan import (
 )
 from cosmos_curator.pipelines.video.output_comparison.json_types import JsonValue
 from cosmos_curator.pipelines.video.output_comparison.report import FeatureComparison, Issue
-from cosmos_curator.pipelines.video.output_comparison.score_comparator import (
-    ScoreComparisonPolicy,
-    ScoreFeatureComparator,
-)
 from cosmos_curator.pipelines.video.output_comparison.summary_loader import OutputRoot
 from cosmos_curator.pipelines.video.output_comparison.summary_schema import OutputSummary
 from cosmos_curator.pipelines.video.output_comparison.video_planning import (
@@ -62,13 +57,9 @@ def compare_features(  # noqa: PLR0913
     profile_name: str | None = None,
     video_limit: int | None = None,
     selected_video_key: str | None = None,
-    feature_planners: Sequence[FeatureComparisonPlanner] | None = None,
+    feature_planners: Sequence[FeatureComparisonPlanner],
     workers_per_node: int = 32,
     cpus_per_worker: float = 0.25,
-    motion_score_abs_tolerance: float = 1e-6,
-    motion_score_rel_tolerance: float = 1e-6,
-    aesthetic_score_abs_tolerance: float = 1e-6,
-    aesthetic_score_rel_tolerance: float = 1e-6,
 ) -> VideoComparisonResult:
     """Compare output features using resolved or Ray Data clip-feature plans.
 
@@ -85,20 +76,11 @@ def compare_features(  # noqa: PLR0913
             first N video keys from output A are planned for feature work.
         selected_video_key: Optional exact summary video key to compare. Mutually
             exclusive with ``video_limit``.
-        feature_planners: Optional feature-specific planners. Each planner
-            returns either a resolved result or a clip-level Ray Data plan. When
-            omitted, caption structure and score metadata comparisons are run.
+        feature_planners: Feature-specific planners. Each planner returns either
+            a resolved result or a clip-level Ray Data plan.
         workers_per_node: Number of Ray Data worker actors/tasks to schedule per
             Ray node for clip-level feature plans.
         cpus_per_worker: CPU reservation for each Ray Data worker actor/task.
-        motion_score_abs_tolerance: Absolute tolerance for motion score value
-            comparisons.
-        motion_score_rel_tolerance: Relative tolerance for motion score value
-            comparisons.
-        aesthetic_score_abs_tolerance: Absolute tolerance for aesthetic score
-            value comparisons.
-        aesthetic_score_rel_tolerance: Relative tolerance for aesthetic score
-            value comparisons.
 
     Returns:
         Feature comparison result containing feature-level issues and report
@@ -107,16 +89,7 @@ def compare_features(  # noqa: PLR0913
     """
     if profile_name is None:
         profile_name = DEFAULT_PROFILE_NAME
-    feature_planners = (
-        _default_feature_planners(
-            motion_score_abs_tolerance=motion_score_abs_tolerance,
-            motion_score_rel_tolerance=motion_score_rel_tolerance,
-            aesthetic_score_abs_tolerance=aesthetic_score_abs_tolerance,
-            aesthetic_score_rel_tolerance=aesthetic_score_rel_tolerance,
-        )
-        if feature_planners is None
-        else tuple(feature_planners)
-    )
+    feature_planners = tuple(feature_planners)
     started_at = time.perf_counter()
     specs = build_video_comparison_specs(
         output_a,
@@ -189,26 +162,6 @@ def compare_features(  # noqa: PLR0913
         time.perf_counter() - started_at,
     )
     return comparison_result
-
-
-def _default_feature_planners(
-    *,
-    motion_score_abs_tolerance: float = 1e-6,
-    motion_score_rel_tolerance: float = 1e-6,
-    aesthetic_score_abs_tolerance: float = 1e-6,
-    aesthetic_score_rel_tolerance: float = 1e-6,
-) -> tuple[FeatureComparisonPlanner, ...]:
-    return (
-        CaptionFeatureComparator(),
-        ScoreFeatureComparator(
-            ScoreComparisonPolicy(
-                motion_abs_tolerance=motion_score_abs_tolerance,
-                motion_rel_tolerance=motion_score_rel_tolerance,
-                aesthetic_abs_tolerance=aesthetic_score_abs_tolerance,
-                aesthetic_rel_tolerance=aesthetic_score_rel_tolerance,
-            )
-        ),
-    )
 
 
 @attrs.define(frozen=True)

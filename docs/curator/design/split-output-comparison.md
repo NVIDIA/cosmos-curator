@@ -83,8 +83,10 @@ Score comparison reports motion and aesthetic scores as separate features:
 - `aesthetic_score` compares the scalar `aesthetic_score` metadata field.
 - `motion_score` compares `motion_score.global_mean` and `motion_score.per_patch_min_256`.
 
-The planner uses one clip plan named `scores` because both score features consume the same loaded metadata row. The
-reducer emits separate `feature_comparisons` entries so tolerances, metrics, and failures remain independent.
+Motion and aesthetic scores are planned as separate feature stages so callers can enable, disable, and tune them
+independently. When both are enabled, their matching clip specs and loader settings let the generic feature pipeline
+share one metadata load stage while keeping separate `feature_comparisons` entries for tolerances, metrics, and
+failures.
 
 ### Caption Pair
 
@@ -233,7 +235,7 @@ feature may need different artifacts depending on summaries and configuration.
 The driver owns:
 
 - loading summaries;
-- resolving comparison policy/configuration;
+- resolving comparison policy/configuration, including artifact-backed feature selection;
 - building video specs;
 - expanding video specs into clip specs;
 - routing resolved work vs. artifact/model work;

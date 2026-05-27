@@ -21,8 +21,14 @@ from collections.abc import Sequence
 from math import isfinite
 
 from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
-from cosmos_curator.pipelines.video.output_comparison.comparison import compare_split_outputs
+from cosmos_curator.pipelines.video.output_comparison.comparison import (
+    DEFAULT_OUTPUT_COMPARISON_FEATURES,
+    OUTPUT_COMPARISON_FEATURE_NAMES,
+    OutputComparisonConfig,
+    compare_split_outputs,
+)
 from cosmos_curator.pipelines.video.output_comparison.report import ComparisonReport, Issue, report_to_json
+from cosmos_curator.pipelines.video.output_comparison.score_comparator import ScoreComparisonPolicy
 
 MAX_STDOUT_ISSUES = 5
 _CAPTION_METADATA_LIMITATION = (
@@ -44,16 +50,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = _build_parser().parse_args(argv)
     comparison_started_at = time.perf_counter()
+    config = OutputComparisonConfig(
+        token_count_abs_tolerance=args.token_count_abs_tolerance,
+        token_count_rel_tolerance=args.token_count_rel_tolerance,
+        enabled_features=args.features,
+        motion_score_policy=ScoreComparisonPolicy(
+            abs_tolerance=args.motion_score_abs_tolerance,
+            rel_tolerance=args.motion_score_rel_tolerance,
+        ),
+        aesthetic_score_policy=ScoreComparisonPolicy(
+            abs_tolerance=args.aesthetic_score_abs_tolerance,
+            rel_tolerance=args.aesthetic_score_rel_tolerance,
+        ),
+    )
     report = compare_split_outputs(
         args.output_a,
         args.output_b,
         profile_name=args.profile_name,
-        token_count_abs_tolerance=args.token_count_abs_tolerance,
-        token_count_rel_tolerance=args.token_count_rel_tolerance,
-        motion_score_abs_tolerance=args.motion_score_abs_tolerance,
-        motion_score_rel_tolerance=args.motion_score_rel_tolerance,
-        aesthetic_score_abs_tolerance=args.aesthetic_score_abs_tolerance,
-        aesthetic_score_rel_tolerance=args.aesthetic_score_rel_tolerance,
+        config=config,
         video_limit=args.limit,
         selected_video_key=args.selected_video_key,
     )
@@ -93,15 +107,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token-count-abs-tolerance",
-        type=float,
+        type=_non_negative_float,
         default=0,
         help="Absolute tolerance for token total differences.",
     )
     parser.add_argument(
         "--token-count-rel-tolerance",
-        type=float,
+        type=_non_negative_float,
         default=0.01,
         help="Relative tolerance for token total differences.",
+    )
+    parser.add_argument(
+        "--features",
+        type=_feature_names,
+        default=DEFAULT_OUTPUT_COMPARISON_FEATURES,
+        help=(
+            "Comma-separated artifact-backed features to compare. "
+            f"Known features: {', '.join(sorted(OUTPUT_COMPARISON_FEATURE_NAMES))}. "
+            "Use 'none' for summary-only comparison."
+        ),
     )
     parser.add_argument(
         "--motion-score-abs-tolerance",
@@ -148,6 +172,22 @@ def _non_negative_float(value: str) -> float:
         msg = "value must be a finite number greater than or equal to 0"
         raise argparse.ArgumentTypeError(msg)
     return parsed
+
+
+def _feature_names(value: str) -> frozenset[str]:
+    normalized_value = value.strip()
+    if normalized_value == "none":
+        return frozenset()
+    if normalized_value == "all":
+        return DEFAULT_OUTPUT_COMPARISON_FEATURES
+    feature_names = frozenset(feature.strip() for feature in normalized_value.split(",") if feature.strip())
+    unknown_features = sorted(feature_names - OUTPUT_COMPARISON_FEATURE_NAMES)
+    if unknown_features or not feature_names:
+        msg = (
+            f"features must be 'none', 'all', or a comma-separated subset of {sorted(OUTPUT_COMPARISON_FEATURE_NAMES)}"
+        )
+        raise argparse.ArgumentTypeError(msg)
+    return feature_names
 
 
 def _format_stdout_summary(

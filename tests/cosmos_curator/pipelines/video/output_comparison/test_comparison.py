@@ -21,12 +21,17 @@ from typing import Any, cast
 import attrs
 import pytest
 
-from cosmos_curator.pipelines.video.output_comparison.comparison import compare_split_outputs
+from cosmos_curator.pipelines.video.output_comparison.caption_result import CAPTIONS_FEATURE_NAME
+from cosmos_curator.pipelines.video.output_comparison.comparison import OutputComparisonConfig, compare_split_outputs
 from cosmos_curator.pipelines.video.output_comparison.report import (
     ComparisonReport,
     FeatureComparison,
     Issue,
     SummaryComparison,
+)
+from cosmos_curator.pipelines.video.output_comparison.score_comparator import (
+    AESTHETIC_SCORE_FEATURE_NAME,
+    MOTION_SCORE_FEATURE_NAME,
 )
 from cosmos_curator.pipelines.video.output_comparison.summary_policy import DEFAULT_SUMMARY_POLICY
 from cosmos_curator.pipelines.video.output_comparison.video_planning import VideoComparisonResult
@@ -143,30 +148,25 @@ def test_compare_split_outputs_mutual_exclusion(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("score_tolerance_kwargs", "message"),
+    ("config_kwargs", "message"),
     [
-        pytest.param({"motion_score_abs_tolerance": -1e-6}, "motion_score_abs_tolerance", id="motion-abs"),
-        pytest.param({"motion_score_rel_tolerance": float("nan")}, "motion_score_rel_tolerance", id="motion-rel"),
+        pytest.param({"token_count_abs_tolerance": -1e-6}, "token_count_abs_tolerance", id="token-abs"),
+        pytest.param({"token_count_rel_tolerance": float("nan")}, "token_count_rel_tolerance", id="token-rel"),
+        pytest.param({"enabled_features": {"unknown"}}, "unknown output comparison features", id="feature-name"),
         pytest.param(
-            {"aesthetic_score_abs_tolerance": float("inf")},
-            "aesthetic_score_abs_tolerance",
-            id="aesthetic-abs",
-        ),
-        pytest.param(
-            {"aesthetic_score_rel_tolerance": -1e-6},
-            "aesthetic_score_rel_tolerance",
-            id="aesthetic-rel",
+            {"enabled_features": {CAPTIONS_FEATURE_NAME, 1, object()}},
+            "enabled_features contains non-string members",
+            id="non-string-feature-name",
         ),
     ],
 )
-def test_compare_split_outputs_rejects_invalid_score_tolerances(
-    tmp_path: Path,
-    score_tolerance_kwargs: dict[str, float],
+def test_output_comparison_config_rejects_invalid_values(
+    config_kwargs: dict[str, object],
     message: str,
 ) -> None:
-    """Public comparison API rejects invalid score tolerances before loading outputs."""
+    """Comparison config rejects invalid values before loading outputs."""
     with pytest.raises(ValueError, match=message):
-        compare_split_outputs(tmp_path / "output-a", tmp_path / "output-b", **score_tolerance_kwargs)
+        OutputComparisonConfig(**config_kwargs)
 
 
 @pytest.mark.parametrize(
@@ -200,21 +200,13 @@ def test_compare_split_outputs_merges_feature_comparison(
         profile_name: str,
         video_limit: int | None,
         selected_video_key: str | None,
-        motion_score_abs_tolerance: float = 1e-6,
-        motion_score_rel_tolerance: float = 1e-6,
-        aesthetic_score_abs_tolerance: float = 1e-6,
-        aesthetic_score_rel_tolerance: float = 1e-6,
+        feature_planners: tuple[object, ...],
     ) -> VideoComparisonResult:
-        _ = (
-            motion_score_abs_tolerance,
-            motion_score_rel_tolerance,
-            aesthetic_score_abs_tolerance,
-            aesthetic_score_rel_tolerance,
-        )
         captured["args"] = (output_a_arg, output_b_arg, summary_a_arg, summary_b_arg)
         captured["profile_name"] = profile_name
         captured["video_limit"] = video_limit
         captured["selected_video_key"] = selected_video_key
+        captured["feature_planner_names"] = [planner.name for planner in feature_planners]
         return VideoComparisonResult(
             issues=(Issue(code="fake_feature_issue", message="Fake feature issue"),),
             feature_comparisons={"fake": FeatureComparison(status="failed", metrics={"rows": 1})},
@@ -238,9 +230,71 @@ def test_compare_split_outputs_merges_feature_comparison(
     assert captured["profile_name"] == "profile-a"
     assert captured["video_limit"] == expected_video_limit
     assert captured["selected_video_key"] == expected_selected_video_key
+    assert set(cast("list[str]", captured["feature_planner_names"])) == {
+        "captions",
+        "aesthetic_score",
+        "motion_score",
+    }
     assert report["passed"] is False
     assert report["issues"] == [{"code": "fake_feature_issue", "message": "Fake feature issue"}]
     assert report["feature_comparisons"]["fake"] == {"status": "failed", "metrics": {"rows": 1}}
+
+
+@pytest.mark.parametrize(
+    ("enabled_features", "expected_feature_planner_names"),
+    [
+        pytest.param(frozenset(), set(), id="summary-only"),
+        pytest.param(frozenset((CAPTIONS_FEATURE_NAME,)), {"captions"}, id="captions-only"),
+        pytest.param(
+            frozenset((AESTHETIC_SCORE_FEATURE_NAME, MOTION_SCORE_FEATURE_NAME)),
+            {"aesthetic_score", "motion_score"},
+            id="score-only",
+        ),
+    ],
+)
+def test_compare_split_outputs_builds_feature_planners_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    enabled_features: frozenset[str],
+    expected_feature_planner_names: set[str],
+) -> None:
+    """Feature selection config controls which artifact-backed planners run."""
+    output_a = tmp_path / "output-a"
+    output_b = tmp_path / "output-b"
+    write_summary(output_a, summary())
+    write_summary(output_b, summary())
+    captured: dict[str, object] = {}
+
+    def fake_compare_features(  # noqa: PLR0913
+        output_a_arg: object,
+        output_b_arg: object,
+        summary_a_arg: object,
+        summary_b_arg: object,
+        *,
+        profile_name: str,
+        video_limit: int | None,
+        selected_video_key: str | None,
+        feature_planners: tuple[object, ...],
+    ) -> VideoComparisonResult:
+        _ = output_a_arg, output_b_arg, summary_a_arg, summary_b_arg, profile_name, video_limit, selected_video_key
+        captured["feature_planner_names"] = [planner.name for planner in feature_planners]
+        return VideoComparisonResult(issues=(), feature_comparisons={})
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.comparison.compare_features",
+        fake_compare_features,
+    )
+
+    report = _json_report(
+        compare_split_outputs(
+            output_a,
+            output_b,
+            config=OutputComparisonConfig(enabled_features=enabled_features),
+        )
+    )
+
+    assert report["passed"] is True
+    assert set(cast("list[str]", captured["feature_planner_names"])) == expected_feature_planner_names
 
 
 def test_missing_summary_produces_structured_failure(tmp_path: Path) -> None:
@@ -433,16 +487,20 @@ def test_token_totals_use_configured_tolerances(tmp_path: Path) -> None:
         compare_split_outputs(
             output_a,
             output_b,
-            token_count_abs_tolerance=5,
-            token_count_rel_tolerance=0.0,
+            config=OutputComparisonConfig(
+                token_count_abs_tolerance=5,
+                token_count_rel_tolerance=0.0,
+            ),
         )
     )
     failing_report = _json_report(
         compare_split_outputs(
             output_a,
             output_b,
-            token_count_abs_tolerance=4,
-            token_count_rel_tolerance=0.0,
+            config=OutputComparisonConfig(
+                token_count_abs_tolerance=4,
+                token_count_rel_tolerance=0.0,
+            ),
         )
     )
 
@@ -467,7 +525,9 @@ def test_zero_token_totals_compare_without_relative_delta_error(tmp_path: Path) 
     write_summary(output_a, summary(total_prompt_tokens=0, total_output_tokens=0))
     write_summary(output_b, summary(total_prompt_tokens=0, total_output_tokens=0))
 
-    report = _json_report(compare_split_outputs(output_a, output_b, token_count_rel_tolerance=0.1))
+    report = _json_report(
+        compare_split_outputs(output_a, output_b, config=OutputComparisonConfig(token_count_rel_tolerance=0.1))
+    )
 
     assert report["passed"] is True
 
@@ -488,7 +548,7 @@ def test_custom_tolerant_policy_field_requires_numeric_value(tmp_path: Path) -> 
     )
 
     with pytest.raises(TypeError, match=r"summary field 'custom_total' must be numeric for token comparison"):
-        compare_split_outputs(output_a, output_b, summary_policy=policy)
+        compare_split_outputs(output_a, output_b, config=OutputComparisonConfig(summary_policy=policy))
 
 
 def test_nonnumeric_token_totals_produce_load_failure(tmp_path: Path) -> None:
@@ -743,7 +803,9 @@ def test_custom_clip_list_policy_fields_are_compared(tmp_path: Path) -> None:
     )
     policy = attrs.evolve(DEFAULT_SUMMARY_POLICY, clip_list_fields=("kept_clips",))
 
-    report = _json_report(compare_split_outputs(output_a, output_b, summary_policy=policy))
+    report = _json_report(
+        compare_split_outputs(output_a, output_b, config=OutputComparisonConfig(summary_policy=policy))
+    )
 
     assert report["passed"] is False
     assert _issue_for(report, "clip_uuid_set_mismatch", "kept_clips") == {
@@ -781,4 +843,4 @@ def test_custom_clip_list_policy_field_requires_list_value(tmp_path: Path) -> No
     policy = attrs.evolve(DEFAULT_SUMMARY_POLICY, clip_list_fields=("kept_clips",))
 
     with pytest.raises(TypeError, match=r"summary field 'kept_clips' must be a list for clip UUID comparison"):
-        compare_split_outputs(output_a, output_b, summary_policy=policy)
+        compare_split_outputs(output_a, output_b, config=OutputComparisonConfig(summary_policy=policy))

@@ -20,10 +20,16 @@ from typing import Any, cast
 
 import pytest
 
+from cosmos_curator.pipelines.video.output_comparison.caption_comparator import CaptionFeatureComparator
 from cosmos_curator.pipelines.video.output_comparison.compare_features import compare_features
-from cosmos_curator.pipelines.video.output_comparison.comparison import compare_split_outputs
+from cosmos_curator.pipelines.video.output_comparison.comparison import OutputComparisonConfig, compare_split_outputs
 from cosmos_curator.pipelines.video.output_comparison.report import ComparisonReport
-from cosmos_curator.pipelines.video.output_comparison.score_comparator import ScoreComparisonPolicy
+from cosmos_curator.pipelines.video.output_comparison.score_comparator import (
+    AESTHETIC_SCORE_FEATURE_NAME,
+    MOTION_SCORE_FEATURE_NAME,
+    ScoreComparisonPolicy,
+    ScoreFeatureComparator,
+)
 from cosmos_curator.pipelines.video.output_comparison.summary_schema import OutputSummary
 
 from .conftest import summary, video_summary, write_summary
@@ -101,10 +107,10 @@ def _score_issue_codes(report: dict[str, Any]) -> list[str]:
 @pytest.mark.parametrize(
     "policy_kwargs",
     [
-        pytest.param({"motion_abs_tolerance": -1e-6}, id="motion-abs-negative"),
-        pytest.param({"motion_rel_tolerance": float("nan")}, id="motion-rel-nan"),
-        pytest.param({"aesthetic_abs_tolerance": float("inf")}, id="aesthetic-abs-inf"),
-        pytest.param({"aesthetic_rel_tolerance": -1e-6}, id="aesthetic-rel-negative"),
+        pytest.param({"abs_tolerance": -1e-6}, id="abs-negative"),
+        pytest.param({"rel_tolerance": float("nan")}, id="rel-nan"),
+        pytest.param({"abs_tolerance": float("inf")}, id="abs-inf"),
+        pytest.param({"rel_tolerance": -1e-6}, id="rel-negative"),
     ],
 )
 def test_score_comparison_policy_rejects_invalid_tolerances(policy_kwargs: dict[str, float]) -> None:
@@ -168,24 +174,30 @@ def test_score_tolerances_are_configured_per_feature(tmp_path: Path) -> None:
         compare_split_outputs(
             output_a,
             output_b,
-            motion_score_abs_tolerance=0.01,
-            aesthetic_score_abs_tolerance=0.0001,
+            config=OutputComparisonConfig(
+                motion_score_policy=ScoreComparisonPolicy(abs_tolerance=0.01, rel_tolerance=0.0),
+                aesthetic_score_policy=ScoreComparisonPolicy(abs_tolerance=0.0001, rel_tolerance=0.0),
+            ),
         )
     )
     aesthetic_tolerant_report = _json_report(
         compare_split_outputs(
             output_a,
             output_b,
-            motion_score_abs_tolerance=0.0001,
-            aesthetic_score_abs_tolerance=0.01,
+            config=OutputComparisonConfig(
+                motion_score_policy=ScoreComparisonPolicy(abs_tolerance=0.0001, rel_tolerance=0.0),
+                aesthetic_score_policy=ScoreComparisonPolicy(abs_tolerance=0.01, rel_tolerance=0.0),
+            ),
         )
     )
     tolerant_report = _json_report(
         compare_split_outputs(
             output_a,
             output_b,
-            motion_score_abs_tolerance=0.01,
-            aesthetic_score_abs_tolerance=0.01,
+            config=OutputComparisonConfig(
+                motion_score_policy=ScoreComparisonPolicy(abs_tolerance=0.01, rel_tolerance=0.0),
+                aesthetic_score_policy=ScoreComparisonPolicy(abs_tolerance=0.01, rel_tolerance=0.0),
+            ),
         )
     )
 
@@ -483,7 +495,17 @@ def test_default_metadata_backed_features_share_clip_metadata_reads(
         fake_read_json_object,
     )
 
-    result = compare_features(tmp_path / "output-a", tmp_path / "output-b", summary_value, summary_value)
+    result = compare_features(
+        tmp_path / "output-a",
+        tmp_path / "output-b",
+        summary_value,
+        summary_value,
+        feature_planners=(
+            CaptionFeatureComparator(),
+            ScoreFeatureComparator(AESTHETIC_SCORE_FEATURE_NAME),
+            ScoreFeatureComparator(MOTION_SCORE_FEATURE_NAME),
+        ),
+    )
 
     assert result.issues == ()
     assert sorted(result.feature_comparisons) == ["aesthetic_score", "captions", "motion_score"]

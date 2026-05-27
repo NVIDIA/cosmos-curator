@@ -32,6 +32,11 @@ from cosmos_curator.pipelines.video.output_comparison.feature_plan import (
     ResolvedFeaturePlan,
 )
 from cosmos_curator.pipelines.video.output_comparison.report import FeatureComparison
+from cosmos_curator.pipelines.video.output_comparison.score_comparator import (
+    AESTHETIC_SCORE_FEATURE_NAME,
+    MOTION_SCORE_FEATURE_NAME,
+    ScoreFeatureComparator,
+)
 from cosmos_curator.pipelines.video.output_comparison.summary_schema import OutputSummary
 from cosmos_curator.pipelines.video.output_comparison.video_planning import (
     build_clip_comparison_specs,
@@ -491,11 +496,16 @@ def test_compare_features_caps_ray_compute_size_to_clip_rows(
         tmp_path / "output-b",
         _output_summary(),
         _output_summary(),
+        feature_planners=(
+            CaptionFeatureComparator(),
+            ScoreFeatureComparator(AESTHETIC_SCORE_FEATURE_NAME),
+            ScoreFeatureComparator(MOTION_SCORE_FEATURE_NAME),
+        ),
         workers_per_node=32,
     )
 
     assert actor_sizes == [1, 2]
-    assert task_sizes == [1, 2]
+    assert task_sizes == [1, 2, 2]
 
 
 @pytest.mark.parametrize(
@@ -517,6 +527,11 @@ def test_compare_features_rejects_invalid_ray_execution_config(
             tmp_path / "output-b",
             _output_summary(),
             _output_summary(),
+            feature_planners=(
+                CaptionFeatureComparator(),
+                ScoreFeatureComparator(AESTHETIC_SCORE_FEATURE_NAME),
+                ScoreFeatureComparator(MOTION_SCORE_FEATURE_NAME),
+            ),
             **ray_config,
         )
 
@@ -561,10 +576,22 @@ def test_compare_features_loads_metadata_once_per_clip(
         fake_read_json_object,
     )
 
-    result = compare_features(tmp_path / "output-a", tmp_path / "output-b", summary_value, summary_value)
+    result = compare_features(
+        tmp_path / "output-a",
+        tmp_path / "output-b",
+        summary_value,
+        summary_value,
+        feature_planners=(
+            CaptionFeatureComparator(),
+            ScoreFeatureComparator(AESTHETIC_SCORE_FEATURE_NAME),
+            ScoreFeatureComparator(MOTION_SCORE_FEATURE_NAME),
+        ),
+    )
 
     assert result.issues == ()
     assert result.feature_comparisons["captions"].status == "passed"
+    assert result.feature_comparisons[AESTHETIC_SCORE_FEATURE_NAME].status == "skipped"
+    assert result.feature_comparisons[MOTION_SCORE_FEATURE_NAME].status == "skipped"
     assert read_paths == [
         str(tmp_path / "output-a" / "metas" / "v0" / "clip-a.json"),
         str(tmp_path / "output-b" / "metas" / "v0" / "clip-a.json"),
@@ -685,12 +712,19 @@ def test_compare_features_selector_scopes_caption_expected_counts(
         tmp_path / "output-b",
         summary_value,
         summary_value,
+        feature_planners=(
+            CaptionFeatureComparator(),
+            ScoreFeatureComparator(AESTHETIC_SCORE_FEATURE_NAME),
+            ScoreFeatureComparator(MOTION_SCORE_FEATURE_NAME),
+        ),
         **selector_kwargs,
     )
 
     assert result.issues == ()
     assert result.feature_comparisons["captions"].status == "passed"
     assert result.feature_comparisons["captions"].metrics["clips_with_captions_a"] == 1
+    assert result.feature_comparisons[AESTHETIC_SCORE_FEATURE_NAME].status == "skipped"
+    assert result.feature_comparisons[MOTION_SCORE_FEATURE_NAME].status == "skipped"
     assert read_paths == [
         str(tmp_path / "output-a" / "metas" / "v0" / f"{expected_clip_id}.json"),
         str(tmp_path / "output-b" / "metas" / "v0" / f"{expected_clip_id}.json"),

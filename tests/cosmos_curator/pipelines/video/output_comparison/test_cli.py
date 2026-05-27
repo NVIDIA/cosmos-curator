@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from cosmos_curator.pipelines.video.output_comparison.cli import _format_stdout_summary, main
+from cosmos_curator.pipelines.video.output_comparison.comparison import OutputComparisonConfig
 from cosmos_curator.pipelines.video.output_comparison.report import ComparisonReport, Issue, SummaryComparison
 
 from .conftest import summary, write_summary
@@ -136,17 +137,11 @@ def test_cli_forwards_video_limit(
         output_b: object,
         *,
         profile_name: str | None = None,
-        token_count_abs_tolerance: float = 0,
-        token_count_rel_tolerance: float = 0,
-        motion_score_abs_tolerance: float = 0,
-        motion_score_rel_tolerance: float = 0,
-        aesthetic_score_abs_tolerance: float = 0,
-        aesthetic_score_rel_tolerance: float = 0,
+        config: OutputComparisonConfig,
         video_limit: int | None = None,
         selected_video_key: str | None = None,
     ) -> ComparisonReport:
-        _ = profile_name, token_count_abs_tolerance, token_count_rel_tolerance, motion_score_abs_tolerance
-        _ = motion_score_rel_tolerance, aesthetic_score_abs_tolerance, aesthetic_score_rel_tolerance
+        _ = profile_name, config
         captured["args"] = (output_a, output_b)
         captured["video_limit"] = video_limit
         captured["selected_video_key"] = selected_video_key
@@ -181,17 +176,11 @@ def test_cli_forwards_video_key(
         output_b: object,
         *,
         profile_name: str | None = None,
-        token_count_abs_tolerance: float = 0,
-        token_count_rel_tolerance: float = 0,
-        motion_score_abs_tolerance: float = 0,
-        motion_score_rel_tolerance: float = 0,
-        aesthetic_score_abs_tolerance: float = 0,
-        aesthetic_score_rel_tolerance: float = 0,
+        config: OutputComparisonConfig,
         video_limit: int | None = None,
         selected_video_key: str | None = None,
     ) -> ComparisonReport:
-        _ = profile_name, token_count_abs_tolerance, token_count_rel_tolerance, motion_score_abs_tolerance
-        _ = motion_score_rel_tolerance, aesthetic_score_abs_tolerance, aesthetic_score_rel_tolerance
+        _ = profile_name, config
         captured["args"] = (output_a, output_b)
         captured["video_limit"] = video_limit
         captured["selected_video_key"] = selected_video_key
@@ -225,12 +214,7 @@ def test_cli_forwards_score_tolerances(
         output_b: object,
         *,
         profile_name: str | None = None,
-        token_count_abs_tolerance: float = 0,
-        token_count_rel_tolerance: float = 0,
-        motion_score_abs_tolerance: float = 0,
-        motion_score_rel_tolerance: float = 0,
-        aesthetic_score_abs_tolerance: float = 0,
-        aesthetic_score_rel_tolerance: float = 0,
+        config: OutputComparisonConfig,
         video_limit: int | None = None,
         selected_video_key: str | None = None,
     ) -> ComparisonReport:
@@ -238,15 +222,13 @@ def test_cli_forwards_score_tolerances(
             output_a,
             output_b,
             profile_name,
-            token_count_abs_tolerance,
-            token_count_rel_tolerance,
             video_limit,
             selected_video_key,
         )
-        captured["motion_score_abs_tolerance"] = motion_score_abs_tolerance
-        captured["motion_score_rel_tolerance"] = motion_score_rel_tolerance
-        captured["aesthetic_score_abs_tolerance"] = aesthetic_score_abs_tolerance
-        captured["aesthetic_score_rel_tolerance"] = aesthetic_score_rel_tolerance
+        captured["motion_score_abs_tolerance"] = config.motion_score_policy.abs_tolerance
+        captured["motion_score_rel_tolerance"] = config.motion_score_policy.rel_tolerance
+        captured["aesthetic_score_abs_tolerance"] = config.aesthetic_score_policy.abs_tolerance
+        captured["aesthetic_score_rel_tolerance"] = config.aesthetic_score_policy.rel_tolerance
         return ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
 
     monkeypatch.setattr(
@@ -276,6 +258,82 @@ def test_cli_forwards_score_tolerances(
     assert captured["motion_score_rel_tolerance"] == 0.02
     assert captured["aesthetic_score_abs_tolerance"] == 0.03
     assert captured["aesthetic_score_rel_tolerance"] == 0.04
+
+
+def test_cli_forwards_feature_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI feature selection is converted into the comparison config."""
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "comparison.json"
+
+    def fake_compare_split_outputs(  # noqa: PLR0913
+        output_a: object,
+        output_b: object,
+        *,
+        profile_name: str | None = None,
+        config: OutputComparisonConfig,
+        video_limit: int | None = None,
+        selected_video_key: str | None = None,
+    ) -> ComparisonReport:
+        _ = output_a, output_b, profile_name, video_limit, selected_video_key
+        captured["enabled_features"] = config.enabled_features
+        return ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.cli.compare_split_outputs",
+        fake_compare_split_outputs,
+    )
+
+    exit_code = main(["output-a", "output-b", "--report-path", str(report_path), "--features", "captions"])
+
+    assert exit_code == 0
+    assert captured["enabled_features"] == frozenset({"captions"})
+
+
+def test_cli_accepts_summary_only_feature_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI ``--features none`` requests summary-only comparison."""
+    captured: dict[str, object] = {}
+    report_path = tmp_path / "comparison.json"
+
+    def fake_compare_split_outputs(  # noqa: PLR0913
+        output_a: object,
+        output_b: object,
+        *,
+        profile_name: str | None = None,
+        config: OutputComparisonConfig,
+        video_limit: int | None = None,
+        selected_video_key: str | None = None,
+    ) -> ComparisonReport:
+        _ = output_a, output_b, profile_name, video_limit, selected_video_key
+        captured["enabled_features"] = config.enabled_features
+        return ComparisonReport.from_issues("output-a", "output-b", SummaryComparison(), [])
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.output_comparison.cli.compare_split_outputs",
+        fake_compare_split_outputs,
+    )
+
+    exit_code = main(["output-a", "output-b", "--report-path", str(report_path), "--features", "none"])
+
+    assert exit_code == 0
+    assert captured["enabled_features"] == frozenset()
+
+
+def test_cli_rejects_unknown_feature_selection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI feature selection rejects unknown feature names."""
+    with pytest.raises(SystemExit) as exc_info:
+        main(["output-a", "output-b", "--report-path", str(tmp_path / "comparison.json"), "--features", "unknown"])
+
+    assert exc_info.value.code == 2
+    assert "features must be" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
