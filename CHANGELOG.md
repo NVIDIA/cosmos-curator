@@ -2,14 +2,83 @@
 
 ## Latest
 
+## [2.0.0]
+
+### Released
+
+- 2026-05-27
+
+### Breaking Changes
+
+- Rename the project from Cosmos-Curate to Cosmos Curator:
+  - Python imports and package paths move from `cosmos_curate` to `cosmos_curator`.
+  - The command-line entry point moves from `cosmos-curate` to `cosmos-curator`.
+  - The Helm chart path/name moves from `charts/cosmos-curate` to `charts/cosmos-curator`.
+  - Examples, docs, and config paths now use `cosmos_curator` naming, including
+    `~/.config/cosmos_curator/config.yaml`.
+- Clean up split-pipeline CLI and config arguments:
+  - Replace `--enable-sam3` with `--sam3` / `--no-sam3`.
+  - Replace `--enable-event-captioning` with `--event-captioning` / `--no-event-captioning`.
+  - Replace `--generate-cosmos-predict-dataset predict2` with the boolean
+    `--generate-cosmos-predict-dataset`; JSON/YAML configs now use `true` or `false`.
+  - Replace `--artificial-text-filter enable|disable` with
+    `--artificial-text-filter` / `--no-artificial-text-filter`.
+  - Replace `--video-classifier enable|disable` with `--video-classifier` /
+    `--no-video-classifier`.
+  - Remove the `--qwen-filter-*` and `--qwen-video-classifier-*` aliases; use
+    `--vlm-filter-*` and `--video-classifier-*`.
+  - Remove the unsupported `--qwen-use-async-engine` flag.
+- Rename all-caps documentation filenames to lowercase kebab-case; update external links that
+  target old branch-relative docs paths such as `docs/client/END_USER_GUIDE.md`.
+
 ### Added
 
 - Qwen3.6-27B (BF16 and FP8) support for video and image captioning, registered as
   `qwen3_6_27b` and `qwen3_6_27b_fp8` variants.
+- Ray Data support for Qwen captioning and TransNetV2 splitting.
+- Split-output comparison tooling for summaries, captions, motion scores, and aesthetic scores.
+- Run-level caption quality statistics for split-video outputs and heuristic caption quality flags.
+- Video pixel budget override support for windowed vLLM captions.
+- vLLM async and OpenAI backend support for SAM3 per-event captioning.
+- Sensor-library overlap support, motion-vector data on `CameraSensor`, and a
+  decoder-utils-compatible sampling grid.
+- Interactive Slurm launch workflow.
+- Pixi development tasks for linting, CPU tests, and the `cosmos-curator` CLI.
+
+### Fixed
+
+- Stabilize GPU stage autoscaling and upgrade `cosmos-xenna` to v0.4.2.
+- Release GPU memory on stage teardown to prevent lingering CUDA contexts.
+- Include the caption window end frame in CPU sampling and average caption tokens by window.
+- Fix Slurm submit launches during pixi solves and guard `nvidia-smi` calls on CPU-only nodes.
+- Repair client wheel packaging, including required storage utilities and clip-viewer assets.
+- Serve `marked.min.js` locally in the clip viewer to avoid a CDN dependency.
+- Avoid clobbering generated Dockerfiles during parallel CI builds.
+- Pin `PyNvVideoCodec` to `>=2.0.4,<2.1` in the `unified` pixi environment for FFmpeg
+  vulnerability remediation.
 
 ### Removed
 
 - Remove deprecated `RemuxStage` class; remuxing remains handled inline by `VideoDownloader`.
+
+### Changed
+
+- Replace Slurm launch internals with a shell-based launch path and simplify submit defaults.
+- Migrate vLLM async captioning to Xenna continuous mode and consolidate sync/async tuning through
+  the vLLM plugin layer.
+- Refactor the sensor library around `DataSource`.
+- Include the `sam3` pixi environment by default.
+- Build distribution-ready FFmpeg without H.264 support.
+- Upgrade vLLM to 0.21.0, Ray to 2.55.1, Pixi to 0.68.0, and FFmpeg to `>8.1`.
+
+### Documentation
+
+- Add split-pipeline stage reference documentation.
+- Refresh captioning contracts and metadata guidance.
+- Add split-output comparison and Orca agentic orchestration design documents.
+- Normalize documentation filenames to lowercase kebab-case.
+- Clarify host CLI versus runtime container usage.
+- Update MR description guidance.
 
 ## [1.4.0]
 
