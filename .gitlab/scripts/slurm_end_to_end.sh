@@ -89,12 +89,64 @@ fi
 
 echo "Submitted SLURM end-to-end job ${JOB_ID}"
 
+LOG_FILE="${LOG_DIR}/${JOB_NAME}_${JOB_ID}.log"
+echo "SLURM job log will stream from ${LOG_FILE} once it is created"
+
+TAIL_PID=""
+stop_slurm_log_tail() {
+  if [[ -n "${TAIL_PID}" ]]; then
+    kill "${TAIL_PID}" >/dev/null 2>&1 || true
+    wait "${TAIL_PID}" 2>/dev/null || true
+    TAIL_PID=""
+  fi
+}
+trap stop_slurm_log_tail EXIT
+
+start_slurm_log_tail() {
+  local log_file=$1
+  (
+    while [[ ! -f "${log_file}" ]]; do
+      sleep 5
+    done
+    echo "---- Streaming SLURM job log (${log_file}) ----"
+    exec tail --pid="$$" -n +1 -F "${log_file}"
+  ) &
+  TAIL_PID=$!
+}
+
+wait_for_slurm_log_drain() {
+  local log_file=$1
+  local previous_size=""
+  local current_size
+  local stable_attempts=0
+
+  for _ in {1..10}; do
+    if [[ ! -f "${log_file}" ]]; then
+      sleep 1
+      continue
+    fi
+
+    current_size=$(stat -c %s "${log_file}" 2>/dev/null || true)
+    if [[ -n "${current_size}" && "${current_size}" == "${previous_size}" ]]; then
+      stable_attempts=$((stable_attempts + 1))
+      if (( stable_attempts >= 2 )); then
+        return 0
+      fi
+    else
+      previous_size="${current_size}"
+      stable_attempts=0
+    fi
+
+    sleep 1
+  done
+}
+
 wait_for_job() {
   local job_id=$1
   local max_attempts=120  # Align with the 02:00:00 sbatch time limit (120 minutes)
   local attempt=0
   while (( attempt < max_attempts )); do
-    if squeue -h -j "${job_id}" >/dev/null 2>&1; then
+    if [[ -n "$(squeue -h -j "${job_id}" 2>/dev/null)" ]]; then
       echo "[$(date -Ins)] Job ${job_id} still running..."
     else
       local state
@@ -112,8 +164,10 @@ wait_for_job() {
   return 1
 }
 
+start_slurm_log_tail "${LOG_FILE}"
+
 if ! wait_for_job "${JOB_ID}"; then
-  LOG_FILE="${LOG_DIR}/${JOB_NAME}_${JOB_ID}.log"
+  stop_slurm_log_tail
   if [[ -f "${LOG_FILE}" ]]; then
     echo "---- SLURM job log (${LOG_FILE}) ----"
     tail -n 200 "${LOG_FILE}"
@@ -123,7 +177,8 @@ if ! wait_for_job "${JOB_ID}"; then
   exit 1
 fi
 
-LOG_FILE="${LOG_DIR}/${JOB_NAME}_${JOB_ID}.log"
+wait_for_slurm_log_drain "${LOG_FILE}"
+stop_slurm_log_tail
 if [[ -f "${LOG_FILE}" ]]; then
   echo "Collected SLURM log at ${LOG_FILE}"
 fi
@@ -135,5 +190,8 @@ wait_for_s3_file "${SLURM_E2E_OUTPUT_CLIP_PATH}/summary.json" || exit 1
 wait_for_s3_file "${SLURM_E2E_OUTPUT_DEDUP_PATH}/extraction/dedup_summary_0.01.csv" || exit 1
 wait_for_s3_file "${SLURM_E2E_OUTPUT_DATASET_PATH}/v0/wdinfo_list.csv" || exit 1
 
-SUMMARY_CONTENT=$(validate_s3_json "${SLURM_E2E_OUTPUT_CLIP_PATH}/summary.json") || exit 1
+if ! summary_content=$(validate_s3_json "${SLURM_E2E_OUTPUT_CLIP_PATH}/summary.json"); then
+  echo "${summary_content}" >&2
+  exit 1
+fi
 echo "Split summary JSON is valid"
