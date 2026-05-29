@@ -118,7 +118,7 @@ def fake_ray_data(monkeypatch: pytest.MonkeyPatch) -> None:
                 raise AssertionError(msg)
             return self.rows
 
-    monkeypatch.setattr("ray.data.from_items", lambda rows: FakeDataset(rows))
+    monkeypatch.setattr("ray.data.from_items", FakeDataset)
     monkeypatch.setattr("ray.is_initialized", lambda: True)
     monkeypatch.setattr("ray.nodes", lambda: [{"NodeID": "node-1"}])
     monkeypatch.setattr(

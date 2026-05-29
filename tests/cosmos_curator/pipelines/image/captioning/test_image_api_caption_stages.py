@@ -453,7 +453,7 @@ def test_openai_stage_retries_timeout_errors(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_gemini_stage_setup_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing Gemini config should fail fast at construction."""
-    monkeypatch.setattr(image_api_caption_stages, "load_config", lambda: ConfigFileData())
+    monkeypatch.setattr(image_api_caption_stages, "load_config", ConfigFileData)
 
     with pytest.raises(RuntimeError, match="Gemini API key missing"):
         ImageGeminiCaptionStage()

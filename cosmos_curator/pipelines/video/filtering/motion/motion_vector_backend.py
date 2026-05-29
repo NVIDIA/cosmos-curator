@@ -242,11 +242,7 @@ def decode_for_motion(  # noqa: C901
         shape = torch.Size([1, 1])
 
         # Get video framerate and duration
-        if stream.average_rate:
-            source_fps = float(stream.average_rate)
-        else:
-            # Use nominal base rate if average not available
-            source_fps = float(stream.base_rate if stream.base_rate else 30)
+        source_fps = float(stream.average_rate) if stream.average_rate else float(stream.base_rate or 30)
 
         # Get duration in seconds
         duration_seconds = 0

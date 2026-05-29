@@ -220,7 +220,7 @@ def test_stage_setup_raises_when_config_missing(monkeypatch: pytest.MonkeyPatch)
 def test_stage_setup_raises_when_openai_section_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """stage_setup should raise RuntimeError when openai section is absent."""
     monkeypatch.setattr(openai_caption_stage, "openai", _fake_openai_module(), raising=False)
-    monkeypatch.setattr(openai_caption_stage, "maybe_load_config", lambda: ConfigFileData())
+    monkeypatch.setattr(openai_caption_stage, "maybe_load_config", ConfigFileData)
 
     stage = OpenAICaptionStage(model_name="m")
     with pytest.raises(RuntimeError, match="OpenAI caption configuration not found"):

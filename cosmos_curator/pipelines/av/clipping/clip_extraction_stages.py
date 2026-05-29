@@ -96,7 +96,7 @@ class ClipTranscodingStage(CuratorStage):
                 raise ValueError(error)
             with self._timer.time_process(
                 len(video.clips),
-                video.metadata.duration if video.metadata.duration else 0,
+                video.metadata.duration or 0,
             ):
                 if not video.clips:
                     logger.warning(f"No clips to transcode for {video.source_video}. Skipping...")

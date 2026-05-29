@@ -222,9 +222,10 @@ class TestEqualityAndIdentity:
         arr = np.arange(512, dtype=np.uint8)
         a: LazyData[npt.NDArray[np.uint8]] = LazyData(value=arr)
         b: LazyData[npt.NDArray[np.uint8]] = LazyData(value=arr.copy())
+        other_items = [b]
 
         assert a in [a, b]
-        assert a not in [b]
+        assert a not in other_items
 
     def test_hashable_as_dict_key_and_set_member(self) -> None:
         """LazyData is hashable via id-based object.__hash__."""

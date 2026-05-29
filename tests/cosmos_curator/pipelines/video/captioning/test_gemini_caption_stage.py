@@ -272,7 +272,7 @@ def test_stage_setup_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(gemini_caption_stage, "genai", SimpleNamespace(Client=_FakeClient))
     monkeypatch.setattr(gemini_caption_stage, "genai_types", object())
-    monkeypatch.setattr(gemini_caption_stage, "load_config", lambda: ConfigFileData())
+    monkeypatch.setattr(gemini_caption_stage, "load_config", ConfigFileData)
 
     with pytest.raises(RuntimeError, match="Gemini API key missing"):
         GeminiCaptionStage()

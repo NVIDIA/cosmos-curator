@@ -47,7 +47,7 @@ class NVCFResponse(dict[str, Any]):
             response: Optional dictionary containing the response data
 
         """
-        super().__init__(response if response else {})
+        super().__init__(response or {})
 
     def __str__(self) -> str:
         """Get a string representation of the response.

@@ -250,7 +250,7 @@ def test_apply_schema_changes_handles_array_columns(monkeypatch: pytest.MonkeyPa
     engine.begin.return_value = context_manager
 
     messages: list[str] = []
-    monkeypatch.setattr(typer, "echo", lambda message: messages.append(message))
+    monkeypatch.setattr(typer, "echo", messages.append)
 
     postgres_cli._apply_schema_changes(
         engine=engine,
@@ -294,7 +294,7 @@ def test_apply_schema_changes_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = MagicMock()
 
     messages: list[str] = []
-    monkeypatch.setattr(typer, "echo", lambda message: messages.append(message))
+    monkeypatch.setattr(typer, "echo", messages.append)
 
     postgres_cli._apply_schema_changes(
         engine=engine,

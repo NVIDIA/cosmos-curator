@@ -263,7 +263,7 @@ def _build_slurm_container_runtime(  # noqa: PLR0913
     conda_override_cuda: str | None,
     pixi_envs: str | None,
 ) -> SlurmContainerRuntime:
-    cuda_override = conda_override_cuda if conda_override_cuda else None
+    cuda_override = conda_override_cuda or None
     return SlurmContainerRuntime(
         container_image=container_image,
         curator_path=curator_path,

@@ -32,11 +32,11 @@ from benchmarks.secrets import _get_bearer_token, _get_secrets_from_env
         # Success case - all variables set
         (
             {"api_key": "API_KEY_ENV", "secret": "SECRET_ENV", "region": "REGION_ENV"},
-            lambda env_name: {
+            {
                 "API_KEY_ENV": "test_api_key",
                 "SECRET_ENV": "test_secret",
                 "REGION_ENV": "us-east-1",
-            }.get(env_name),
+            }.get,
             {"API_KEY_ENV": "test_api_key", "SECRET_ENV": "test_secret", "REGION_ENV": "us-east-1"},
             nullcontext(),
             {"api_key": "test_api_key", "secret": "test_secret", "region": "us-east-1"},
@@ -44,7 +44,7 @@ from benchmarks.secrets import _get_bearer_token, _get_secrets_from_env
         # Single missing variable
         (
             {"api_key": "API_KEY_ENV", "secret": "SECRET_ENV"},
-            lambda env_name: {"API_KEY_ENV": "test_api_key", "SECRET_ENV": None}.get(env_name),
+            {"API_KEY_ENV": "test_api_key", "SECRET_ENV": None}.get,
             None,
             pytest.raises(ValueError, match="Environment variables secret are not set"),
             None,
@@ -52,7 +52,7 @@ from benchmarks.secrets import _get_bearer_token, _get_secrets_from_env
         # Multiple missing variables
         (
             {"api_key": "API_KEY_ENV", "secret": "SECRET_ENV", "region": "REGION_ENV"},
-            lambda env_name: {"API_KEY_ENV": "test_api_key", "SECRET_ENV": None, "REGION_ENV": None}.get(env_name),
+            {"API_KEY_ENV": "test_api_key", "SECRET_ENV": None, "REGION_ENV": None}.get,
             None,
             pytest.raises(ValueError, match="Environment variables secret, region are not set"),
             None,

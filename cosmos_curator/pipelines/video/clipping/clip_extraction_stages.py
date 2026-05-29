@@ -283,7 +283,7 @@ class ClipTranscodingStage(CuratorStage):
             for video in task.videos:
                 with self._timer.time_process(
                     len(video.clips),
-                    video.metadata.duration if video.metadata.duration else 0,
+                    video.metadata.duration or 0,
                 ):
                     try:
                         self._process_video(video)

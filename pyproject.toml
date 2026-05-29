@@ -233,7 +233,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.poetry.group.dev.dependencies]
-mypy = "1.19.0"
+mypy = "2.1.0"
 pandas-stubs = "*"
 pre-commit = "4.2.0"
 pyinstrument = "*"
@@ -255,7 +255,7 @@ pytest-dependency = "*"
 pytest-mock = "*"
 pytest-order = "*"
 pytest-xdist = "*"
-ruff = "0.14.9"
+ruff = "0.15.15"
 types-aiofiles = "*"
 types-awscrt = "*"
 types-beautifulsoup4 = "*"

@@ -345,7 +345,7 @@ def test_download_model_weights_from_huggingface_invokes_reduce_for_t5(
 
     monkeypatch.setattr(model_utils, "_download_model_weights_from_huggingface_to_workspace", fake_download)
     reduce_calls: list[pathlib.Path] = []
-    monkeypatch.setattr(model_utils, "_reduce_t5_model_weights", lambda dest: reduce_calls.append(dest))
+    monkeypatch.setattr(model_utils, "_reduce_t5_model_weights", reduce_calls.append)
 
     model_utils.download_model_weights_from_huggingface_to_workspace("google-t5/t5-11b", "rev1")
     assert reduce_calls == [tmp_path / "google-t5/t5-11b"]

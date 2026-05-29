@@ -46,13 +46,13 @@ def _get_default_models() -> list[str]:
         }:
             # too large for new users
             continue
-        if model in {"gpt_oss_20b"}:
+        if model == "gpt_oss_20b":
             # large and only for enhanced caption
             continue
         if model.startswith("seedvr2"):
             # large SR models, opt-in only
             continue
-        if model in {"sam3"}:
+        if model == "sam3":
             # gated by Meta approval, opt-in only
             continue
         default_models_to_download.append(model)

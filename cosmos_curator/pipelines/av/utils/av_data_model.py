@@ -153,7 +153,7 @@ class AvSessionVideoSplitTask(PipelineTask):
             The duration of the source video.
 
         """
-        return sum(x.metadata.duration if x.metadata.duration else 0 for x in self.videos)
+        return sum(x.metadata.duration or 0 for x in self.videos)
 
     def get_major_size(self) -> int:
         """Get the major size of the session video split task.

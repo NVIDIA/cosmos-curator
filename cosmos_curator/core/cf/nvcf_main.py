@@ -775,7 +775,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             pipeline_args.s3_config = "REDACTED"
 
         logger.info(f"Launching pipeline {pipeline_type} with args: {pipeline_args}")
-        if pipeline_type in {"split"}:
+        if pipeline_type == "split":
             # handle possible assets. Do not override presigned URL paths.
             if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
                 pipeline_args.input_video_path = get_asset_input_dir(request)

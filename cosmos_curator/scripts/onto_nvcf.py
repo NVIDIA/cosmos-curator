@@ -90,7 +90,7 @@ def get_ray_worker_count() -> int:
         output: str = result.stdout
 
         if "Active:" in output:
-            active_section: str = output.split("Active:")[1].split("Pending:")[0]
+            active_section: str = output.split("Active:")[1].split("Pending:", maxsplit=1)[0]
             worker_count: int = sum(1 for line in active_section.splitlines() if "node_" in line)
             return max(0, worker_count)
     except subprocess.TimeoutExpired:
@@ -447,7 +447,7 @@ def main() -> None:
         os.environ["NVCF_REQUEST_STATUS"] = os.environ.get("NVCF_REQUEST_STATUS", "true")
 
     # Extract replica information
-    replica: str = POD_NAME.split("-")[-1]
+    replica: str = POD_NAME.rsplit("-", maxsplit=1)[-1]
     replica_group: str = "-".join(POD_NAME.split("-")[:-1])
     head_pod: str = f"{replica_group}-0.{HEADLESS_SERVICE_NAME}"
 

@@ -43,7 +43,7 @@ def test_developer_tool_versions_match_poetry() -> None:
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
     pyproject_config = tomllib.loads(_read_repo_file("pyproject.toml"))
 
-    dev_dependencies = pixi_config.get("feature", {}).get("dev", {}).get("dependencies")
+    dev_dependencies = pixi_config.get("feature", {}).get("dev", {}).get("pypi-dependencies")
     poetry_dev_dependencies = (
         pyproject_config.get("tool", {})
         .get("poetry", {})
@@ -57,7 +57,12 @@ def test_developer_tool_versions_match_poetry() -> None:
     assert isinstance(poetry_dev_dependencies, dict)
 
     for dependency_name in ("ruff", "mypy"):
-        assert dev_dependencies[dependency_name] == f"=={poetry_dev_dependencies[dependency_name]}"
+        pixi_dependency = dev_dependencies[dependency_name]
+        poetry_dependency = poetry_dev_dependencies[dependency_name]
+
+        assert isinstance(pixi_dependency, str)
+        assert isinstance(poetry_dependency, str)
+        assert pixi_dependency == f"=={poetry_dependency}"
 
 
 def test_local_test_plugins_are_available_in_pixi_dev() -> None:

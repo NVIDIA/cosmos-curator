@@ -408,7 +408,7 @@ def _get_clip_metadata_paths_from_summary(
         logger.error(f"Failed to read summary file from {input_path}: {e}")
         return []
     else:
-        return sorted(clip_metadata_paths, key=lambda x: str(x))
+        return sorted(clip_metadata_paths, key=str)
 
 
 def _worker_read_clip_metadata(

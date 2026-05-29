@@ -210,7 +210,7 @@ def add_common_args(parser: argparse.ArgumentParser, pipeline_name: str) -> None
             help="Custom prompt text to use instead of predefined prompt types",
         )
 
-    if pipeline_name in ["shard"]:
+    if pipeline_name == "shard":
         parser.add_argument(
             "--prompt-type",
             type=str,

@@ -33,7 +33,7 @@ from collections.abc import Generator, Iterable
 T = typing.TypeVar("T")
 
 
-def split_by_chunk_size(
+def split_by_chunk_size[T](
     iterable: Iterable[T],
     chunk_size: int,
     custom_size_func: typing.Callable[[T], int] = lambda x: 1,  # noqa: ARG005

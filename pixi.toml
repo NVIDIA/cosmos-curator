@@ -78,16 +78,16 @@ webdataset = "*" # conda-forge package pulls in pytorch
 channels = ["conda-forge"]
 
 [feature.dev.dependencies]
-mypy = "==1.19.0"
 pytest-mock = "*"
-ruff = "==0.14.9"
 
 [feature.dev.pypi-dependencies]
 cosmos-curator = { path = ".", editable = true }
 fabric = "==3.2.2"
 invoke = "==3.0.3"
+mypy = "==2.1.0"
 openai = "*"
 pandas-stubs = "*"
+ruff = "==0.15.15"
 types-aiofiles = "*"
 types-boto3 = "*"
 types-psutil = "*"
