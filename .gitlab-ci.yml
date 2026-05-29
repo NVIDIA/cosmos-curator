@@ -181,8 +181,14 @@ stages:
 
 # Reusable snippets (anchors)
 .snippets:
+  # Single-purpose web pipelines should not fan out into default web jobs.
+  skip_single_purpose_web_rule: &skip_single_purpose_web_rule
+    if: '$CI_PIPELINE_SOURCE == "web" && ($REFRESH_CI_BUILDER_IMAGE == "True" || $RUN_BENCHMARK == "True")'
+    when: never
+
   # Rules for pre-merge jobs
   pre_merge_rules: &pre_merge_rules
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
     - when: never
 
@@ -207,6 +213,8 @@ stages:
       when: on_success
       allow_failure: true
 
+    - *skip_single_purpose_web_rule
+
     # Web-triggered pipelines
     - if: '$CI_PIPELINE_SOURCE == "web" && $NVCF_HELM_STRICT == "true"'
       when: on_success
@@ -221,6 +229,7 @@ stages:
   # Rules for jobs that should run both before and after merging
   # Post-merge runs on any protected branch
   pre_post_merge_rules: &pre_post_merge_rules
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
@@ -228,6 +237,7 @@ stages:
   # Rules for jobs that should run on pre/post merge AND web triggers
   # Post-merge runs on any protected branch
   pre_post_merge_and_web_rules: &pre_post_merge_and_web_rules
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
@@ -239,13 +249,14 @@ stages:
     - when: never
 
   # Rules for the redistributable image:
-  # - Always on post-merge to main / protected pushes and on web triggers,
-  #   so the post-merge pipeline produces all three images (regular, slim,
-  #   distributable) at the same moment from the same apt/conda/pixi state.
+  # - Always on post-merge to main / protected pushes, and on ordinary web
+  #   triggers, so the post-merge pipeline produces all three images (regular,
+  #   slim, distributable) at the same moment from the same apt/conda/pixi state.
   # - On MR pipelines: only when the image/runtime surface changes, or when
   #   the explicit `build-all-images` MR label is set as an escape hatch.
   distributable_rules: &distributable_rules
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)build-all-images($|,)/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -260,8 +271,6 @@ stages:
   ci_builder_refresh_rules: &ci_builder_refresh_rules
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $REFRESH_CI_BUILDER_IMAGE == "True"'
     - if: '$CI_PIPELINE_SOURCE == "web" && $REFRESH_CI_BUILDER_IMAGE == "True"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
     - when: never
 
   # Compute IMAGE_TAG from target branch (MR) or commit branch (push/web)
@@ -1096,6 +1105,7 @@ k8s_gpu_tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
     - when: never
@@ -1139,6 +1149,7 @@ k8s_helm_test:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
+    - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
     - when: never
