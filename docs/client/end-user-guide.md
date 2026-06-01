@@ -585,6 +585,54 @@ rclone copy -P ${COSMOS_CURATOR_LOCAL_WORKSPACE_PREFIX:-$HOME}/cosmos_curator_lo
 
 ### Create sqsh Image and Copy to the Slurm Cluster
 
+If the Docker image is reachable from the Slurm cluster, import it directly on the cluster. The command runs
+`enroot import` through `srun`, defaults to the `cpu` partition, writes to `~/container_images`, and overwrites the
+default output file `cosmos-curator+1.0.0.sqsh` unless `--no-overwrite` is provided:
+
+For private registries, create `~/.config/enroot/.credentials` on the Slurm cluster login node so it is stored in the
+home directory visible to Enroot on that cluster. Ignore registries you do not use; entries can be added later.
+For NGC, include both `nvcr.io` and `authn.nvidia.com`:
+
+```text
+machine nvcr.io login $oauthtoken password YOUR-NGC-API-KEY
+machine authn.nvidia.com login $oauthtoken password YOUR-NGC-API-KEY
+```
+
+For other private registries, add the registry host with the username and token format required by that service:
+
+```text
+machine PRIVATE-REGISTRY-HOST login YOUR-USERNAME password YOUR-TOKEN
+```
+
+Then restrict the credentials file permissions:
+
+```bash
+chmod 0600 ~/.config/enroot/.credentials
+```
+
+```bash
+cosmos-curator slurm import-image \
+  -A my_slurm_account \
+  --output-filename cosmos-curator_hello-world.sqsh \
+  nvcr.io/your-org/your-cosmos-curator-image:your-tag
+```
+
+When running from outside the Slurm login host, add `--login-node` and `--username` as needed:
+
+```bash
+cosmos-curator slurm import-image \
+  --login-node my-slurm-login-01.my-cluster.com \
+  --username my_username_on_slurm_cluster_if_different_than_local_username \
+  -A my_slurm_account \
+  --output-filename cosmos-curator_hello-world.sqsh \
+  docker://cosmos-curator:hello-world
+```
+
+Unprefixed image references are treated as `docker://` references. Use an explicit Enroot URI such as `dockerd://...`
+only when the Slurm compute node can access that source.
+
+If the image exists only on your local machine, use the manual local import and copy flow:
+
 1. Install `enroot` on your local machine based on the [instructions here](https://github.com/NVIDIA/enroot/blob/master/doc/installation.md).
 
 2. Import the hello world docker image built above to create a `.sqsh` file.

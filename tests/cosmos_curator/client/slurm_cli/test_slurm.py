@@ -513,6 +513,148 @@ def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
     mock_curator_submit.assert_not_called()
 
 
+def test_import_image_uses_enroot_defaults(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Import an image through srun with Enroot paths placed under the image directory."""
+    output_dir = tmp_path / "container_images"
+    monkeypatch.setenv(_SLURM_ACCOUNT_ENV_VAR, "env_account")
+
+    with patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "import-image",
+                "nvcr.io/nvidia/cosmos-curator:1.0.0",
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Imported docker://nvcr.io/nvidia/cosmos-curator:1.0.0" in result.output
+    srun_cmd = mock_call.call_args.args[0]
+    subprocess_env = mock_call.call_args.kwargs["env"]
+
+    assert srun_cmd[0] == "srun"
+    assert "--nodes=1" in srun_cmd
+    assert "--ntasks=1" in srun_cmd
+    assert "--export=HOME,PATH,ENROOT_CACHE_PATH,ENROOT_DATA_PATH,ENROOT_TEMP_PATH" in srun_cmd
+    assert "--export=ALL" not in srun_cmd
+    assert "--account=env_account" in srun_cmd
+    assert "--partition=cpu" in srun_cmd
+    assert "--job-name=cosmos_curator_import_image" in srun_cmd
+    assert str(output_dir / "cosmos-curator+1.0.0.sqsh") in srun_cmd
+    assert "docker://nvcr.io/nvidia/cosmos-curator:1.0.0" in srun_cmd
+    assert any('mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH"' in arg for arg in srun_cmd)
+    assert any('rm -f -- "$1"' in arg for arg in srun_cmd)
+    assert any('exec enroot import --output "$1" "$2"' in arg for arg in srun_cmd)
+
+    assert subprocess_env["ENROOT_CACHE_PATH"] == str(output_dir / ".enroot-cache")
+    assert subprocess_env["ENROOT_DATA_PATH"] == str(output_dir)
+    assert subprocess_env["ENROOT_TEMP_PATH"] == str(pathlib.Path("/") / "tmp")
+    assert "HOME" in subprocess_env
+
+
+def test_import_image_accepts_custom_output_and_no_overwrite(tmp_path: pathlib.Path) -> None:
+    """Allow callers to preserve existing outputs and pass explicit Enroot URI schemes."""
+    output_dir = tmp_path / "images"
+
+    with patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "import-image",
+                "dockerd://cosmos-curator:hello-world",
+                "--output-dir",
+                str(output_dir),
+                "--output-filename",
+                "cosmos-curator_hello-world.sqsh",
+                "--no-overwrite",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    srun_cmd = mock_call.call_args.args[0]
+    assert "Imported dockerd://cosmos-curator:hello-world" in result.output
+    assert str(output_dir / "cosmos-curator_hello-world.sqsh") in result.output
+    assert not any('rm -f -- "$1"' in arg for arg in srun_cmd)
+
+
+def test_import_image_remote_login_expands_default_output_dir_with_cluster_username() -> None:
+    """Remote imports should not expand the default output directory against the local user's home."""
+    with (
+        patch(f"{MODULE_NAME}._is_local_host", return_value=False),
+        patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call,
+    ):
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "import-image",
+                "cosmos-curator:1.0.0",
+                "--login-node",
+                "login.example.com",
+                "--username",
+                "cluster_user",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    ssh_cmd = mock_call.call_args.args[0]
+    assert ssh_cmd[:3] == ["ssh", "-t", "cluster_user@login.example.com"]
+    remote_command = ssh_cmd[-1]
+    assert "HOME=/home/cluster_user" in remote_command
+    assert "ENROOT_CACHE_PATH=/home/cluster_user/container_images/.enroot-cache" in remote_command
+    assert "ENROOT_DATA_PATH=/home/cluster_user/container_images" in remote_command
+    assert "/home/cluster_user/container_images/cosmos-curator+1.0.0.sqsh" in remote_command
+
+
+def test_import_image_rejects_output_filename_path() -> None:
+    """Keep output directory and filename options unambiguous."""
+    with patch(f"{MODULE_NAME}.subprocess.call") as mock_call:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "import-image",
+                "cosmos-curator:1.0.0",
+                "--output-filename",
+                "nested/cosmos-curator.sqsh",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "--output-filename must be a filename" in result.output
+    mock_call.assert_not_called()
+
+
+def test_import_image_retries_failed_srun(tmp_path: pathlib.Path) -> None:
+    """Transient Enroot or Slurm failures should retry like the previous helper script."""
+    with (
+        patch(f"{MODULE_NAME}.subprocess.call", side_effect=[1, 0]) as mock_call,
+        patch(f"{MODULE_NAME}.time_module.sleep") as mock_sleep,
+    ):
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "import-image",
+                "cosmos-curator:1.0.0",
+                "--output-dir",
+                str(tmp_path / "images"),
+                "--retries",
+                "2",
+                "--retry-delay",
+                "0",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_call.call_count == 2
+    mock_sleep.assert_called_once_with(0)
+
+
 @pytest.mark.parametrize(
     ("mail_type", "mail_user", "should_include_mail_type", "should_include_mail_user"),
     [
