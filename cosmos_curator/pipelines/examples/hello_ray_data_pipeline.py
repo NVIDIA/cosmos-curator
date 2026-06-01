@@ -57,7 +57,7 @@ def main() -> None:
         batch_format="pyarrow",
         num_gpus=0.8,
         compute=ActorPoolStrategy(size=1),
-        runtime_env=PixiRuntimeEnv("transformers"),
+        runtime_env=PixiRuntimeEnv("default"),
     )
     ds.show()
 

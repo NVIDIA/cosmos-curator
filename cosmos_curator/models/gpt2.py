@@ -22,7 +22,7 @@ from cosmos_curator.core.utils.model import conda_utils, model_utils
 
 # pyright: reportMissingImports=false
 # pyright: reportUnboundVariable=false
-if conda_utils.is_running_in_env("transformers"):
+if conda_utils.is_running_in_env("default"):
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 
@@ -49,7 +49,7 @@ class GPT2(ModelInterface):
             The conda environment name.
 
         """
-        return "transformers"
+        return "default"
 
     # need override model_id_names to tell underlying logic which model IDs to use
     @property

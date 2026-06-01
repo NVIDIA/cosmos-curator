@@ -76,7 +76,7 @@ ds = ray.data.from_items([{"prompt": p} for p in prompts])
 ds = ds.with_column("prompt", col("prompt").str.lower())
 ds = ds.map_batches(GPT2Predictor, batch_size=1, batch_format="pyarrow",
                     num_gpus=0.8, compute=ActorPoolStrategy(size=1),
-                    runtime_env=PixiRuntimeEnv("transformers"))
+                    runtime_env=PixiRuntimeEnv("default"))
 ds.show()
 ```
 
@@ -229,7 +229,7 @@ commitment.
 
 ## Pixi Multi-Environment Support
 
-Stages that require specific Pixi environments (e.g. `transformers`, `unified`) pass `runtime_env=PixiRuntimeEnv(name)`
+Stages that require specific Pixi environments (e.g. `default`, `unified`) pass `runtime_env=PixiRuntimeEnv(name)`
 as a `map_batches` kwarg. This is the same `PixiRuntimeEnv` already used by the Xenna path — it is a
 `ray.runtime_env.RuntimeEnv` subclass that configures `pixi run` as the Python executable.
 

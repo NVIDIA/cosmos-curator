@@ -20,7 +20,7 @@ from cosmos_curator.core.utils.model import model_utils
 from cosmos_curator.models.gpt2 import GPT2
 
 
-@pytest.mark.env("transformers")
+@pytest.mark.env("default")
 def test_gpt2_generate_text() -> None:
     """Ensure GPT-2 loads real weights and generates text."""
     model = GPT2(max_output_len=32)

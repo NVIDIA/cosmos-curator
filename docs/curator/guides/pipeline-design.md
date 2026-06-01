@@ -127,7 +127,7 @@ class GPT2(ModelInterface):
     # need override conda_env_name to tell underlying logic which conda env to use
     @property
     def conda_env_name(self) -> str:
-        return "transformers"
+        return "default"
 
     # need override model_id_names to faciliate model download
     @property
@@ -161,8 +161,8 @@ To help management of models, add a section in [all_models.json](../../../cosmos
 
 ### Conda Environment Management
 
-The `GPT2` model above uses a conda environment called `transformers`;
-that corresponds to the environment `transformers` in [pixi.toml](../../../pixi.toml).
+The `GPT2` model above uses the default conda environment;
+that corresponds to the environment `default` in [pixi.toml](../../../pixi.toml).
 
 Every `env` needs to be listed in [pixi.toml](../../../pixi.toml).
 Note as a convention enforced by `pixi`, you should use `-` instead of `_` for the `env` name.

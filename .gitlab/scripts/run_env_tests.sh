@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Install pixi environments inside the container from the Lustre-mounted cache.
 # This writes .pixi to local container storage so Python imports are fast.
-ENVS=(default legacy-transformers transformers unified)
+ENVS=(default legacy-transformers unified)
 ENV_ARGS=()
 for e in "${ENVS[@]}"; do ENV_ARGS+=(-e "$e"); done
 echo "Installing pixi environments: ${ENVS[*]}"

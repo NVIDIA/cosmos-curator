@@ -175,8 +175,8 @@ The steps below only shows how to run the pipeline.
 ```bash
 # 1. Build a docker image for hello-world pipeline
 #    - The hello-world pipeline uses the GPT-2 model
-#    - We create a dedicated conda environment called transformers to run the GPT-2 model (hence `--env transformers`)
-cosmos-curator image build --image-name cosmos-curator --image-tag hello-world --envs transformers
+#    - GPT-2 runs in the default conda environment
+cosmos-curator image build --image-name cosmos-curator --image-tag hello-world --envs default
 
 # 2. Download the GPT-2 model weights
 cosmos-curator local launch --image-name cosmos-curator --image-tag hello-world -- pixi run --as-is model_download --models gpt2

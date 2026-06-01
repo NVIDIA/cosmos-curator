@@ -577,7 +577,7 @@ COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock {{code_dir_
 #
 # IMPORTANT: Do NOT set RATTLER_CACHE_DIR or UV_CACHE_DIR to a BuildKit cache mount.
 # Rattler uses hardlinks from its package cache into each environment directory. When
-# multiple environments share packages (e.g. torch across default, unified, transformers),
+# multiple environments share packages (e.g. torch across default and unified),
 # the hardlinked files share a single inode and Docker stores the data ONCE in the layer tar.
 # Redirecting the cache to a mount (different filesystem) breaks hardlinks -- rattler falls
 # back to full copies, duplicating multi-GB packages across every environment (~8GB -> ~21GB).

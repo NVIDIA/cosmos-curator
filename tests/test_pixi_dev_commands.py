@@ -84,6 +84,7 @@ def test_developer_commands_run_in_dev_environment_only() -> None:
 
     environments = pixi_config.get("environments")
     assert isinstance(environments, dict)
+    assert "transformers" not in environments
     assert set(environments["dev"]) == {"core", "transformers", "tracing", "profiling", "dev"}
     for environment_name, features in environments.items():
         if environment_name != "dev":
@@ -93,7 +94,7 @@ def test_developer_commands_run_in_dev_environment_only() -> None:
 def test_image_cli_default_envs_do_not_include_dev() -> None:
     """Verify image env parsing does not add the developer tooling environment by default."""
     default_envs = set(_parse_envs(""))
-    configured_runtime_envs = set(_parse_envs("cuml,legacy-transformers,sam3,seedvr,transformers,unified"))
+    configured_runtime_envs = set(_parse_envs("cuml,legacy-transformers,sam3,seedvr,unified"))
 
     assert "dev" not in default_envs
     assert "dev" not in configured_runtime_envs
