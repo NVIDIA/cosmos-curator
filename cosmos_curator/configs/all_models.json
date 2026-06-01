@@ -70,6 +70,20 @@
         "precision": "BF16",
         "nvcf_model_id": "cosmos_reason2_8b"
     },
+    "cosmos3_nano_reasoner": {
+        "model_id": "nvidia/Cosmos3-Nano-Reasoner",
+        "version": "bb9c6f530ef861cdba064f151fac653330ef3444",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos3_nano_reasoner_8b"
+    },
+    "cosmos3_super_reasoner": {
+        "model_id": "nvidia/Cosmos3-Super-Reasoner",
+        "version": "b6df0d1b0a026876361f51958d0dfbea2060597a",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos3_super_reasoner_32b"
+    },
     "gpt2": {
         "model_id": "openai-community/gpt2",
         "version": "607a30d783dfa663caf39e06633721c8d4cfcd7e",

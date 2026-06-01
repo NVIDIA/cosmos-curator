@@ -28,6 +28,8 @@ from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
         ("qwen", "Qwen/Qwen2.5-VL-7B-Instruct", nullcontext()),
         ("cosmos_r1", "nvidia/Cosmos-Reason1-7B", nullcontext()),
         ("cosmos_r2", "nvidia/Cosmos-Reason2-8B", nullcontext()),
+        ("cosmos3_nano_reasoner", "nvidia/Cosmos3-Nano-Reasoner", nullcontext()),
+        ("cosmos3_super_reasoner", "nvidia/Cosmos3-Super-Reasoner", nullcontext()),
         ("qwen3_5_27b", "Qwen/Qwen3.5-27B-FP8", nullcontext()),
         ("qwen3_6_27b", "Qwen/Qwen3.6-27B", nullcontext()),
         ("qwen3_6_27b_fp8", "Qwen/Qwen3.6-27B-FP8", nullcontext()),

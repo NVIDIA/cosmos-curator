@@ -146,6 +146,8 @@ from cosmos_curator.pipelines.video.utils.video_pipe_input import (
 
 QWEN2_CAPTION_ALGOS = {"qwen"}
 QWEN3_CAPTION_ALGOS = {
+    "cosmos3_nano_reasoner",
+    "cosmos3_super_reasoner",
     "qwen3_5_27b",
     "qwen3_6_27b",
     "qwen3_6_27b_fp8",

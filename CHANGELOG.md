@@ -33,6 +33,8 @@
 
 ### Added
 
+- Cosmos3-Reasoner (Nano 8B and Super 32B) support for video and image captioning,
+  registered as `cosmos3_nano_reasoner` and `cosmos3_super_reasoner` variants (HF-gated).
 - Qwen3.6-27B (BF16 and FP8) support for video and image captioning, registered as
   `qwen3_6_27b` and `qwen3_6_27b_fp8` variants.
 - Ray Data support for Qwen captioning and TransNetV2 splitting.

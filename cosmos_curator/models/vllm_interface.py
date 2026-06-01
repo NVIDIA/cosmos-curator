@@ -63,6 +63,8 @@ fallback for simpler debugging and testing. Production code uses inflight batchi
 Plugin Implementations (model-specific code):
 - VllmCosmosReason1VL:     cosmos_curator/models/vllm_cosmos_reason1_vl.py
 - VllmCosmosReason2VL:     cosmos_curator/models/vllm_cosmos_reason2_vl.py
+- VllmCosmos3NanoReasonerVL:  cosmos_curator/models/vllm_cosmos_reason3_vl.py
+- VllmCosmos3SuperReasonerVL: cosmos_curator/models/vllm_cosmos_reason3_vl.py
 - VllmNemotronNano12Bv2VL: cosmos_curator/models/vllm_nemotron.py
 - VllmQwen7B:              cosmos_curator/models/vllm_qwen.py
 - VllmQwen3VL30B:          cosmos_curator/models/vllm_qwen.py
@@ -112,6 +114,7 @@ from cosmos_curator.core.utils.infra.tracing import traced_span
 from cosmos_curator.core.utils.misc import grouping
 from cosmos_curator.models.vllm_cosmos_reason1_vl import VllmCosmosReason1VL
 from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
+from cosmos_curator.models.vllm_cosmos_reason3_vl import VllmCosmos3NanoReasonerVL, VllmCosmos3SuperReasonerVL
 from cosmos_curator.models.vllm_nemotron import VllmNemotronNano12Bv2VL
 from cosmos_curator.models.vllm_plugin import VllmPlugin
 from cosmos_curator.models.vllm_qwen import (
@@ -140,6 +143,8 @@ if TYPE_CHECKING:
 _VLLM_PLUGINS = {
     VllmCosmosReason1VL.model_variant(): VllmCosmosReason1VL,
     VllmCosmosReason2VL.model_variant(): VllmCosmosReason2VL,
+    VllmCosmos3NanoReasonerVL.model_variant(): VllmCosmos3NanoReasonerVL,
+    VllmCosmos3SuperReasonerVL.model_variant(): VllmCosmos3SuperReasonerVL,
     VllmNemotronNano12Bv2VL.model_variant(): VllmNemotronNano12Bv2VL,
     VllmQwen3527B.model_variant(): VllmQwen3527B,
     VllmQwen3627B.model_variant(): VllmQwen3627B,

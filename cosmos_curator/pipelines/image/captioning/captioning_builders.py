@@ -38,7 +38,7 @@ IMAGE_CAPTION_ALGOS: frozenset[str] = frozenset(
         "qwen3_vl_235b",
         "qwen3_vl_235b_fp8",
     }
-    | {"nemotron", "cosmos_r1", "cosmos_r2", "openai", "gemini"}
+    | {"nemotron", "cosmos_r1", "cosmos_r2", "cosmos3_nano_reasoner", "cosmos3_super_reasoner", "openai", "gemini"}
 )
 
 

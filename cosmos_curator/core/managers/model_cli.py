@@ -46,6 +46,9 @@ def _get_default_models() -> list[str]:
         }:
             # too large for new users
             continue
+        if model in {"cosmos3_nano_reasoner", "cosmos3_super_reasoner"}:
+            # HF-gated, opt-in only
+            continue
         if model == "gpt_oss_20b":
             # large and only for enhanced caption
             continue

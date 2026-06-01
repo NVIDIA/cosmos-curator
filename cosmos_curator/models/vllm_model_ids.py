@@ -30,6 +30,8 @@ This allows for a location for variant -> model id mapping.
 _VLLM_MODELS = {
     "cosmos_r1": "nvidia/Cosmos-Reason1-7B",
     "cosmos_r2": "nvidia/Cosmos-Reason2-8B",
+    "cosmos3_nano_reasoner": "nvidia/Cosmos3-Nano-Reasoner",
+    "cosmos3_super_reasoner": "nvidia/Cosmos3-Super-Reasoner",
     "qwen": "Qwen/Qwen2.5-VL-7B-Instruct",
     "nemotron": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
     "qwen3_vl_235b": "Qwen/Qwen3-VL-235B-A22B-Instruct",
