@@ -13,7 +13,7 @@ pip = "*"
 click = "<8.3.0" # click 8.3.0 is broken
 
 [pypi-dependencies]
-cosmos-xenna = "==0.4.2"
+cosmos-xenna = "==0.4.3"
 ray = { version = "==2.55.1", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
 
 [feature.core.system-requirements]

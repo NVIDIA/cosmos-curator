@@ -31,12 +31,16 @@ import contextlib
 import dataclasses
 import gc
 import logging
+import os
+import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import attrs
 import nvtx  # type: ignore[import-untyped]
 import psutil
+import ray
 import tenacity
 from loguru import logger
 
@@ -111,6 +115,16 @@ _VLLM_REQUIRED_FREE_FRACTION = 0.95
 # ignored SIGTERM. If we exceed a SIGTERM timeout, we may leak GPU memory when
 # SIGKILL is sent.
 _VLLM_SIGTERM_GRACE_S = 30.0
+
+# How often the background watchdog polls for ``VLLM::EngineCore`` subprocess
+# liveness. The watchdog exists to catch the case where EngineCore exits cleanly
+# (e.g. SIGTERM from the OOM-killer) while a ``process_data`` call is mid-flight
+# inside ``llm.generate()`` - the pre-call ``_engine_core_is_alive()`` check
+# cannot run for an already-running call, so the slot stays wedged on a closed
+# IPC pipe forever. 10 s is a balance between detection latency (worst case ~10 s
+# of stale-slot occupancy before we hand off to xenna) and overhead (a single
+# ``psutil.Process.children()`` walk on a quiet actor).
+_ENGINE_CORE_WATCHDOG_INTERVAL_S = 10.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,6 +549,13 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         self._caption_single_top_k = caption_single_options.top_k
         self._caption_single_max_tokens = caption_single_options.max_tokens
         self._caption_single_sampling_params: SamplingParams | None = None
+        # Background watchdog state. Both must stay None here so the stage instance
+        # remains picklable - xenna deepcopies the pipeline spec before sending it to
+        # remote actors, and ``threading.Event`` contains a ``_thread.lock`` that is
+        # not picklable. The real ``Event`` is created lazily by
+        # ``_start_engine_core_watchdog`` on the remote actor in ``stage_setup``.
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop_event: threading.Event | None = None
 
     def stage_setup_on_node(self) -> None:
         """Set up on a node by copying model weights if configured.
@@ -578,6 +599,14 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
     def stage_setup(self) -> None:
         """Set up the model for processing."""
         if self._llm is None:
+            # Reap any orphan ``VLLM::EngineCore`` processes left behind by a prior
+            # actor that died hard on this node (SIGSEGV/SIGKILL/OOM-kill). Such
+            # orphans typically release their GPU memory via vLLM's IPC-closure
+            # handler, but the Python process itself persists indefinitely - leaking
+            # CPU/RAM/process slots and potentially holding small CUDA contexts that
+            # accumulate over multiple recoveries. Runs before ``gpu_stage_startup``
+            # so the post-reap state is what the readiness check sees.
+            self._kill_orphan_engine_cores()
             gpu_stage_startup(
                 self.__class__.__name__,
                 self.resources.gpus,
@@ -589,6 +618,9 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         self._caption_single_sampling_params = self._build_caption_single_sampling_params()
         self._processor = auto_processor(self._vllm_config)
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
+        # Start the EngineCore watchdog only after vLLM is fully up, so it doesn't fire
+        # spuriously during mid-init (when subprocesses are still being spawned).
+        self._start_engine_core_watchdog()
 
     def destroy(self) -> None:
         """Release vLLM and GPU resources before the actor exits.
@@ -613,6 +645,10 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         Safe to call when ``stage_setup`` did not complete or was never called.
         """
         start = time.monotonic()
+        # Stop the watchdog FIRST: ``_terminate_vllm_subprocesses`` is about to kill
+        # EngineCore intentionally, which would otherwise trigger the watchdog to call
+        # ``os._exit(1)`` mid-teardown and abort the clean shutdown.
+        self._stop_engine_core_watchdog()
         self._terminate_vllm_subprocesses()
         self._drop_vllm_refs()
         gpu_stage_cleanup(self.__class__.__name__)
@@ -663,6 +699,210 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         if alive:
             psutil.wait_procs(alive, timeout=2.0)
         logger.info(f"VllmCaptionStage.destroy: terminated {len(gone)} via SIGTERM, {len(alive)} required SIGKILL")
+
+    @staticmethod
+    def _in_ray_actor_context() -> bool:
+        """Return True iff currently executing inside a Ray actor worker.
+
+        ``ray.actor.exit_actor()`` raises ``TypeError`` when invoked from a non-actor
+        context (driver, unit test, etc.), which would mask the underlying recovery
+        intent. Call this guard before any ``exit_actor`` invocation so callers can
+        fall back to ordinary exception handling in tests / driver code.
+        """
+        try:
+            # ``ray._private.worker`` is the only documented way to introspect actor
+            # context; Ray itself recommends this attribute access in its own examples.
+            # Lazy import so the dependency is local to this function.
+            import ray._private.worker as _ray_worker_internal  # noqa: PLC0415
+
+            worker = _ray_worker_internal.global_worker
+            return worker.mode == ray.WORKER_MODE and not worker.actor_id.is_nil()
+        except Exception:  # noqa: BLE001 - any Ray internals access can fail; treat as "not actor"
+            return False
+
+    @staticmethod
+    def _is_live_engine_core(child: psutil.Process) -> bool:
+        """Return True if ``child`` is a live (non-zombie/dead) ``VLLM::EngineCore`` process."""
+        try:
+            cmdline = " ".join(child.cmdline())
+            status = child.status()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+        return "EngineCore" in cmdline and status not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+
+    def _engine_core_is_alive(self) -> bool:
+        """Return True if at least one live ``VLLM::EngineCore`` subprocess is present.
+
+        Catches clean shutdowns of the GPU-resident EngineCore subprocess (e.g. SIGTERM
+        from ``systemd-oomd``, a container's signal-propagation chain, or vLLM's own
+        engine-side watchdog) that don't surface as exceptions in the parent process.
+
+        Returns ``True`` when the underlying ``psutil`` call cannot enumerate children
+        (e.g. macOS sandbox blocks ``sysctl()``, kernel-level ``EPERM`` on hardened
+        containers): we cannot prove the engine is dead, so do *not* trigger a false
+        positive recovery. Production Linux workers always succeed.
+        """
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.AccessDenied, PermissionError, OSError) as exc:
+            logger.debug(f"psutil children() unavailable ({exc!r}); assuming EngineCore alive.")
+            return True
+        return any(self._is_live_engine_core(child) for child in children)
+
+    def _kill_orphan_engine_cores(self) -> None:
+        """SIGKILL any orphan ``VLLM::EngineCore`` processes from prior dead actors.
+
+        When a ``StageWorker`` dies abruptly (SIGSEGV, SIGKILL, OOM-killer), no
+        Python-level cleanup runs - neither ``destroy()`` nor the watchdog gets a
+        chance to terminate the EngineCore child. The kernel reparents the orphan to
+        PID 1 (init), where it usually releases its GPU allocation through vLLM's
+        IPC-closure handler but keeps the Python interpreter resident indefinitely.
+        Over multiple recoveries these accumulate, exhausting process slots / RAM and
+        sometimes leaving small CUDA contexts that block fresh allocations.
+
+        Strategy: scan all processes on the node and SIGKILL any whose cmdline marks
+        them as an EngineCore *and* whose parent is PID 1 (the unambiguous orphan
+        signature - a live sibling actor's EngineCore has ``ppid == that_actor_pid``,
+        never 1). This is safe even with multiple live ``VllmCaptionStage`` actors on
+        the same node, because we never touch processes with a live parent.
+
+        Called from ``stage_setup`` on every newly-spawned actor so replacement
+        actors clean up after their dead predecessors before bringing vLLM back up.
+        """
+        # Defensive: if our actor process is PID 1 (unusual, but possible in some
+        # container entrypoint configs), our own live children also have ppid==1 and
+        # would be indistinguishable from orphans. Skip the sweep rather than risk a
+        # self-kill; Ray + the standard image runs raylet as PID 1, not actors.
+        if os.getpid() == 1:
+            logger.warning("Skipping orphan EngineCore sweep: actor is PID 1, cannot disambiguate.")
+            return
+
+        orphans: list[psutil.Process] = []
+        for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+            try:
+                if proc.info["ppid"] != 1:
+                    continue
+                cmdline = " ".join(proc.info["cmdline"] or [])
+                if "EngineCore" not in cmdline:
+                    continue
+                orphans.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not orphans:
+            return
+
+        pids = [p.info["pid"] for p in orphans]
+        logger.warning(
+            f"Found {len(orphans)} orphan VLLM::EngineCore process(es) "
+            f"(parent died unexpectedly); SIGKILLing them: {pids}"
+        )
+        for proc in orphans:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                proc.kill()
+        gone, alive = psutil.wait_procs(orphans, timeout=5.0)
+        if alive:
+            stuck_pids = [p.pid for p in alive]
+            logger.error(f"Orphan EngineCore(s) survived SIGKILL after 5s: {stuck_pids}")
+        else:
+            logger.info(f"Reaped {len(gone)} orphan VLLM::EngineCore process(es).")
+
+    def _start_engine_core_watchdog(self) -> None:
+        """Start the background EngineCore liveness watchdog (idempotent).
+
+        Installs a *fresh* ``self._watchdog_stop_event`` on every start to avoid
+        stale thread resurrection.
+
+        The event is created here (lazily, on the remote actor) rather than in
+        ``__init__`` so the stage instance stays picklable for xenna's pre-launch
+        ``deepcopy`` of the pipeline spec - ``threading.Event`` holds a
+        ``_thread.lock`` which is not picklable.
+        """
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._engine_core_watchdog_loop,
+            name="VllmCaptionStage-EngineCoreWatchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+        logger.debug(f"VllmCaptionStage: started EngineCore watchdog (pid={os.getpid()})")
+
+    def _stop_engine_core_watchdog(self) -> None:
+        """Stop the watchdog and wait briefly for the thread to exit.
+
+        Called from ``destroy()`` before we intentionally kill EngineCore so the
+        watchdog doesn't observe the (intentional) subprocess loss and ``os._exit``
+        the actor mid-teardown. No-op if the watchdog was never started.
+        """
+        if self._watchdog_stop_event is not None:
+            self._watchdog_stop_event.set()
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2.0)
+            if self._watchdog_thread.is_alive():
+                # Thread still running past the join deadline: ``_terminate_vllm_subprocesses``
+                # is about to kill EngineCore, and a still-active watchdog could observe that
+                # kill as a failure and ``os._exit`` mid-teardown. Risk is small and harmless
+                # but worth surfacing if it ever happens.
+                logger.warning("VllmCaptionStage: watchdog thread did not exit within 2s; proceeding with teardown.")
+        self._watchdog_thread = None
+
+    def _engine_core_watchdog_loop(self) -> None:
+        """Periodically check EngineCore liveness; ``os._exit`` the actor if it's gone.
+
+        Complements the pre-call ``_engine_core_is_alive()`` check in ``process_data``,
+        which can only fire on a *new* ``process_data`` call. The pre-call check misses
+        the case where SIGTERM (or any clean-shutdown signal) lands on EngineCore while
+        ``process_data`` is mid-flight inside ``llm.generate()``: vLLM's IPC layer
+        blocks on ``recv()`` against the now-closed pipe forever, so the slot's
+        ``process_data`` never returns and the next call (where our pre-check would
+        run) never happens.
+
+        Implementation notes:
+            - Uses ``os._exit(1)`` rather than ``ray.actor.exit_actor()`` because the
+              latter raises ``SystemExit`` and from a non-main thread only kills the
+              calling thread, leaving the actor (and its wedged slots) alive. ``os._exit``
+              terminates the whole process unconditionally, which Ray observes as
+              ``ActorDiedError`` and xenna's ``_handle_actor_death`` recovers from
+              normally.
+            - Reads stdout/stderr are flushed first because ``os._exit`` skips Python's
+              normal interpreter shutdown (including buffered I/O flushing), so the
+              "exiting actor" log line could otherwise be lost.
+            - Stops cleanly when ``destroy()`` sets the stop event - the loop's
+              ``Event.wait(timeout=...)`` returns True on signal, breaking the loop.
+        """
+        # Snapshot the event reference. ``_start_engine_core_watchdog`` always assigns
+        # a non-None Event before spawning this thread, but the type checker can't see
+        # that invariant - this snapshot both narrows the type and avoids re-reading
+        # the attribute across iterations (cheap defensive practice).
+        stop_event = self._watchdog_stop_event
+        if stop_event is None:
+            return
+        while not stop_event.wait(timeout=_ENGINE_CORE_WATCHDOG_INTERVAL_S):
+            # Defense-in-depth against stale-thread resurrection: if a newer watchdog
+            # has taken over (our snapshot is no longer the instance's active event),
+            # exit quietly. ``_start_engine_core_watchdog`` always installs a fresh
+            # Event, so this only ever fires for an orphaned thread from a prior setup
+            # whose teardown ``join`` timed out.
+            if stop_event is not self._watchdog_stop_event:
+                return
+            if self._llm is None:
+                # Actor is being torn down through the normal path; let it proceed.
+                return
+            if self._engine_core_is_alive():
+                continue
+            logger.error(
+                "vLLM EngineCore subprocess died (watchdog detected after no in-band "
+                "exception); exiting actor so xenna can replace this worker group."
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Must be os._exit (not sys.exit / ray.actor.exit_actor) to escape a wedged
+            # actor from a daemon thread - see this method's docstring for the rationale.
+            os._exit(1)
 
     def _drop_vllm_refs(self) -> None:
         """Release Python-side references to vLLM and force a GC pass.
@@ -856,7 +1096,7 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         return str(text).strip()
 
     @nvtx.annotate("VllmCaptionStage")  # type: ignore[untyped-decorator]
-    def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901
+    def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901, PLR0915
         """Process the data for the vLLM caption stage.
 
         Args:
@@ -867,8 +1107,33 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
 
         """
         if self._llm is None:
-            msg = "vLLM model not initialized, call stage_setup() first"
+            # Reaching this point with no engine means a prior batch's retry path called
+            # ``_reset()`` (which nulls ``self._llm`` via ``destroy()``) and the subsequent
+            # ``stage_setup()`` failed to rebuild it - usually because the GPU is contaminated
+            # with leaked memory from a dead EngineCore subprocess. Raising RuntimeError here
+            # would surface as RayTaskError on the driver (not in xenna's _ACTOR_DEATH_ERRORS),
+            # killing the whole pipeline. Instead, exit the actor cleanly: xenna catches
+            # ActorDiedError, requeues in-flight tasks, and replaces this worker group.
+            msg = "vLLM engine unavailable after retry/recovery"
+            logger.error(f"{msg}; exiting actor so xenna can replace this worker group.")
+            if self._in_ray_actor_context():
+                ray.actor.exit_actor()  # type: ignore[no-untyped-call]  # never returns
+            # Driver / unit-test fallback: surface as a normal exception so the caller sees it.
             raise RuntimeError(msg)
+
+        if not self._engine_core_is_alive():
+            # The vLLM ``LLM`` wrapper still looks healthy from Python's perspective, but
+            # its GPU-resident ``VLLM::EngineCore`` subprocess has exited (e.g. SIGTERM from
+            # the OOM-killer or a container shutdown signal). The next vLLM call would
+            # block forever in an IPC ``recv()`` against the closed pipe, leaving xenna
+            # unable to detect or recover the worker. Hand off to xenna proactively.
+            logger.error(
+                "vLLM EngineCore subprocess unavailable; exiting actor so xenna can replace this worker group."
+            )
+            if self._in_ray_actor_context():
+                ray.actor.exit_actor()  # type: ignore[no-untyped-call]  # never returns
+            # Driver / unit-test fallback: tests with mocked ``_llm`` won't have a real
+            # EngineCore subprocess - skip the exit and let the mocked ``generate`` path run.
 
         if self._sampling_params is None:
             msg = "Sampling parameters not initialized, call stage_setup() first"

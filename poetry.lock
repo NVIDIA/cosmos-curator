@@ -977,16 +977,16 @@ colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [[package]]
 name = "cosmos-xenna"
-version = "0.4.2"
+version = "0.4.3"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 optional = true
 python-versions = ">=3.12"
 groups = ["main"]
 markers = "extra == \"local\""
 files = [
-    {file = "cosmos_xenna-0.4.2-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:bda28e3a3bf9fc57897601cd5ebabac30d705e77c1d9f971667d4690ab327d35"},
-    {file = "cosmos_xenna-0.4.2-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:946585b2913a72f55830d8820604cc89cddecc8d2c88fed63723ffab21574bd1"},
-    {file = "cosmos_xenna-0.4.2.tar.gz", hash = "sha256:ccc7eef06d0e96346ea25d21f6fd4e51741def1668e1286f58ad794d470c01da"},
+    {file = "cosmos_xenna-0.4.3-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f0f6bac5d7393a1b4f3d3eae6b59fbd2eecadc86a3c76b2135e30a3a50f50d96"},
+    {file = "cosmos_xenna-0.4.3-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ac4aa03ab6337bd88ac996aecaf0cec57e2f931dacbd146428e78ab7e5b57746"},
+    {file = "cosmos_xenna-0.4.3.tar.gz", hash = "sha256:38fd16cda3aec67ba88817ba71416bd81689423f9c3ffb0c20b360fc99a3b579"},
 ]
 
 [package.dependencies]
@@ -8638,4 +8638,4 @@ local = ["Pillow", "aiofiles", "astral", "attrs", "av", "awscli", "awscli_plugin
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.13"
-content-hash = "f4412608c8d802ae6261a3515c05f8023d6ca9e5dddeaf71dea7b99ec770db45"
+content-hash = "a48fd9e13405d26fb5ab31dc17456fd19d3629d012abb89e2ac06214388e4a63"

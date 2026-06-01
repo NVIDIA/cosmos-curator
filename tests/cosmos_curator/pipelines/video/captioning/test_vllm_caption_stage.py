@@ -14,6 +14,7 @@
 # limitations under the License.
 """Test vllm_caption_stage.py."""
 
+import threading
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import attrs
+import psutil
 import pytest
 
 from cosmos_curator.core.utils.model import conda_utils
@@ -635,3 +637,211 @@ def test_setup_on_node_handles_copy_failure(tmp_path: Path) -> None:
             # Either the directory doesn't exist or it exists but is empty
             if dest_dir.exists():
                 assert not any(dest_dir.iterdir()), f"Expected {dest_dir} to be empty after failed copy"
+
+
+# ---------------------------------------------------------------------------
+# EngineCore liveness / orphan-reaper / watchdog helpers.
+#
+# These exercise the actor-death recovery hardening added alongside the
+# xenna 0.4.3 bump. They are intentionally CPU-only (no ``env`` marker): every
+# path is driven through mocked ``psutil`` / ``threading`` primitives, so no
+# GPU, vLLM, or real subprocess is required.
+# ---------------------------------------------------------------------------
+
+
+def _make_watchdog_stage() -> "vllm_caption_stage.VllmCaptionStage":
+    """Construct a bare ``VllmCaptionStage`` for liveness/watchdog unit tests.
+
+    Construction is cheap on CPU (matches the other non-env tests above) and the
+    watchdog/liveness helpers only touch ``_watchdog_thread``, ``_watchdog_stop_event``,
+    and ``_llm`` plus the (mocked) ``psutil`` surface.
+    """
+    return vllm_caption_stage.VllmCaptionStage(vllm_config=VllmConfig(model_variant="qwen"))
+
+
+def _fake_proc(cmdline: list[str], status: str = psutil.STATUS_RUNNING) -> MagicMock:
+    """Return a ``psutil.Process``-like mock with the given cmdline/status."""
+    proc = MagicMock()
+    proc.cmdline.return_value = cmdline
+    proc.status.return_value = status
+    return proc
+
+
+def test_is_live_engine_core_detects_running_engine_core() -> None:
+    """A running process whose cmdline mentions EngineCore is reported live."""
+    proc = _fake_proc(["python", "-c", "from vllm ... VLLM::EngineCore"])
+    assert vllm_caption_stage.VllmCaptionStage._is_live_engine_core(proc) is True
+
+
+def test_is_live_engine_core_ignores_non_engine_core() -> None:
+    """A process without EngineCore in its cmdline is not a live EngineCore."""
+    proc = _fake_proc(["bash", "-c", "sleep"])
+    assert vllm_caption_stage.VllmCaptionStage._is_live_engine_core(proc) is False
+
+
+def test_is_live_engine_core_treats_zombie_as_dead() -> None:
+    """A zombie/dead EngineCore must not count as live."""
+    zombie = _fake_proc(["VLLM::EngineCore"], status=psutil.STATUS_ZOMBIE)
+    assert vllm_caption_stage.VllmCaptionStage._is_live_engine_core(zombie) is False
+
+
+def test_is_live_engine_core_handles_vanished_process() -> None:
+    """If the process vanishes mid-inspection, treat it as not-live (no raise)."""
+    proc = MagicMock()
+    proc.cmdline.side_effect = psutil.NoSuchProcess(1234)
+    assert vllm_caption_stage.VllmCaptionStage._is_live_engine_core(proc) is False
+
+
+def test_engine_core_is_alive_true_when_child_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At least one live EngineCore child => alive."""
+    stage = _make_watchdog_stage()
+    parent = MagicMock()
+    parent.children.return_value = [_fake_proc(["bash"]), _fake_proc(["VLLM::EngineCore"])]
+    monkeypatch.setattr(vllm_caption_stage.psutil, "Process", lambda: parent)
+    assert stage._engine_core_is_alive() is True
+
+
+def test_engine_core_is_alive_false_when_no_engine_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Children present but none are EngineCore => dead."""
+    stage = _make_watchdog_stage()
+    parent = MagicMock()
+    parent.children.return_value = [_fake_proc(["bash"]), _fake_proc(["python", "other"])]
+    monkeypatch.setattr(vllm_caption_stage.psutil, "Process", lambda: parent)
+    assert stage._engine_core_is_alive() is False
+
+
+def test_engine_core_is_alive_false_on_no_such_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If our own process record vanishes, report dead."""
+    stage = _make_watchdog_stage()
+    parent = MagicMock()
+    parent.children.side_effect = psutil.NoSuchProcess(1)
+    monkeypatch.setattr(vllm_caption_stage.psutil, "Process", lambda: parent)
+    assert stage._engine_core_is_alive() is False
+
+
+def test_engine_core_is_alive_fails_open_on_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When psutil cannot enumerate children, assume alive (no false-positive recovery)."""
+    stage = _make_watchdog_stage()
+    parent = MagicMock()
+    parent.children.side_effect = psutil.AccessDenied()
+    monkeypatch.setattr(vllm_caption_stage.psutil, "Process", lambda: parent)
+    assert stage._engine_core_is_alive() is True
+
+
+def test_in_ray_actor_context_false_outside_actor() -> None:
+    """Outside a Ray actor (i.e. under pytest) the guard must report False."""
+    assert vllm_caption_stage.VllmCaptionStage._in_ray_actor_context() is False
+
+
+def test_kill_orphan_engine_cores_skips_when_actor_is_pid_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the actor itself is PID 1, the sweep is skipped (can't disambiguate orphans)."""
+    stage = _make_watchdog_stage()
+    monkeypatch.setattr(vllm_caption_stage.os, "getpid", lambda: 1)
+    process_iter = MagicMock()
+    monkeypatch.setattr(vllm_caption_stage.psutil, "process_iter", process_iter)
+    stage._kill_orphan_engine_cores()
+    process_iter.assert_not_called()
+
+
+def test_kill_orphan_engine_cores_kills_only_reparented_orphans(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only EngineCore procs reparented to PID 1 are killed; live siblings are untouched."""
+    stage = _make_watchdog_stage()
+    monkeypatch.setattr(vllm_caption_stage.os, "getpid", lambda: 42)
+
+    orphan = MagicMock()
+    orphan.info = {"pid": 100, "ppid": 1, "cmdline": ["python", "VLLM::EngineCore"]}
+    live_sibling = MagicMock()  # ppid points at a live actor, not init
+    live_sibling.info = {"pid": 101, "ppid": 42, "cmdline": ["python", "VLLM::EngineCore"]}
+    unrelated_orphan = MagicMock()  # reparented to init but not an EngineCore
+    unrelated_orphan.info = {"pid": 102, "ppid": 1, "cmdline": ["bash", "-c", "sleep"]}
+
+    monkeypatch.setattr(
+        vllm_caption_stage.psutil,
+        "process_iter",
+        lambda _attrs: [orphan, live_sibling, unrelated_orphan],
+    )
+    monkeypatch.setattr(vllm_caption_stage.psutil, "wait_procs", lambda procs, **_kwargs: (procs, []))
+
+    stage._kill_orphan_engine_cores()
+
+    orphan.kill.assert_called_once()
+    live_sibling.kill.assert_not_called()
+    unrelated_orphan.kill.assert_not_called()
+
+
+def test_watchdog_start_is_idempotent_and_stops_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second start while alive reuses the running thread; stop joins and clears it."""
+    stage = _make_watchdog_stage()
+    stage._llm = object()  # keep the loop from early-returning on ``_llm is None``
+    monkeypatch.setattr(vllm_caption_stage, "_ENGINE_CORE_WATCHDOG_INTERVAL_S", 0.01)
+    monkeypatch.setattr(stage, "_engine_core_is_alive", lambda: True)
+
+    stage._start_engine_core_watchdog()
+    first_thread = stage._watchdog_thread
+    assert first_thread is not None
+    assert first_thread.is_alive()
+
+    stage._start_engine_core_watchdog()
+    assert stage._watchdog_thread is first_thread  # no second thread spawned
+
+    stage._stop_engine_core_watchdog()
+    assert stage._watchdog_thread is None
+    first_thread.join(timeout=5.0)
+    assert not first_thread.is_alive()
+
+
+def test_watchdog_is_not_resurrected_after_stop_then_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test for the watchdog resurrection bug.
+
+    If ``_stop_engine_core_watchdog`` cannot join the thread within its deadline (the
+    thread is wedged mid liveness check), it nulls ``_watchdog_thread`` while the old
+    thread is still alive. The previous implementation reused and ``clear()``-ed the
+    shared stop ``Event`` on the next start, which un-signalled the stale thread's
+    ``wait()`` and resurrected it -- leaving two live watchdogs. The fix installs a
+    fresh ``Event`` per start (plus an identity guard in the loop), so the stale thread
+    observes its own already-``set()`` event and exits.
+    """
+    stage = _make_watchdog_stage()
+    stage._llm = object()
+    monkeypatch.setattr(vllm_caption_stage, "_ENGINE_CORE_WATCHDOG_INTERVAL_S", 0.01)
+
+    call_started = threading.Event()
+    release_gate = threading.Event()
+
+    def gated_alive() -> bool:
+        # Mark that a watchdog iteration reached the liveness check, then block until
+        # the test releases it. Returning True prevents the loop from calling os._exit.
+        call_started.set()
+        release_gate.wait(timeout=10.0)
+        return True
+
+    monkeypatch.setattr(stage, "_engine_core_is_alive", gated_alive)
+
+    # Start the first watchdog and wait until it is wedged inside the gated check.
+    stage._start_engine_core_watchdog()
+    old_thread = stage._watchdog_thread
+    assert old_thread is not None
+    assert call_started.wait(timeout=5.0)
+
+    # Stop it: the thread is blocked in the gated check, so join() times out and
+    # ``_watchdog_thread`` is reset to None while the old thread is still alive.
+    stage._stop_engine_core_watchdog()
+    assert old_thread.is_alive()
+
+    # Start a replacement. With the fix this installs a brand-new Event.
+    stage._start_engine_core_watchdog()
+    new_thread = stage._watchdog_thread
+    assert new_thread is not None
+    assert new_thread is not old_thread
+
+    # Release the gate: the stale thread must observe its own already-set() event
+    # (and the identity guard) and exit instead of looping forever.
+    release_gate.set()
+    old_thread.join(timeout=5.0)
+    assert not old_thread.is_alive(), "stale watchdog thread was resurrected"
+    assert new_thread.is_alive()
+
+    # Cleanup the replacement watchdog.
+    stage._stop_engine_core_watchdog()
+    new_thread.join(timeout=5.0)
+    assert not new_thread.is_alive()

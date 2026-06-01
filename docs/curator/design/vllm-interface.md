@@ -431,7 +431,7 @@ Generate initial captions, then refine them with additional context for higher q
 
 ### Stage 2: Caption Refinement
 
-**Input**: 
+**Input**:
 - Original video frames
 - Stage 1 caption
 - Refinement prompt (e.g., "Improve and refine following video description...")
