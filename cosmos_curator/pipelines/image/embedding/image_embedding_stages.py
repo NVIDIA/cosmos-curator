@@ -28,7 +28,7 @@ from cosmos_curator.core.interfaces.stage_interface import CuratorStage, Curator
 from cosmos_curator.core.utils.config.config import maybe_load_config, resolve_model_name_auto
 from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_cleanup, gpu_stage_startup
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.models.clip import CLIPImageEmbeddings
 from cosmos_curator.models.cosmos_embed1 import CosmosEmbed1
 from cosmos_curator.models.internvideo2_mm import InternVideo2MultiModality
@@ -38,7 +38,7 @@ from cosmos_curator.pipelines.image.utils.data_model import ImagePipeTask
 if TYPE_CHECKING:
     import openai
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import openai
 
 

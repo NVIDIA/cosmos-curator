@@ -29,7 +29,7 @@ from cosmos_curator.core.interfaces.stage_interface import (
     CuratorStageSpec,
     PipelineTask,
 )
-from cosmos_curator.core.utils.model.conda_utils import get_conda_env_name
+from cosmos_curator.core.utils.model.pixi_utils import get_env_name
 from cosmos_curator.models.gpt2 import GPT2
 
 EXAMPLE_PROMPTS = ["The KEY TO A CREATING GOOD art is", "Once upon a time"]
@@ -50,7 +50,7 @@ class HelloWorldTask(PipelineTask):
 
 def get_processing_log_str(component_name: str, prompt: str) -> str:
     """Format a consistent processing log message for pipeline components."""
-    return f"processing task prompt='{prompt}' in stage={component_name} pid={os.getpid()} env={get_conda_env_name()}"
+    return f"processing task prompt='{prompt}' in stage={component_name} pid={os.getpid()} env={get_env_name()}"
 
 
 def _get_stage_processing_log_str(stage: CuratorStage, task: HelloWorldTask) -> str:

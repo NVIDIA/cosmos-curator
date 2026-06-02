@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig
 
 # Heavy vLLM imports are env-gated: the ``unified`` pixi env carries vLLM
@@ -44,7 +44,7 @@ from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, Vll
 # tests themselves are skipped via ``pytestmark``.  ``VllmCosmosReason2VL``
 # joined this set as part of cosmos_r2 onboarding -- import it from the
 # same conditional so test bodies do not need a per-test local import.
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from cosmos_curator.models import vllm_cosmos_reason1_vl, vllm_nemotron, vllm_qwen
     from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
 

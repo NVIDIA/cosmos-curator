@@ -26,9 +26,9 @@ from typing import Any
 import nvtx  # type: ignore[import-untyped]
 import torch
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import cvcuda  # type: ignore[import-untyped]
     import PyNvVideoCodec as Nvc  # type: ignore[import-untyped]
 

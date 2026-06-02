@@ -27,7 +27,7 @@ from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_startup
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.models.all_models import get_all_models_by_id
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
@@ -45,7 +45,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 
 IMAGE_FACTOR = 28
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import torch
     from PIL import Image as PILImage
     from torchvision import transforms  # type: ignore[import-untyped]

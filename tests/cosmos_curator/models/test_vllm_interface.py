@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import (
     TokenCounts,
     VllmCaptionRequest,
@@ -30,7 +30,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     WindowConfig,
 )
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import torch
     from vllm import SamplingParams
 
@@ -60,7 +60,7 @@ else:
 @pytest.fixture(autouse=True)
 def patch_vllm_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch _VLLM_PLUGINS dict with {"mock": MockVllmPlugin} for every test in this module."""
-    if conda_utils.is_running_in_env("unified"):
+    if pixi_utils.is_running_in_env("unified"):
         monkeypatch.setitem(
             _VLLM_PLUGINS,
             "mock",

@@ -25,7 +25,7 @@ import attrs
 import psutil
 import pytest
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.models.vllm_model_ids import _VLLM_MODELS
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.video.captioning import vllm_caption_stage
@@ -40,7 +40,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     WindowConfig,
 )
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import torch
 
     from cosmos_curator.models.vllm_interface import _VLLM_PLUGINS, VllmWindowResult

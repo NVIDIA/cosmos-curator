@@ -84,7 +84,7 @@ from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_cleanup, 
 from cosmos_curator.core.utils.infra.performance_utils import StagePerfStats
 from cosmos_curator.core.utils.infra.tracing import TracedSpan, traced_span
 from cosmos_curator.core.utils.misc.logging_utils import make_tagged_logger
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.pipelines.video.captioning.single_inference import SingleInferenceCaptionStage
@@ -114,7 +114,7 @@ if TYPE_CHECKING:
     from cosmos_curator.models.vllm_interface import VllmWindowResult
     from cosmos_curator.models.vllm_plugin import VllmPlugin
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from vllm.utils.gc_utils import freeze_gc_heap
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.exceptions import EngineDeadError

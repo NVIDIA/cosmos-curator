@@ -22,9 +22,9 @@ import numpy.typing as npt
 import torch
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from torchvision import transforms  # type: ignore[import-untyped]
     from transformers import CLIPModel
 else:

@@ -24,13 +24,13 @@ from nvtx import nvtx  # type: ignore[import-untyped]
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.utils.config.config import maybe_load_config, resolve_model_name_auto
 from cosmos_curator.core.utils.misc import grouping
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 
 if TYPE_CHECKING:
     from openai import OpenAI as OpenAIClient
     from vllm.model_executor.layers.quantization import QuantizationMethods
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from openai import OpenAI as OpenAIClient
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams

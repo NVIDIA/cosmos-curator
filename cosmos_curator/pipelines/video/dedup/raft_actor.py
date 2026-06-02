@@ -35,9 +35,9 @@ from typing import Any, TypeVar
 import ray
 from loguru import logger
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 
-if conda_utils.is_running_in_env("cuml"):
+if pixi_utils.is_running_in_env("cuml"):
     from pylibraft.common import DeviceResources  # type: ignore[import-not-found]
     from raft_dask.common import nccl  # type: ignore[import-not-found]
     from raft_dask.common.comms_utils import inject_comms_on_handle_coll_only  # type: ignore[import-not-found]

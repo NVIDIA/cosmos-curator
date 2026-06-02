@@ -26,10 +26,10 @@ from loguru import logger
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.config.operation_context import make_pipeline_named_temporary_file
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask
 
-if conda_utils.is_running_in_env("unified") and torch.cuda.is_available():
+if pixi_utils.is_running_in_env("unified") and torch.cuda.is_available():
     from cosmos_curator.pipelines.video.utils.nvcodec_utils import PyNvcFrameExtractor
 else:
     PyNvcFrameExtractor = None

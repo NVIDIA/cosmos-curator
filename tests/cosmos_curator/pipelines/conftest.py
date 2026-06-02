@@ -24,29 +24,29 @@ import pytest
 import torch
 
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
+from cosmos_curator.core.utils.environment import PIXI_ENVIRONMENT_NAME_VAR_NAME
 from tests.utils.sequential_runner import SequentialRunner
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """When the user runs `pytest -m env`, filter tests by environment.
 
-    `@pytest.mark.env("<name>")` argument must matche the current
-    CONDA_DEFAULT_ENV.  Everything else is deselected.
+    `@pytest.mark.env("<name>")` argument must match the current
+    Pixi environment. Everything else is deselected.
     """
     # Was the user's command-line marker expression exactly `env`?
     if (config.option.markexpr or "").strip() != "env":
         # User didn't ask for the env filter; do nothing special.
         return
 
-    current_env = os.environ.get("CONDA_DEFAULT_ENV")
+    current_env = os.environ.get(PIXI_ENVIRONMENT_NAME_VAR_NAME)
     if not current_env:
-        # No active conda env ⇒ deselect all tests with the marker.
+        # No active Pixi env means env-marked tests cannot be matched.
         marked_tests = [item for item in items if item.get_closest_marker("env") is not None]
         if marked_tests:
             config.hook.pytest_deselected(items=marked_tests)
             items[:] = [item for item in items if item.get_closest_marker("env") is None]
         return
-    current_env = current_env.removeprefix("cosmos-curator:")
 
     selected, deselected = [], []
     for item in items:

@@ -23,13 +23,13 @@ import numpy.typing as npt
 import tenacity
 from PIL import Image
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 
 if TYPE_CHECKING:
     import openai
     from openai.types.create_embedding_response import CreateEmbeddingResponse
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import openai
     from openai.types.create_embedding_response import CreateEmbeddingResponse
 

@@ -29,11 +29,11 @@ from torch import nn
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.utils.environment import CONTAINER_PATHS_CODE_DIR
 from cosmos_curator.core.utils.misc import grouping
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 
 # pyright: reportMissingImports=false
 # pyright: reportUnboundVariable=false
-if conda_utils.is_running_in_env("legacy-transformers"):
+if pixi_utils.is_running_in_env("legacy-transformers"):
     from transformers import BatchEncoding, PreTrainedTokenizer  # noqa: F401
 
     from .internvideo2_multi_modality.bert.builder import build_bert

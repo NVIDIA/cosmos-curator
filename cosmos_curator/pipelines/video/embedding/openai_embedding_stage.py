@@ -25,7 +25,7 @@ from loguru import logger
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.config.config import maybe_load_config, resolve_model_name_auto
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.common.openai_embedding_utils import call_openai_embedding_api, frame_to_base64_jpeg
 from cosmos_curator.pipelines.video.utils.data_model import (
     Clip,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     import openai
 
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import openai
 
 

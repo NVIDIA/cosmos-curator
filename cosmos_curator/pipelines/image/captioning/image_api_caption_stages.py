@@ -27,7 +27,7 @@ from loguru import logger
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.config.config import load_config, maybe_load_config
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.models.prompts import get_prompt
 from cosmos_curator.pipelines.common.api_caption_utils import (
     create_openai_client_and_resolve_model,
@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from google import genai
     from google.genai import types as genai_types
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     import openai
     from google import genai
     from google.api_core.exceptions import DeadlineExceeded

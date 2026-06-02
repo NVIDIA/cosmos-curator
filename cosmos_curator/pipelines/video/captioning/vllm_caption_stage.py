@@ -51,7 +51,7 @@ from cosmos_curator.core.utils.infra.gpu_start_helper import (
     gpu_stage_startup,
 )
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 from cosmos_curator.models.all_models import get_all_models_by_id
 from cosmos_curator.models.prompts import get_prompt, get_stage2_prompt
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
@@ -70,7 +70,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     get_video_from_task,
 )
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     if TYPE_CHECKING:
         from transformers import AutoProcessor
         from vllm import LLM, SamplingParams

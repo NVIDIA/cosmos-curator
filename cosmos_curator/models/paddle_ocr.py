@@ -29,14 +29,14 @@ import cv2
 from loguru import logger
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 
 if TYPE_CHECKING:
     import paddle  # type: ignore[import-not-found]
     import paddle.inference  # type: ignore[import-not-found]
     from paddleocr import PaddleOCR  # type: ignore[import-not-found]
 
-if conda_utils.is_running_in_env("paddle-ocr") or conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("paddle-ocr") or pixi_utils.is_running_in_env("unified"):
     import paddle  # type: ignore[import-not-found]
     import paddle.inference  # type: ignore[import-not-found]
     from paddleocr import PaddleOCR

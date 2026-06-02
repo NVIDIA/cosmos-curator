@@ -12,17 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Utilities for dealing with conda environments."""
+"""Utilities for dealing with Pixi environments."""
 
 import os
 
+from cosmos_curator.core.utils.environment import PIXI_ENVIRONMENT_NAME_VAR_NAME
+
 
 def is_running_in_env(env_name: str) -> bool:
-    """Check whether python is running under a given env name."""
-    current_conda_env = os.environ.get("CONDA_DEFAULT_ENV", "")
-    return current_conda_env in (env_name, f"cosmos-curator:{env_name}")
+    """Check whether Python is running under a given Pixi environment name."""
+    return os.environ.get(PIXI_ENVIRONMENT_NAME_VAR_NAME) == env_name
 
 
-def get_conda_env_name() -> str:
-    """Return the name of the current conda environment."""
-    return os.environ.get("CONDA_DEFAULT_ENV", "")
+def get_env_name() -> str:
+    """Return the name of the current Pixi environment."""
+    return os.environ.get(PIXI_ENVIRONMENT_NAME_VAR_NAME, "")

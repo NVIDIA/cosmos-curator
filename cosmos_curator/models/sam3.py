@@ -27,12 +27,12 @@ import torch
 from loguru import logger
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 
 if TYPE_CHECKING:
     from transformers import Sam3VideoConfig, Sam3VideoModel, Sam3VideoProcessor  # type: ignore[attr-defined]
 
-if conda_utils.is_running_in_env("sam3"):
+if pixi_utils.is_running_in_env("sam3"):
     from transformers import Sam3VideoConfig, Sam3VideoModel, Sam3VideoProcessor  # type: ignore[attr-defined]
 
 _SAM3_MODEL_ID = "facebook/sam3"

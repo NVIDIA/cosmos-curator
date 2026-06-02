@@ -22,7 +22,7 @@ import torch
 from loguru import logger
 
 from cosmos_curator.core.utils.config.operation_context import make_pipeline_named_temporary_file
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import (
     Clip,
     Video,
@@ -32,7 +32,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 from cosmos_curator.pipelines.video.utils.decoder_utils import DEFAULT_TRANSCODE_BITRATE_M, get_frame_count
 from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from cosmos_curator.pipelines.video.utils.vision_process import fetch_video
 
 

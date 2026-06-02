@@ -19,10 +19,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from cosmos_curator.core.utils.model import conda_utils
+from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
 
-if conda_utils.is_running_in_env("unified"):
+if pixi_utils.is_running_in_env("unified"):
     from cosmos_curator.models.vllm_qwen import (
         VllmQwen,
         VllmQwen3VL,

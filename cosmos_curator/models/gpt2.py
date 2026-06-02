@@ -18,11 +18,11 @@
 from loguru import logger
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
-from cosmos_curator.core.utils.model import conda_utils, model_utils
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
 
 # pyright: reportMissingImports=false
 # pyright: reportUnboundVariable=false
-if conda_utils.is_running_in_env("default"):
+if pixi_utils.is_running_in_env("default"):
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 
@@ -71,7 +71,7 @@ class GPT2(ModelInterface):
 
         """
         # this runs in the specified conda environment on the actor
-        logger.info(f"Setting up GPT2 model in env={conda_utils.get_conda_env_name()}")
+        logger.info(f"Setting up GPT2 model in env={pixi_utils.get_env_name()}")
         model_dir = model_utils.get_local_dir_for_weights_name(self.model_id_names[0])
         self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         self.model = GPT2LMHeadModel.from_pretrained(model_dir)
