@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for cosmos_curator.core.utils.storage.presigned_s3_zip."""
 
+import argparse
 import contextlib
 import io
 import math
@@ -33,6 +34,7 @@ from cosmos_curator.core.utils.storage.presigned_s3_zip import (
     _download_and_extract_zip_single_node,
     _validate_archive_size,
     _validate_upload_completion,
+    _write_split_metadata,
     zip_and_upload_directory,
     zip_and_upload_directory_multipart,
 )
@@ -174,6 +176,57 @@ def test_zip_and_upload_directory_round_trip(tmp_path: Path) -> None:
         assert set(zf.namelist()) == {"beta/", "beta/nested.bin", "alpha.txt"}
         assert zf.read("alpha.txt") == b"alpha"
         assert zf.read("beta/nested.bin") == expected_bytes
+
+
+def test_write_split_metadata_skips_all_captions_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Presigned split uploads should not rebuild aggregate captions unless opted in."""
+    called = False
+
+    def fake_write_all_window_captions(**_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip._write_all_window_captions",
+        fake_write_all_window_captions,
+    )
+
+    _write_split_metadata(
+        argparse.Namespace(input_video_path="/input", write_all_caption_json=False),
+        "/output",
+    )
+
+    assert called is False
+
+
+def test_write_split_metadata_rebuilds_all_captions_when_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The positive all-captions option should reach the presigned metadata rewrite path."""
+    called = False
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip.get_storage_client",
+        lambda *args, **_kwargs: f"client:{args[0]}",
+    )
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip.get_files_relative",
+        lambda *_args, **_kwargs: ["video.mp4"],
+    )
+
+    def fake_write_all_window_captions(**_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip._write_all_window_captions",
+        fake_write_all_window_captions,
+    )
+
+    _write_split_metadata(
+        argparse.Namespace(input_video_path="/input", write_all_caption_json=True),
+        "/output",
+    )
+
+    assert called is True
 
 
 def test_zip_and_upload_directory_multipart(tmp_path: Path) -> None:

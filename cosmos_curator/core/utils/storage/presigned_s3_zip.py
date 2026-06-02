@@ -605,6 +605,9 @@ def _get_output_path(pipeline_type: str, args: argparse.Namespace) -> str | None
 
 def _write_split_metadata(args: argparse.Namespace, output_path: str) -> None:
     """Write consolidated window-captions metadata for split pipeline."""
+    if not getattr(args, "write_all_caption_json", False):
+        return
+
     logger.info("Re-writing consolidated window-captions metadata …")
     input_client = get_storage_client(args.input_video_path)
     output_client = get_storage_client(output_path, can_overwrite=True)

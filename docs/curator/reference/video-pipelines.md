@@ -91,7 +91,7 @@ Today the split-annotate pipeline produces the following artifacts under the pat
 │   ├── {clip-uuid}_{frame_range}.webp
 ├── processed_videos/               # record for each processed input videos
 │   ├── {input-video-relpath}.json
-├── v0/all_window_captions.json     # aggregattion of all the captions generated for all the clips
+├── v0/all_window_captions.json     # optional aggregation of all captions; enabled by `--write-all-caption-json`
 ├── summary.json                    # summary of the pipeline results
 ├── caption_quality_stats.json      # caption structural-health counters; emitted for captioning unless disabled
 ```
@@ -196,6 +196,7 @@ In case you want the output to be in a different S3 bucket than the input, you c
 - `--no-generate-captions`: disables VLM captioning; use `"generate_captions": false` in API endpoint.
 - `--no-caption-quality-stats`: disables the run-level `caption_quality_stats.json` artifact; use `"caption_quality_stats_enabled": false` in API endpoint.
 - `--no-caption-quality-flags`: disables heuristic caption-quality flag annotations in per-clip metadata.
+- `--write-all-caption-json`: writes the optional `v0/all_window_captions.json` aggregate caption artifact.
 - `--generate-previews`: enables web preview generation when captioning is enabled.
 - `--upload-clip-info-in-chunks`: enables metadata jsonl for a group of clips and disables per-clip embedding & metadata writes.
 - `--upload-cds-parquet`: enables generating parquet files for Milvus indexing.

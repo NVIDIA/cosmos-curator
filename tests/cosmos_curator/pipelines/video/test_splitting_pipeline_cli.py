@@ -117,6 +117,26 @@ def test_no_caption_quality_stats_reaches_clip_writer(monkeypatch: pytest.Monkey
     assert writers[0]._caption_quality_stats_enabled is False
 
 
+def test_write_all_caption_json_default_disabled() -> None:
+    """Aggregate caption JSON should be opt-in."""
+    args = _parser().parse_args([])
+
+    assert args.write_all_caption_json is False
+
+
+def test_write_all_caption_json_opt_in() -> None:
+    """The positive flag should enable aggregate caption JSON."""
+    args = _parser().parse_args(["--write-all-caption-json"])
+
+    assert args.write_all_caption_json is True
+
+
+def test_no_write_all_caption_json_flag_removed() -> None:
+    """The old negative flag should no longer be accepted."""
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--no-write-all-caption-json"])
+
+
 @pytest.mark.parametrize(
     "caption_algo",
     ["qwen", "qwen3_6_27b", "qwen3_vl_30b", "cosmos_r1", "cosmos_r2", "nemotron"],

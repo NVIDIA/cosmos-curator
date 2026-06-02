@@ -175,20 +175,18 @@ The remaining question is whether model batching or training/export paths still 
 **Open question:** Which Cosmos training/export paths still consume window-level videos, captions, or T5 embeddings?
 Those consumers decide whether windowing can be removed from outputs or only hidden from the default output contract.
 
-### 5. Make "all captions" JSON opt-in for large runs
+### 5. Make "all captions" JSON opt-in
 
-**Recommendation:** Change `--write-all-caption-json` from default-on to default-off in scalable config presets, and
-eventually make it explicit everywhere.
+**Recommendation:** Keep `--write-all-caption-json` as an explicit opt-in artifact.
 
 **Current behavior:** The split summary writer builds `v0/all_window_captions.json` from processed-video chunk records
-when `write_all_caption_json` is true. The CLI default is true, with `--no-write-all-caption-json` as the opt-out.
+when `write_all_caption_json` is true. The CLI default is false, and `--write-all-caption-json` opts in.
 
 **Motivation:** A single aggregate caption JSON is convenient for manual inspection, but it is another legacy export
 that can grow large and duplicates information already present in metadata. In a Lance-default world, this should be an
 export command or explicit compatibility artifact, not default output.
 
-**Compatibility plan:** Add an explicit `--write-all-caption-json` positive flag, keep the old negative flag with a
-warning for one release, and document how to generate the aggregate from Lance when needed.
+**Compatibility plan:** Remove the old negative flag and document how to generate the aggregate from Lance when needed.
 
 ### 6. Treat per-clip embedding pickles as compatibility output
 
@@ -233,8 +231,7 @@ removes many `conda_env_name == "unified"` special cases.
 2. Add versioned pipeline config schemas, resolved-config validation, and packaged preset support.
 3. Prune obsolete built-in model variants and remove their docs/tests.
 4. Merge `unified` into `default` and update stage environment declarations.
-5. Add `--metadata-output-format`, map old metadata flags to it, and warn when users rely on old metadata flags or the
-   all-captions JSON default.
+5. Add `--metadata-output-format`, map old metadata flags to it, and warn when users rely on old metadata flags.
 6. Update first-party readers to support Lance metadata.
-7. Flip scalable config presets to Lance, grouped embeddings, and no aggregate caption JSON.
+7. Flip scalable config presets to Lance and grouped embeddings.
 8. Audit window consumers and remove or hide window-level output contracts where they are not required.

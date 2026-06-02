@@ -1227,11 +1227,11 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         help="Generate Cosmos-Predict2 post-training dataset.",
     )
     parser.add_argument(
-        "--no-write-all-caption-json",
+        "--write-all-caption-json",
         dest="write_all_caption_json",
-        action="store_false",
-        default=True,
-        help="Whether to write all captions to a single JSON file in the output path.",
+        action="store_true",
+        default=False,
+        help="Write all captions to a single JSON file in the output path.",
     )
     # --- SAM3 tracking + per-event VLM captioning (optional) ---
     add_sam3_args(parser)
