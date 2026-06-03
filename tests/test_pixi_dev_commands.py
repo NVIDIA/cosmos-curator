@@ -72,11 +72,12 @@ def test_developer_tools_are_declared_in_pixi_dev() -> None:
         assert pixi_dependency.startswith("==")
 
     assert conda_dependencies["pre-commit"] == "==4.2.0"
+    assert "nvtop" in conda_dependencies
     assert "python-build" in conda_dependencies
     assert "cosmos-curator" in dev_dependencies
     assert "awscli" in dev_dependencies
     assert "awscli-plugin-endpoint" in dev_dependencies
-    required_tasks = {"build", "cosmos-curator", "mypy", "pre-commit", "pytest", "ruff"}
+    required_tasks = {"build", "cosmos-curator", "mypy", "nvtop", "pre-commit", "pytest", "ruff"}
     assert required_tasks.issubset(dev_tasks)
     for task_name in required_tasks:
         task_command = dev_tasks[task_name]

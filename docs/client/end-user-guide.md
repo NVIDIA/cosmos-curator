@@ -141,6 +141,9 @@ manage NVCF resources. Runtime container images are focused on pipeline executio
 `pixi run --as-is` with the Pixi task aliases shown below, or `pixi run --as-is python -m cosmos_curator...` for modules
 without a task alias.
 
+On Linux GPU hosts, the `dev` environment also includes `nvtop`; run `pixi run nvtop` to monitor GPU utilization and
+memory during local Docker launches.
+
 ## Quick Start for Local Run
 
 **The overall workflow is as follows:**

@@ -96,6 +96,7 @@ ruff = "==0.15.15"
 channels = ["conda-forge"]
 
 [feature.dev.dependencies]
+nvtop = "*"
 pre-commit = "==4.2.0"
 pytest-mock = "*"
 python-build = "*"
@@ -126,6 +127,7 @@ types-tqdm = "*"
 build = "python -m build"
 cosmos-curator = "python -m cosmos_curator.client.cli"
 mypy = "mypy"
+nvtop = "nvtop"
 pre-commit = "pre-commit"
 pytest = "pytest"
 ruff = "ruff"

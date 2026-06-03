@@ -156,6 +156,9 @@ pytest tests/test_pixi_dev_commands.py
 python -m build
 ```
 
+The `dev` environment also includes `nvtop`; run `pixi run nvtop` for interactive GPU utilization and memory monitoring
+on Linux GPU hosts.
+
 Note: For pipeline execution, always use the Docker container as shown in the testing section.
 
 ### Interactive Slurm Development
