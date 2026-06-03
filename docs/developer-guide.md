@@ -226,12 +226,13 @@ Inside `pixi shell -e dev`, use the same `PYTEST_ADDOPTS` value with `pytest -s`
 
 ### Model and Stage Tests
 
-Launch the docker container locally and simply run `pytest` command:
+Launch the docker container locally and run the `gputest` task, which runs the
+env-marked model and stage tests:
 
 ```bash
 for conda_env in default legacy-transformers unified; do
    cosmos-curator local launch --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
-   -- pixi run --as-is -e $conda_env pytest -m env tests/cosmos_curator/{pipelines,models}/;
+   -- pixi run --as-is -e $conda_env gputest;
 done
 
 ================ test session starts ================

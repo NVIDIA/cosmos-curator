@@ -17,16 +17,17 @@ pixi install --frozen "${ENV_ARGS[@]}"
 WHEEL_DIR="/config/project/cosmos-xenna/target/wheels" \
     bash /config/project/.gitlab/scripts/install_local_xenna_into_pixi.sh "${ENVS[@]}"
 
-# Run tests for each environment with unique report files and coverage
+# Run tests for each environment with unique report files and coverage.
+# The `gputest` task bakes in `pytest -m env <test paths>`; the flags below are
+# forwarded to pytest.
 for env in "${ENVS[@]}"; do
   echo "Running tests for $env environment"
-  pixi run --as-is -e $env pytest -m env -n "${PYTEST_XDIST_WORKERS}" \
+  pixi run --as-is -e $env gputest -n "${PYTEST_XDIST_WORKERS}" \
     --junitxml="/config/project/$env-report.xml" \
     --cov=cosmos_curator \
     --cov-report=term \
     --cov-report=xml:/config/project/$env-coverage.xml \
-    --cov-report=html:/config/project/$env-htmlcov \
-    tests/cosmos_curator/pipelines tests/cosmos_curator/models
+    --cov-report=html:/config/project/$env-htmlcov
 
   # Save the coverage data file for each environment
   if [ -f .coverage ]; then

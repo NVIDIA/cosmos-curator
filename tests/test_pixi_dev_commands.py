@@ -20,6 +20,7 @@ substitutes for running the commands themselves. They verify that:
 
 - Pixi carries the tools needed for local development, CI checks, and package
   builds.
+- The `gputest` task is exposed on `core` so every GPU runtime env can run it.
 - The Pixi `dev` feature stays isolated from runtime environments and image
   defaults so lint tooling is not installed in production containers.
 """
@@ -95,6 +96,18 @@ def test_local_test_plugins_are_available_in_pixi_dev() -> None:
     assert isinstance(dev_dependencies, dict)
 
     assert "pytest-mock" in dev_dependencies
+
+
+def test_gputest_task_is_defined_on_core() -> None:
+    """Verify the GPU/env test task lives on `core` so every runtime env has it."""
+    pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
+    core_tasks = pixi_config.get("feature", {}).get("core", {}).get("tasks")
+    assert isinstance(core_tasks, dict)
+
+    gputest = core_tasks["gputest"]
+    assert isinstance(gputest, str)
+    assert "pytest -m env" in gputest
+    assert "gputest" in core_tasks
 
 
 def test_developer_commands_run_in_dev_environment_only() -> None:
