@@ -23,10 +23,11 @@ import pathlib
 import re
 import shutil
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from typing import IO, Any
 
 import attrs
+import botocore.exceptions
 from loguru import logger
 
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
@@ -1169,3 +1170,36 @@ def get_smart_open_client_params(client: StorageClient) -> dict[str, Any]:
         return {"transport_params": {"client": client.service_client}}
     msg = f"Unsupported StorageClient type for smart_open bridge: {type(client)}"
     raise TypeError(msg)
+
+
+def get_smart_open_params(output_root: str, *, profile_name: str | None = None) -> Mapping[str, Any]:
+    """Resolve ``smart_open`` ``client_params`` for ``output_root`` in one call.
+
+    Convenience over ``get_storage_client`` + ``get_smart_open_client_params``
+    when the caller only needs the params (not the client itself). Returns an
+    empty mapping for local paths.
+    """
+    profile_name = profile_name or "default"
+    client = get_storage_client(output_root, profile_name=profile_name)
+    return get_smart_open_client_params(client) if client is not None else {}
+
+
+def is_missing_object_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` represents 'file/object not found' for a supported backend.
+
+    Covers two cases:
+
+    * Local filesystem -- Python raises :class:`FileNotFoundError` directly.
+    * S3 via ``smart_open`` -- ``smart_open`` wraps boto3's NoSuchKey
+      ``botocore.exceptions.ClientError`` in a plain :class:`OSError` and
+      preserves the original via ``__cause__`` / ``__context__``.
+
+    Lets callers do EAFP without an extra existence probe round-trip.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return True
+    cause = exc.__cause__ or exc.__context__
+    if isinstance(cause, botocore.exceptions.ClientError):
+        response = cause.response or {}
+        return response.get("Error", {}).get("Code") == "NoSuchKey"
+    return False

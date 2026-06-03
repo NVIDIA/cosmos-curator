@@ -210,6 +210,9 @@ pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (model-download omits core)
 [feature.transformers.dependencies]
 transformers = ">=4.57.1,<5.0.0" # Transformers v5 changes apply_chat_template to return BatchEncoding instead of input_ids
 
+[feature.transformers.pypi-dependencies]
+sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch==2.11.0
+
 [feature.unified.dependencies]
 cuda-libraries-dev = "*"
 libgl = "*" # paddleocr -> opencv-python needs libGL.so.1; previously satisfied transitively via FFmpeg's conda deps

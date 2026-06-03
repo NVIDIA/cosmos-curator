@@ -19,6 +19,13 @@
         "precision": "FP32",
         "nvcf_model_id": "bert_large_uncased"
     },
+    "bge_small_en_v1_5": {
+        "model_id": "BAAI/bge-small-en-v1.5",
+        "version": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "bge_small_en_v1_5"
+    },
     "clip_vit": {
         "model_id": "openai/clip-vit-large-patch14",
         "version": "32bd64288804d66eefd0ccbe215aa642df71cc41",

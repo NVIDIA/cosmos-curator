@@ -348,3 +348,36 @@ def test_extract_parquet_files_filters_and_limits(tmp_path: Path) -> None:
     assert len(results) == 1
     assert isinstance(results[0], Path)
     assert results[0].name == "a.parquet"
+
+
+def _oserror_from_s3_code(code: str) -> OSError:
+    """Build the OSError-wraps-ClientError chain that smart_open produces for an S3 error."""
+    import botocore.exceptions  # noqa: PLC0415 -- only needed in this helper
+
+    boto_exc = botocore.exceptions.ClientError(
+        error_response={"Error": {"Code": code, "Message": "test"}},
+        operation_name="GetObject",
+    )
+    wrapped = OSError(f"unable to access object (code={code})")
+    wrapped.__cause__ = boto_exc
+    return wrapped
+
+
+def test_is_missing_object_error_detects_local_filenotfound() -> None:
+    """FileNotFoundError (raised by Python's open() for local paths) reads as missing."""
+    assert storage_utils.is_missing_object_error(FileNotFoundError("nope"))
+
+
+def test_is_missing_object_error_detects_s3_nosuchkey_chained_in_oserror() -> None:
+    """smart_open wraps boto3's NoSuchKey ClientError in OSError; the chained cause flags it as missing."""
+    assert storage_utils.is_missing_object_error(_oserror_from_s3_code("NoSuchKey"))
+
+
+def test_is_missing_object_error_rejects_other_client_errors() -> None:
+    """A non-NoSuchKey ClientError (e.g. AccessDenied) is treated as 'present but unreadable'."""
+    assert not storage_utils.is_missing_object_error(_oserror_from_s3_code("AccessDenied"))
+
+
+def test_is_missing_object_error_rejects_unrelated_exceptions() -> None:
+    """A plain ValueError (e.g. decode failure) is not 'missing' -- it's 'unreadable'."""
+    assert not storage_utils.is_missing_object_error(ValueError("bad bytes"))

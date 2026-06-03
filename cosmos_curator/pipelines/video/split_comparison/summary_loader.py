@@ -12,36 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Storage-backed loading for split pipeline summaries."""
+"""Storage-backed loader for split pipeline ``summary.json``."""
 
 import json
 import pathlib
-from typing import cast
 
 import smart_open  # type: ignore[import-untyped]
 
 from cosmos_curator.core.utils.storage import storage_utils
 from cosmos_curator.core.utils.storage.storage_client import StoragePrefix
-from cosmos_curator.pipelines.video.output_comparison.json_types import JsonDictObject
-from cosmos_curator.pipelines.video.output_comparison.summary_schema import OutputSummary
+from cosmos_curator.pipelines.video.split_comparison.summary_schema import OutputSummary
 
 OutputRoot = str | pathlib.Path | StoragePrefix
 
 
-def load_summary(
-    output_root: OutputRoot,
-    *,
-    profile_name: str,
-) -> OutputSummary:
-    """Load ``summary.json`` from an output root.
+def load_summary(output_root: OutputRoot, *, profile_name: str) -> OutputSummary:
+    """Load and validate ``summary.json`` from a split pipeline output root.
 
-    Args:
-        output_root: Split pipeline output root.
-        profile_name: Storage profile used for remote paths.
-
-    Returns:
-        Loaded typed summary.
-
+    Raises ``OSError`` / ``json.JSONDecodeError`` on IO + parse failure and
+    pydantic ``ValidationError`` on schema mismatch. The driver catches all of
+    these and routes them into a ``summary_load_failed`` issue.
     """
     summary_path = storage_utils.get_full_path(output_root, "summary.json")
     client = storage_utils.get_storage_client(str(summary_path), profile_name=profile_name)
@@ -51,4 +41,4 @@ def load_summary(
     if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
         error_msg = "summary.json must contain a JSON object with string keys"
         raise ValueError(error_msg)
-    return OutputSummary.from_json_dict(cast("JsonDictObject", data))
+    return OutputSummary.from_json(data)

@@ -14,8 +14,9 @@
 # limitations under the License.
 """Video index and metadata classes for the sensor library."""
 
+import typing
 from fractions import Fraction
-from typing import Protocol, Self
+from typing import ClassVar, Protocol, Self
 
 import attrs
 import numpy as np
@@ -25,6 +26,15 @@ from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import bool_array, int64_array, strictly_increasing_int64_array
 
 VIDEO_METADATA_VERSION = "1"
+
+
+def _is_ndarray_field(attr: attrs.Attribute) -> bool:  # type: ignore[type-arg]
+    """Return True iff ``attr`` is annotated as ``numpy.typing.NDArray[...]``.
+
+    ``numpy.typing.NDArray`` is a generic alias of ``numpy.ndarray``; we use
+    :func:`typing.get_origin` to extract the underlying class and compare.
+    """
+    return typing.get_origin(attr.type) is np.ndarray
 
 
 class _HasVideoPacketFields(Protocol):
@@ -237,6 +247,50 @@ class VideoIndex:
             and bool(np.all(self.kf_pts_stream == other.kf_pts_stream))
             and self.time_base == other.time_base
         )
+
+    # Lazily filled by :meth:`packet_array_fields` / :meth:`scalar_fields`.
+    # ``ClassVar`` keeps attrs from treating these as per-instance fields; we
+    # mutate them on the class object itself, so the frozen-instance contract
+    # is unaffected. Per-class storage is enforced via ``cls.__dict__`` lookup
+    # (not attribute access) so a subclass with its own field set doesn't
+    # silently inherit the parent's cached tuple via MRO.
+    _cached_packet_array_fields: ClassVar[tuple[str, ...] | None] = None
+    _cached_scalar_fields: ClassVar[tuple[str, ...] | None] = None
+
+    @classmethod
+    def packet_array_fields(cls) -> tuple[str, ...]:
+        """Return the names of the per-packet ``ndarray`` attributes on this class.
+
+        Filtered by attrs metadata: init=True, not underscore-prefixed (skips
+        the ``_display_*`` caches), and annotated as ``numpy.typing.NDArray[...]``.
+        Result is cached per-class on first call. Useful for downstream code
+        that needs to iterate per-packet arrays (e.g. the split-comparison
+        audit tool) without hardcoding a list that drifts as ``VideoIndex``
+        evolves.
+        """
+        cached: tuple[str, ...] | None = cls.__dict__.get("_cached_packet_array_fields")
+        if cached is None:
+            cached = tuple(
+                f.name for f in attrs.fields(cls) if f.init and not f.name.startswith("_") and _is_ndarray_field(f)
+            )
+            cls._cached_packet_array_fields = cached
+        return cached
+
+    @classmethod
+    def scalar_fields(cls) -> tuple[str, ...]:
+        """Return the names of the scalar (non-array) attributes on this class.
+
+        Complement of :meth:`packet_array_fields` over the init=True,
+        non-underscore-prefixed attrs fields. Today this is just
+        ``("time_base",)``; any future non-array init field auto-appears.
+        """
+        cached: tuple[str, ...] | None = cls.__dict__.get("_cached_scalar_fields")
+        if cached is None:
+            cached = tuple(
+                f.name for f in attrs.fields(cls) if f.init and not f.name.startswith("_") and not _is_ndarray_field(f)
+            )
+            cls._cached_scalar_fields = cached
+        return cached
 
 
 @attrs.define(frozen=True)
