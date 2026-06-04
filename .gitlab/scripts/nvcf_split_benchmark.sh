@@ -89,7 +89,7 @@ for captioning_algorithm in "${_captioning_algorithm_list[@]}"; do
       for splitting_algorithm in "${_splitting_algo_list[@]}"; do
         PERF_S3_OUTPUT_DIR="${PERF_S3_ROOT_DIR}/${date_str}_model_${captioning_algorithm}_nodes_${num_nodes}_caption_${caption}_${splitting_algorithm}"
         echo "PERF_S3_OUTPUT_DIR: ${PERF_S3_OUTPUT_DIR}"
-        python benchmarks/split_pipeline/nvcf_split_benchmark.py \
+        python -m benchmarks.split_pipeline.nvcf_split_benchmark \
           --num-nodes "${num_nodes}" \
           --caption "${caption}" \
           --splitting-algorithm "${splitting_algorithm}" \

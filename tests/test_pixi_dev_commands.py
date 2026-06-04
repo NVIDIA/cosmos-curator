@@ -192,6 +192,14 @@ def test_slurm_end_to_end_uses_pixi_dev_for_submit_cli() -> None:
     assert "uv venv" not in commands
 
 
+def test_nvcf_split_benchmark_runs_as_package_module() -> None:
+    """Verify the NVCF split benchmark preserves repo-root imports."""
+    script = _read_repo_file(".gitlab/scripts/nvcf_split_benchmark.sh")
+
+    assert "python -m benchmarks.split_pipeline.nvcf_split_benchmark" in script
+    assert "python benchmarks/split_pipeline/nvcf_split_benchmark.py" not in script
+
+
 def test_image_cli_default_envs_do_not_include_dev() -> None:
     """Verify image env parsing does not add the developer tooling environment by default."""
     default_envs = set(_parse_envs(""))
