@@ -24,7 +24,7 @@ import socket
 import uuid
 from collections.abc import Callable, Iterable
 
-from click import BadParameter
+from typer import BadParameter
 
 
 def validate_uuid(value: str | None) -> str | None:

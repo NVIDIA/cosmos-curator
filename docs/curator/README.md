@@ -33,6 +33,7 @@ This directory collects documentation for the curator pipeline layer. It is orga
 - [Captioning Approaches](design/captioning-approaches.md) - comparison of captioning architectures.
 - [Deprecation and Default Changes](design/deprecation.md) - proposed cleanup of legacy features and large-run defaults.
 - [Multi-Camera Design](design/multicam.md) - multi-camera data model and implementation plan.
+- [Release Versioning Design](design/release-versioning.md) - tag-derived release and package versioning.
 - [Ray Data Design](design/ray-data.md) - Ray Data direction and implementation notes.
 - [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.
 - [Split Output Comparison Design](design/split-output-comparison.md) - feature-comparator design for split output reports.

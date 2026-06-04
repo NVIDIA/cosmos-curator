@@ -320,6 +320,9 @@ stages:
     command -v pixi
     export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
     export PYTHONNOUSERSITE=1
+    export CONDA_OVERRIDE_CUDA="${CONDA_OVERRIDE_CUDA:-13.0.2}"
+    git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
+    : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
     pixi install --frozen -e dev
     eval "$(pixi shell-hook -e dev -s bash)"
 
@@ -336,11 +339,15 @@ stages:
   # PyPI-pinned release. The helper is a no-op when no wheel artifact is
   # present.
   setup_curator: &setup_curator |
+    git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
+    : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
     python -m pip install --no-deps -e .
     bash .gitlab/scripts/install_local_xenna_wheel_if_present.sh
 
   # Install the checked-out curator CLI package.
   setup_curator_cli: &setup_curator_cli |
+    git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
+    : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
     python -m pip install --no-deps -e .
 
   # Configure cosmos-curator nvcf CLI
@@ -355,10 +362,41 @@ ruff:
   variables:
     GIT_SUBMODULE_STRATEGY: none
   rules: *pre_merge_rules
+  needs: []
   script:
     - *setup_ci_builder_env
     - ruff format --check
     - ruff check
+
+resolve_version:
+  stage: .pre
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $REFRESH_CI_BUILDER_IMAGE == "True"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && ($RUN_PROMOTE_TO_PROD == "True" || $RUN_BENCHMARK == "True")'
+    - when: never
+  script:
+    - *install_pixi_if_missing
+    - export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
+    - export PYTHONNOUSERSITE=1
+    - export CONDA_OVERRIDE_CUDA="${CONDA_OVERRIDE_CUDA:-13.0.2}"
+    - bash .gitlab/scripts/fetch_git_metadata.sh
+    - pixi install --frozen -e dev
+    - VERSION="$(pixi run --as-is -e dev python -m setuptools_scm)"
+    - 'echo "Resolved cosmos-curator package version: ${VERSION}"'
+    - printf 'SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR=%s\n' "${VERSION}" > version.env
+  artifacts:
+    reports:
+      dotenv: version.env
 
 # Build cosmos-xenna wheels (amd64 + arm64) once per pipeline and publish them
 # as artifacts so every downstream consumer can pick the arch they need:
@@ -385,6 +423,7 @@ build_xenna_wheels:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)use-local-xenna-build($|,)/'
       when: on_success
     - when: never
+  needs: []
   script:
     - bash .gitlab/scripts/build_xenna_wheel.sh
     - ls -la cosmos-xenna/target/wheels/
@@ -411,6 +450,8 @@ mypy:
     - build-runner  # Override to Docker executor
   rules: *pre_merge_rules
   needs:
+    - job: resolve_version
+      artifacts: true
     - job: build_xenna_wheels
       optional: true
       artifacts: true
@@ -425,6 +466,8 @@ mypy:
 unit_tests:
   stage: test
   needs:
+    - job: resolve_version
+      artifacts: true
     - job: build_xenna_wheels
       optional: true
       artifacts: true
@@ -457,7 +500,9 @@ unit_tests:
 
 client_wheel_smoke:
   stage: test
-  needs: []
+  needs:
+    - job: resolve_version
+      artifacts: true
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner
@@ -731,7 +776,9 @@ gpu_tests:
   # present, run_env_tests.sh inside the container overrides the
   # pixi-installed cosmos-xenna with the locally-built wheel before tests run.
   needs:
-    - build_deploy_curator_slim
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator_slim
     - job: build_xenna_wheels
       optional: true
       artifacts: true
@@ -795,7 +842,10 @@ slurm_end_to_end:
   id_tokens:
     VAULT_JWT_TOKEN:
       aud: ${VAULT_ADDR}
-  needs: ["build_deploy_curator_slim"]
+  needs:
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator_slim
   rules: *merge_result_and_web_rules
   tags:
     - ${SLURM_RUNNER_TAG}
@@ -873,7 +923,10 @@ semgrep-sast:
 # Run end-to-end tests on NVCF cluster
 nvcf-helm:
   stage: end-to-end
-  needs: ["build_deploy_curator"]
+  needs:
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator
   rules: *merge_result_and_web_rules
   image: ${CI_BUILDER_IMAGE}
   tags:
@@ -976,6 +1029,9 @@ resolve_nvcf_staging_tag:
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner
+  needs:
+    - job: resolve_version
+      artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $RUN_BENCHMARK == "True" && $NVCF_SPLIT_BENCHMARK_SOURCE_REF != ""'
       when: never
@@ -1018,36 +1074,19 @@ promote_to_prod:
 build-packages:
   stage: post-merge
   rules: *schedule_rules_promote
+  needs:
+    - job: resolve_version
+      artifacts: true
+  variables:
+    GIT_DEPTH: "0"
   id_tokens:
     VAULT_JWT_TOKEN:
       aud: ${VAULT_ADDR}
   before_script:
     - source .gitlab/vault/vault-auth.sh
     - *setup_pixi_dev
-    - TIMESTAMP=$(date -d ${CI_COMMIT_TIMESTAMP} +%s)
-    - VERSION=$(grep -m 1 'version = ' pyproject.toml | cut -d'"' -f2)
-    - export PKG_VERSION="${VERSION}.dev${TIMESTAMP}"
-    - echo "Building package for ${PKG_VERSION}"
-    - |
-      python - <<'PY'
-      import os
-      import re
-      from pathlib import Path
-
-      path = Path("pyproject.toml")
-      version = os.environ["PKG_VERSION"]
-      contents, count = re.subn(
-          r'(?m)^version = "[^"]+"$',
-          f'version = "{version}"',
-          path.read_text(encoding="utf-8"),
-          count=1,
-      )
-      if count != 1:
-          raise SystemExit("Expected exactly one project version in pyproject.toml")
-      path.write_text(contents, encoding="utf-8")
-      PY
-    - python -m build
   script:
+    - python -m build
     - twine upload --skip-existing -u gitlab-ci-token -p ${CI_JOB_TOKEN} --repository-url
       "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" dist/*
     - twine upload --skip-existing -u ${ARTIFACTORY_USER} -p ${ARTIFACTORY_TOKEN} --repository-url
@@ -1061,6 +1100,8 @@ nvcf_split_benchmark:
   tags:
     - build-runner
   needs:
+    - job: resolve_version
+      artifacts: true
     - job: resolve_nvcf_staging_tag
       artifacts: true
       optional: true
@@ -1089,7 +1130,9 @@ k8s_gpu_tests:
   # present, the before_script overrides the pixi-installed cosmos-xenna with
   # the locally-built wheel before tests run.
   needs:
-    - build_deploy_curator_slim
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator_slim
     - job: build_xenna_wheels
       optional: true
       artifacts: true

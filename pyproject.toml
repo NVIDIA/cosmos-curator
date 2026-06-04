@@ -15,7 +15,7 @@
 
 [project]
 name = "cosmos_curator"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Cosmos Curator"
 readme = "README.md"
 authors = [
@@ -64,7 +64,7 @@ Repository = "https://github.com/nvidia-cosmos/cosmos-curate.git"
 cosmos-curator = 'cosmos_curator.client.cli:cosmos_curator'
 
 [build-system]
-requires = ["setuptools==80.7.1", "jinja2>=3.1.6", "tomli>=2.2.1", "wheel"]
+requires = ["setuptools==80.7.1", "setuptools-scm[simple]>=8", "jinja2>=3.1.6", "tomli>=2.2.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
@@ -81,6 +81,9 @@ build-backend = "setuptools.build_meta"
     "clip_viewer_webdocs/*",
     "clip_viewer_webdocs/images/*",
 ]
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
 
 [tool.coverage.run]
 omit = [

@@ -19,7 +19,7 @@ import socket
 import uuid
 
 import pytest
-from click import BadParameter
+from typer import BadParameter
 
 from cosmos_curator.client.utils.validations import (  # type: ignore[import-untyped]
     validate_address,

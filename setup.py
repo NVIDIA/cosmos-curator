@@ -29,29 +29,22 @@ import tomli
 from setuptools import find_packages, setup
 
 
-def load_metadata() -> tuple[str, str, str, str, str, list[str]]:
-    """Load package metadata from pyproject.toml.
+def load_project_name() -> str:
+    """Load the package name from pyproject.toml.
 
-    Extracts package name, version, description, and dependencies from the
-    pyproject.toml configuration file.
+    Package metadata, including the dynamic version, is supplied by pyproject.toml
+    and setuptools-scm. This script only needs the name for build-directory paths.
 
     Returns:
-        tuple: Contains name, version, description, and dependencies list.
+        Package name.
 
     """
     with Path("pyproject.toml").open("rb") as f:
         pyproject = tomli.load(f)
-    project = pyproject["project"]
-    name = project["name"]
-    version = project["version"]
-    lic = project["license"]
-    authors = project["authors"]
-    description = project.get("description", "")
-    deps = pyproject.get("project", {}).get(name, {}).get("dependencies", [])
-    return name, version, lic, authors, description, deps
+    return pyproject["project"]["name"]
 
 
-name, version, lic, authors, description, install_requires = load_metadata()
+name = load_project_name()
 
 build_dir = "build"
 dist_dir = "dist"
@@ -154,10 +147,6 @@ else:
 
 setup(
     name=name,
-    version=version,
-    license=lic,
-    author=authors,
-    description=description,
     packages=find_packages(where=package_search_dir, include=[name, f"{name}.*"]),
     include_package_data=True,
     package_dir=package_dir,
@@ -165,5 +154,4 @@ setup(
         name: ["examples/**/*"],
         f"{name}.client.nvcf_cli.ncf.launcher": ["helm_values/*"],
     },
-    install_requires=install_requires,
 )

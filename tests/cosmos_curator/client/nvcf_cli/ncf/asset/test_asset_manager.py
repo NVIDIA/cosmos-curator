@@ -31,6 +31,7 @@ runner = CliRunner()
 
 _USAGE_ERROR = 2
 _BAD_EXIT_CODE = 1
+_VALID_ASSET_ID = "00000000-0000-0000-0000-000000000000"
 
 
 @pytest.mark.parametrize(
@@ -217,11 +218,11 @@ def test_nvcf_asset_list_asset_detail_command(
             "asset",
             "list-asset-detail",
             "--assetid",
-            "test-asset-id",
+            _VALID_ASSET_ID,
         ]
         result = runner.invoke(cosmos_curator, args)
         # The command should fail because no assets are found (no config set up)
-        assert result.exit_code == _USAGE_ERROR
+        assert result.exit_code == _BAD_EXIT_CODE
 
 
 def test_nvcf_asset_upload_asset_command(
@@ -287,8 +288,8 @@ def test_nvcf_asset_delete_asset_command(
             "asset",
             "delete-asset",
             "--assetid",
-            "test-asset-id",
+            _VALID_ASSET_ID,
         ]
         result = runner.invoke(cosmos_curator, args)
         # The command should fail because no assets are found (no config set up)
-        assert result.exit_code == _USAGE_ERROR
+        assert result.exit_code == _BAD_EXIT_CODE

@@ -34,7 +34,6 @@ import invoke
 import jinja2
 import typer
 from attrs import field, validators
-from click.core import ParameterSource
 from invoke.context import Context
 from invoke.runners import Result as InvokeResult
 from typer import Argument, Option
@@ -384,7 +383,7 @@ def _should_show_shell_help(ctx: typer.Context, command: list[str] | None) -> bo
     if command:
         return False
     return all(
-        ctx.get_parameter_source(parameter_name) is ParameterSource.DEFAULT
+        getattr(ctx.get_parameter_source(parameter_name), "name", None) == "DEFAULT"
         for parameter_name in ctx.params
         if parameter_name != "command"
     )

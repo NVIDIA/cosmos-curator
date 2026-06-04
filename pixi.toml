@@ -101,6 +101,7 @@ nvtop = "*"
 pre-commit = "==4.2.0"
 pytest-mock = "*"
 python-build = "*"
+setuptools-scm = ">=8"
 
 [feature.dev.pypi-dependencies]
 awscli = "*"
