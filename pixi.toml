@@ -75,9 +75,9 @@ uvicorn = "*"
 webdataset = "*" # conda-forge package pulls in pytorch
 
 [feature.core.tasks]
-hello_world = "python -m cosmos_curator.pipelines.examples.hello_world_pipeline"
-model_download = "python -m cosmos_curator.core.managers.model_cli download"
-video_pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
+hello-world = "python -m cosmos_curator.pipelines.examples.hello_world_pipeline"
+model-download = "python -m cosmos_curator.core.managers.model_cli download"
+video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
 gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models"
 
 [feature.dev-hooks]

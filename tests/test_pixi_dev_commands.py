@@ -110,6 +110,24 @@ def test_gputest_task_is_defined_on_core() -> None:
     assert "gputest" in core_tasks
 
 
+def test_user_facing_core_tasks_use_hyphenated_names() -> None:
+    """Verify public Pixi tasks follow the CLI naming style."""
+    pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
+    core_tasks = pixi_config.get("feature", {}).get("core", {}).get("tasks")
+    assert isinstance(core_tasks, dict)
+
+    expected_tasks = {"hello-world", "model-download", "video-pipeline"}
+    for task_name in expected_tasks:
+        task_command = core_tasks[task_name]
+        assert isinstance(task_command, str)
+        assert task_command.startswith("python -m ")
+        assert task_command.removeprefix("python -m ").strip()
+
+    assert "hello_world" not in core_tasks
+    assert "model_download" not in core_tasks
+    assert "video_pipeline" not in core_tasks
+
+
 def test_developer_commands_run_in_dev_environment_only() -> None:
     """Verify developer tooling is isolated from production runtime Pixi environments."""
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
