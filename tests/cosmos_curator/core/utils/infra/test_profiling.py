@@ -94,8 +94,8 @@ def _ensure_valid_otel_provider() -> None:
 def _hide_greenlet() -> Generator[None, None, None]:
     """Temporarily hide greenlet from ``sys.modules`` during each test.
 
-    When the full test suite runs, earlier test files (e.g.
-    ``test_database_utils``) import SQLAlchemy which pulls in greenlet.
+    When the full test suite runs, earlier test files can import libraries that
+    pull in greenlet.
     If memray sees greenlet in ``sys.modules`` it activates experimental
     greenlet tracking that can hang or be extremely slow on some systems.
     The profiling tests don't need greenlet, so we hide it.

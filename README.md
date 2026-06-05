@@ -34,8 +34,7 @@ Comprehensive documentation is available under [docs/](docs/README.md) directory
 
 ### User Documentation
 - [End User Guide](docs/client/end-user-guide.md) - instructions to setup environment and run data pipelines
-- [Reference Video Pipelines Guide](docs/curator/reference/video-pipelines.md) - details for general video processing pipelines
-- [Reference AV Pipelines Guide](docs/curator/reference/av-pipelines.md) - details for multi-camera video, and (upcoming) GPS & LiDAR processing pipelines for autonomous vehicle (AV)
+- [Reference Video Pipelines Guide](docs/curator/reference/video-pipelines.md) - details for general and multi-camera video processing pipelines
 - [NVCF Guide](docs/client/nvcf-guide.md) - deployment instruction on [Nvidia Cloud Functions](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html)
 
 ### Developer Documentation

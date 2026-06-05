@@ -100,13 +100,13 @@ When a stage produces N artifacts per input row (e.g. N clips per video), there 
 
 **Pick `flat_map` when:**
 
-- Inputs are long with many sub-units (AV sessions with thousands of clips per session). A single huge list column
+- Inputs are long with many sub-units (multi-camera sessions with thousands of clips per session). A single huge list column
   per row creates memory pressure and blocks Ray Data's streaming block sizing.
 - Sub-unit counts vary significantly across rows (heavy skew). Row-level parallelism distributes work more uniformly.
 - Downstream stages operate per-sub-unit (per-clip GPU inference). Fan-out once early, reuse the shape throughout.
 - Per-source-unit atomicity can be recovered with a terminal `groupby` or side-channel state.
 
-For cosmos-curator, `flat_map` is the safer default because the pipeline must handle AV sessions in addition to
+For cosmos-curator, `flat_map` is the safer default because the pipeline must handle multi-camera sessions in addition to
 short videos. The current splitting pipeline uses `flat_map` at the transcode stage.
 
 ### Arrow as the internal block format

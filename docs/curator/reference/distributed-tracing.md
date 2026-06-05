@@ -516,7 +516,6 @@ span automatically.
 | **urllib3** | `opentelemetry-instrumentation-urllib3` | Low-level HTTP transport (used by boto3, requests) |
 | **threading** | `opentelemetry-instrumentation-threading` | Context propagation across threads |
 | **logging** | `opentelemetry-instrumentation-logging` | Injects `otelTraceID` / `otelSpanID` into stdlib log records |
-| **sqlalchemy** | `opentelemetry-instrumentation-sqlalchemy` | SQL query spans |
 | **fastapi** | `opentelemetry-instrumentation-fastapi` | Inbound HTTP endpoint spans |
 
 Instrumentors are gated on `importlib.util.find_spec()`, so only

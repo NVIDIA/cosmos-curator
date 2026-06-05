@@ -464,7 +464,7 @@ class ClipWriterStage(CuratorStage):
                     window.webp_bytes.drop()
 
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # type: ignore[override]
-        """Save bytes to blobstore and metadata to postgres."""
+        """Save clip bytes and metadata."""
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
             for video_index, video in enumerate(task.videos):

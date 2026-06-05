@@ -2,7 +2,7 @@
 
 - [Cosmos Curator Documentation](#cosmos-curator-documentation)
   - [Documentation Structure](#documentation-structure)
-    - [1. End User Guide and Reference Pipelines Guide for Video, AV, and Image](#1-end-user-guide-and-reference-pipelines-guide-for-video-av-and-image)
+    - [1. End User Guide and Reference Pipelines Guide for Video and Image](#1-end-user-guide-and-reference-pipelines-guide-for-video-and-image)
     - [2. Architecture Guide and Pipeline Design Guide](#2-architecture-guide-and-pipeline-design-guide)
     - [3. Observability Guide and Deployment Guide for NVCF](#3-observability-guide-and-deployment-guide-for-nvcf)
     - [4. Developer Guide](#4-developer-guide)
@@ -16,14 +16,14 @@ Welcome to the Cosmos Curator documentation. This documentation is organized int
 
 ## Documentation Structure
 
-### 1. [End User Guide](client/end-user-guide.md) and Reference Pipelines Guide for [Video](curator/reference/video-pipelines.md), [AV](curator/reference/av-pipelines.md), and [Image](curator/reference/image-pipeline.md)
+### 1. [End User Guide](client/end-user-guide.md) and Reference Pipelines Guide for [Video](curator/reference/video-pipelines.md) and [Image](curator/reference/image-pipeline.md)
 The end user guide is designed for users who want to use the Cosmos Curator to process and curate videos and images:
 - Prerequisites and environment setup
 - Basic usage instructions
 - Running pipelines
 - Troubleshooting common issues
 
-The reference pipelines guides are for users to understand the details of reference pipelines (video, AV, and image):
+The reference pipelines guides are for users to understand the details of reference pipelines (video and image):
 - Output directory structure of each reference pipeline
 - Explanation of the configuration parameters
 
@@ -93,7 +93,6 @@ graph TD
 1. **New Users**:
    - Start with the [End User Guide](client/end-user-guide.md) to learn how to use the system
    - Refer to the [Reference Video Pipelines Guide](curator/reference/video-pipelines.md) to explore the many options to configure the reference pipelines targeting general videos
-   - Refer to the [Reference AV Pipelines Guide](curator/reference/av-pipelines.md) to explore the many options to configure the reference pipelines targeting autonomous vehicle
    - Refer to the [Reference Image Pipeline Guide](curator/reference/image-pipeline.md) for the image annotate pipeline, including filtering, embedding, captioning, outputs, and key configuration options
 2. **Developers**:
    - Begin with the [Developer Guide](developer-guide.md) to set up your development environment

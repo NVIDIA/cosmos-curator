@@ -62,22 +62,6 @@ class Huggingface:
 
 
 @attrs.define
-class PostgresUser:
-    """A class to represent and interact with Postgres database configuration details."""
-
-    user: str
-    password: str = attrs.field(repr=False)
-    endpoint: str = attrs.field(repr=False)
-
-
-@attrs.define
-class Postgres:
-    """A class to represent and interact with Postgres configuration details."""
-
-    profiles: dict[str, PostgresUser] = attrs.Factory(dict)
-
-
-@attrs.define
 class ConfigFileData:
     """A class to handle the configuration data for cosmos-curator.
 
@@ -107,19 +91,12 @@ class ConfigFileData:
     huggingface:
         user: "abc"
         api_key: "xyz"
-    postgres:
-        profiles:
-            nvc_dev:
-               user: "abc"
-               password: "xyz"
-               endpoint: ""
     ```
     """
 
     openai: OpenAIConfig | None = None
     gemini: Gemini | None = None
     huggingface: Huggingface | None = None
-    postgres: Postgres | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -161,27 +138,6 @@ class ConfigFileData:
         data = cattrs.unstructure(self, ConfigFileData)
         assert isinstance(data, dict)
         return data
-
-    def get_postgres_profile(self, profile_name: str) -> PostgresUser:
-        """Get a Postgres profile from the config file.
-
-        Args:
-            profile_name: The name of the profile to get.
-
-        Returns:
-            The PostgresUser object.
-
-        """
-        if self.postgres is None:
-            error_msg = "Config does not have any Postgres data."
-            raise ValueError(error_msg)
-        if profile_name not in self.postgres.profiles:
-            error_msg = (
-                f"{profile_name=} not found in Postgres config. "
-                f"Available profiles: {sorted(self.postgres.profiles.keys())}."
-            )
-            raise ValueError(error_msg)
-        return self.postgres.profiles[profile_name]
 
 
 def resolve_model_name_auto(client: object, model_name: str, *, endpoint_label: str = "OpenAI") -> str:

@@ -389,7 +389,6 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     if not LOCAL_WORKSPACE_PATH.exists():
         Path(LOCAL_WORKSPACE_PATH).mkdir()
     is_model_cli = command_contains(opts.command, "model_cli")
-    is_postgres_cli = command_contains(opts.command, "postgres_cli")
 
     gpus_string = f'"device={opts.gpus}"' if opts.gpus else "all"
 
@@ -408,7 +407,6 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     )
     scratch_home.mkdir(parents=True, exist_ok=True)
     home_strings = ["-v", f"{scratch_home}:{home_dir}", "-e", f"HOME={home_dir}"]
-    interactive_strings = ["-i"] if is_postgres_cli else []
 
     docker_command = [
         "docker",
@@ -440,7 +438,6 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     for vol in opts.extra_volumes:
         docker_command.extend(["-v", vol])
     docker_command.extend(_get_identity_mounts(scratch_home))
-    docker_command.extend(interactive_strings)
     docker_command.extend(
         [
             "-t",

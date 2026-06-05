@@ -143,7 +143,6 @@ exclude = [
     "build/",
     "dist/",
     "cosmos-xenna/",
-    "cosmos_curator/core/managers/postgres_cli.py",
     "cosmos_curator/models/internvideo2_multi_modality/",
     "cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py",
     "cosmos_curator/pipelines/video/utils/vision_process.py",

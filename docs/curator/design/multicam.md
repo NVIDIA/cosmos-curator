@@ -10,12 +10,6 @@
 - session-based input (prefix + configurable session-dir pattern, no DB).
 - Pipeline will continue to be capable of splitting single-camera video, no functionality change planned.
 
-### Out of scope
-
-- AV pipelines remain untouched (no removal, deprecation, or changes).
-
----
-
 ## Data Model: Multi-Cam in SplitPipeTask and Video
 
 **File**: [cosmos_curator/pipelines/video/utils/data_model.py](../../../cosmos_curator/pipelines/video/utils/data_model.py)

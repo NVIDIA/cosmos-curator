@@ -7,7 +7,7 @@ Cosmos Curator is a video curation system for AI training data generation, built
 **Architecture**: Three-layer modular design
 - `cosmos_curator/client/`: Deployment CLIs (local, Slurm, NVCF, Docker image management)
 - `cosmos_curator/core/`: Base interfaces (`PipelineTask`, `CuratorStage`, `ModelInterface`), managers, utilities
-- `cosmos_curator/pipelines/`: Video/AV pipelines + examples (start with `hello_world_pipeline.py`)
+- `cosmos_curator/pipelines/`: Video and image pipelines + examples (start with `hello_world_pipeline.py`)
 
 ## Development
 

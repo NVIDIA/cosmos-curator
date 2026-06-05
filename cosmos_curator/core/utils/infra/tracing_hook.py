@@ -101,7 +101,6 @@ monkey-patches its target library to emit spans automatically:
 * **threading** -- propagates trace context across threads.
 * **logging** -- injects ``otelTraceID`` / ``otelSpanID`` into
   stdlib ``logging.LogRecord`` attributes.
-* **sqlalchemy** -- spans for SQL queries.
 * **fastapi** -- spans for inbound HTTP endpoints (NVCF).
 
 Instrumentors are gated on ``importlib.util.find_spec()`` so they
@@ -756,7 +755,6 @@ _current_backend: _TracingBackend | None = None
 #   urllib3            opentelemetry-instrumentation-urllib3       Low-level HTTP
 #   threading          opentelemetry-instrumentation-threading    Context propagation
 #   logging            opentelemetry-instrumentation-logging      trace_id in logs
-#   sqlalchemy         opentelemetry-instrumentation-sqlalchemy   SQL queries
 #   fastapi            opentelemetry-instrumentation-fastapi      NVCF HTTP endpoints
 
 
@@ -831,11 +829,6 @@ def _instrument_libraries() -> None:
         "LoggingInstrumentor",
         "logging (trace context injection)",
         set_logging_format=False,
-    )
-
-    # sqlalchemy (SQL query spans)
-    _try_instrument(
-        "sqlalchemy", "opentelemetry.instrumentation.sqlalchemy", "SQLAlchemyInstrumentor", "sqlalchemy (SQL queries)"
     )
 
     # fastapi (NVCF service endpoints)
