@@ -98,13 +98,29 @@ def test_caption_workers_use_downloaded_gpu_count() -> None:
     )
 
 
-def test_transnetv2_frame_decode_cpus_cli_rejects_non_integral_values() -> None:
-    """Decode CPU count maps directly to FFmpeg threads and must be integral."""
+def test_transnetv2_frame_decode_cpus_cli_accepts_positive_integer() -> None:
+    """Decode CPU count maps directly to FFmpeg threads."""
     assert _parse_args("--transnetv2-frame-decode-cpus-per-worker", "2").transnetv2_frame_decode_cpus_per_worker == 2
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_reason"),
+    [
+        ("1.5", "'1.5' is not an integer"),
+        ("0", "'0' must be positive"),
+    ],
+)
+def test_transnetv2_frame_decode_cpus_cli_rejects_non_integral_values(
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+    expected_reason: str,
+) -> None:
+    """Decode CPU count must be a positive integer; argparse rejects other values cleanly."""
     with pytest.raises(SystemExit):
-        _parse_args("--transnetv2-frame-decode-cpus-per-worker", "1.5")
-    with pytest.raises(SystemExit):
-        _parse_args("--transnetv2-frame-decode-cpus-per-worker", "0")
+        _parse_args("--transnetv2-frame-decode-cpus-per-worker", value)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"argument --transnetv2-frame-decode-cpus-per-worker: {expected_reason}" in captured.err
 
 
 def test_configure_ray_data_progress_sets_all_progress_flags() -> None:
@@ -164,20 +180,31 @@ def test_transnetv2_cli_defaults_match_xenna_splitter() -> None:
     assert args.transnetv2_gpus_per_worker == 0.25
 
 
-def test_transnetv2_cli_rejects_invalid_values() -> None:
+@pytest.mark.parametrize(
+    ("flag", "value", "expected_reason"),
+    [
+        ("--transnetv2-threshold", "-0.1", "'-0.1' must be between 0 and 1"),
+        ("--transnetv2-threshold", "1.1", "'1.1' must be between 0 and 1"),
+        ("--transnetv2-threshold", "nan", "'nan' must be finite"),
+        ("--transnetv2-min-length-frames", "0", "'0' must be positive"),
+        ("--transnetv2-min-length-frames", "-1", "'-1' must be positive"),
+        ("--transnetv2-gpus-per-worker", "0", "'0' must be positive"),
+        ("--transnetv2-gpus-per-worker", "-0.25", "'-0.25' must be positive"),
+        ("--transnetv2-gpus-per-worker", "inf", "'inf' must be finite"),
+    ],
+)
+def test_transnetv2_cli_rejects_invalid_values(
+    capsys: pytest.CaptureFixture[str],
+    flag: str,
+    value: str,
+    expected_reason: str,
+) -> None:
     """TransNetV2 CLI values should fail before Ray startup when impossible."""
-    for args in [
-        ("--transnetv2-threshold", "-0.1"),
-        ("--transnetv2-threshold", "1.1"),
-        ("--transnetv2-threshold", "nan"),
-        ("--transnetv2-min-length-frames", "0"),
-        ("--transnetv2-min-length-frames", "-1"),
-        ("--transnetv2-gpus-per-worker", "0"),
-        ("--transnetv2-gpus-per-worker", "-0.25"),
-        ("--transnetv2-gpus-per-worker", "inf"),
-    ]:
-        with pytest.raises(SystemExit):
-            _parse_args(*args)
+    with pytest.raises(SystemExit):
+        _parse_args(flag, value)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"argument {flag}: {expected_reason}" in captured.err
 
 
 def test_required_model_ids_are_gated_by_selected_features(monkeypatch: pytest.MonkeyPatch) -> None:
