@@ -342,7 +342,7 @@ def nvcf_split_benchmark(  # noqa: PLR0913
             "input_video_path": s3_input_prefix,
             "captioning_algorithm": captioning_algorithm,
             "splitting_algorithm": splitting_algorithm,
-            "qwen_preprocess_dtype": "uint8" if caption == 1 else "float16",
+            "qwen_preprocess_dtype": "float16",
             "generate_captions": caption == 1,
             "limit": limit,
             "clip_re_chunk_size": clip_re_chunk_size,

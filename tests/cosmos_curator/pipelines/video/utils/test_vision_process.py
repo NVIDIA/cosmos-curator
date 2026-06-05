@@ -136,3 +136,25 @@ def test_fetch_video_override_uses_exact_max_pixels(monkeypatch: pytest.MonkeyPa
 
     assert captured["smart_resize"]["max_pixels"] == 100500
     assert captured["smart_resize"]["min_pixels"] == vision_process.VIDEO_MIN_PIXELS
+
+
+def test_fetch_video_rejects_uint8_with_curator_preprocess() -> None:
+    """Normalized curator-side tensors must stay in a floating dtype."""
+    with pytest.raises(ValueError, match=r"preprocess_dtype='uint8' is only valid when do_preprocess=False"):
+        vision_process.fetch_video("video.mp4", do_preprocess=True, preprocess_dtype="uint8")
+
+
+def test_fetch_video_allows_uint8_without_curator_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model-side preprocessing paths may still request resized uint8 frames."""
+    _patch_fetch_video_resize(monkeypatch, nframes=4)
+
+    video, frame_counts = vision_process.fetch_video("video.mp4", do_preprocess=False, preprocess_dtype="uint8")
+
+    assert video.dtype == torch.uint8
+    assert frame_counts == [4]
+
+
+def test_fetch_video_rejects_unsupported_preprocess_dtype() -> None:
+    """Unsupported dtype strings should fail before decode instead of falling back."""
+    with pytest.raises(ValueError, match=r"Unsupported preprocess_dtype='float8'"):
+        vision_process.fetch_video("video.mp4", preprocess_dtype="float8")

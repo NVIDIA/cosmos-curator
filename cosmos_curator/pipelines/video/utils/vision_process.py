@@ -146,7 +146,7 @@ def read_video_cpu(
     return video, frame_counts
 
 
-def fetch_video(  # noqa: C901, PLR0911, PLR0913
+def fetch_video(  # noqa: C901, PLR0913
     video_path: str,
     sampling_fps: float = 2.0,
     window_range: list[WindowFrameInfo] | None = None,
@@ -163,8 +163,14 @@ def fetch_video(  # noqa: C901, PLR0911, PLR0913
         video_path: Path to the video file.
         sampling_fps: Target frames per second for sampling.
         window_range: List of frame windows to extract.
-        do_preprocess: Whether to preprocess the frames.
-        preprocess_dtype: Data type for preprocessing.
+        do_preprocess: Whether to preprocess frames with curator-side normalization
+            (rescale to [0,1] + CLIP mean/std) into a model-ready floating-point tensor.
+            Frames are resized to the sampled dimensions either way; when False, they
+            are returned in preprocess_dtype without normalization for downstream
+            model-side preprocessing.
+        preprocess_dtype: Output dtype for prepared frames. Use a floating dtype when
+            do_preprocess is True; uint8 is only valid when do_preprocess is False so
+            downstream model-side preprocessing receives resized frames.
         num_frames_to_use: Number of frames to extract (0 for all).
         flip_input: Whether to flip frames horizontally.
         max_pixels_per_frame: Optional fixed per-frame resize upper bound.
@@ -173,6 +179,20 @@ def fetch_video(  # noqa: C901, PLR0911, PLR0913
         Tuple of (processed frames tensor, frame counts for each window).
 
     """
+    valid_preprocess_dtypes = {"float32", "float16", "bfloat16", "uint8"}
+    if preprocess_dtype not in valid_preprocess_dtypes:
+        msg = f"Unsupported preprocess_dtype={preprocess_dtype!r}. Expected one of {sorted(valid_preprocess_dtypes)}."
+        raise ValueError(msg)
+
+    if do_preprocess and preprocess_dtype == "uint8":
+        msg = (
+            "preprocess_dtype='uint8' is only valid when do_preprocess=False, where fetch_video returns "
+            "resized uint8 frames for downstream model-side preprocessing. With do_preprocess=True, "
+            "curator-side preprocessing normalizes frames into floating-point tensors; casting those normalized "
+            "values to uint8 corrupts the visual input. Use a floating dtype for curator-side preprocessing."
+        )
+        raise ValueError(msg)
+
     if window_range is None:
         window_range = []
     video, frame_counts = read_video_cpu(
@@ -198,13 +218,7 @@ def fetch_video(  # noqa: C901, PLR0911, PLR0913
     )
 
     if do_preprocess:
-        try:
-            desired_dtype = getattr(torch, preprocess_dtype)
-        except AttributeError:
-            desired_dtype = torch.float32  # Fallback to default dtype
-
-        if preprocess_dtype == "uint8":
-            desired_dtype = torch.bfloat16
+        desired_dtype = getattr(torch, preprocess_dtype)
 
         resizeNormTransform = v2.Compose(
             [
@@ -221,8 +235,6 @@ def fetch_video(  # noqa: C901, PLR0911, PLR0913
         if flip_input:
             # Flip along the width and height dims
             video = torch.stack([torch.flip(frame, dims=[1, 2]) for frame in video], dim=0)
-        if preprocess_dtype == "uint8":
-            return video.to(torch.uint8), frame_counts
         return video, frame_counts
     video = transforms.functional.resize(
         video,
