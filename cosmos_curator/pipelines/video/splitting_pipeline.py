@@ -741,6 +741,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             # unless the user opts in to vLLM-side preprocessing.
             window_config.model_does_preprocess = bool(args.vllm_async_preprocess)
         elif caption_algo == "nemotron":
+            vllm_config.preprocess = True
+            window_config.model_does_preprocess = True
             vllm_config.stage2_caption = args.nemotron_stage2_caption
 
         if args.vllm_video_max_pixels_per_frame is not None:

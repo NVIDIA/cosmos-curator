@@ -209,6 +209,26 @@ def test_vllm_video_max_pixels_rejects_unsupported_caption_algorithm(
         _assemble_stages(args)
 
 
+def test_nemotron_forces_model_does_preprocess_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Selecting nemotron must force both preprocess flags to True at the call site.
+
+    Nemotron's intended mode is ``model_does_preprocess=True``: vLLM owns
+    ``do_resize``/``do_rescale``/``do_normalize`` rather than the CPU prep stage.
+    Both ``window_config.model_does_preprocess`` and ``backend.preprocess`` must
+    be True regardless of the dataclass defaults so the contract is visible at
+    the call site and resistant to default drift.
+    """
+    captured = _capture_captioning_config(monkeypatch)
+    args = _caption_args(["--captioning-algorithm", "nemotron"])
+
+    _assemble_stages(args)
+
+    config = captured["config"]
+    assert config.window_config.model_does_preprocess is True
+    assert isinstance(config.backend, VllmConfig)
+    assert config.backend.preprocess is True
+
+
 def test_vllm_video_max_pixels_help_text_names_scope_bounds_and_grid() -> None:
     """Help text should describe the upper-bound scope, bounds, and grid quantization."""
     help_text = _parser().format_help()
