@@ -115,6 +115,8 @@ def build(  # noqa: PLR0913
     cache_to: str | None = None,
     push: bool = False,
     load: bool = True,
+    compression: str | None = None,
+    compression_level: int = 3,
     verbose: bool = False,
 ) -> None:
     """Build a Docker image using buildx with optional registry cache.
@@ -137,6 +139,10 @@ def build(  # noqa: PLR0913
             registry (requires docker-container driver). Default is False.
         load: If True, load the built image into the local Docker
             daemon. Useful for local development. Default is True.
+        compression: Layer compression for the pushed image (e.g. ``"zstd"``
+            or ``"gzip"``). When None (default), BuildKit's default gzip is used.
+        compression_level: Compression level passed through when ``compression``
+            is set. Default is 3.
         verbose: If True, logs detailed information. Default is False.
 
     """
@@ -157,7 +163,20 @@ def build(  # noqa: PLR0913
     if cache_to:
         cmd.extend(["--cache-to", cache_to])
     if push:
-        cmd.extend(["--push"])
+        if compression:
+            # buildx's `--push` shorthand cannot carry compression options, so
+            # spell out the equivalent image exporter when a compression codec
+            # is requested. force-compression=false lets already-compressed
+            # cached layers be reused as-is; oci-mediatypes=true is required for
+            # zstd layers.
+            push_output = (
+                f"type=image,push=true,compression={compression},"
+                f"compression-level={compression_level},"
+                "force-compression=false,oci-mediatypes=true"
+            )
+            cmd.extend(["--output", push_output])
+        else:
+            cmd.extend(["--push"])
     if load:
         cmd.extend(["--load"])
     cmd.extend(

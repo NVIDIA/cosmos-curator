@@ -233,6 +233,8 @@ def test_full_dockerfile_rebuilds_opencv_against_local_ffmpeg(
     assert "CMAKE_BUILD_RPATH=/opt/ffmpeg/lib" in contents
     assert "pip install --no-cache-dir --no-deps /opencv-wheelhouse/opencv_python_headless-*.whl" in contents
     assert 'raise SystemExit(0 if "FFMPEG:                      YES" in info else 1)' in contents
+    assert "rm -rf /pyav-build/.pixi /root/.cache/pip /tmp/pip-*" in contents
+    assert "rm -rf /opencv-build/.pixi /opencv-python-src /root/.cache/pip /tmp/pip-*" in contents
     assert "COPY --from=opencv-builder /opencv-wheelhouse /opt/cosmos-curator-wheelhouse" in contents
     assert "pip uninstall -y opencv-python-headless opencv-python opencv-contrib-python" in contents
     assert (
@@ -322,6 +324,59 @@ def test_full_dockerfile_rewrites_pixi_lock_to_local_video_wheels(
     assert "file:///opt/cosmos-curator-wheelhouse/" in full_contents
     assert "ERROR: full image runtime pixi.lock still references bundled PyPI wheels (av/opencv)" in full_contents
     assert "COPY --chown=1000:1000 pixi.toml pixi.lock" in slim_contents
+
+
+def _capture_build_command(monkeypatch: pytest.MonkeyPatch, **build_kwargs: object) -> list[str]:
+    """Run docker_utils.build with subprocess stubbed and return the buildx command."""
+    captured: dict[str, list[str]] = {}
+
+    def fake_check_call(cmd: list[str], *_args: object, **_kwargs: object) -> int:
+        captured["cmd"] = cmd
+        return 0
+
+    monkeypatch.setattr(docker_utils.subprocess, "check_call", fake_check_call)
+    docker_utils.build(
+        curator_path=Path.cwd(),
+        dockerfile_path=Path("Dockerfile"),
+        image="reg/img:tag",
+        **build_kwargs,  # type: ignore[arg-type]
+    )
+    return captured["cmd"]
+
+
+def test_build_push_with_zstd_uses_explicit_output_exporter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compression + push should replace --push with an --output image exporter."""
+    cmd = _capture_build_command(monkeypatch, push=True, load=False, compression="zstd")
+
+    assert "--push" not in cmd
+    output_value = cmd[cmd.index("--output") + 1]
+    # Assert the meaningful attributes are present without pinning their order,
+    # since BuildKit treats the comma-separated --output keys as unordered.
+    attributes = set(output_value.split(","))
+    assert {
+        "type=image",
+        "push=true",
+        "compression=zstd",
+        "compression-level=3",
+        "force-compression=false",
+        "oci-mediatypes=true",
+    } <= attributes
+
+
+def test_build_push_without_compression_uses_push_shorthand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without compression, the fast --push shorthand is preserved."""
+    cmd = _capture_build_command(monkeypatch, push=True, load=False)
+
+    assert "--push" in cmd
+    assert "--output" not in cmd
+
+
+def test_build_compression_does_not_affect_local_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compression only applies to push; load-only builds keep --load and no exporter."""
+    cmd = _capture_build_command(monkeypatch, push=False, load=True, compression="zstd")
+
+    assert "--load" in cmd
+    assert "--output" not in cmd
 
 
 def test_full_dockerfile_with_cuml_keeps_local_video_wheel_lockfile(

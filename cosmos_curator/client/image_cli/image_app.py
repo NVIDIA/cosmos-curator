@@ -134,6 +134,26 @@ def build(  # noqa: PLR0913
             rich_help_panel="common",
         ),
     ] = True,
+    compression: Annotated[
+        str | None,
+        Option(
+            help=(
+                "Layer compression for the pushed image (e.g. 'zstd' or 'gzip'). "
+                "zstd compresses faster and produces smaller blobs than the default "
+                "gzip, but the registry and every image consumer must support zstd + "
+                "OCI media types. Only affects --push, not --load. Defaults to "
+                "BuildKit's default (gzip) when unset."
+            ),
+            rich_help_panel="common",
+        ),
+    ] = None,
+    compression_level: Annotated[
+        int,
+        Option(
+            help="Compression level used when --compression is set. Ignored otherwise.",
+            rich_help_panel="common",
+        ),
+    ] = 3,
     dry_run: Annotated[
         bool,
         Option(
@@ -242,6 +262,8 @@ def build(  # noqa: PLR0913
         cache_to=cache_to,
         push=push,
         load=load,
+        compression=compression,
+        compression_level=compression_level,
         verbose=verbose,
     )
     logger.info(f"Built docker image: {image_label}")

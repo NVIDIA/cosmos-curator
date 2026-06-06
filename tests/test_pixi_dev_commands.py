@@ -186,10 +186,10 @@ def test_pre_commit_ruff_hooks_use_pixi_dev_hooks_environment() -> None:
     hooks_by_id = {hook["id"]: hook for hook in hooks}
 
     assert hooks_by_id["ruff"]["entry"] == (
-        "pixi run -e dev-hooks ruff check --fix --force-exclude --config=pyproject.toml"
+        "pixi run --frozen -e dev-hooks ruff check --fix --force-exclude --config=pyproject.toml"
     )
     assert hooks_by_id["ruff-format"]["entry"] == (
-        "pixi run -e dev-hooks ruff format --force-exclude --config=pyproject.toml"
+        "pixi run --frozen -e dev-hooks ruff format --force-exclude --config=pyproject.toml"
     )
 
 

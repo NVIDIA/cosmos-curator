@@ -21,12 +21,12 @@ repos:
     hooks:
       - id: ruff
         name: ruff
-        entry: pixi run -e dev-hooks ruff check --fix --force-exclude --config=pyproject.toml
+        entry: pixi run --frozen -e dev-hooks ruff check --fix --force-exclude --config=pyproject.toml
         language: system
         types_or: [python, pyi, jupyter]
       - id: ruff-format
         name: ruff format
-        entry: pixi run -e dev-hooks ruff format --force-exclude --config=pyproject.toml
+        entry: pixi run --frozen -e dev-hooks ruff format --force-exclude --config=pyproject.toml
         language: system
         types_or: [python, pyi, jupyter]
       - id: submodule-check

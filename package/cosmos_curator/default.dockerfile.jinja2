@@ -281,7 +281,8 @@ RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheel
     export LD_LIBRARY_PATH="/opt/ffmpeg/lib:${LD_LIBRARY_PATH:-}" && \
     mkdir -p /pyav-wheelhouse && \
     pixi run --as-is -e default pip wheel --no-binary av --no-cache-dir \
-        --wheel-dir /pyav-wheelhouse av==17.0.0
+        --wheel-dir /pyav-wheelhouse av==17.0.0 && \
+    rm -rf /pyav-build/.pixi /root/.cache/pip /tmp/pip-*
 
 # ---------------------------------------------------------------------------
 # OpenCV builder stage: source-build OpenCV against /opt/ffmpeg
@@ -403,7 +404,8 @@ RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheel
     patch_lock_wheel av av-17.0.0 && \
     patch_lock_wheel opencv-python-headless "opencv_python_headless-${OPENCV_PYTHON_VERSION}"{% if 'paddle-ocr' in envs or 'default' in envs %} && \
     patch_lock_wheel opencv-python "opencv_python-${OPENCV_PYTHON_VERSION}" && \
-    patch_lock_wheel opencv-contrib-python "opencv_contrib_python-${OPENCV_PYTHON_VERSION}"{% endif %}
+    patch_lock_wheel opencv-contrib-python "opencv_contrib_python-${OPENCV_PYTHON_VERSION}"{% endif %} && \
+    rm -rf /opencv-build/.pixi /opencv-python-src /root/.cache/pip /tmp/pip-*
 {% endif %}
 
 # ---------------------------------------------------------------------------
