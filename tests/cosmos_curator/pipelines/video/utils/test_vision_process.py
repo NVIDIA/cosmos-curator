@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.utils import vision_process
 from cosmos_curator.pipelines.video.utils.windowing_utils import WindowFrameInfo
 
@@ -138,23 +139,27 @@ def test_fetch_video_override_uses_exact_max_pixels(monkeypatch: pytest.MonkeyPa
     assert captured["smart_resize"]["min_pixels"] == vision_process.VIDEO_MIN_PIXELS
 
 
-def test_fetch_video_rejects_uint8_with_curator_preprocess() -> None:
-    """Normalized curator-side tensors must stay in a floating dtype."""
-    with pytest.raises(ValueError, match=r"preprocess_dtype='uint8' is only valid when do_preprocess=False"):
-        vision_process.fetch_video("video.mp4", do_preprocess=True, preprocess_dtype="uint8")
-
-
-def test_fetch_video_allows_uint8_without_curator_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Model-side preprocessing paths may still request resized uint8 frames."""
+def test_fetch_video_curator_preprocess_returns_float16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Curator-owned preprocessing emits normalized float16 frames."""
     _patch_fetch_video_resize(monkeypatch, nframes=4)
 
-    video, frame_counts = vision_process.fetch_video("video.mp4", do_preprocess=False, preprocess_dtype="uint8")
+    video, frame_counts = vision_process.fetch_video("video.mp4")
+
+    assert video.dtype == torch.float16
+    assert frame_counts == [4]
+
+
+def test_fetch_video_model_preprocess_returns_uint8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model-side preprocessing receives resized uint8 frames."""
+    _patch_fetch_video_resize(monkeypatch, nframes=4)
+
+    video, frame_counts = vision_process.fetch_video("video.mp4", preprocess_mode=PreprocessMode.MODEL)
 
     assert video.dtype == torch.uint8
     assert frame_counts == [4]
 
 
-def test_fetch_video_rejects_unsupported_preprocess_dtype() -> None:
-    """Unsupported dtype strings should fail before decode instead of falling back."""
-    with pytest.raises(ValueError, match=r"Unsupported preprocess_dtype='float8'"):
-        vision_process.fetch_video("video.mp4", preprocess_dtype="float8")
+def test_fetch_video_rejects_unsupported_preprocess_mode() -> None:
+    """Unsupported preprocess modes fail before decode instead of falling back."""
+    with pytest.raises(ValueError, match=r"'float8' is not a valid PreprocessMode"):
+        vision_process.fetch_video("video.mp4", preprocess_mode="float8")  # type: ignore[arg-type]

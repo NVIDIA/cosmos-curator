@@ -20,6 +20,7 @@ from typing import Any
 
 import attrs
 
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmSamplingConfig
 
 # Matches cosmos_curator.pipelines.video.utils.vision_process.FPS.
@@ -211,12 +212,14 @@ _VLLM_ARG_SPECS: tuple[_VllmArgSpec, ...] = (
         ),
     ),
     _VllmArgSpec(
-        field="preprocess",
+        field="preprocess_mode",
+        arg_type=str,
+        choices=tuple(mode.value for mode in PreprocessMode),
         help=(
-            "Let the vLLM multimodal processor run resize/rescale/normalize on incoming "
-            "frames. False (default) makes the upstream CPU prep stage authoritative for "
-            "deterministic preprocessing (smart_resize + tokenization) and tells vLLM to "
-            "skip its own image preprocessing via mm_processor_kwargs."
+            "Owner of visual resize/rescale/normalize before vLLM inference. "
+            "'curator' (default) makes the CPU prep stage emit normalized float16 frames "
+            "and tells vLLM to skip those processor steps. 'model' hands resized uint8 "
+            "frames to vLLM/HF and enables its multimodal processor."
         ),
     ),
     _VllmArgSpec(
@@ -300,6 +303,11 @@ def build_vllm_async_config(
         if cli_val is None:
             continue
         kwargs[spec.field] = cli_val
+
+    kwargs["preprocess_mode"] = resolve_preprocess_mode(
+        model_variant,
+        kwargs.get("preprocess_mode", PreprocessMode.CURATOR),
+    )
 
     # enable_log_requests is wired from --verbose, not a --vllm-async-* arg
     kwargs["enable_log_requests"] = getattr(args, "verbose", False)

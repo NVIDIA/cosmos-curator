@@ -19,6 +19,7 @@ import pytest
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStageSpec
 from cosmos_curator.core.utils.config.config import ConfigFileData, Gemini
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.image.captioning import image_api_caption_stages
 from cosmos_curator.pipelines.image.captioning.captioning_builders import (
     ImageCaptioningConfig,
@@ -69,8 +70,8 @@ def test_build_image_captioning_stages_enables_model_preprocess_for_qwen3() -> N
     assert isinstance(caption_stage, CuratorStageSpec)
     assert isinstance(prep_stage.stage, ImageVllmPrepStage)
     assert isinstance(caption_stage.stage, ImageVllmCaptionStage)
-    assert prep_stage.stage._vllm_config.preprocess is True
-    assert caption_stage.stage._vllm_config.preprocess is True
+    assert prep_stage.stage._vllm_config.preprocess_mode == PreprocessMode.MODEL
+    assert caption_stage.stage._vllm_config.preprocess_mode == PreprocessMode.MODEL
 
 
 def test_build_image_captioning_stages_leaves_qwen25_preprocess_disabled() -> None:
@@ -80,7 +81,7 @@ def test_build_image_captioning_stages_leaves_qwen25_preprocess_disabled() -> No
     prep_stage = stages[0]
     assert isinstance(prep_stage, CuratorStageSpec)
     assert isinstance(prep_stage.stage, ImageVllmPrepStage)
-    assert prep_stage.stage._vllm_config.preprocess is False
+    assert prep_stage.stage._vllm_config.preprocess_mode == PreprocessMode.CURATOR
 
 
 def test_build_image_captioning_stages_returns_gemini_stage(monkeypatch: pytest.MonkeyPatch) -> None:

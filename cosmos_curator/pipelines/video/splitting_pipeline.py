@@ -50,6 +50,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     is_path_nested,
     verify_path,
 )
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 from cosmos_curator.pipelines.pipeline_args import (
     add_common_args,
 )
@@ -363,6 +364,24 @@ def _get_vllm_sampling_defaults() -> dict[str, Any]:
     return {field.name: getattr(default_config, field.name) for field in attrs.fields(VllmSamplingConfig)}
 
 
+def _validate_deprecated_vllm_preprocess_args(args: argparse.Namespace) -> None:
+    """Reject deprecated vLLM preprocessing CLI flags after argparse accepts them."""
+    deprecated_args = []
+    if getattr(args, "qwen_preprocess_dtype", None) is not None:
+        deprecated_args.append("--qwen-preprocess-dtype")
+    if getattr(args, "qwen_model_does_preprocess", None) is not None:
+        deprecated_args.append("--qwen-model-does-preprocess")
+
+    if deprecated_args:
+        joined_args = ", ".join(deprecated_args)
+        verb = "is" if len(deprecated_args) == 1 else "are"
+        msg = (
+            f"{joined_args} {verb} deprecated and no longer supported. "
+            "Use --vllm-preprocess-mode with 'curator' or 'model' instead."
+        )
+        raise ValueError(msg)
+
+
 def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
     args: argparse.Namespace,
 ) -> list[CuratorStage | CuratorStageSpec]:
@@ -378,6 +397,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         The ordered stage list ready for run_pipeline().
 
     """
+    _validate_deprecated_vllm_preprocess_args(args)
+
     stages: list[CuratorStage | CuratorStageSpec] = []
     # Keep caption-quality controls explicit; writer collection and summary emission use the same CLI request.
     caption_quality_flags_enabled = args.caption_quality_flags_enabled
@@ -573,8 +594,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             sampling_fps=args.captioning_sampling_fps,
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
-            preprocess_dtype=args.qwen_preprocess_dtype,
-            model_does_preprocess=args.qwen_model_does_preprocess,
+            preprocess_mode=args.vllm_preprocess_mode,
             generate_previews=args.generate_previews,
             verbose=args.verbose,
             perf_profile=args.perf_profile,
@@ -601,8 +621,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             sampling_fps=args.captioning_sampling_fps,
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
-            preprocess_dtype=args.qwen_preprocess_dtype,
-            model_does_preprocess=args.qwen_model_does_preprocess,
+            preprocess_mode=args.vllm_preprocess_mode,
             generate_previews=args.generate_previews,
             verbose=args.verbose,
             perf_profile=args.perf_profile,
@@ -687,6 +706,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             model_variant=args.captioning_algorithm,
             prompt_variant=args.captioning_prompt_variant,
             prompt_text=args.captioning_prompt_text,
+            preprocess_mode=args.vllm_preprocess_mode,
             num_cpus_for_prepare=args.vllm_prepare_num_cpus_per_worker,
             max_retries=args.vllm_max_retries,
             copy_weights_to=pathlib.Path(args.copy_weights_to) if args.copy_weights_to else None,
@@ -698,7 +718,6 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
             sampling_fps=args.captioning_sampling_fps,
-            preprocess_dtype=args.qwen_preprocess_dtype,
             use_input_bit_rate=args.transcode_use_input_video_bit_rate,
         )
 
@@ -709,17 +728,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             vllm_config.num_gpus = args.qwen_num_gpus_per_worker
             vllm_config.stage2_caption = args.qwen_stage2_caption
             vllm_config.stage2_prompt_text = args.qwen_stage2_prompt_text
-            window_config.preprocess_dtype = args.qwen_preprocess_dtype
-            window_config.model_does_preprocess = args.qwen_model_does_preprocess
 
             vllm_config.num_gpus = _clamp_num_gpus_for_model(caption_algo, vllm_config.num_gpus)
-
-            if caption_algo not in QWEN2_CAPTION_ALGOS and not window_config.model_does_preprocess:
-                logger.warning(
-                    f"{caption_algo} does not support model_does_preprocess=False, "
-                    f"setting model_does_preprocess to True"
-                )
-                window_config.model_does_preprocess = True
 
         elif caption_algo in COSMOS_REASON_ALGOS:
             vllm_config.batch_size = args.qwen_batch_size
@@ -728,21 +738,10 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             vllm_config.num_gpus = args.qwen_num_gpus_per_worker
             vllm_config.stage2_caption = args.qwen_stage2_caption
             vllm_config.stage2_prompt_text = args.qwen_stage2_prompt_text
-            window_config.preprocess_dtype = "float16"
-            window_config.model_does_preprocess = args.qwen_model_does_preprocess
-            if caption_algo == "cosmos_r2":
-                vllm_config.preprocess = True
-                window_config.model_does_preprocess = True
-        elif caption_algo in {"gemini", "openai"}:
+            vllm_config.preprocess_mode = resolve_preprocess_mode(caption_algo, vllm_config.preprocess_mode)
+        elif caption_algo in {"gemini", "openai"} or caption_algo == "vllm_async":
             pass
-        elif caption_algo == "vllm_async":
-            # vllm_async unifies with sync by reusing VllmPrepStage. The CPU
-            # prep stage is authoritative for deterministic preprocessing
-            # unless the user opts in to vLLM-side preprocessing.
-            window_config.model_does_preprocess = bool(args.vllm_async_preprocess)
         elif caption_algo == "nemotron":
-            vllm_config.preprocess = True
-            window_config.model_does_preprocess = True
             vllm_config.stage2_caption = args.nemotron_stage2_caption
 
         if args.vllm_video_max_pixels_per_frame is not None:
@@ -2037,21 +2036,36 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--qwen-preprocess-dtype",
         type=str,
-        default="float16",
+        default=None,
         choices=[
             "float32",
             "float16",
             "bfloat16",
             "uint8",
         ],
-        help="Precision for tensor preprocess operations in QwenInputPreparationStage.",
+        help=(
+            "Deprecated; use --vllm-preprocess-mode instead. This flag is accepted only to report a migration error."
+        ),
     )
     parser.add_argument(
         "--qwen-model-does-preprocess",
         dest="qwen_model_does_preprocess",
         action="store_true",
-        default=False,
-        help="If set, Qwen will handle preprocessing (resize, rescale, normalize) instead of our code.",
+        default=None,
+        help=(
+            "Deprecated; use --vllm-preprocess-mode model instead. "
+            "This flag is accepted only to report a migration error."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-preprocess-mode",
+        type=str,
+        default=PreprocessMode.CURATOR.value,
+        choices=[mode.value for mode in PreprocessMode],
+        help=(
+            "Owner of visual resize/rescale/normalize before vLLM inference. "
+            "'curator' emits normalized float16 frames; 'model' hands resized uint8 frames to vLLM/HF."
+        ),
     )
     parser.add_argument(
         "--qwen-stage2-caption",

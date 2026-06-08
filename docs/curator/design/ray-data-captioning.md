@@ -56,8 +56,8 @@ treats as a pass-through row. The final normalizer converts the row into the sta
 The Ray Data path uses the existing Qwen defaults:
 
 ```python
-VllmConfig(model_variant="qwen", preprocess=False, num_gpus=1, batch_size=32)
-WindowConfig(model_does_preprocess=False, preprocess_dtype="float16")
+VllmConfig(model_variant="qwen", preprocess_mode="curator", num_gpus=1, batch_size=32)
+WindowConfig()
 VllmSamplingConfig()
 ```
 

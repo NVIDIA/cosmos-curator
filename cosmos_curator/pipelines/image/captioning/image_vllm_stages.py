@@ -170,7 +170,7 @@ def prepare_image_model_input(image_frame: np.ndarray[Any, Any], params: _ImageP
         ValueError: If resize fails.
 
     """
-    if params.vllm_config.preprocess:
+    if params.vllm_config.model_preprocess_enabled:
         tensor = _image_frame_to_model_preprocess_tensor(image_frame)
     else:
         tensor = _image_frame_to_tensor(image_frame)

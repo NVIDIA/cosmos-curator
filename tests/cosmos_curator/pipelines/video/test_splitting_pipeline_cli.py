@@ -15,15 +15,23 @@
 """Tests for split pipeline CLI argument wiring."""
 
 import argparse
+import json
 from pathlib import Path
 
 import pytest
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import VllmConfig
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_SPLIT_INVOKE_TEMPLATES = (
+    _REPO_ROOT / "examples/nvcf/function/invoke_video_split_full.json",
+    _REPO_ROOT / "examples/workflow/template_invoke_video_split.json",
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -137,6 +145,50 @@ def test_no_write_all_caption_json_flag_removed() -> None:
         _parser().parse_args(["--no-write-all-caption-json"])
 
 
+def test_deprecated_vllm_preprocess_args_default_to_none() -> None:
+    """Legacy preprocessing flags stay parseable with inert defaults."""
+    args = _parser().parse_args([])
+
+    assert args.qwen_preprocess_dtype is None
+    assert args.qwen_model_does_preprocess is None
+
+
+def test_deprecated_vllm_preprocess_args_are_documented() -> None:
+    """Help text should point legacy preprocessing users at the new flag."""
+    help_text = _parser().format_help()
+
+    assert "--qwen-preprocess-dtype" in help_text
+    assert "--qwen-model-does-preprocess" in help_text
+    assert "--vllm-preprocess-mode" in help_text
+    assert "Deprecated" in help_text
+
+
+@pytest.mark.parametrize(
+    "legacy_args",
+    [
+        ["--qwen-preprocess-dtype", "float16"],
+        ["--qwen-model-does-preprocess"],
+    ],
+)
+def test_deprecated_vllm_preprocess_args_raise_migration_error(legacy_args: list[str]) -> None:
+    """Using a legacy preprocessing flag should fail with the replacement flag named."""
+    args = _caption_args(legacy_args)
+
+    with pytest.raises(ValueError, match="--vllm-preprocess-mode"):
+        _assemble_stages(args)
+
+
+def test_split_invoke_templates_use_supported_vllm_preprocess_mode() -> None:
+    """Split invoke templates should not pass legacy qwen preprocessing args."""
+    deprecated_args = {"qwen_preprocess_dtype", "qwen_model_does_preprocess"}
+
+    for template_path in _SPLIT_INVOKE_TEMPLATES:
+        invoke_args = json.loads(template_path.read_text())["args"]
+
+        assert deprecated_args.isdisjoint(invoke_args), template_path.as_posix()
+        assert invoke_args["vllm_preprocess_mode"] == PreprocessMode.CURATOR.value
+
+
 @pytest.mark.parametrize(
     "caption_algo",
     ["qwen", "qwen3_6_27b", "qwen3_vl_30b", "cosmos_r1", "cosmos_r2", "nemotron"],
@@ -209,24 +261,17 @@ def test_vllm_video_max_pixels_rejects_unsupported_caption_algorithm(
         _assemble_stages(args)
 
 
-def test_nemotron_forces_model_does_preprocess_true(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Selecting nemotron must force both preprocess flags to True at the call site.
-
-    Nemotron's intended mode is ``model_does_preprocess=True``: vLLM owns
-    ``do_resize``/``do_rescale``/``do_normalize`` rather than the CPU prep stage.
-    Both ``window_config.model_does_preprocess`` and ``backend.preprocess`` must
-    be True regardless of the dataclass defaults so the contract is visible at
-    the call site and resistant to default drift.
-    """
+def test_nemotron_forces_model_preprocess_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Selecting nemotron must force vLLM/HF-owned preprocessing."""
     captured = _capture_captioning_config(monkeypatch)
     args = _caption_args(["--captioning-algorithm", "nemotron"])
 
     _assemble_stages(args)
 
     config = captured["config"]
-    assert config.window_config.model_does_preprocess is True
     assert isinstance(config.backend, VllmConfig)
-    assert config.backend.preprocess is True
+    assert config.backend.preprocess_mode == PreprocessMode.MODEL
+    assert config.backend.model_preprocess_enabled is True
 
 
 def test_vllm_video_max_pixels_help_text_names_scope_bounds_and_grid() -> None:

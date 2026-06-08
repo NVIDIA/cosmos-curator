@@ -75,12 +75,12 @@ class _RayDataLlmProcessor(Protocol):
 
 def make_default_vllm_config() -> VllmConfig:
     """Build the Ray Data Qwen config."""
-    return VllmConfig(model_variant=_MODEL_VARIANT, preprocess=False, num_gpus=1, batch_size=32)
+    return VllmConfig(model_variant=_MODEL_VARIANT, num_gpus=1, batch_size=32)
 
 
 def make_default_window_config() -> WindowConfig:
     """Build the first-version Qwen window config to match Xenna defaults."""
-    return WindowConfig(model_does_preprocess=False, preprocess_dtype="float16")
+    return WindowConfig()
 
 
 def qwen_model_id() -> str:
@@ -384,8 +384,7 @@ def make_caption_window_rows_fn(
             window_size=resolved_window_config.window_size,
             remainder_threshold=resolved_window_config.remainder_threshold,
             sampling_fps=resolved_window_config.sampling_fps,
-            model_does_preprocess=resolved_window_config.model_does_preprocess,
-            preprocess_dtype=resolved_window_config.preprocess_dtype,
+            preprocess_mode=resolved_vllm_config.preprocess_mode,
             return_bytes=False,
             return_video_frames=True,
             max_pixels_per_frame=resolved_window_config.video_max_pixels_per_frame,
@@ -530,9 +529,9 @@ def _build_processor(
         "max_model_len": 32768,
         "gpu_memory_utilization": 0.85,
         "mm_processor_kwargs": {
-            "do_resize": vllm_config.preprocess,
-            "do_rescale": vllm_config.preprocess,
-            "do_normalize": vllm_config.preprocess,
+            "do_resize": vllm_config.model_preprocess_enabled,
+            "do_rescale": vllm_config.model_preprocess_enabled,
+            "do_normalize": vllm_config.model_preprocess_enabled,
         },
         "mm_processor_cache_gb": 0.0 if vllm_config.disable_mmcache else 4.0,
         "max_num_batched_tokens": 32768,

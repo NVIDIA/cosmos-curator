@@ -21,6 +21,7 @@ import torch
 from torchvision import transforms  # type: ignore[import-untyped]
 from torchvision.transforms import InterpolationMode, v2  # type: ignore[import-untyped]
 
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.utils.decoder_utils import decode_video_cpu_frame_ids, get_avg_frame_rate
 from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
@@ -146,13 +147,12 @@ def read_video_cpu(
     return video, frame_counts
 
 
-def fetch_video(  # noqa: C901, PLR0913
+def fetch_video(  # noqa: PLR0913
     video_path: str,
     sampling_fps: float = 2.0,
     window_range: list[WindowFrameInfo] | None = None,
     *,
-    do_preprocess: bool = False,
-    preprocess_dtype: str = "float32",
+    preprocess_mode: PreprocessMode = PreprocessMode.CURATOR,
     num_frames_to_use: int = 0,
     flip_input: bool = False,
     max_pixels_per_frame: int | None = None,
@@ -163,14 +163,8 @@ def fetch_video(  # noqa: C901, PLR0913
         video_path: Path to the video file.
         sampling_fps: Target frames per second for sampling.
         window_range: List of frame windows to extract.
-        do_preprocess: Whether to preprocess frames with curator-side normalization
-            (rescale to [0,1] + CLIP mean/std) into a model-ready floating-point tensor.
-            Frames are resized to the sampled dimensions either way; when False, they
-            are returned in preprocess_dtype without normalization for downstream
-            model-side preprocessing.
-        preprocess_dtype: Output dtype for prepared frames. Use a floating dtype when
-            do_preprocess is True; uint8 is only valid when do_preprocess is False so
-            downstream model-side preprocessing receives resized frames.
+        preprocess_mode: Owner of resize/rescale/normalize. Curator mode returns
+            normalized float16 frames. Model mode returns resized uint8 frames.
         num_frames_to_use: Number of frames to extract (0 for all).
         flip_input: Whether to flip frames horizontally.
         max_pixels_per_frame: Optional fixed per-frame resize upper bound.
@@ -179,20 +173,7 @@ def fetch_video(  # noqa: C901, PLR0913
         Tuple of (processed frames tensor, frame counts for each window).
 
     """
-    valid_preprocess_dtypes = {"float32", "float16", "bfloat16", "uint8"}
-    if preprocess_dtype not in valid_preprocess_dtypes:
-        msg = f"Unsupported preprocess_dtype={preprocess_dtype!r}. Expected one of {sorted(valid_preprocess_dtypes)}."
-        raise ValueError(msg)
-
-    if do_preprocess and preprocess_dtype == "uint8":
-        msg = (
-            "preprocess_dtype='uint8' is only valid when do_preprocess=False, where fetch_video returns "
-            "resized uint8 frames for downstream model-side preprocessing. With do_preprocess=True, "
-            "curator-side preprocessing normalizes frames into floating-point tensors; casting those normalized "
-            "values to uint8 corrupts the visual input. Use a floating dtype for curator-side preprocessing."
-        )
-        raise ValueError(msg)
-
+    preprocess_mode = PreprocessMode(preprocess_mode)
     if window_range is None:
         window_range = []
     video, frame_counts = read_video_cpu(
@@ -217,9 +198,7 @@ def fetch_video(  # noqa: C901, PLR0913
         max_pixels=max_pixels,
     )
 
-    if do_preprocess:
-        desired_dtype = getattr(torch, preprocess_dtype)
-
+    if preprocess_mode == PreprocessMode.CURATOR:
         resizeNormTransform = v2.Compose(
             [
                 v2.Resize(
@@ -227,7 +206,7 @@ def fetch_video(  # noqa: C901, PLR0913
                     interpolation=InterpolationMode.BICUBIC,
                     antialias=True,
                 ),
-                v2.ToDtype(desired_dtype, scale=True),
+                v2.ToDtype(torch.float16, scale=True),
                 v2.Normalize(mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD),
             ],
         )
@@ -244,12 +223,4 @@ def fetch_video(  # noqa: C901, PLR0913
     )
     if flip_input:
         video = torch.stack([torch.flip(frame, dims=[1, 2]) for frame in video], dim=0)
-    if preprocess_dtype == "float32":
-        return video.float(), frame_counts
-    if preprocess_dtype == "float16":
-        return video.half(), frame_counts
-    if preprocess_dtype == "bfloat16":
-        return video.to(torch.bfloat16), frame_counts
-    if preprocess_dtype == "uint8":
-        return video.to(torch.uint8), frame_counts
-    return video, frame_counts
+    return video.to(torch.uint8), frame_counts

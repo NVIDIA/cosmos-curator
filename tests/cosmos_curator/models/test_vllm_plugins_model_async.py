@@ -36,6 +36,7 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_curator.core.utils.model import pixi_utils
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig
 
 # Heavy vLLM imports are env-gated: the ``default`` pixi env carries vLLM
@@ -87,7 +88,7 @@ def test_qwen_model_async_uses_module_constants() -> None:
 def test_qwen_model_async_bakes_async_invariants() -> None:
     """``mm_processor_kwargs`` carries ``do_sample_frames=False`` + preprocess gates.
 
-    With ``config.preprocess=False`` (the default), CPU owns resize/rescale/
+    With ``config.preprocess_mode='curator'`` (the default), CPU owns resize/rescale/
     normalize so the vLLM processor must skip them.  ``do_sample_frames``
     is always ``False`` on the async path because CPU prep pre-samples
     frames.  The legacy ``"size"`` kwarg was removed when the plugin
@@ -103,15 +104,15 @@ def test_qwen_model_async_bakes_async_invariants() -> None:
     assert "size" not in args.mm_processor_kwargs
 
 
-def test_qwen_model_async_preprocess_true_enables_vllm_resize() -> None:
-    """``config.preprocess=True`` -> vLLM processor owns resize/rescale/normalize."""
+def test_qwen_model_async_model_preprocess_enables_vllm_resize() -> None:
+    """``config.preprocess_mode='model'`` -> vLLM processor owns resize/rescale/normalize."""
     with patch.object(vllm_qwen.VllmQwen, "model_path", return_value="/m"):
-        args = vllm_qwen.VllmQwen.model_async(_async_cfg(preprocess=True))
+        args = vllm_qwen.VllmQwen.model_async(_async_cfg(preprocess_mode=PreprocessMode.MODEL))
     assert args.mm_processor_kwargs is not None
     assert args.mm_processor_kwargs["do_resize"] is True
     assert args.mm_processor_kwargs["do_rescale"] is True
     assert args.mm_processor_kwargs["do_normalize"] is True
-    # Frame sampling is still owned by CPU prep -- ``preprocess`` only
+    # Frame sampling is still owned by CPU prep -- ``preprocess_mode`` only
     # gates the in-engine pixel-space ops.
     assert args.mm_processor_kwargs["do_sample_frames"] is False
 
@@ -167,11 +168,11 @@ def test_nemotron_model_async_uses_module_constants() -> None:
     assert args.limit_mm_per_prompt == vllm_nemotron.LIMIT_MM_PER_PROMPT_VIDEO
 
 
-def test_nemotron_model_async_emits_preprocess_gates_with_default_preprocess() -> None:
-    """Nemotron skips in-engine resize/rescale/normalize when ``config.preprocess=False``.
+def test_nemotron_model_async_emits_preprocess_gates_with_default_preprocess_mode() -> None:
+    """Nemotron skips in-engine resize/rescale/normalize when ``config.preprocess_mode='curator'``.
 
     Nemotron's custom processor accepts the generic ``do_resize``/``do_rescale``/
-    ``do_normalize`` toggles plus ``do_sample_frames``; ``preprocess=False``
+    ``do_normalize`` toggles plus ``do_sample_frames``; curator mode
     (default) means CPU prep owns those steps so vLLM must skip them.
     The legacy assertion that ``mm_processor_kwargs`` contained ONLY
     ``do_sample_frames`` is stale -- the plugin now also forwards the
@@ -187,10 +188,10 @@ def test_nemotron_model_async_emits_preprocess_gates_with_default_preprocess() -
     }
 
 
-def test_nemotron_model_async_preprocess_true_enables_vllm_resize() -> None:
-    """``config.preprocess=True`` -> Nemotron lets vLLM run resize/rescale/normalize."""
+def test_nemotron_model_async_model_preprocess_enables_vllm_resize() -> None:
+    """``config.preprocess_mode='model'`` -> Nemotron lets vLLM run resize/rescale/normalize."""
     with patch.object(vllm_nemotron.VllmNemotronNano12Bv2VL, "model_path", return_value="/n"):
-        args = vllm_nemotron.VllmNemotronNano12Bv2VL.model_async(_async_cfg(preprocess=True))
+        args = vllm_nemotron.VllmNemotronNano12Bv2VL.model_async(_async_cfg(preprocess_mode=PreprocessMode.MODEL))
     assert args.mm_processor_kwargs == {
         "do_sample_frames": False,
         "do_resize": True,
@@ -210,10 +211,10 @@ def test_cosmos_reason1_model_async_uses_module_constants() -> None:
     assert args.limit_mm_per_prompt == vllm_cosmos_reason1_vl.LIMIT_MM_PER_PROMPT_VIDEO
 
 
-def test_cosmos_reason1_model_async_preprocess_true_enables_vllm_resize() -> None:
-    """``config.preprocess=True`` -> Cosmos-Reason1 lets vLLM run resize/rescale/normalize."""
+def test_cosmos_reason1_model_async_model_preprocess_enables_vllm_resize() -> None:
+    """``config.preprocess_mode='model'`` -> Cosmos-Reason1 lets vLLM run resize/rescale/normalize."""
     with patch.object(vllm_cosmos_reason1_vl.VllmCosmosReason1VL, "model_path", return_value="/c"):
-        args = vllm_cosmos_reason1_vl.VllmCosmosReason1VL.model_async(_async_cfg(preprocess=True))
+        args = vllm_cosmos_reason1_vl.VllmCosmosReason1VL.model_async(_async_cfg(preprocess_mode=PreprocessMode.MODEL))
     assert args.mm_processor_kwargs is not None
     assert args.mm_processor_kwargs["do_resize"] is True
     assert args.mm_processor_kwargs["do_rescale"] is True
@@ -222,7 +223,7 @@ def test_cosmos_reason1_model_async_preprocess_true_enables_vllm_resize() -> Non
 
 
 def test_cosmos_reason1_model_async_default_preprocess_disables_vllm_resize() -> None:
-    """Default ``config.preprocess=False`` -> CPU owns resize/rescale/normalize."""
+    """Default ``config.preprocess_mode='curator'`` -> CPU owns resize/rescale/normalize."""
     with patch.object(vllm_cosmos_reason1_vl.VllmCosmosReason1VL, "model_path", return_value="/c"):
         args = vllm_cosmos_reason1_vl.VllmCosmosReason1VL.model_async(_async_cfg())
     assert args.mm_processor_kwargs is not None

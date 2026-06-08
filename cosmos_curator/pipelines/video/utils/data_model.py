@@ -34,6 +34,7 @@ from cosmos_curator.core.interfaces.stage_interface import PipelineTask
 from cosmos_curator.core.utils.data.lazy_data import LazyData
 from cosmos_curator.core.utils.infra.performance_utils import StagePerfStats
 from cosmos_curator.core.utils.storage import storage_client
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 from cosmos_curator.pipelines.video.utils.decoder_utils import extract_video_metadata, get_video_timestamps
 
 if TYPE_CHECKING:
@@ -1159,7 +1160,7 @@ class VllmConfig:
         prompt_text: Custom prompt text if provided.
         batch_size: Number of samples to process in parallel.
         fp8: Whether to enable FP8 precision.
-        preprocess: Whether model handles preprocessing.
+        preprocess_mode: Owner of resize/rescale/normalize for visual inputs.
         disable_mmcache: Whether to disable model cache.
         num_gpus_per_worker: Number of GPUs to allocate per worker.
         batch_size: Number of samples to process in parallel.
@@ -1188,7 +1189,7 @@ class VllmConfig:
     prompt_variant: str = "default"
     prompt_text: str | None = None
     fp8: bool = False
-    preprocess: bool = False
+    preprocess_mode: PreprocessMode = attrs.field(default=PreprocessMode.CURATOR, converter=PreprocessMode)
     disable_mmcache: bool = False
     num_cpus_for_prepare: float = 2.0
     num_gpus: int = 1
@@ -1202,6 +1203,15 @@ class VllmConfig:
     debug_save_frames: bool = False
     debug_frames_output_dir: pathlib.Path | None = None
     video_max_pixels_per_frame: int | None = None
+
+    @property
+    def model_preprocess_enabled(self) -> bool:
+        """Whether vLLM/HF should own resize/rescale/normalize."""
+        return self.preprocess_mode == PreprocessMode.MODEL
+
+    def __attrs_post_init__(self) -> None:
+        """Normalize variant-required preprocessing mode at construction time."""
+        self.preprocess_mode = resolve_preprocess_mode(self.model_variant, self.preprocess_mode)
 
 
 def validate_optional_json_str_str_dict(
@@ -1235,7 +1245,7 @@ class VllmAsyncConfig:
     """Configuration for the in-process ``AsyncLLM`` engine.
 
     Mirrors sync's ``VllmConfig`` shape where overlapping (``fp8``,
-    ``disable_mmcache``, ``preprocess``, ``max_retries``).  Use
+    ``disable_mmcache``, ``preprocess_mode``, ``max_retries``).  Use
     :meth:`to_vllm_config` when calling plugin methods that take a sync
     ``VllmConfig`` (``model_path``, ``processor``, ``make_llm_input``).
     Note: ``model_async`` takes ``VllmAsyncConfig`` directly (no
@@ -1268,13 +1278,10 @@ class VllmAsyncConfig:
     skip_mm_profiling: bool = True
     stream_interval: int = 9999
 
-    # When False (default), CPU prep stage owns the deterministic resize and
-    # tokenization and vLLM's processor only does rescale + normalize; this
-    # mirrors sync's VllmConfig.preprocess=False (vLLM's mm_processor_kwargs
-    # set do_resize/do_rescale/do_normalize to False).  Set True to let
-    # vLLM's processor re-run resize + rescale + normalize on top of the
-    # CPU-prepared frames (rarely needed; matches sync's behaviour).
-    preprocess: bool = False
+    # When CURATOR (default), CPU prep owns resize/rescale/normalize and
+    # vLLM's processor skips those operations.  When MODEL, the prep stage
+    # hands resized uint8 frames to vLLM/HF for model-side preprocessing.
+    preprocess_mode: PreprocessMode = attrs.field(default=PreprocessMode.CURATOR, converter=PreprocessMode)
 
     # Per-request retry budget around engine.generate (mirrors sync's
     # VllmConfig.max_retries).  EngineDeadError is never retried - it
@@ -1309,6 +1316,19 @@ class VllmAsyncConfig:
         """Total GPU footprint across data-parallel replicas: ``num_gpus * data_parallel_size``."""
         return self.num_gpus * self.data_parallel_size
 
+    @property
+    def model_preprocess_enabled(self) -> bool:
+        """Whether vLLM/HF should own resize/rescale/normalize."""
+        return self.preprocess_mode == PreprocessMode.MODEL
+
+    def __attrs_post_init__(self) -> None:
+        """Normalize variant-required preprocessing mode at construction time."""
+        object.__setattr__(
+            self,
+            "preprocess_mode",
+            resolve_preprocess_mode(self.model_variant, self.preprocess_mode),
+        )
+
     def to_vllm_config(self) -> "VllmConfig":
         """Translate to ``VllmConfig`` for plugin methods that require it."""
         return VllmConfig(
@@ -1317,7 +1337,7 @@ class VllmAsyncConfig:
             copy_weights_to=None,
             fp8=self.fp8,
             disable_mmcache=self.disable_mmcache,
-            preprocess=self.preprocess,
+            preprocess_mode=self.preprocess_mode,
             max_retries=self.max_retries,
         )
 
@@ -1330,8 +1350,6 @@ class WindowConfig:
         sampling_fps: Frames per second for sampling.
         window_size: Size of each window in frames.
         remainder_threshold: Minimum frames required for a remainder window.
-        preprocess_dtype: Data type for preprocessing.
-        model_does_preprocess: Whether model handles preprocessing.
         use_input_bit_rate: Whether to use the input video's bit rate for processing.
         video_max_pixels_per_frame: Optional per-frame video resize upper bound.
 
@@ -1340,8 +1358,6 @@ class WindowConfig:
     window_size: int = 256
     sampling_fps: float = 2.0
     remainder_threshold: int = 128
-    model_does_preprocess: bool = True
-    preprocess_dtype: str = "float32"
     use_input_bit_rate: bool = False
     video_max_pixels_per_frame: int | None = None
 

@@ -20,7 +20,7 @@ import attrs
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.pipelines.common.filter_prompts import get_qwen_filter_prompt
-from cosmos_curator.pipelines.common.model_constraints import MODEL_VARIANTS_REQUIRING_PREPROCESS
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 from cosmos_curator.pipelines.common.semantic_filter_postprocess import (
     custom_categories_union,
     read_categories_file,
@@ -84,8 +84,7 @@ class VlmFilterConfig:
     sampling_fps: float = 2.0
     window_size: int = 256
     remainder_threshold: int = 128
-    preprocess_dtype: str = "float16"
-    model_does_preprocess: bool = False
+    preprocess_mode: PreprocessMode = attrs.field(default=PreprocessMode.CURATOR, converter=PreprocessMode)
     generate_previews: bool = False
     verbose: bool = False
     perf_profile: bool = False
@@ -118,8 +117,7 @@ class VideoClassifierConfig:
     sampling_fps: float = 2.0
     window_size: int = 256
     remainder_threshold: int = 128
-    preprocess_dtype: str = "float16"
-    model_does_preprocess: bool = False
+    preprocess_mode: PreprocessMode = attrs.field(default=PreprocessMode.CURATOR, converter=PreprocessMode)
     generate_previews: bool = False
     verbose: bool = False
     perf_profile: bool = False
@@ -174,12 +172,11 @@ def build_artificial_text_filter_stages(config: ArtificialTextFilterConfig) -> l
 
 def _make_vllm_config(config: VlmFilterConfig | VideoClassifierConfig, prompt_text: str) -> VllmConfig:
     """Build a VllmConfig from a filter/classifier config."""
-    model_does_preprocess = config.model_does_preprocess or config.model_variant in MODEL_VARIANTS_REQUIRING_PREPROCESS
     return VllmConfig(
         model_variant=config.model_variant,
         prompt_text=prompt_text,
         fp8=config.fp8_enable,
-        preprocess=model_does_preprocess,
+        preprocess_mode=resolve_preprocess_mode(config.model_variant, config.preprocess_mode),
         disable_mmcache=not config.use_mmcache,
         num_gpus=config.num_gpus,
         batch_size=config.batch_size,
@@ -188,14 +185,11 @@ def _make_vllm_config(config: VlmFilterConfig | VideoClassifierConfig, prompt_te
 
 
 def _make_window_config(config: VlmFilterConfig | VideoClassifierConfig) -> WindowConfig:
-    """Build a WindowConfig from a legacy Qwen filter/classifier config."""
-    model_does_preprocess = config.model_does_preprocess or config.model_variant in MODEL_VARIANTS_REQUIRING_PREPROCESS
+    """Build a WindowConfig from a filter/classifier config."""
     return WindowConfig(
         sampling_fps=config.sampling_fps,
         window_size=config.window_size,
         remainder_threshold=config.remainder_threshold,
-        model_does_preprocess=model_does_preprocess,
-        preprocess_dtype=config.preprocess_dtype,
     )
 
 

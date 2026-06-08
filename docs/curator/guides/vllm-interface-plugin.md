@@ -198,9 +198,9 @@ def model(cls, config: VllmConfig) -> LLM:
     quantization = "fp8" if config.fp8 else None
     
     mm_processor_kwargs = {
-        "do_resize": config.preprocess,
-        "do_rescale": config.preprocess,
-        "do_normalize": config.preprocess,
+        "do_resize": config.model_preprocess_enabled,
+        "do_rescale": config.model_preprocess_enabled,
+        "do_normalize": config.model_preprocess_enabled,
     }
     
     return LLM(
@@ -313,13 +313,13 @@ def model_async(cls, config: VllmAsyncConfig) -> AsyncEngineArgs:
         # longer exists), so the processor MUST NOT re-sample them.
         # This flag is the contract between prep and engine; never set
         # it elsewhere.  ``do_resize``/``do_rescale``/``do_normalize``
-        # are gated by ``config.preprocess`` so the single-owner
+        # are gated by ``config.model_preprocess_enabled`` so the single-owner
         # contract (CPU vs vLLM) stays explicit.
         mm_processor_kwargs={
             "do_sample_frames": False,
-            "do_resize": config.preprocess,
-            "do_rescale": config.preprocess,
-            "do_normalize": config.preprocess,
+            "do_resize": config.model_preprocess_enabled,
+            "do_rescale": config.model_preprocess_enabled,
+            "do_normalize": config.model_preprocess_enabled,
         },
 
         compilation_config=CompilationConfig(cudagraph_mode="piecewise"),

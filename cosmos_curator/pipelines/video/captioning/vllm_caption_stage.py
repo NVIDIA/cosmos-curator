@@ -56,6 +56,7 @@ from cosmos_curator.models.all_models import get_all_models_by_id
 from cosmos_curator.models.prompts import get_prompt, get_stage2_prompt
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.caption_quality_flags import apply_caption_quality_flags
 from cosmos_curator.pipelines.video.captioning.single_inference import SingleInferenceCaptionStage
 from cosmos_curator.pipelines.video.utils import windowing_utils
@@ -76,7 +77,6 @@ if pixi_utils.is_running_in_env("default"):
         from vllm import LLM, SamplingParams
 
     from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
-    from cosmos_curator.models.qwen_vl import QWEN_VARIANTS_NEED_RAW_FRAMES
     from cosmos_curator.models.vllm_interface import (
         VllmWindowResult,
         auto_processor,
@@ -408,6 +408,7 @@ class VllmPrepStage(CuratorStage):
             video,
             self._window_config,
             num_video_decode_threads,
+            preprocess_mode=self._vllm_config.preprocess_mode,
             keep_mp4=self._keep_mp4,
         )
 
@@ -997,9 +998,9 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
     def _decode_video_for_caption_single(self, video_bytes: bytes) -> tuple[Any, dict[str, Any]]:
         """Decode whole-clip mp4 bytes into a frame tensor + HF video metadata.
 
-        Branches on :data:`QWEN_VARIANTS_NEED_RAW_FRAMES`: Qwen3-VL needs
-        raw uint8 TCHW frames + HF's own video processor; everything
-        else uses the 28-aligned float16 ``fetch_video`` path.
+        Branches on ``VllmConfig.preprocess_mode``: model-side preprocessing
+        needs decoded uint8 TCHW frames + HF's own video processor; curator
+        preprocessing uses the float16 ``fetch_video`` path.
         """
         total_frames = get_frame_count(video_bytes)
         if total_frames <= 0:
@@ -1014,7 +1015,7 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         # ``windowing_utils.make_windows_for_video``); ``end=total_frames``
         # would request a frame at out-of-range index ``total_frames``.
         window_range = [WindowFrameInfo(start=0, end=total_frames - 1)]
-        needs_raw_frames = self._vllm_config.model_variant in QWEN_VARIANTS_NEED_RAW_FRAMES
+        needs_raw_frames = self._vllm_config.model_preprocess_enabled
         with buffer_as_memfd_path(video_bytes, name="vllm-caption-single") as path:
             if needs_raw_frames:
                 video_tensor, _frame_counts = read_video_cpu(
@@ -1028,8 +1029,7 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
                     path,
                     sampling_fps=sampling_fps,
                     window_range=window_range,
-                    do_preprocess=True,
-                    preprocess_dtype="float16",
+                    preprocess_mode=PreprocessMode.CURATOR,
                 )
 
         num_sampled_frames = int(video_tensor.shape[0]) if video_tensor.ndim >= 1 else 0

@@ -27,6 +27,7 @@ from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
 from cosmos_curator.core.utils.model.model_utils import get_local_dir_for_weights_name
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.vllm_caption_stage import (
     VllmCaptionStage,
     VllmPrepStage,
@@ -49,25 +50,24 @@ _THRESHOLDS = {
 _NUM_CLIPS = 1
 _VLLM_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
     "cosmos_r2": {
-        "preprocess": True,
+        "preprocess_mode": PreprocessMode.MODEL,
+    },
+    "qwen3_5_27b": {
+        "preprocess_mode": PreprocessMode.MODEL,
     },
 }
 _WINDOW_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
     "qwen": {
         "sampling_fps": 2.0,
-        "model_does_preprocess": False,
     },
     "cosmos_r1": {
         "sampling_fps": 4.0,
-        "model_does_preprocess": False,
     },
     "cosmos_r2": {
         "sampling_fps": 4.0,
-        "model_does_preprocess": True,
     },
     "qwen3_5_27b": {
         "sampling_fps": 2.0,
-        "model_does_preprocess": True,
     },
 }
 _EXPECTED_CAPTIONS: dict[str, list[str]] = {
@@ -376,7 +376,7 @@ def test_vllm_caption_regression_signals(
         prompt_variant="default",
         prompt_text=None,
         fp8=False,
-        preprocess=False,
+        preprocess_mode=PreprocessMode.CURATOR,
         stage2_caption=False,
         sampling_config=VllmSamplingConfig(
             temperature=0.1,
@@ -394,7 +394,6 @@ def test_vllm_caption_regression_signals(
         sampling_fps=2.0,
         window_size=256,
         remainder_threshold=128,
-        model_does_preprocess=False,
     )
     stages = [
         VllmPrepStage(vllm_config=vllm_config, window_config=window_config),

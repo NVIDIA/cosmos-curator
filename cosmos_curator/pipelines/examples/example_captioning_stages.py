@@ -29,6 +29,7 @@ from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.models import t5_encoder
 from cosmos_curator.models.chat_lm import ChatLM
 from cosmos_curator.models.prompts import get_enhance_prompt
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.vllm_caption_stage import (
     VllmCaptionStage,
     VllmPrepStage,
@@ -46,8 +47,6 @@ _BASE_WINDOW_CONFIG: dict[str, Any] = {
     "window_size": 256,
     "remainder_threshold": 128,
     "sampling_fps": 2.0,
-    "preprocess_dtype": "float32",
-    "model_does_preprocess": False,
     "use_input_bit_rate": False,
 }
 
@@ -63,7 +62,7 @@ _WINDOW_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
 _BASE_VLLM_CONFIG: dict[str, Any] = {
     "fp8": False,
     "max_output_tokens": 8192,
-    "preprocess": False,
+    "preprocess_mode": PreprocessMode.CURATOR,
     "disable_mmcache": False,
     "num_cpus_for_prepare": 4.0,
     "num_gpus": 1,
@@ -79,6 +78,7 @@ _VLLM_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "cosmos_r2": {
         "batch_size": 8,
+        "preprocess_mode": PreprocessMode.MODEL,
     },
 }
 

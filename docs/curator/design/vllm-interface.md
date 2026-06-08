@@ -130,7 +130,8 @@ class VllmConfig:
     prompt_variant: str = "default"       # Prompt template variant
     prompt_text: str | None = None        # Custom prompt text
     fp8: bool = False                     # Enable FP8 quantization
-    preprocess: bool = False              # Let model handle preprocessing
+    preprocess_mode: PreprocessMode = PreprocessMode.CURATOR
+                                           # Owner of visual preprocessing
     disable_mmcache: bool = False         # Disable multimodal cache
     num_cpus_for_prepare: float = 2.0     # CPUs for preparation stage
     num_gpus: int = 1                     # GPUs for inference

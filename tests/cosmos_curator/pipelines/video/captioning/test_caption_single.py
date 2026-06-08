@@ -533,7 +533,8 @@ def test_vllm_decode_video_for_caption_single_uses_inclusive_window(
 def test_vllm_decode_video_for_caption_single_qwen3_uses_inclusive_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Qwen3-VL takes the ``read_video_cpu`` branch — same inclusive contract."""
+    """Model-side preprocessing takes the ``read_video_cpu`` branch — same inclusive contract."""
+    from cosmos_curator.pipelines.common.model_constraints import PreprocessMode  # noqa: PLC0415
     from cosmos_curator.pipelines.video.captioning import vllm_caption_stage as vcs  # noqa: PLC0415
     from cosmos_curator.pipelines.video.utils.data_model import VllmConfig  # noqa: PLC0415
 
@@ -556,7 +557,9 @@ def test_vllm_decode_video_for_caption_single_qwen3_uses_inclusive_window(
     monkeypatch.setattr(vcs, "read_video_cpu", _fake_read_video_cpu)
     monkeypatch.setattr(vcs, "buffer_as_memfd_path", _fake_memfd)
 
-    stage = vcs.VllmCaptionStage(vllm_config=VllmConfig(model_variant="qwen3_vl_30b"))
+    stage = vcs.VllmCaptionStage(
+        vllm_config=VllmConfig(model_variant="qwen3_vl_30b", preprocess_mode=PreprocessMode.MODEL)
+    )
     stage._decode_video_for_caption_single(b"\x00mp4")
 
     window_range = captured["window_range"]
@@ -608,7 +611,8 @@ def test_vllm_async_decode_video_for_caption_single_uses_inclusive_window(
 def test_vllm_async_decode_video_for_caption_single_qwen3_uses_inclusive_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Async Qwen3-VL also hits ``read_video_cpu`` — same inclusive contract."""
+    """Async model-side preprocessing also hits ``read_video_cpu`` — same inclusive contract."""
+    from cosmos_curator.pipelines.common.model_constraints import PreprocessMode  # noqa: PLC0415
     from cosmos_curator.pipelines.video.captioning import vllm_async_stage as vas  # noqa: PLC0415
     from cosmos_curator.pipelines.video.captioning.vllm_async_config import VllmAsyncConfig  # noqa: PLC0415
 
@@ -632,7 +636,8 @@ def test_vllm_async_decode_video_for_caption_single_qwen3_uses_inclusive_window(
     monkeypatch.setattr(vas, "buffer_as_memfd_path", _fake_memfd)
 
     stage = vas.VllmAsyncCaptionStage(
-        serve_config=VllmAsyncConfig(model_variant="qwen3_vl_30b"), model_name="qwen3_vl_30b"
+        serve_config=VllmAsyncConfig(model_variant="qwen3_vl_30b", preprocess_mode=PreprocessMode.MODEL),
+        model_name="qwen3_vl_30b",
     )
     stage._decode_video_for_caption_single(b"\x00mp4")
 

@@ -23,7 +23,7 @@ from cosmos_curator.pipelines.common.filter_prompts import (
     IMAGE_TYPE_LABELS,
     get_image_filter_prompt,
 )
-from cosmos_curator.pipelines.common.model_constraints import MODEL_VARIANTS_REQUIRING_PREPROCESS
+from cosmos_curator.pipelines.common.model_constraints import resolve_preprocess_mode
 from cosmos_curator.pipelines.common.semantic_filter_postprocess import custom_categories_union, read_categories_file
 from cosmos_curator.pipelines.image.captioning.image_api_caption_stages import (
     ImageGeminiCaptionStage,
@@ -104,7 +104,7 @@ def _make_image_vllm_config(
         batch_size=batch_size,
         prompt_variant="image",
         prompt_text=prompt_text,
-        preprocess=model_variant in MODEL_VARIANTS_REQUIRING_PREPROCESS,
+        preprocess_mode=resolve_preprocess_mode(model_variant),
         sampling_config=VllmSamplingConfig(max_tokens=max_output_tokens),
     )
 

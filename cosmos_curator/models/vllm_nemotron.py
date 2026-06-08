@@ -277,9 +277,9 @@ class VllmNemotronNano12Bv2VL(VllmPlugin):
             mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
             mm_processor_kwargs={
                 "do_sample_frames": False,
-                "do_resize": config.preprocess,
-                "do_rescale": config.preprocess,
-                "do_normalize": config.preprocess,
+                "do_resize": config.model_preprocess_enabled,
+                "do_rescale": config.model_preprocess_enabled,
+                "do_normalize": config.model_preprocess_enabled,
             },
             compilation_config=CompilationConfig(cudagraph_mode="piecewise"),  # type: ignore[arg-type]
             enable_prefix_caching=True,

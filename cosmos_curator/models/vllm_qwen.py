@@ -176,9 +176,9 @@ class VllmQwen(VllmPlugin):
             quantization = "fp8"
 
         mm_processor_kwargs = {
-            "do_resize": config.preprocess,
-            "do_rescale": config.preprocess,
-            "do_normalize": config.preprocess,
+            "do_resize": config.model_preprocess_enabled,
+            "do_rescale": config.model_preprocess_enabled,
+            "do_normalize": config.model_preprocess_enabled,
         }
 
         limit_mm = LIMIT_MM_PER_PROMPT_IMAGE if config.use_image_input else LIMIT_MM_PER_PROMPT_VIDEO
@@ -234,9 +234,9 @@ class VllmQwen(VllmPlugin):
             mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
             mm_processor_kwargs={
                 "do_sample_frames": False,
-                "do_resize": config.preprocess,
-                "do_rescale": config.preprocess,
-                "do_normalize": config.preprocess,
+                "do_resize": config.model_preprocess_enabled,
+                "do_rescale": config.model_preprocess_enabled,
+                "do_normalize": config.model_preprocess_enabled,
             },
             compilation_config=CompilationConfig(cudagraph_mode="piecewise"),  # type: ignore[arg-type]
             enable_prefix_caching=True,
@@ -404,9 +404,9 @@ class VllmQwen3VL(VllmQwen):
             mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
             mm_processor_kwargs={
                 "do_sample_frames": False,
-                "do_resize": config.preprocess,
-                "do_rescale": config.preprocess,
-                "do_normalize": config.preprocess,
+                "do_resize": config.model_preprocess_enabled,
+                "do_rescale": config.model_preprocess_enabled,
+                "do_normalize": config.model_preprocess_enabled,
             },
             compilation_config=CompilationConfig(cudagraph_mode="piecewise"),  # type: ignore[arg-type]
             enable_prefix_caching=True,

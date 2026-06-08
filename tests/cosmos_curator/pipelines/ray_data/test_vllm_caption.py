@@ -27,6 +27,7 @@ import pytest
 import ray
 from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage, vLLMEngineStageUDF
 
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.ray_data import _vllm_caption as _captioner
 from cosmos_curator.pipelines.ray_data._vllm_caption import (
     _add_ray_llm_columns,
@@ -89,7 +90,7 @@ def test_default_vllm_config_uses_benchmark_batch_size() -> None:
     config = make_default_vllm_config()
 
     assert config.model_variant == "qwen"
-    assert config.preprocess is False
+    assert config.preprocess_mode == PreprocessMode.CURATOR
     assert config.num_gpus == 1
     assert config.batch_size == 32
 

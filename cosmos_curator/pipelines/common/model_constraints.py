@@ -15,6 +15,39 @@
 
 """Shared pipeline-level model capability constraints."""
 
-MODEL_VARIANTS_REQUIRING_PREPROCESS: frozenset[str] = frozenset(
-    {"qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8", "cosmos_r2"}
+import enum
+
+
+class PreprocessMode(enum.StrEnum):
+    """Owner of resize/rescale/normalize before a model consumes visual inputs."""
+
+    CURATOR = "curator"
+    MODEL = "model"
+
+
+MODEL_VARIANTS_REQUIRING_MODEL_PREPROCESS: frozenset[str] = frozenset(
+    {
+        "cosmos3_nano",
+        "cosmos3_super",
+        "cosmos_r2",
+        "nemotron",
+        "qwen3_5_27b",
+        "qwen3_6_27b",
+        "qwen3_6_27b_fp8",
+        "qwen3_vl_30b",
+        "qwen3_vl_30b_fp8",
+        "qwen3_vl_235b",
+        "qwen3_vl_235b_fp8",
+    }
 )
+
+
+def resolve_preprocess_mode(
+    model_variant: str,
+    requested_mode: PreprocessMode | str = PreprocessMode.CURATOR,
+) -> PreprocessMode:
+    """Return the effective preprocessing mode for a model variant."""
+    requested_mode = PreprocessMode(requested_mode)
+    if model_variant in MODEL_VARIANTS_REQUIRING_MODEL_PREPROCESS:
+        return PreprocessMode.MODEL
+    return requested_mode

@@ -23,6 +23,7 @@ from loguru import logger
 
 from cosmos_curator.core.utils.config.operation_context import make_pipeline_named_temporary_file
 from cosmos_curator.core.utils.model import pixi_utils
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.utils.data_model import (
     Clip,
     Video,
@@ -249,8 +250,7 @@ def split_video_into_windows(  # noqa: PLR0913
     remainder_threshold: int = 128,
     sampling_fps: float = 2.0,
     *,
-    model_does_preprocess: bool = False,
-    preprocess_dtype: str = "uint8",
+    preprocess_mode: PreprocessMode = PreprocessMode.CURATOR,
     flip_input: bool = False,
     num_frames_to_use: int = 0,
     return_bytes: bool = False,
@@ -274,8 +274,7 @@ def split_video_into_windows(  # noqa: PLR0913
         window_size: window size
         remainder_threshold: threshold for remainder
         sampling_fps: sampling fps when generating frames
-        model_does_preprocess: if the model does preprocessing
-        preprocess_dtype: Data type to use for preprocessing the video/image inputs.
+        preprocess_mode: Owner of resize/rescale/normalize for returned video frames.
         flip_input: Whether to flip the input video/image horizontally.
         num_frames_to_use: Number of frames to extract from the video. If 0, uses all frames.
         return_bytes: Whether to extract mp4 bytes for each window for use by PreviewStage
@@ -311,8 +310,7 @@ def split_video_into_windows(  # noqa: PLR0913
                 str(input_file),
                 sampling_fps=sampling_fps,
                 window_range=windows,
-                do_preprocess=not model_does_preprocess,
-                preprocess_dtype=preprocess_dtype,
+                preprocess_mode=preprocess_mode,
                 num_frames_to_use=num_frames_to_use,
                 flip_input=flip_input,
                 max_pixels_per_frame=max_pixels_per_frame,
@@ -366,6 +364,7 @@ def _make_windows_for_clip(  # noqa: PLR0913
     target_bit_rate: str,
     num_decode_threads: int,
     *,
+    preprocess_mode: PreprocessMode = PreprocessMode.CURATOR,
     keep_mp4: bool = False,
     return_frames: bool = True,
 ) -> tuple[list[Window], list[torch.Tensor]]:
@@ -376,6 +375,7 @@ def _make_windows_for_clip(  # noqa: PLR0913
         config: The configuration for the windowing.
         target_bit_rate: The target bit rate.
         num_decode_threads: The number of threads to use.
+        preprocess_mode: Owner of resize/rescale/normalize for returned video frames.
         keep_mp4: Whether to keep the MP4.
         return_frames: Whether to decode and return frame tensors.
 
@@ -397,8 +397,7 @@ def _make_windows_for_clip(  # noqa: PLR0913
         window_size=config.window_size,
         remainder_threshold=config.remainder_threshold,
         sampling_fps=config.sampling_fps,
-        model_does_preprocess=config.model_does_preprocess,
-        preprocess_dtype=config.preprocess_dtype,
+        preprocess_mode=preprocess_mode,
         return_bytes=keep_mp4,
         target_bit_rate=target_bit_rate,
         return_video_frames=return_frames,
@@ -429,11 +428,12 @@ def _make_windows_for_clip(  # noqa: PLR0913
     return windows, frames
 
 
-def make_windows_for_video(
+def make_windows_for_video(  # noqa: PLR0913
     video: Video,
     config: WindowConfig,
     num_decode_threads: int,
     *,
+    preprocess_mode: PreprocessMode = PreprocessMode.CURATOR,
     keep_mp4: bool = False,
     return_frames: bool = True,
 ) -> tuple[list[Window], list[torch.Tensor]]:
@@ -443,6 +443,7 @@ def make_windows_for_video(
         video: The video to make vLLM inputs for.
         config: The configuration for the windowing.
         num_decode_threads: The number of threads to use when decoding the video.
+        preprocess_mode: Owner of resize/rescale/normalize for returned video frames.
         keep_mp4: Whether to keep the MP4.
         return_frames: Whether to decode and return frame tensors.
 
@@ -468,6 +469,7 @@ def make_windows_for_video(
             config,
             target_bit_rate,
             num_decode_threads,
+            preprocess_mode=preprocess_mode,
             keep_mp4=keep_mp4,
             return_frames=return_frames,
         )

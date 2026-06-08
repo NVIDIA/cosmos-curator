@@ -18,7 +18,7 @@
 import attrs
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
-from cosmos_curator.pipelines.common.model_constraints import MODEL_VARIANTS_REQUIRING_PREPROCESS
+from cosmos_curator.pipelines.common.model_constraints import resolve_preprocess_mode
 from cosmos_curator.pipelines.image.captioning.image_api_caption_stages import (
     ImageGeminiCaptionStage,
     ImageOpenAICaptionStage,
@@ -130,7 +130,6 @@ def build_image_captioning_stages(config: ImageCaptioningConfig) -> list[Curator
         )
         return stages
 
-    model_does_preprocess = config.caption_algo in MODEL_VARIANTS_REQUIRING_PREPROCESS
     vllm_config = VllmConfig(
         model_variant=config.caption_algo,
         use_image_input=True,
@@ -141,7 +140,7 @@ def build_image_captioning_stages(config: ImageCaptioningConfig) -> list[Curator
         sampling_config=VllmSamplingConfig(max_tokens=config.max_output_tokens),
         stage2_caption=config.stage2_caption,
         stage2_prompt_text=config.stage2_prompt_text,
-        preprocess=model_does_preprocess,
+        preprocess_mode=resolve_preprocess_mode(config.caption_algo),
     )
     return [
         CuratorStageSpec(

@@ -26,6 +26,7 @@ from nvtx import nvtx  # type: ignore[import-untyped]
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.utils.misc import grouping
 from cosmos_curator.core.utils.model import model_utils, pixi_utils
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 
 _QWEN2_5_VL_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -38,14 +39,6 @@ _QWEN_VARIANTS_INFO = {
     "qwen3_vl_30b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
     "qwen3_vl_30b_fp8": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
 }
-
-# Variants that skip our 28-aligned ``fetch_video`` preprocessing and instead
-# expect raw uint8 TCHW frames + HF's native video processor. Qwen3-VL uses a
-# 32-aligned patch grid that our preprocessor would corrupt; let HF resize/
-# rescale/normalize itself. Single source of truth — both ``QwenVL.__init__``
-# (for ``model_does_preprocess`` defaulting) and ``PerEventCaptionStage._call_qwen``
-# (for picking the decoder path) key off this set.
-QWEN_VARIANTS_NEED_RAW_FRAMES: frozenset[str] = frozenset({"qwen3_vl_30b", "qwen3_vl_30b_fp8"})
 
 _DEFAULT_STAGE2_PROMPT = """
 Improve and refine following video description. Focus on highlighting the key visual and sensory elements.
@@ -187,7 +180,7 @@ class QwenVL(ModelInterface):
         *,
         fp8: bool = True,
         max_output_tokens: int = 8192,
-        model_does_preprocess: bool | None = None,
+        preprocess_mode: PreprocessMode | None = None,
         stage2_prompt_text: str | None = None,
         disable_mmcache: bool = False,
         num_gpus: int = 1,
@@ -198,11 +191,10 @@ class QwenVL(ModelInterface):
             model_variant: The variant of the Qwen model to use.
             fp8: Whether to use FP8 quantization.
             max_output_tokens: The maximum number of tokens to generate.
-            model_does_preprocess: Whether vLLM's HF mm-processor should
-                resize/rescale/normalize the video. ``None`` picks a
-                per-variant default: ``False`` for Qwen2.5-VL (28-aligned
+            preprocess_mode: Owner of resize/rescale/normalize. ``None`` picks a
+                per-variant default: curator mode for Qwen2.5-VL (28-aligned
                 patch grid; callers pre-process with ``fetch_video``) and
-                ``True`` for Qwen3-VL (32-aligned grid; let HF do it).
+                model mode for Qwen3-VL (32-aligned grid; let HF do it).
             stage2_prompt_text: The prompt for the stage 2 caption.
             disable_mmcache: Whether to disable the MM cache.
             num_gpus: Number of GPUs to use for processing.
@@ -213,9 +205,8 @@ class QwenVL(ModelInterface):
         self.weight_file = str(model_utils.get_local_dir_for_weights_name(self._weights_name))
         self.fp8 = fp8
         self.max_output_tokens = max_output_tokens
-        if model_does_preprocess is None:
-            model_does_preprocess = model_variant in QWEN_VARIANTS_NEED_RAW_FRAMES
-        self.model_does_preprocess = model_does_preprocess
+        requested_preprocess_mode = PreprocessMode.CURATOR if preprocess_mode is None else preprocess_mode
+        self.preprocess_mode = resolve_preprocess_mode(model_variant, requested_preprocess_mode)
         self.disable_mmcache = disable_mmcache
         self.llm: LLM | None = None
         self.model_variant = model_variant
@@ -257,10 +248,11 @@ class QwenVL(ModelInterface):
 
         """
         logger.info("Setting up Qwen model")
+        model_preprocess_enabled = self.preprocess_mode == PreprocessMode.MODEL
         mm_processor_kwargs = {
-            "do_resize": self.model_does_preprocess,
-            "do_rescale": self.model_does_preprocess,
-            "do_normalize": self.model_does_preprocess,
+            "do_resize": model_preprocess_enabled,
+            "do_rescale": model_preprocess_enabled,
+            "do_normalize": model_preprocess_enabled,
         }
 
         quantization: QuantizationMethods | None = None

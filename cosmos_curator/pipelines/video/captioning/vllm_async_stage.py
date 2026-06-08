@@ -87,6 +87,7 @@ from cosmos_curator.core.utils.misc.logging_utils import make_tagged_logger
 from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.single_inference import SingleInferenceCaptionStage
 from cosmos_curator.pipelines.video.utils.data_model import (
     CaptionOutcome,
@@ -120,7 +121,6 @@ if pixi_utils.is_running_in_env("default"):
     from vllm.v1.engine.exceptions import EngineDeadError
 
     from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
-    from cosmos_curator.models.qwen_vl import QWEN_VARIANTS_NEED_RAW_FRAMES
     from cosmos_curator.models.vllm_interface import (
         _get_vllm_plugin,
         make_model_inputs,
@@ -831,8 +831,8 @@ class VllmAsyncCaptionStage(SingleInferenceCaptionStage, ContinuousInterface):  
         """Decode whole-clip mp4 bytes into a frame tensor + HF video metadata.
 
         Mirrors :meth:`VllmCaptionStage._decode_video_for_caption_single`:
-        Qwen3-VL needs raw uint8 TCHW frames + HF's video processor;
-        everything else uses the 28-aligned float16 ``fetch_video`` path.
+        model-side preprocessing needs decoded uint8 TCHW frames + HF's
+        video processor; curator preprocessing uses the float16 ``fetch_video`` path.
         """
         total_frames = get_frame_count(video_bytes)
         if total_frames <= 0:
@@ -843,7 +843,7 @@ class VllmAsyncCaptionStage(SingleInferenceCaptionStage, ContinuousInterface):  
         # ``windowing_utils.make_windows_for_video``); ``end=total_frames``
         # would request a frame at out-of-range index ``total_frames``.
         window_range = [WindowFrameInfo(start=0, end=total_frames - 1)]
-        needs_raw_frames = self._serve_config.model_variant in QWEN_VARIANTS_NEED_RAW_FRAMES
+        needs_raw_frames = self._serve_config.model_preprocess_enabled
         with buffer_as_memfd_path(video_bytes, name="vllm-async-caption-single") as path:
             if needs_raw_frames:
                 video_tensor, _frame_counts = read_video_cpu(
@@ -857,8 +857,7 @@ class VllmAsyncCaptionStage(SingleInferenceCaptionStage, ContinuousInterface):  
                     path,
                     sampling_fps=sampling_fps,
                     window_range=window_range,
-                    do_preprocess=True,
-                    preprocess_dtype="float16",
+                    preprocess_mode=PreprocessMode.CURATOR,
                 )
 
         num_sampled_frames = int(video_tensor.shape[0]) if video_tensor.ndim >= 1 else 0
