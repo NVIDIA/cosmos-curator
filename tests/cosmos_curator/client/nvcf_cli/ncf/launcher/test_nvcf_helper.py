@@ -1407,6 +1407,29 @@ def test_nvcf_helper_get_deployment_detail_success(monkeypatch: MonkeyPatch, tmp
     }
 
 
+def test_nvcf_helper_get_deployment_detail_unauthorized(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """A 401 with no detail (e.g. expired API key) must raise a coded auth error, not "None".
+
+    Regression test: previously get_detail() stringified the missing detail to the literal "None",
+    so this surfaced as ``RuntimeError: None`` and masked an expired PERF_NGC_NVCF_API_KEY.
+    """
+    mock_ncg_client = MagicMock()
+    # Shape mirrors NvcfClient._handle_client_error for a 401 body without a "detail" field.
+    mock_ncg_client.get.return_value = NVCFResponse({"status": 401, "issue": {"status": 401, "title": "Unauthorized"}})
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.ncg_api_hdl = mock_ncg_client
+
+    with pytest.raises(RuntimeError) as exc_info:
+        nvcf_helper.nvcf_helper_get_deployment_detail(funcid="test-funcid", version="test-version")
+
+    message = str(exc_info.value)
+    assert message != "None"
+    assert "HTTP 401" in message
+    assert "check API key" in message
+
+
 @pytest.mark.parametrize(
     ("response", "exception"),
     [

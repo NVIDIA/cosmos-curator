@@ -85,23 +85,28 @@ def test_nvcf_response_get_detail() -> None:
     response = NVCFResponse()
     assert response.get_detail() is None
 
+    # An error body with an "issue" but no "detail" (e.g. a 401 from an expired key) must return
+    # None, not the literal string "None", so callers fall back to get_error() with the HTTP code.
+    response = NVCFResponse({"status": 401, "issue": {"title": "Unauthorized"}})
+    assert response.get_detail() is None
+
 
 def test_nvcf_response_get_error() -> None:
     """Test nvcf response get error."""
     response = NVCFResponse({"status": 400})
-    assert response.get_error("test") == "invalid request for test"
+    assert response.get_error("test") == "[HTTP 400] invalid request for test"
     response = NVCFResponse({"status": 401})
-    assert response.get_error("test") == "operation not authorized for test"
+    assert response.get_error("test") == "[HTTP 401] operation not authorized for test (check API key / credentials)"
     response = NVCFResponse({"status": 403})
-    assert response.get_error("test") == "operation not allowed for test"
+    assert response.get_error("test") == "[HTTP 403] operation not allowed for test (check API key / credentials)"
     response = NVCFResponse({"status": 404})
-    assert response.get_error("test") == "test not found"
+    assert response.get_error("test") == "[HTTP 404] test not found"
     response = NVCFResponse({"status": 412})
-    assert response.get_error("test") == "test precondition failed"
+    assert response.get_error("test") == "[HTTP 412] test precondition failed"
     response = NVCFResponse({"status": 429})
-    assert response.get_error("test") == "test too many requests"
+    assert response.get_error("test") == "[HTTP 429] test too many requests"
     response = NVCFResponse({"status": 500})
-    assert response.get_error("test") == "unknown error occurred: status=500"
+    assert response.get_error("test") == "[HTTP 500] unknown error occurred: status=500"
 
     response = NVCFResponse()
     assert response.get_error("test") == "unexpected empty response"

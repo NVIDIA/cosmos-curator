@@ -149,7 +149,10 @@ class NVCFResponse(dict[str, Any]):
         """
         issue = self.get("issue")
         if issue is not None:
-            return str(issue.get("detail"))
+            detail = issue.get("detail")
+            # Avoid surfacing a literal "None" string when the error body has no detail field;
+            # callers rely on a real None to fall back to get_error() (which includes the HTTP code).
+            return str(detail) if detail is not None else None
         return self.get("detail")
 
     def get_error(self, obj: str) -> str:
@@ -167,8 +170,8 @@ class NVCFResponse(dict[str, Any]):
 
         messages = {
             400: f"invalid request for {obj}",
-            401: f"operation not authorized for {obj}",
-            403: f"operation not allowed for {obj}",
+            401: f"operation not authorized for {obj} (check API key / credentials)",
+            403: f"operation not allowed for {obj} (check API key / credentials)",
             404: f"{obj} not found",
             412: f"{obj} precondition failed",
             429: f"{obj} too many requests",
@@ -178,7 +181,8 @@ class NVCFResponse(dict[str, Any]):
         if extra := self.get("requestStatus", {}).get("statusDescription"):
             out = f"{out}: {extra}"
 
-        return out
+        # Always surface the HTTP status code so engineers can tell 401 vs 403 vs 404 at a glance.
+        return f"[HTTP {self.status}] {out}"
 
 
 class NvcfClient:
