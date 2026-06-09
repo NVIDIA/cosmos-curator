@@ -22,13 +22,13 @@ if [[ ! -e "${AWS_CREDS_PATH}" ]]; then
   exit 1
 fi
 
-PIXI_CACHE_DIR=/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache
+SLIM_PIXI_CACHE_DIR=${SLURM_E2E_PIXI_CACHE_DIR:-/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache}
 MOUNTS=(
   "${DATA_DIR}:/config/data"
   "${MODEL_DIR}:/config/models"
   "${AWS_CREDS_PATH}:/creds/s3_creds"
   "${CI_PROJECT_DIR}:/config/project"
-  "${PIXI_CACHE_DIR}:/pixi-cache"
+  "${SLIM_PIXI_CACHE_DIR}:/pixi-cache"
 )
 MOUNTS_STR=$(IFS=, ; echo "${MOUNTS[*]}")
 

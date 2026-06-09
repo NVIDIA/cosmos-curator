@@ -198,15 +198,26 @@ def test_slurm_end_to_end_uses_pixi_dev_for_submit_cli() -> None:
     slurm_job = _read_ci_job("slurm_end_to_end")
     before_script = _script_lines(slurm_job["before_script"])
     script = _script_lines(slurm_job["script"])
+    after_script = _script_lines(slurm_job["after_script"])
     commands = "\n".join([*before_script, *script])
     pixi_bootstrap_index = next(index for index, command in enumerate(before_script) if "pixi.sh/install.sh" in command)
+    pixi_cache_index = next(
+        index
+        for index, command in enumerate(before_script)
+        if 'PIXI_CACHE_DIR="${SLURM_E2E_PIXI_CACHE_DIR}"' in command
+    )
     pixi_setup_index = next(
         index for index, command in enumerate(before_script) if "pixi install --frozen -e dev" in command
     )
 
     assert pixi_bootstrap_index < pixi_setup_index
+    assert pixi_bootstrap_index < pixi_cache_index < pixi_setup_index
+    assert slurm_job["variables"]["SLURM_E2E_PIXI_CACHE_DIR"] == (
+        "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache"
+    )
     assert "pixi install --frozen -e dev" in commands
     assert ".gitlab/scripts/slurm_end_to_end.sh" in script
+    assert 'rm -rf "${CI_PROJECT_DIR}/.pixi"' in after_script
     assert "pip install -e ." not in commands
     assert "source venv/bin/activate" not in commands
     assert "uv venv" not in commands

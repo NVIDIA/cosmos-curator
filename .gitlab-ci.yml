@@ -853,12 +853,16 @@ slurm_end_to_end:
     CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
     ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
     SLURM_E2E_S3_PROFILE_NAME: "default"
+    SLURM_E2E_PIXI_CACHE_DIR: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache"
   before_script:
     - source .gitlab/vault/vault-auth.sh
     - *install_pixi_if_missing
+    - export PIXI_CACHE_DIR="${SLURM_E2E_PIXI_CACHE_DIR}"
     - *setup_pixi_dev
   script:
     - .gitlab/scripts/slurm_end_to_end.sh
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.pixi"
   retry:
     max: 2
     when: always
