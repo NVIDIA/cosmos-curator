@@ -27,13 +27,15 @@ from collections.abc import Mapping, Sequence
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-import numpy as np
 import pyarrow as pa
 import smart_open  # type: ignore[import-untyped]
 from loguru import logger
 
-from cosmos_curator.core.utils.model import model_utils
 from cosmos_curator.core.utils.storage import storage_utils
+from cosmos_curator.pipelines.video.split_comparison.caption_embedding import (
+    cosine_similarity_batch,
+    load_caption_model,
+)
 from cosmos_curator.pipelines.video.split_comparison.config import (
     CaptionPolicy,
     ScoreTolerance,
@@ -122,7 +124,7 @@ class MetadataStage:
         self._output_a = output_a
         self._output_b = output_b
         self._config = config
-        self._caption_model = _load_caption_model(config.caption.model_id) if config.compare_captions else None
+        self._caption_model = load_caption_model(config.caption.model_id) if config.compare_captions else None
         self._params_a: Mapping[str, Any] = storage_utils.get_smart_open_params(output_a, profile_name=profile_name)
         self._params_b: Mapping[str, Any] = storage_utils.get_smart_open_params(output_b, profile_name=profile_name)
 
@@ -138,30 +140,6 @@ class MetadataStage:
             caption_model=self._caption_model,
         )
         return pa.Table.from_pylist(rows, schema=ISSUE_SCHEMA)
-
-
-def _load_caption_model(model_id: str, device: str | None = None) -> "SentenceTransformer":
-    """Load the caption embedding model from the project's local weights cache.
-
-    Default device is cpu if not specified. CPU inference is cheap enough
-    for BGE-small at audit batch sizes.
-
-    ``sentence_transformers``/``torch`` are imported here rather than at module
-    top so heavy deps are only loaded when captions are actually compared.
-    """
-    from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]  # noqa: PLC0415
-
-    device = device or "cpu"
-    model_dir = model_utils.get_local_dir_for_weights_name(model_id)
-    if not model_dir.exists():
-        msg = (
-            f"Caption model weights not found at {model_dir}. Download via: "
-            "cosmos-curator local launch --image-name cosmos-curator -- "
-            "pixi run --as-is python -m cosmos_curator.core.managers.model_cli download "
-            "--models bge_small_en_v1_5"
-        )
-        raise FileNotFoundError(msg)
-    return SentenceTransformer(str(model_dir), local_files_only=True, device=device)  # type: ignore[no-any-return]
 
 
 def _process_batch(  # noqa: PLR0913
@@ -306,6 +284,10 @@ def _read_metadata(
       ``NoSuchKey`` wrapped in ``OSError``); silent, the expected one-sided case.
     * ``(None, UNREADABLE)`` -- present but unusable (corrupt/truncated JSON,
       transport error, or a payload that isn't a JSON object); logged.
+
+    NOTE: transitional twin of ``measure_stage.read_clip_metadata`` (same I/O,
+    this returns the ``MetadataRead`` enum, that returns presence bools). When
+    CVC-1029 retires this module the two collapse into one shared reader.
     """
     path = storage_utils.get_full_path(output_root, "metas", "v0", f"{clip_id}.json")
     try:
@@ -657,7 +639,7 @@ def _emit_caption_issues(
         return []
     texts_a = [job.text_a for job in jobs]
     texts_b = [job.text_b for job in jobs]
-    similarities = _cosine_similarity_batch(model, texts_a, texts_b, batch_size=policy.encode_batch_size)
+    similarities = cosine_similarity_batch(model, texts_a, texts_b, batch_size=policy.encode_batch_size)
     return [
         make_issue(
             code="caption_similarity_below_threshold",
@@ -678,28 +660,3 @@ def _emit_caption_issues(
         for job, sim in zip(jobs, similarities, strict=True)
         if float(sim) < policy.min_similarity
     ]
-
-
-def _cosine_similarity_batch(
-    model: "SentenceTransformer",
-    texts_a: list[str],
-    texts_b: list[str],
-    *,
-    batch_size: int,
-) -> "np.ndarray[Any, Any]":
-    """Embed both lists in one ``encode()`` call; return paired cosine similarities, shape (N,).
-
-    ``sentence_transformers`` chunks the input internally at ``batch_size``;
-    the Python-level call overhead is paid once.
-    """
-    if not texts_a:
-        return np.zeros(0, dtype=np.float32)
-    embeddings = model.encode(
-        texts_a + texts_b,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
-    embs_a, embs_b = np.vsplit(np.asarray(embeddings), 2)
-    return np.asarray((embs_a * embs_b).sum(axis=1))
