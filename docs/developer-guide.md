@@ -46,11 +46,11 @@ pixi shell -e dev
 For an explicit one-time setup without the smoke test, install the pre-commit hook directly:
 
 ```bash
-pixi run -e dev-hooks pre-commit install
+pixi run -e tools pre-commit install
 ```
 
 macOS is not a supported runtime platform for Cosmos Curator pipelines, but Apple Silicon developers can use the
-lightweight `dev-hooks` Pixi environment for pre-commit formatting checks and the `./devset.sh` bootstrap. Full CPU/GPU
+lightweight `tools` Pixi environment for pre-commit formatting checks and the `./devset.sh` bootstrap. Full CPU/GPU
 tests and pipeline execution should run on Linux or inside the project container.
 
 ### Working with Pixi Environments

@@ -1,7 +1,7 @@
 [workspace]
-channels = ["rapidsai", "conda-forge", "nvidia"]
+channels = ["rapidsai", "conda-forge"]
 name = "cosmos-curator"
-platforms = ["linux-64", "linux-aarch64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 version = "1.0.0"
 
 [activation.env]
@@ -10,15 +10,9 @@ PYTHONNOUSERSITE = "1"  # isolate pixi environments from user/system site-packag
 [dependencies]
 python = ">=3.12.13,<3.13"
 pip = "*"
-click = ">=8.4.1"
 
-[pypi-dependencies]
-cosmos-xenna = "==0.4.3"
-ray = { version = "==2.55.1", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
-
-[feature.core.system-requirements]
-cuda = "13.0.2" # match the version of the nvidia/cuda docker base image
-libc = { family = "glibc", version = "2.35" } # vllm cu130 wheels require manylinux_2_35
+[feature.core]
+platforms = ["linux-64", "linux-aarch64"]
 
 [feature.core.dependencies]
 astral = "*"
@@ -28,8 +22,6 @@ azure-storage-blob = "*"
 cattrs = "*"
 easydict = "*"
 fastapi = "*"
-starlette = "<1"  # prometheus-fastapi-instrumentator (via vllm) requires <1.0.0
-gpustat = "*"
 huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
@@ -48,6 +40,7 @@ pytest-cov = "*"
 pytest-xdist = "*"
 scipy = "*"
 setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
+starlette = "<1"  # Ray Serve imports starlette during broad GPU test collection
 tabulate = "*"
 tblib = "*"
 tenacity = "*"
@@ -58,18 +51,14 @@ uvicorn = "*"
 websockets = "<16" # google-genai requires websockets<16
 
 [feature.core.pypi-dependencies]
-av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
-google-genai= ">=1.59.0" # conda-forge package is too old
+cosmos-xenna = "==0.4.3"
+google-genai = ">=1.59.0" # conda-forge package is too old
 ngcsdk = "*" # not available on conda-forge
-opencv-python-headless = "*" # not available on conda-forge
 pillow = ">=12.2.0"  # CVE-2026-40192: patched in Pillow 12.2.0+ (core PyPI dep)
 pyasn1 = ">=0.6.3" # CVE remediation: require 0.6.3+ (fixes vs vulnerable 0.6.2 in default/core envs)
 pylance = ">=0.39.0" # conda-forge package is too old
 pulp = "*" # conda-forge package is too old
-timm = "*" # conda-forge package pulls in torchvision, which is behind
-torch = "==2.11.0"
-torchvision = "==0.26.0"
-uvicorn = "*"
+ray = { version = "==2.55.1", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
 webdataset = "*" # conda-forge package pulls in pytorch
 
 [feature.core.tasks]
@@ -78,40 +67,59 @@ model-download = "python -m cosmos_curator.core.managers.model_cli download"
 video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
 gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models"
 
-[feature.dev-hooks]
+[feature.tools]
 channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
-[feature.dev-hooks.dependencies]
-python = ">=3.12.13,<3.13"
-pip = "*"
+[feature.tools.dependencies]
 pre-commit = "==4.2.0"
 python-build = "*"
+setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
+setuptools-scm = ">=8"
 
-[feature.dev-hooks.pypi-dependencies]
+[feature.tools.pypi-dependencies]
+cosmos-curator = { path = ".", editable = true }
 ruff = "==0.15.15"
+
+[feature.tools.tasks]
+build = "python -m build"
+cosmos-curator = "python -m cosmos_curator.client.cli"
+pre-commit = "pre-commit"
+ruff = "ruff"
+
+[feature.cluster]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.cluster.dependencies]
+nvitop = "*"
+nvtop = "*"
+
+[feature.cluster.pypi-dependencies]
+awscli = "*"
+awscli-plugin-endpoint = "*"
+
+[feature.cluster.tasks]
+nvitop = "nvitop"
+nvtop = "nvtop"
 
 [feature.dev]
 channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
 
 [feature.dev.dependencies]
-nvitop = "*"
-nvtop = "*"
-pre-commit = "==4.2.0"
+gpustat = "*"
 pytest-mock = "*"
-python-build = "*"
-setuptools-scm = ">=8"
+safetensors = "*"
 
 [feature.dev.pypi-dependencies]
-awscli = "*"
-awscli-plugin-endpoint = "*"
-cosmos-curator = { path = ".", editable = true }
-fabric = "==3.2.2"
-invoke = "==3.0.3"
+av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
 mypy = "==2.1.0"
 openai = "*"
+opencv-python-headless = "*" # not available on conda-forge
 pandas-stubs = "*"
-ruff = "==0.15.15"
+torch = "==2.11.0"
+torchvision = "==0.26.0"
 twine = "==6.1.0"
 types-aiofiles = "*"
 types-boto3 = "*"
@@ -124,16 +132,53 @@ types-toml = "*"
 types-tqdm = "*"
 
 [feature.dev.tasks]
-build = "python -m build"
-cosmos-curator = "python -m cosmos_curator.client.cli"
 mypy = "mypy"
-nvitop = "nvitop"
-nvtop = "nvtop"
-pre-commit = "pre-commit"
 pytest = "pytest"
-ruff = "ruff"
 
-[feature.core.target.linux-aarch64.dependencies]
+[feature.runtime.system-requirements]
+cuda = "13.0.2" # match the version of the nvidia/cuda docker base image
+libc = { family = "glibc", version = "2.35" } # vllm cu130 wheels require manylinux_2_35
+
+[feature.runtime]
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.runtime.dependencies]
+cuda-libraries-dev = "*"
+gpustat = "*"
+libgl = "*" # paddleocr -> opencv-python needs libGL.so.1; previously satisfied transitively via FFmpeg's conda deps
+pycountry = "*"
+
+[feature.runtime.pypi-dependencies]
+av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
+cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (default env; fixes vs vulnerable 5.8.x)
+cvcuda-cu13 = "*" # not available on conda-forge
+opencv-python-headless = "*" # not available on conda-forge
+PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
+timm = "*" # conda-forge package pulls in torchvision, which is behind
+torch = "==2.11.0"
+torchvision = "==0.26.0"
+vllm = "==0.21.0" # not available on conda-forge
+# transformers-cosmos3 registers the cosmos3_omni HF AutoConfig type; vllm-cosmos3
+# registers Cosmos3ReasonerForConditionalGeneration for the nvidia/Cosmos3-Nano +
+# Cosmos3-Super omnimodel reasoning head. Both are subdirectory packages of the
+# NVIDIA/cosmos-framework monorepo, installed from the archive tarball (no git
+# binary needed in the build container) pinned to a commit for a reproducible lock.
+# They must both be declared here: uv only honors vllm-cosmos3's `[tool.uv.sources]`
+# for a root project, so vllm-cosmos3's transformers-cosmos3 requirement is
+# satisfied by this explicit pin instead.
+#
+# The `subdirectory = "..."` key selects which package to build from the tarball.
+# The `#subdirectory=...` URL fragment is also required and load-bearing: pixi keys
+# source packages by URL, so two deps sharing the identical tarball URL collapse to
+# one (vllm-cosmos3 gets silently dropped). The differing fragment makes the URLs
+# distinct; do not remove it.
+transformers-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/transformers-cosmos3", subdirectory = "packages/transformers-cosmos3" }
+vllm-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/vllm-cosmos3", subdirectory = "packages/vllm-cosmos3" }
+paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
+paddleocr = "==2.10.*"
+
+[feature.runtime.target.linux-aarch64.dependencies]
 # Add CUDA toolchain packages on aarch64 -- these are automatic dependencies on linux-64.
 cuda-nvvm-tools = "13.0.*"
 cuda-nvcc-tools = "13.0.*"
@@ -145,7 +190,7 @@ cuda-cuobjdump = "13.0.*"
 cuda-nvdisasm = "13.0.*"
 triton = "==3.6.0"
 
-[feature.core.target.linux-aarch64.pypi-dependencies]
+[feature.runtime.target.linux-aarch64.pypi-dependencies]
 # Add available NVIDIA CUDA runtime wheels for aarch64 to match linux-64 installs.
 # With CUDA 13, most nvidia-*-cu13 PyPI packages are deprecated stubs that fail to build.
 # Use unsuffixed names (e.g. nvidia-cublas) for those; keep -cu13 only where real wheels exist.
@@ -164,6 +209,10 @@ nvidia-nccl-cu13 = "*"
 nvidia-nvjitlink = "*"
 nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
+
+[feature.cuml]
+channels = ["nvidia"]
+platforms = ["linux-64", "linux-aarch64"]
 
 [feature.cuml.system-requirements]
 cuda = "13.0.2" # match the version of the nvidia/cuda docker base image
@@ -187,37 +236,11 @@ ngcsdk = "*" # not available on conda-forge
 pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as core)
 pylance = ">=0.39.0" # conda-forge package is too old
 
-[feature.model-download.dependencies]
-azure-identity = "*"
-azure-storage-blob = "*"
-cattrs = "*"
-huggingface_hub = "*"
-loguru = "*"
-pandas = "*"
-numpy = ">2,<2.3" # opencv-python-headless requires >=2; numba 0.61.x requires <2.3
-nvidia-ml-py = "*"
-openssl = ">=3.6.2,<4.0a0" # model-download env: bin/openssl (e.g. CVE-2026-28386)
-pyjwt = ">=2.12.0" # CVE remediation: PyJWT 2.12+ (model-download omits core)
-scipy = "*"
-setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
-tabulate = "*"
-
-[feature.model-download.pypi-dependencies]
-ngcsdk = "*" # not available on conda-forge
-opencv-python-headless = "*" # not available on conda-forge
-pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (model-download omits core)
-
 [feature.transformers.dependencies]
 transformers = ">=4.57.1,<5.0.0" # Transformers v5 changes apply_chat_template to return BatchEncoding instead of input_ids
 
 [feature.transformers.pypi-dependencies]
 sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch==2.11.0
-
-# Formerly the standalone `unified` environment; folded into runtime `default` only.
-[feature.unified.dependencies]
-cuda-libraries-dev = "*"
-libgl = "*" # paddleocr -> opencv-python needs libGL.so.1; previously satisfied transitively via FFmpeg's conda deps
-pycountry = "*"
 
 # SeedVR2 super-resolution dependencies.
 # SeedVR's own requirements.txt pins old versions (e.g. diffusers==0.29.1,
@@ -233,33 +256,16 @@ diffusers = "*"
 mediapy = "*" # SeedVR uses mediapy.write_image / write_video for super-resolution output (cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py). PyPI variant: the conda package transitively pulls conda-forge ffmpeg + openh264, which we no longer ship; PyPI mediapy shells out to /opt/ffmpeg via PATH instead.
 rotary-embedding-torch = "*"
 
-[feature.unified.pypi-dependencies]
-cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (default env; fixes vs vulnerable 5.8.x)
-cvcuda-cu13 = "*" # not available on conda-forge
-PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
-vllm = "==0.21.0" # not available on conda-forge
-# transformers-cosmos3 registers the cosmos3_omni HF AutoConfig type; vllm-cosmos3
-# registers Cosmos3ReasonerForConditionalGeneration for the nvidia/Cosmos3-Nano +
-# Cosmos3-Super omnimodel reasoning head. Both are subdirectory packages of the
-# NVIDIA/cosmos-framework monorepo, installed from the archive tarball (no git
-# binary needed in the build container) pinned to a commit for a reproducible lock.
-# They must both be declared here: uv only honors vllm-cosmos3's `[tool.uv.sources]`
-# for a root project, so vllm-cosmos3's transformers-cosmos3 requirement is
-# satisfied by this explicit pin instead.
-#
-# The `subdirectory = "..."` key selects which package to build from the tarball.
-# The `#subdirectory=...` URL fragment is also required and load-bearing: pixi keys
-# source packages by URL, so two deps sharing the identical tarball URL collapse to
-# one (vllm-cosmos3 gets silently dropped). The differing fragment makes the URLs
-# distinct; do not remove it.
-transformers-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/transformers-cosmos3", subdirectory = "packages/transformers-cosmos3" }
-vllm-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/vllm-cosmos3", subdirectory = "packages/vllm-cosmos3" }
-paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
-paddleocr = "==2.10.*"
-
 [feature.legacy-transformers.dependencies]
 einops = "*"
 transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require older transformers
+
+[feature.legacy-transformers.pypi-dependencies]
+av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
+opencv-python-headless = "*" # not available on conda-forge
+timm = "*" # conda-forge package pulls in torchvision, which is behind
+torch = "==2.11.0"
+torchvision = "==0.26.0"
 
 # PaddleOCR for artificial text (overlay/post-production) detection. Isolated from default's vllm dependencies.
 [feature.paddle-ocr.target.linux-64.dependencies]
@@ -304,12 +310,13 @@ kernels = "*"
 transformers = ">=5.0.0"
 
 [environments]
-cuml = ["cuml", "tracing"]
-default = ["core", "transformers", "unified", "tracing", "profiling"]
-dev = ["core", "transformers", "tracing", "profiling", "dev"]
-dev-hooks = { features = ["dev-hooks"], no-default-feature = true }
+tools = ["tools"]
+cluster = ["tools", "cluster"]
+cuml = ["core", "cuml", "tracing"]
+default = ["core", "runtime", "transformers", "tracing", "profiling"]
+dev = ["tools", "cluster", "core", "transformers", "tracing", "profiling", "dev"]
 legacy-transformers = ["core", "legacy-transformers", "tracing", "profiling"]
-model-download = ["model-download", "tracing"]
+model-download = ["core", "tracing"]
 paddle-ocr = ["core", "paddle-ocr", "tracing", "profiling"]
-seedvr = ["core", "transformers", "seedvr", "tracing", "profiling"]
-sam3 = ["core", "sam3", "tracing", "profiling"]
+seedvr = ["core", "runtime", "transformers", "seedvr", "tracing", "profiling"]
+sam3 = ["core", "runtime", "sam3", "tracing", "profiling"]

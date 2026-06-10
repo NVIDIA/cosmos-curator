@@ -124,25 +124,27 @@ cd cosmos-curator
 pixi install --frozen -e dev
 
 # 4. Verify the CLI tool is available
-pixi run cosmos-curator --help
+pixi run -e dev cosmos-curator --help
 ```
 
 Developers may also execute `./devset.sh` from the repository root to install local git hooks and run a package build
 smoke test.
 
 macOS is not a supported runtime platform for Cosmos Curator pipelines. Apple Silicon developers can use the lightweight
-`dev-hooks` Pixi environment for pre-commit formatting checks, but full CPU/GPU tests and pipeline execution should run
-on Linux or inside the project container.
+`tools` Pixi environment for pre-commit formatting checks, builds, and CLI smoke checks, but full CPU/GPU tests and
+pipeline execution should run on Linux or inside the project container.
 
-The `cosmos-curator` command is a host-side deployment CLI available through `pixi run cosmos-curator ...`, or directly
-after running `pixi shell -e dev`. Use it on the host to build images, launch local Docker runs, submit Slurm jobs, and
-manage NVCF resources. Runtime container images are focused on pipeline execution and do not guarantee the
+The `cosmos-curator` command is a host-side deployment CLI available through `pixi run -e tools cosmos-curator ...`,
+`pixi run -e cluster cosmos-curator ...`, or directly after running `pixi shell -e dev`. Use it on the host to build
+images, launch local Docker runs, submit Slurm jobs, and manage NVCF resources. Runtime container images are focused on
+pipeline execution and do not guarantee the
 `cosmos-curator` command or the `cosmos_curator.client` package inside the container. In-container commands should use
 `pixi run --as-is` with the Pixi task aliases shown below, or `pixi run --as-is python -m cosmos_curator...` for modules
 without a task alias.
 
-On Linux GPU hosts, the `dev` environment also includes `nvtop` and `nvitop`; run `pixi run nvtop` or `pixi run nvitop`
-to monitor GPU utilization and memory during local Docker launches.
+On Linux GPU hosts, the `cluster` and `dev` environments include `nvtop` and `nvitop`; run
+`pixi run -e cluster nvtop` or `pixi run -e cluster nvitop` to monitor GPU utilization and memory during local Docker
+launches.
 
 ## Quick Start for Local Run
 

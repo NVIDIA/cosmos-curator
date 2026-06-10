@@ -42,7 +42,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 )  # type: ignore[import-untyped]
 
 _THRESHOLDS = {
-    "qwen": 0.9,
+    "qwen": 0.8,
     "cosmos_r1": 0.7,
     "cosmos_r2": 0.7,
     "qwen3_5_27b": 0.8,

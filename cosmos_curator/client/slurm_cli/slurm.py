@@ -127,7 +127,11 @@ class LocalConnection:
 
     def run(self, command: str, **kwargs: Any) -> InvokeResult:  # noqa: ANN401
         """Execute a shell command locally."""
-        return self._context.run(command, **kwargs)
+        result = self._context.run(command, **kwargs)
+        if result is None:
+            error_message = f"Local command did not produce a result: {command}"
+            raise RuntimeError(error_message)
+        return result
 
     def put(self, local: str, remote: str) -> None:
         """Copy a local file path to the destination on the same host."""

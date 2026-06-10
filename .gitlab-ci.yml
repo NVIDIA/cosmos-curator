@@ -40,7 +40,7 @@ variables:
   CURATOR_SLIM_IMAGE: ${CI_REGISTRY_IMAGE}/curator-slim
   CURATOR_DISTRIBUTABLE_IMAGE: ${CI_REGISTRY_IMAGE}/curator-distributable
   CI_BUILDER_IMAGE_REPO: ${CI_REGISTRY_IMAGE}/ci-builder
-  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE_REPO}:latest
+  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE_REPO}:slim-dev
   BUILDX_BUILDER_NAME: ci-cosmos-builder
 
   # Pytest configuration
@@ -325,6 +325,17 @@ stages:
     : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
     pixi install --frozen -e dev
     eval "$(pixi shell-hook -e dev -s bash)"
+
+  # Install and activate the Pixi cluster environment on shell runners.
+  setup_pixi_cluster: &setup_pixi_cluster |
+    export PATH="/usr/local/bin:${HOME}/.pixi/bin:${PATH}"
+    command -v pixi
+    export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
+    export PYTHONNOUSERSITE=1
+    git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
+    : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
+    pixi install --frozen -e cluster
+    eval "$(pixi shell-hook -e cluster -s bash)"
 
   # Activate the prebuilt Pixi dev environment from the ci-builder image.
   setup_ci_builder_env: &setup_ci_builder_env |
@@ -858,7 +869,7 @@ slurm_end_to_end:
     - source .gitlab/vault/vault-auth.sh
     - *install_pixi_if_missing
     - export PIXI_CACHE_DIR="${SLURM_E2E_PIXI_CACHE_DIR}"
-    - *setup_pixi_dev
+    - *setup_pixi_cluster
   script:
     - .gitlab/scripts/slurm_end_to_end.sh
   after_script:
