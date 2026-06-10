@@ -287,7 +287,7 @@ def _read_metadata(
 
     NOTE: transitional twin of ``measure_stage.read_clip_metadata`` (same I/O,
     this returns the ``MetadataRead`` enum, that returns presence bools). When
-    CVC-1029 retires this module the two collapse into one shared reader.
+    the evaluate phase retires this module the two collapse into one shared reader.
     """
     path = storage_utils.get_full_path(output_root, "metas", "v0", f"{clip_id}.json")
     try:
