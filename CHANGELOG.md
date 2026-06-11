@@ -2,6 +2,67 @@
 
 ## Latest
 
+## [2.2.0]
+
+### Released
+
+- 2026-06-11
+
+### Breaking Changes
+
+- Remove legacy AV pipeline and PostgreSQL helper modules; see `Removed` for affected paths.
+- Remove the `unified` Pixi environment; use `default` for stages and commands that previously
+  selected `unified`.
+
+### Added
+
+- Add `cosmos-curator pipeline` config tooling for Ray Data pipeline configs:
+  - `template` prints editable config templates.
+  - `validate` checks resolved JSON/YAML configs.
+  - `render` emits the canonical resolved config used for execution.
+  - `schema` prints the supported config JSON Schema.
+  - `presets list` and `presets show` inspect packaged presets.
+- Add schema-validated Ray Data `video_split` configs with defaults, packaged presets, template
+  profiles, strict field validation, and `--set` dotted-path overrides.
+- Add split-comparison measurement schema and field-spec catalog for typed measure/evaluate flows.
+- Add caption quality statistics to split benchmark summary metrics.
+- Add shared caption embedding helpers for split-comparison measurement code.
+
+### Fixed
+
+- Reject invalid curator-side `uint8` video preprocessing configurations before execution.
+- Force model-side preprocessing for Nemotron in the split pipeline.
+- Centralize vLLM preprocess-mode handling across supported vLLM model wrappers.
+- Return NVCF API response status codes when surfacing API errors.
+- Improve image-build CI behavior and allow pre-commit setup to run on macOS.
+
+### Changed
+
+- Split Pixi tooling into narrower developer, tooling, cluster, runtime, and model-specific
+  environments to reduce development-environment weight.
+- Keep the Pixi developer environment slimmer by moving runtime-heavy dependencies out of the
+  general dev feature.
+- Reduce Slurm end-to-end CI inode usage.
+- Update Ray Data split pipeline internals to execute through resolved config objects.
+
+### Removed
+
+- Remove the legacy AV pipeline package:
+  - `cosmos_curator.pipelines.av` is no longer included.
+  - The old AV pipeline reference documentation is removed.
+- Remove PostgreSQL helper modules that supported the legacy AV pipeline:
+  - `cosmos_curator.core.managers.postgres_cli` is no longer included.
+  - `cosmos_curator.core.utils.db` is no longer included.
+- Remove the `unified` Pixi environment after folding its common GPU-capable runtime dependencies
+  into `default`.
+
+### Documentation
+
+- Add pipeline-config design documentation for schema-versioned config files and config tooling.
+- Add Pixi environment design documentation for the split developer/runtime environment layout.
+- Refresh deprecation and split-comparison design notes for the new config-driven and measurement
+  workflows.
+
 ## [2.1.0]
 
 ### Released
