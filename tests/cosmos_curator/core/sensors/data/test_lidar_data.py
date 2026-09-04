@@ -57,7 +57,8 @@ def _make_ego_trajectory(**overrides: object) -> EgoTrajectory:
     values: dict[str, object] = {
         "align_timestamps_ns": np.array([100, 200], dtype=np.int64),
         "sensor_timestamps_ns": np.array([90, 210], dtype=np.int64),
-        "poses": np.tile(np.eye(4, dtype=np.float64), (2, 1, 1)),
+        "positions_m": np.zeros((2, 3), dtype=np.float64),
+        "orientations_xyzw": np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64), (2, 1)),
         "pose_valid": np.array([True, True], dtype=np.bool_),
         "frame": "world",
     }

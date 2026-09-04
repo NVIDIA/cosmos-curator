@@ -30,7 +30,8 @@ def _make_ego_trajectory(**overrides: object) -> EgoTrajectory:
     values: dict[str, object] = {
         "align_timestamps_ns": np.array([100, 200], dtype=np.int64),
         "sensor_timestamps_ns": np.array([90, 210], dtype=np.int64),
-        "poses": np.tile(np.eye(4, dtype=np.float64), (2, 1, 1)),
+        "positions_m": np.zeros((2, 3), dtype=np.float64),
+        "orientations_xyzw": np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64), (2, 1)),
         "pose_valid": np.array([True, True], dtype=np.bool_),
         "frame": "world",
     }
@@ -67,7 +68,8 @@ def test_ego_trajectory_arrays_are_readonly() -> None:
     for array in (
         ego.align_timestamps_ns,
         ego.sensor_timestamps_ns,
-        ego.poses,
+        ego.positions_m,
+        ego.orientations_xyzw,
         ego.pose_valid,
         ego.host_timestamps_ns,
         ego.sequence_counter,
@@ -85,10 +87,12 @@ def test_ego_trajectory_arrays_are_readonly() -> None:
             np.array([100, 100], dtype=np.int64),
             "strictly sorted in ascending order with no duplicates",
         ),
-        ("poses", np.tile(np.eye(4, dtype=np.float32), (2, 1, 1)), "dtype float64"),
-        ("poses", np.zeros((2, 3, 3), dtype=np.float64), r"shape \(N, 4, 4\)"),
-        ("poses", np.zeros((2, 4, 4), dtype=np.float64), r"last row of each \(4, 4\)"),
-        ("poses", np.full((2, 4, 4), np.nan, dtype=np.float64), "finite"),
+        ("positions_m", np.zeros((2, 3), dtype=np.float32), "dtype float64"),
+        ("positions_m", np.zeros((2, 4), dtype=np.float64), r"shape \(N, 3\)"),
+        ("positions_m", np.full((2, 3), np.nan, dtype=np.float64), "finite"),
+        ("orientations_xyzw", np.zeros((2, 4), dtype=np.float64), "unit norm"),
+        ("orientations_xyzw", np.tile(np.array([0.0, 0.0, 0.0, 2.0], dtype=np.float64), (2, 1)), "unit norm"),
+        ("orientations_xyzw", np.zeros((2, 3), dtype=np.float64), r"shape \(N, 4\)"),
         ("pose_valid", np.array([True, False], dtype=np.int8), "dtype bool"),
         ("frame", "", "frame must be a non-empty string"),
     ],
@@ -98,7 +102,7 @@ def test_ego_trajectory_rejects_invalid_required_fields(
     value: object,
     match: str,
 ) -> None:
-    """EgoTrajectory should validate poses, pose_valid, and frame."""
+    """EgoTrajectory should validate position, orientation, pose_valid, and frame."""
     with pytest.raises(ValueError, match=match):
         _make_ego_trajectory(**{field_name: value})
 
@@ -107,7 +111,8 @@ def test_ego_trajectory_rejects_invalid_required_fields(
     ("field_name", "value"),
     [
         ("sensor_timestamps_ns", np.array([90, 210, 300], dtype=np.int64)),
-        ("poses", np.tile(np.eye(4, dtype=np.float64), (3, 1, 1))),
+        ("positions_m", np.zeros((3, 3), dtype=np.float64)),
+        ("orientations_xyzw", np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64), (3, 1))),
         ("pose_valid", np.array([True, True, False], dtype=np.bool_)),
         ("host_timestamps_ns", np.array([1, 2, 3], dtype=np.int64)),
         ("sequence_counter", np.array([1, 2, 3], dtype=np.uint64)),
@@ -123,37 +128,60 @@ def test_ego_trajectory_rejects_length_mismatch(
 
 
 def test_ego_trajectory_accepts_keep_and_mask_identity_pose() -> None:
-    """Invalid rows may keep an identity transform with pose_valid=false."""
-    poses = np.tile(np.eye(4, dtype=np.float64), (2, 1, 1))
-    poses[0, :3, 3] = (1.0, 2.0, 3.0)
+    """Invalid rows may keep a zero-position, identity-quaternion placeholder."""
+    positions = np.zeros((2, 3), dtype=np.float64)
+    positions[0] = (1.0, 2.0, 3.0)
     ego = _make_ego_trajectory(
-        poses=poses,
+        positions_m=positions,
         pose_valid=np.array([True, False], dtype=np.bool_),
     )
 
     assert ego.pose_valid.tolist() == [True, False]
-    np.testing.assert_array_equal(ego.poses[1], np.eye(4, dtype=np.float64))
+    np.testing.assert_array_equal(ego.positions_m[1], np.zeros(3, dtype=np.float64))
+    np.testing.assert_array_equal(ego.orientations_xyzw[1], np.array([0.0, 0.0, 0.0, 1.0]))
 
 
 def test_ego_trajectory_rejects_non_identity_invalid_pose() -> None:
-    """pose_valid=false rows must store an identity transform, not another finite pose."""
-    poses = np.tile(np.eye(4, dtype=np.float64), (2, 1, 1))
-    poses[1, :3, 3] = (1.0, 2.0, 3.0)
+    """pose_valid=false rows cannot retain another finite pose."""
+    positions = np.zeros((2, 3), dtype=np.float64)
+    positions[1] = (1.0, 2.0, 3.0)
 
-    with pytest.raises(ValueError, match="pose_valid=false must be identity"):
+    with pytest.raises(ValueError, match="zero position and identity quaternion"):
         _make_ego_trajectory(
-            poses=poses,
+            positions_m=positions,
             pose_valid=np.array([True, False], dtype=np.bool_),
         )
 
 
 def test_ego_trajectory_rejects_nonfinite_invalid_pose() -> None:
     """Invalid rows still require finite identity placeholders, not NaN."""
-    poses = np.tile(np.eye(4, dtype=np.float64), (2, 1, 1))
-    poses[1] = np.nan
+    positions = np.zeros((2, 3), dtype=np.float64)
+    positions[1] = np.nan
 
     with pytest.raises(ValueError, match="finite"):
         _make_ego_trajectory(
-            poses=poses,
+            positions_m=positions,
             pose_valid=np.array([True, False], dtype=np.bool_),
         )
+
+
+def test_ego_trajectory_adapts_quaternions_to_homogeneous_matrices() -> None:
+    """Matrix consumers should receive the equivalent world-from-body transforms."""
+    half_sqrt = np.sqrt(0.5)
+    ego = _make_ego_trajectory(
+        positions_m=np.array([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]], dtype=np.float64),
+        orientations_xyzw=np.array([[0.0, 0.0, half_sqrt, half_sqrt], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64),
+    )
+
+    matrices = ego.as_homogeneous_matrices()
+
+    np.testing.assert_allclose(
+        matrices[0],
+        np.array(
+            [[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        ),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(matrices[1], np.eye(4, dtype=np.float64), atol=1e-12)
+    assert matrices.flags.writeable is False

@@ -477,7 +477,8 @@ captures).
 class EgoTrajectory:
     align_timestamps_ns: npt.NDArray[np.int64]
     sensor_timestamps_ns: npt.NDArray[np.int64]
-    poses: npt.NDArray[np.float64]   # shape (N, 4, 4) rig-to-global
+    positions_m: npt.NDArray[np.float64]          # shape (N, 3) rig-to-global translation
+    orientations_xyzw: npt.NDArray[np.float64]    # shape (N, 4) rig-to-global unit quaternion
     frame: str   # e.g., "world", "map", "odom"
 ```
 
@@ -515,10 +516,9 @@ Cons: changes the "what counts as a sensor?" mental model;
   for what is conceptually an "additional sensor stream" — Option C
   achieves the same sharing without the schema change.
 
-`EgoTrajectory.poses` is in row-major homogeneous-transform form
-(`(N, 4, 4) float64`, last row `[0, 0, 0, 1]` within tolerance). The
-quaternion+translation alternative is captured in
-[Open Follow-Up Questions](#open-follow-up-questions).
+`EgoTrajectory` stores translation and XYZW unit quaternions as its canonical
+pose representation. `as_homogeneous_matrices()` provides row-major
+`(N, 4, 4)` transforms to consumers that need matrix composition.
 
 ### D3. Motion-compensation contract
 
@@ -765,7 +765,9 @@ class EgoTrajectory:                                           # satisfies Senso
     __hash__ = None
     align_timestamps_ns:  npt.NDArray[np.int64]                # (N,) strictly increasing
     sensor_timestamps_ns: npt.NDArray[np.int64]                # (N,) non-decreasing
-    poses:                npt.NDArray[np.float64]              # (N, 4, 4) rig-to-global
+    positions_m:          npt.NDArray[np.float64]              # (N, 3) rig-to-global translation
+    orientations_xyzw:    npt.NDArray[np.float64]              # (N, 4) rig-to-global unit quaternion
+    pose_valid:           npt.NDArray[np.bool_]                # (N,) false rows use zero position and identity quaternion
     frame:                str                                  # "world" | "map" | "odom" | ...
 ```
 
@@ -819,7 +821,9 @@ Notes:
 | --- | --- | --- | --- | --- | --- |
 | `align_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Same `SensorData` protocol requirement as `LidarData`. |
 | `sensor_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Same `SensorData` protocol requirement as `LidarData`. |
-| `poses` | `np.float64` | `(N, 4, 4)` | — | yes | Rig-to-global transform at each alignment row's reference time. Last row of each `(4, 4)` equals `[0, 0, 0, 1]` within tolerance. |
+| `positions_m` | `np.float64` | `(N, 3)` | m | yes | Rig-to-global translation at each alignment row's reference time. |
+| `orientations_xyzw` | `np.float64` | `(N, 4)` | — | yes | Rig-to-global unit quaternion in XYZW component order. |
+| `pose_valid` | `np.bool_` | `(N,)` | — | yes | `False` preserves timeline continuity with a zero-position, identity XYZW quaternion placeholder; consumers must not trust that pose. |
 | `frame` | `str` | — | — | yes | Name of the target global frame (e.g., `"world"`, `"map"`, `"odom"`). |
 
 ## Timestamp Semantics
@@ -966,7 +970,9 @@ tables. Non-timestamp fields use these constraints:
 | `LidarData.points_align_index` | Optional `np.uint16`, shape `(P_total,)`. Every entry must satisfy `0 <= v < N`. No ordering or contiguity constraint across points. |
 | `LidarMetadata.extrinsics` | Optional `SensorExtrinsics`; existing 4x4 `float64` validators apply ([SensorExtrinsics](#ref-sensor-extrinsics)). |
 | `LidarMetadata` cross-field | `motion_compensated=True` requires `reference_frame != "sensor"`. `motion_compensated=False` requires `reference_frame in {"sensor", "rig"}` — `"world"` / `"map"` are rejected because reaching a fixed global frame is mathematically equivalent to motion compensation and should be declared as such. |
-| `EgoTrajectory.poses` | `np.float64`, shape `(N, 4, 4)`, last row of each `(4, 4)` equals `[0, 0, 0, 1]` within tolerance. `N` matches the length of `align_timestamps_ns`. |
+| `EgoTrajectory.positions_m` | `np.float64`, shape `(N, 3)`, finite values. `N` matches the length of `align_timestamps_ns`. |
+| `EgoTrajectory.orientations_xyzw` | `np.float64`, shape `(N, 4)`, finite unit XYZW quaternions. `N` matches the length of `align_timestamps_ns`. |
+| `EgoTrajectory.pose_valid` | `np.bool_`, shape `(N,)`. `False` rows must use a zero position and identity XYZW quaternion placeholder. |
 | `EgoTrajectory.frame` | Non-empty `str`; typically `"world"`, `"map"`, or `"odom"`. |
 
 Follow the existing pattern from `CameraData`: attach shared length-match
@@ -1029,20 +1035,21 @@ until concretely needed; matches the precedent from
 
 ## Implementation Status
 
-Proposed; not yet implemented. The implementation will add:
+The core data-model portion of this proposal is implemented:
 
-1. `cosmos_curator/core/sensors/data/lidar_data.py`, with attrs-based
-   `LidarData` and `LidarMetadata` classes matching this design note.
-2. `cosmos_curator/core/sensors/data/ego_trajectory.py` (or a similar path
-   under `core/sensors/data/`), with the `EgoTrajectory` `SensorData`
-   class matching the sketch above.
-3. Shared validation helpers in
-   `cosmos_curator/core/sensors/utils/validation.py` for any LiDAR- or
-   trajectory-specific patterns (e.g., finite `float32` arrays,
-   globally-non-decreasing `int64` arrays, 4x4 transform-batch validators)
-   not already present.
-4. Tests under `tests/cosmos_curator/core/sensors/data/test_lidar_data.py`
-   and `test_ego_trajectory.py`.
+1. `cosmos_curator/core/sensors/data/lidar_data.py` provides attrs-based
+   `LidarData` and `LidarMetadata` classes.
+2. `cosmos_curator/core/sensors/data/egotrajectory_data.py` provides the
+   `EgoTrajectory` `SensorData` class.
+3. `cosmos_curator/core/sensors/utils/validation.py` provides reusable
+   validators, including `nondecreasing_int64_array` and
+   `unit_quaternion_batch`.
+4. Tests cover the data contracts under
+   `tests/cosmos_curator/core/sensors/data/test_lidar_data.py` and
+   `tests/cosmos_curator/core/sensors/data/test_egotrajectory_data.py`.
+
+Concrete sensor readers and motion-compensation or re-alignment helpers remain
+future work as described below.
 
 ## Open Follow-Up Questions
 
@@ -1054,10 +1061,6 @@ Proposed; not yet implemented. The implementation will add:
   timestamp, is uniform interpolation across an estimated capture duration
   acceptable to downstream consumers, or do they require
   sensor-model-specific timing tables?
-- Should `EgoTrajectory.poses` use a quaternion+translation representation
-  (`(N, 7) float64`) instead of `(N, 4, 4) float64`? Quaternion form is
-  smaller and avoids non-orthonormal `R` matrices but requires conversion
-  before composition.
 - Should `LidarData` carry a per-batch `frame_id` string (`"lidar_top"`,
   `"lidar_left"`, ...) for multi-LiDAR rigs, or is that pipeline-task
   metadata?

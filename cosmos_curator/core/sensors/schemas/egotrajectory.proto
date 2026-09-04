@@ -32,21 +32,19 @@ message EgotrajectorySample {
   // A mapped but omitted proto3 scalar decodes as 0.
   uint64 sequence_counter = 3;
 
-  // Exactly 16 double values in row-major order:
-  //
-  // [ R00 R01 R02 tx ]
-  // [ R10 R11 R12 ty ]
-  // [ R20 R21 R22 tz ]
-  // [ 0   0   0   1  ]
-  //
-  // This is T_worldENU_from_sensorBody: it transforms a homogeneous point
-  // from the producing sensor body into the clip-local ENU world.
-  // As a proto3 repeated numeric field, this is packed on the wire.
-  repeated double transform_world_enu_from_sensor_body = 4;
+  // Exactly three metres: the translation component of
+  // T_worldENU_from_sensorBody in X, Y, Z order. As a proto3 repeated numeric
+  // field, this is packed on the wire.
+  repeated double position_m = 4;
 
-  // True when the 4x4 was derived from finite in-range position and attitude
-  // about a valid local ENU anchor. False means the sample is preserved for
-  // timeline continuity but the transform is an identity placeholder and must
-  // not be trusted (GPS/IMU-style keep-and-mask).
-  bool pose_valid = 5;
+  // Exactly four values: the rotation component of
+  // T_worldENU_from_sensorBody as a unit quaternion in X, Y, Z, W order.
+  // As a proto3 repeated numeric field, this is packed on the wire.
+  repeated double orientation_xyzw = 5;
+
+  // True when the position and orientation were derived from finite in-range
+  // position and attitude about a valid local ENU anchor. False means the
+  // sample is preserved for timeline continuity but the position is zero and
+  // orientation is identity; consumers must not trust that placeholder.
+  bool pose_valid = 6;
 }

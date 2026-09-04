@@ -39,7 +39,7 @@ _REFERENCE_MAPPING_PATH = (
     _REPO_ROOT / "cosmos_curator" / "core" / "sensors" / "examples" / "egotrajectory_protobuf_mapping.yaml"
 )
 _REFERENCE_PROTO_PATH = _REPO_ROOT / "cosmos_curator" / "core" / "sensors" / "schemas" / "egotrajectory.proto"
-_IDENTITY_FLAT = tuple(float(value) for value in np.eye(4, dtype=np.float64).ravel(order="C"))
+_IDENTITY_ORIENTATION_XYZW = (0.0, 0.0, 0.0, 1.0)
 
 
 def _reference_descriptor_set() -> descriptor_pb2.FileDescriptorSet:
@@ -52,7 +52,8 @@ def _reference_payload(
     *,
     host_timestamp_ns: int | None = None,
     sequence_counter: int = 1,
-    transform: tuple[float, ...] = _IDENTITY_FLAT,
+    position_m: tuple[float, ...] = (0.0, 0.0, 0.0),
+    orientation_xyzw: tuple[float, ...] = _IDENTITY_ORIENTATION_XYZW,
     pose_valid: bool = True,
 ) -> bytes:
     """Serialize one reference ego-trajectory protobuf sample."""
@@ -61,7 +62,8 @@ def _reference_payload(
     sample.sensor_timestamp_ns = sensor_timestamp_ns
     sample.host_timestamp_ns = sensor_timestamp_ns + 50 if host_timestamp_ns is None else host_timestamp_ns
     sample.sequence_counter = sequence_counter
-    sample.transform_world_enu_from_sensor_body.extend(transform)
+    sample.position_m.extend(position_m)
+    sample.orientation_xyzw.extend(orientation_xyzw)
     sample.pose_valid = pose_valid
     return sample.SerializeToString()
 
@@ -93,18 +95,12 @@ def _reference_sensor(
     )
 
 
-def _translated_flat(tx: float, ty: float, tz: float) -> tuple[float, ...]:
-    """Return an identity 4x4 with translation, flattened row-major."""
-    matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, 3] = (tx, ty, tz)
-    return tuple(float(value) for value in matrix.ravel(order="C"))
-
-
 def _minimal_mapping(**overrides: object) -> dict[str, object]:
     """Required-only ego-trajectory mapping (no host/sequence optionals)."""
     fields: dict[str, object] = {
         "sensor_timestamp_ns": {"from": "sensor_timestamp_ns", "type": "timestamp", "unit": "ns"},
-        "poses": {"from": "transform_world_enu_from_sensor_body", "type": "float"},
+        "position_m": {"from": "position_m", "type": "float"},
+        "orientation_xyzw": {"from": "orientation_xyzw", "type": "float"},
         "pose_valid": {"from": "pose_valid", "type": "bool"},
     }
     fields.update(overrides)
@@ -119,11 +115,16 @@ def test_ego_trajectory_sensor_reads_reference_schema_with_checked_in_mapping(tm
         [
             McapSample(
                 log_time_ns=100,
-                data=_reference_payload(100, sequence_counter=10, transform=_translated_flat(1.0, 2.0, 3.0)),
+                data=_reference_payload(100, sequence_counter=10, position_m=(1.0, 2.0, 3.0)),
             ),
             McapSample(
                 log_time_ns=200,
-                data=_reference_payload(200, sequence_counter=11, transform=_translated_flat(4.0, 5.0, 6.0)),
+                data=_reference_payload(
+                    200,
+                    sequence_counter=11,
+                    position_m=(4.0, 5.0, 6.0),
+                    orientation_xyzw=(0.0, 0.0, float(np.sqrt(0.5)), float(np.sqrt(0.5))),
+                ),
             ),
         ],
     )
@@ -135,24 +136,29 @@ def test_ego_trajectory_sensor_reads_reference_schema_with_checked_in_mapping(tm
     np.testing.assert_array_equal(batch.host_timestamps_ns, np.array([150, 250], dtype=np.int64))
     np.testing.assert_array_equal(batch.sequence_counter, np.array([10, 11], dtype=np.uint64))
     np.testing.assert_array_equal(batch.pose_valid, np.array([True, True], dtype=np.bool_))
-    np.testing.assert_allclose(batch.poses[0, :3, 3], (1.0, 2.0, 3.0))
-    np.testing.assert_allclose(batch.poses[1, :3, 3], (4.0, 5.0, 6.0))
+    np.testing.assert_allclose(batch.positions_m[0], (1.0, 2.0, 3.0))
+    np.testing.assert_allclose(batch.positions_m[1], (4.0, 5.0, 6.0))
+    half_sqrt = float(np.sqrt(0.5))
+    np.testing.assert_allclose(
+        batch.orientations_xyzw,
+        np.array([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, half_sqrt, half_sqrt]]),
+    )
     assert batch.frame == DEFAULT_FRAME
 
 
 def test_ego_trajectory_sensor_preserves_invalid_identity_poses(tmp_path: Path) -> None:
-    """Keep-and-mask rows should retain identity transforms with pose_valid=false."""
+    """Keep-and-mask rows should retain zero-position identity poses when invalid."""
     path = tmp_path / "invalid_pose.mcap"
     _write_reference_mcap(
         path,
         [
             McapSample(
                 log_time_ns=100,
-                data=_reference_payload(100, transform=_translated_flat(1.0, 0.0, 0.0), pose_valid=True),
+                data=_reference_payload(100, position_m=(1.0, 0.0, 0.0), pose_valid=True),
             ),
             McapSample(
                 log_time_ns=200,
-                data=_reference_payload(200, transform=_IDENTITY_FLAT, pose_valid=False, sequence_counter=2),
+                data=_reference_payload(200, pose_valid=False, sequence_counter=2),
             ),
         ],
     )
@@ -160,7 +166,8 @@ def test_ego_trajectory_sensor_preserves_invalid_identity_poses(tmp_path: Path) 
     batch = next(_reference_sensor(path).sample(one_window_spec(100, 300)))
 
     assert batch.pose_valid.tolist() == [True, False]
-    np.testing.assert_array_equal(batch.poses[1], np.eye(4, dtype=np.float64))
+    np.testing.assert_array_equal(batch.positions_m[1], np.zeros(3, dtype=np.float64))
+    np.testing.assert_array_equal(batch.orientations_xyzw[1], np.array([0.0, 0.0, 0.0, 1.0]))
 
 
 def test_ego_trajectory_reference_mapping_empty_window_preserves_optional_arrays(tmp_path: Path) -> None:
@@ -172,7 +179,8 @@ def test_ego_trajectory_reference_mapping_empty_window_preserves_optional_arrays
 
     assert batch.align_timestamps_ns.shape == (0,)
     assert batch.sensor_timestamps_ns.shape == (0,)
-    assert batch.poses.shape == (0, 4, 4)
+    assert batch.positions_m.shape == (0, 3)
+    assert batch.orientations_xyzw.shape == (0, 4)
     assert batch.pose_valid.shape == (0,)
     assert batch.host_timestamps_ns is not None
     assert batch.host_timestamps_ns.shape == (0,)
@@ -250,7 +258,7 @@ def test_ego_trajectory_sensor_read_all(tmp_path: Path) -> None:
     batch = _reference_sensor(path).read_all()
 
     np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([100, 200], dtype=np.int64))
-    assert len(batch.poses) == 2
+    assert len(batch.positions_m) == 2
 
 
 def test_ego_trajectory_sensor_rejects_duplicate_mapped_align_timestamps(tmp_path: Path) -> None:
@@ -316,18 +324,35 @@ def test_ego_trajectory_sensor_stream_timestamps_not_implemented(tmp_path: Path)
         list(_reference_sensor(path).stream_timestamps())
 
 
-def test_ego_trajectory_sensor_rejects_wrong_pose_length(tmp_path: Path) -> None:
-    """Decoded poses must contain exactly 16 row-major doubles."""
-    path = tmp_path / "short_pose.mcap"
+def test_ego_trajectory_sensor_rejects_wrong_position_length(tmp_path: Path) -> None:
+    """Decoded positions must contain exactly three doubles."""
+    path = tmp_path / "short_position.mcap"
     _write_reference_mcap(
         path,
         [
             McapSample(
                 log_time_ns=100,
-                data=_reference_payload(100, transform=(1.0, 0.0, 0.0, 0.0)),
+                data=_reference_payload(100, position_m=(1.0, 0.0)),
             )
         ],
     )
 
-    with pytest.raises(ValueError, match="16 values"):
+    with pytest.raises(ValueError, match=r"fields\.position_m expected 3 values"):
+        next(_reference_sensor(path).sample(one_window_spec(100, 200)))
+
+
+def test_ego_trajectory_sensor_rejects_wrong_orientation_length(tmp_path: Path) -> None:
+    """Decoded orientations must contain exactly four doubles."""
+    path = tmp_path / "short_orientation.mcap"
+    _write_reference_mcap(
+        path,
+        [
+            McapSample(
+                log_time_ns=100,
+                data=_reference_payload(100, orientation_xyzw=(0.0, 0.0, 1.0)),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"fields\.orientation_xyzw expected 4 values"):
         next(_reference_sensor(path).sample(one_window_spec(100, 200)))

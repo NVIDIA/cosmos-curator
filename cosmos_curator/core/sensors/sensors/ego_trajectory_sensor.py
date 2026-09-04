@@ -14,7 +14,7 @@
 # limitations under the License.
 """MCAP protobuf ego-trajectory sensor."""
 
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,28 +40,14 @@ from cosmos_curator.core.sensors.utils.protobuf_mapper import ProtobufRowMapper
 
 DEFAULT_TOPIC = "/egotrajectory"
 DEFAULT_FRAME = "world_enu"
-_POSE_MATRIX_SIZE = 4
-_POSE_FLAT_LENGTH = _POSE_MATRIX_SIZE * _POSE_MATRIX_SIZE
-REQUIRED_EGO_TRAJECTORY_MAPPING_FIELDS = frozenset({"sensor_timestamp_ns", "poses", "pose_valid"})
+_POSITION_COMPONENTS = 3
+_QUATERNION_COMPONENTS = 4
+REQUIRED_EGO_TRAJECTORY_MAPPING_FIELDS = frozenset(
+    {"sensor_timestamp_ns", "position_m", "orientation_xyzw", "pose_valid"}
+)
 
-PoseMatrixFlat = tuple[
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-]
+PositionVector = tuple[float, float, float]
+QuaternionXyzw = tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -70,18 +56,11 @@ class DecodedEgoTrajectorySample:
 
     sensor_timestamp_ns: int
     align_timestamp_ns: int
-    poses: PoseMatrixFlat
+    position_m: PositionVector
+    orientation_xyzw: QuaternionXyzw
     pose_valid: bool = True
     host_timestamp_ns: int | None = None
     sequence_counter: int | None = None
-
-
-def _reshape_pose(flat: Sequence[float]) -> npt.NDArray[np.float64]:
-    """Reshape one length-16 row-major transform into a ``(4, 4)`` matrix."""
-    if len(flat) != _POSE_FLAT_LENGTH:
-        msg = f"poses must contain {_POSE_FLAT_LENGTH} values, got {len(flat)}"
-        raise ValueError(msg)
-    return np.asarray(flat, dtype=np.float64).reshape(_POSE_MATRIX_SIZE, _POSE_MATRIX_SIZE)
 
 
 def _ego_trajectory_from_samples(
@@ -101,11 +80,11 @@ def _ego_trajectory_from_samples(
     if host and any(v is None for v in host_values):
         msg = "host_timestamp_ns must be present for every ego-trajectory sample"
         raise ValueError(msg)
-    poses = np.stack([_reshape_pose(sample.poses) for sample in samples], axis=0)
     return EgoTrajectory(
         align_timestamps_ns=align,
         sensor_timestamps_ns=np.array([sample.sensor_timestamp_ns for sample in samples], dtype=np.int64),
-        poses=poses,
+        positions_m=np.asarray([sample.position_m for sample in samples], dtype=np.float64),
+        orientations_xyzw=np.asarray([sample.orientation_xyzw for sample in samples], dtype=np.float64),
         pose_valid=np.array([sample.pose_valid for sample in samples], dtype=np.bool_),
         host_timestamps_ns=np.array(host_values, dtype=np.int64) if host else None,
         sequence_counter=np.array(seq_values, dtype=np.uint64) if sequence else None,
@@ -124,7 +103,8 @@ def _empty_ego_trajectory(
     return EgoTrajectory(
         align_timestamps_ns=empty_ts,
         sensor_timestamps_ns=empty_ts,
-        poses=np.empty((0, _POSE_MATRIX_SIZE, _POSE_MATRIX_SIZE), dtype=np.float64),
+        positions_m=np.empty((0, _POSITION_COMPONENTS), dtype=np.float64),
+        orientations_xyzw=np.empty((0, _QUATERNION_COMPONENTS), dtype=np.float64),
         pose_valid=np.empty(0, dtype=np.bool_),
         host_timestamps_ns=np.empty(0, dtype=np.int64) if host else None,
         sequence_counter=np.empty(0, dtype=np.uint64) if sequence else None,

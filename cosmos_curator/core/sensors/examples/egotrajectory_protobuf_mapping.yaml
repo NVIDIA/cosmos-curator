@@ -43,9 +43,15 @@ fields:
     from: sequence_counter
     type: int
 
-  # Required row-major 4x4 transform (exactly 16 doubles on the wire).
-  poses:
-    from: transform_world_enu_from_sensor_body
+  # Required translation (exactly three doubles) and unit XYZW quaternion
+  # (exactly four doubles). The sensor stacks these scalar vectors directly
+  # into EgoTrajectory's canonical position and orientation arrays.
+  position_m:
+    from: position_m
+    type: float
+
+  orientation_xyzw:
+    from: orientation_xyzw
     type: float
 
   pose_valid:
