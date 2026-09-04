@@ -219,7 +219,7 @@ def test_normal_full_dockerfile_uses_root_pixi_media_stack(
     assert "AS ffmpeg-builder" not in contents
     assert "AS pyav-builder" not in contents
     assert "AS opencv-builder" not in contents
-    assert "ARG PIXI_VERSION=v0.76.2" in contents
+    assert "ARG PIXI_VERSION=v0.79.0" in contents
     assert "/opt/cosmos-curator-wheelhouse" not in contents
     assert "file:///opt/cosmos-curator-wheelhouse/" not in contents
     assert "pip uninstall -y av" not in contents
