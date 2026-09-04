@@ -243,3 +243,50 @@ def test_a_prefix_for_another_backend_is_refused_rather_than_asserted() -> None:
 
     with pytest.raises(TypeError, match="AzureClient requires an AzurePrefix, got S3Prefix"):
         client.stat(S3Prefix("s3://bucket/key"))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "az://test-container/root/2026-08-01--12-00/a.mp4",
+        "az://test-container/root/cam--01/a.mp4",
+        "az://test-container/a--b",
+    ],
+)
+def test_consecutive_hyphens_in_a_blob_name_are_accepted(path: str) -> None:
+    """Azure forbids consecutive hyphens in a container name, not in a blob name.
+
+    The rule belongs to the segment before the first delimiter. Applied to the whole
+    path it rejects timestamped and camera-numbered layouts that the backend stores
+    happily, and it does so as a "malformed URI" the operator cannot act on.
+    """
+    assert AzurePrefix(path).container == "test-container"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "az://my--container/a.mp4",
+        "az://a--b/root/a.mp4",
+    ],
+)
+def test_consecutive_hyphens_in_the_container_are_still_rejected(path: str) -> None:
+    """The container half of the rule is real: Azure will not serve such a name."""
+    with pytest.raises(ValueError, match="Invalid Azure path format"):
+        AzurePrefix(path)
+
+
+def test_listing_does_not_abort_on_a_blob_whose_name_has_consecutive_hyphens() -> None:
+    """One such blob used to fail the whole enumeration, not just its own entry.
+
+    ``list_recursive_with_suffixes`` builds an ``AzurePrefix`` per match, so a single
+    offending name raised out of the loop and abandoned every result behind it.
+    """
+    client, _ = _listing_client([_FakeBlob("root/cam--01/a.mp4"), _FakeBlob("root/b.mp4")])
+
+    results = client.list_recursive_with_suffixes(AzurePrefix(_PREFIX), (".mp4",))
+
+    assert [str(item) for item in results] == [
+        "az://test-container/root/cam--01/a.mp4",
+        "az://test-container/root/b.mp4",
+    ]

@@ -100,8 +100,9 @@ class AzurePrefix(StoragePrefix):
         # Remove 'az://' prefix if present
         self._input = self._input.removeprefix("az://")
 
-        # Validate input format
-        if not re.match(r"^[a-z0-9](?!.*--)[a-z0-9-]{1,61}[a-z0-9]/.*$", self._input, re.IGNORECASE):
+        # The no-consecutive-hyphens lookahead scans `[a-z0-9-]*` rather than `.*` so it
+        # stops at the delimiter: Azure imposes that rule on the container, not the blob.
+        if not re.match(r"^[a-z0-9](?![a-z0-9-]*--)[a-z0-9-]{1,61}[a-z0-9]/.*$", self._input, re.IGNORECASE):
             error_msg = "Invalid Azure path format. Expected 'container/blob' or 'az://container/blob'"
             raise ValueError(error_msg)
 
