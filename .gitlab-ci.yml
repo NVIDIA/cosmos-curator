@@ -537,6 +537,40 @@ stages:
   configure_nvcf_cli: &configure_nvcf_cli |
     cosmos-curator nvcf config set --org $NGC_NVCF_ORG --key $NVCF_KEY
 
+# GitLab 17.4 only supports a project-wide squash setting. With squashing set
+# to "Encourage", enforce it here while preserving main-to-internal merge commits.
+merge_request_squash_policy:
+  stage: lint
+  variables:
+    GIT_STRATEGY: none
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - when: never
+  needs: []
+  script:
+    - |
+      EXPECTED_SQUASH_ON_MERGE=true
+      case "${CI_MERGE_REQUEST_TITLE}" in
+        "chore: merge nvidia/main into nvidia/internal"|"chore: merge nvidia/main into nvidia/internal "*)
+          if [ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" = "nvidia/internal" ]; then
+            EXPECTED_SQUASH_ON_MERGE=false
+          fi
+          ;;
+      esac
+
+      if [ "${CI_MERGE_REQUEST_SQUASH_ON_MERGE}" = "${EXPECTED_SQUASH_ON_MERGE}" ]; then
+        echo "Squash-on-merge policy satisfied."
+        exit 0
+      fi
+
+      if [ "${EXPECTED_SQUASH_ON_MERGE}" = true ]; then
+        echo 'Error: enable "Squash commits when merge request is accepted" for this merge request.' >&2
+      else
+        echo 'Error: disable "Squash commits when merge request is accepted" for this nvidia/main-to-nvidia/internal sync.' >&2
+      fi
+      exit 1
+
 ruff:
   stage: lint
   image: ${CI_BUILDER_IMAGE}
