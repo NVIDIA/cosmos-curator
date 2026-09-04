@@ -29,7 +29,11 @@ import pytest
 import ray
 import yaml
 
-from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, NAME_ORDERING
+from cosmos_curator.core.sensors.data_integrity.instruments import (
+    INSTRUMENTS,
+    NAME_ORDERING,
+    SESSION_INSTRUMENTS,
+)
 from cosmos_curator.next.recipes.data_integrity import pipeline, store
 from cosmos_curator.next.recipes.data_integrity.config import TOOL_NAME, resolve_config_data
 
@@ -40,6 +44,19 @@ NUM_SESSIONS = 2
 NUM_STREAMS = 4
 NUM_MEASURED = 3
 NUM_METRICS = len(INSTRUMENTS)
+
+
+def _nothing_readable(store_root: pathlib.Path) -> bool:
+    """Report whether a store holds nothing a reader will believe.
+
+    Not the same as an absent directory, which is what this used to check: a run that
+    fails before its commit may already have appended rows -- an unlisted session's
+    ``session.lance`` row, for one. Uncommitted rows are the point of the commit
+    marker, so what has to hold is that no reader sees them.
+    """
+    return not (
+        store.read_streams(str(store_root)) or store.read_sessions(str(store_root)) or store.read_runs(str(store_root))
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -178,6 +195,66 @@ def test_every_measured_stream_contributes_a_row_per_metric(summary: dict[str, o
     assert len(store.read_evaluations(root)) == NUM_MEASURED * NUM_METRICS
 
 
+def test_every_measured_session_is_stored_once(
+    summary: dict[str, object], dataset: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A session's own row is what makes it countable without joining to its streams."""
+    sessions = {row["session_path"]: row for row in store.read_sessions(str(tmp_path / "di-store"))}
+
+    assert set(sessions) == {str(dataset / "a"), str(dataset / "b")}
+    assert {row["run_id"] for row in sessions.values()} == {summary["run_id"]}
+    # Session ``a`` is where the corrupt file lives, and the nested session's stream
+    # is counted under ``b``, which enclosed it.
+    assert (sessions[str(dataset / "a")]["num_streams"], sessions[str(dataset / "a")]["num_unreadable"]) == (2, 1)
+    assert (sessions[str(dataset / "b")]["num_streams"], sessions[str(dataset / "b")]["num_unreadable"]) == (2, 0)
+    assert all(row["error"] is None for row in sessions.values())
+
+
+def test_every_session_contributes_a_row_per_session_metric(summary: dict[str, object], tmp_path: pathlib.Path) -> None:
+    """The pipeline measures the session as well as its streams, and stores both."""
+    del summary
+    root = str(tmp_path / "di-store")
+
+    for spec in SESSION_INSTRUMENTS:
+        assert len(store.read_session_measurements(root, spec.name)) == NUM_SESSIONS, spec.name
+    assert len(store.read_session_evaluations(root)) == NUM_SESSIONS * len(SESSION_INSTRUMENTS)
+
+
+def test_a_failing_session_metric_reaches_the_store(tmp_path: pathlib.Path, h264_video: Callable[..., bytes]) -> None:
+    """The regression this MR exists to prevent: a session verdict that only the report knew.
+
+    Two sensors that stopped a second apart, judged by a policy that allows no
+    non-overlap at all. Every stream passes on its own, so a store reconstructing the
+    session from stream rows alone would read back ``PASS``.
+    """
+    clips = tmp_path / "clips"
+    (clips / "ragged").mkdir(parents=True)
+    (clips / "ragged" / "front.mp4").write_bytes(h264_video(frames=30))
+    (clips / "ragged" / "rear.mp4").write_bytes(h264_video(frames=60))
+    store_root = tmp_path / "di-store"
+
+    summary = pipeline.run_config(
+        resolve_config_data(
+            {
+                "schema_version": 1,
+                "kind": "data-integrity",
+                "input": {"sessions": [str(clips / "ragged")]},
+                "output": {"store_root": str(store_root)},
+                "checks": {"thresholds": {"max_non_overlap_percent": 0.0}},
+            }
+        )
+    )
+
+    assert {row["check_status"] for row in store.read_evaluations(str(store_root))} == {"PASS"}
+    verdicts = {row["metric_name"]: row for row in store.read_session_evaluations(str(store_root))}
+    assert verdicts["multi_sensor_overlap"]["check_status"] == "FAIL"
+    assert store.session_rollup(str(store_root))["status"] == "FAIL"
+    # And the run says so without a reader having to roll the store up: the per-session
+    # counters are summed on the driver, which nothing else here exercises.
+    assert summary["failed_session_metrics"] == 1
+    assert summary["failed_metrics"] == 0
+
+
 def test_the_manifest_describes_the_run_rather_than_a_session(
     summary: dict[str, object], tmp_path: pathlib.Path
 ) -> None:
@@ -230,6 +307,15 @@ def test_a_stale_session_path_costs_the_run_its_exit_status_but_not_its_rows(
     assert len(runs) == 1, "the run committed, so its rows are readable"
     assert len(store.read_streams(str(store_root))) == NUM_STREAMS
 
+    # The stale session is in the store too, as a row that says why it is empty. The
+    # run still failed: the row explains the gap, it does not close it.
+    sessions = {row["session_path"]: row for row in store.read_sessions(str(store_root))}
+    assert set(sessions) == {str(dataset / "a"), str(dataset / "b"), stale}
+    assert sessions[stale]["error"]
+    assert (sessions[stale]["num_streams"], sessions[stale]["num_unreadable"]) == (0, 0)
+    assert stale not in {row["session_path"] for row in store.read_session_evaluations(str(store_root))}
+    assert store.session_rollup(str(store_root))["status"] == "ERROR"
+
 
 def test_an_unreachable_stream_costs_the_run_its_exit_status_but_adds_no_row(
     dataset: pathlib.Path,
@@ -256,6 +342,13 @@ def test_an_unreachable_stream_costs_the_run_its_exit_status_but_adds_no_row(
     assert len(rows) == NUM_STREAMS
     assert str(locked) not in {row["source"] for row in rows}
 
+    # The store does not forget the shortfall, though: session "a" was found to hold a
+    # stream the store has no row for, so it reads ERROR rather than PASS. Otherwise
+    # only the run's exit status knew, and that is gone by the next read.
+    sessions = {row["session_path"]: row["status"] for row in store.session_rollup(str(store_root))["sessions"]}
+    assert sessions == {str(dataset / "a"): "ERROR", str(dataset / "b"): "PASS"}
+    assert store.session_rollup(str(store_root))["status"] == "ERROR"
+
 
 def test_a_run_that_could_list_nothing_at_all_commits_nothing(tmp_path: pathlib.Path) -> None:
     """With no measurement to preserve there is nothing to commit, so this fails the old way."""
@@ -273,7 +366,10 @@ def test_a_run_that_could_list_nothing_at_all_commits_nothing(tmp_path: pathlib.
             )
         )
 
-    assert not store_root.exists()
+    # The two sessions did each append a row saying they could not be listed, but the
+    # run never reached its commit, so nothing above is readable.
+    assert _nothing_readable(store_root)
+    assert len(store.read_sessions(str(store_root), include_incomplete=True)) == 2
 
 
 def test_a_run_that_measured_nothing_names_every_reason_it_did_not(tmp_path: pathlib.Path) -> None:
@@ -303,7 +399,7 @@ def test_a_run_that_measured_nothing_names_every_reason_it_did_not(tmp_path: pat
     message = str(raised.value)
     assert "1 session(s) could not be listed" in message
     assert "1 session(s) held no video streams" in message
-    assert not store_root.exists()
+    assert _nothing_readable(store_root)
 
 
 #: The three clauses a zero-row run can carry, one per cause.
@@ -363,7 +459,9 @@ def test_sessions_holding_no_streams_fail_without_committing(tmp_path: pathlib.P
     """A run that measured nothing is a config mistake, not a passing run.
 
     Only knowable after every session has been listed, so the error comes after the
-    append loop -- which wrote nothing, there being no rows to write.
+    append loop -- which did write the empty session's own rows, and left them
+    uncommitted and therefore unreadable, exactly as any run that does not reach its
+    commit.
     """
     empty = tmp_path / "clips" / "empty"
     empty.mkdir(parents=True)
@@ -381,7 +479,7 @@ def test_sessions_holding_no_streams_fail_without_committing(tmp_path: pathlib.P
             )
         )
 
-    assert not store_root.exists()
+    assert _nothing_readable(store_root)
 
 
 def test_an_unwritable_store_root_fails_the_run(dataset: pathlib.Path, tmp_path: pathlib.Path) -> None:

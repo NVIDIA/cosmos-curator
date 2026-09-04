@@ -23,16 +23,19 @@ import pathlib
 from collections.abc import Callable
 from fractions import Fraction
 
+import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.data_integrity import identity
+from cosmos_curator.core.sensors.data_integrity.engine import run_session_metrics
 from cosmos_curator.core.sensors.data_integrity.instruments import (
     DEFAULT_THRESHOLDS,
     INSTRUMENTS,
+    SESSION_INSTRUMENTS,
     Thresholds,
     instrument,
 )
-from cosmos_curator.core.sensors.data_integrity.results import StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import CheckResult, StreamResult
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
 from cosmos_curator.core.utils.storage_cli import StorageCliError
 from cosmos_curator.next.recipes.data_integrity import storage_io, store, store_schema
@@ -51,6 +54,7 @@ def _write(
     *,
     session_path: str | None = SESSION,
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
+    session_metrics: list[CheckResult] | None = None,
     created_at: datetime.datetime | None = None,
     storage_stats: dict[str, StorageStat] | None = None,
 ) -> str:
@@ -61,9 +65,94 @@ def _write(
         session_path=session_path,
         thresholds=thresholds,
         tool="di-session",
+        session_metrics=session_metrics,
         created_at=created_at,
         storage_stats=storage_stats,
     )
+
+
+#: One second of skew between two sensors, which is what makes a session-grain
+#: measurement have something to say.
+_SKEW_NS = 1_000_000_000
+_ONE_MINUTE_NS = 60_000_000_000
+
+#: Write stamps for tests that need one run to supersede another. Spelled out rather
+#: than taken from the clock so which row wins is a property of the test, not of how
+#: fast it ran, and distinct so no two rows ever tie on ``created_at``.
+_EARLIER = datetime.datetime(2029, 1, 1, tzinfo=datetime.UTC)
+_LATER = datetime.datetime(2030, 1, 1, tzinfo=datetime.UTC)
+_LATEST = datetime.datetime(2031, 1, 1, tzinfo=datetime.UTC)
+
+
+#: The spread metric's registered name, read off the registry rather than spelled out.
+SPREAD = SESSION_INSTRUMENTS[0].name
+
+
+def _metrics_for(bounds: list[tuple[int, int]], thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
+    """Judge one session from its sensors' recording bounds, through the real kernel.
+
+    Straight to :func:`run_session_metrics` rather than through ``session_runner``,
+    both because the store sits below it and because bounds stated outright are how a
+    test says which session shape it is about.
+    """
+    return run_session_metrics(bounds, thresholds=thresholds)
+
+
+def _aligned_metrics(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
+    """Two sensors that started and stopped together: every session metric passes."""
+    return _metrics_for([(0, _ONE_MINUTE_NS), (0, _ONE_MINUTE_NS)], thresholds)
+
+
+def _skewed_metrics(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
+    """Two sensors a second out of step at both ends."""
+    return _metrics_for([(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)], thresholds)
+
+
+def _append_session(
+    root: str,
+    session_path: str,
+    *,
+    num_streams: int,
+    num_unreadable: int = 0,
+    error: str | None = None,
+    created_at: datetime.datetime = _LATEST,
+) -> str:
+    """Commit one hand-built ``session.lance`` row, carrying no stream rows of its own.
+
+    :func:`write_run` derives ``num_streams`` from the streams it is handed, so it
+    cannot express the two shapes the Ray pipeline produces and the rollup has to
+    grade: a session found to hold more streams than the run could reach, and one that
+    could not be listed at all. Both are built here directly and committed the way any
+    run's rows are, since an uncommitted row is not read.
+    """
+    run_id = store.new_run_id()
+    store.append_rows(
+        [
+            store.session_row(
+                session_id=store.session_key(session_path),
+                run_id=run_id,
+                created_at=created_at,
+                session_path=session_path,
+                num_streams=num_streams,
+                num_unreadable=num_unreadable,
+                error=error,
+            )
+        ],
+        store.join(root, store_schema.SESSION_DATASET),
+        store_schema.SESSION_SCHEMA,
+        None,
+    )
+    store.commit_run(
+        root,
+        run_id=run_id,
+        created_at=created_at,
+        tool="data-integrity",
+        session_path=None,
+        thresholds=DEFAULT_THRESHOLDS,
+        num_streams=num_streams,
+        storage_options=None,
+    )
+    return run_id
 
 
 #: Modules the storage layer sits *below*. It shares the result vocabulary with them
@@ -106,17 +195,40 @@ def test_the_storage_layer_does_not_import_the_cli(module: str) -> None:
     assert imported & _CLI_MODULES == set()
 
 
+def test_the_two_verdict_schemas_agree_on_every_shared_column() -> None:
+    """A stream verdict and a session verdict differ only in what they are a verdict *about*.
+
+    ``store._verdict_columns`` fills every column below from one place, so the two
+    schemas have to agree about them: if they drift, a row that builder produces fits
+    only one of the two tables. What may legitimately differ is the subject --
+    ``stream_id`` and ``source`` against ``session_id`` -- and ``session_path``, which
+    only a per-stream verdict can leave null, ``di-check`` judging a stream that
+    belongs to no session.
+    """
+    subject = {"stream_id", "source", "session_id", "session_path"}
+
+    def shared(schema: pa.Schema) -> list[tuple[str, pa.DataType, bool]]:
+        return [(f.name, f.type, f.nullable) for f in schema if f.name not in subject]
+
+    assert shared(store_schema.EVALUATION_SCHEMA), "the shared block cannot be empty"
+    assert shared(store_schema.EVALUATION_SCHEMA) == shared(store_schema.SESSION_EVALUATION_SCHEMA)
+
+
 def test_first_write_creates_the_store(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> None:
     """The root does not have to exist; a first run creates every dataset it needs."""
-    _write(store_root, [make_stream(FRONT, perfect())])
+    _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
     root = pathlib.Path(store_root)
     assert (root / store_schema.STREAM_DATASET).exists()
     assert (root / store_schema.EVALUATION_DATASET).exists()
     assert (root / store_schema.RUN_DATASET).exists()
     for spec in INSTRUMENTS:
         assert (root / store_schema.metric_dataset_path(spec.name)).exists()
+    assert (root / store_schema.SESSION_DATASET).exists()
+    assert (root / store_schema.SESSION_EVALUATION_DATASET).exists()
+    for spec in SESSION_INSTRUMENTS:
+        assert (root / store_schema.session_metric_dataset_path(spec.name)).exists()
     assert (root / store_schema.MANIFEST_NAME).exists()
 
 
@@ -389,6 +501,272 @@ def test_session_rollup_under_a_policy_nothing_was_judged_by_is_an_error(
     assert other["stream_status_counts"] == {"PASS": 0, "FAIL": 0, "ERROR": 1}
 
 
+def test_a_session_run_records_the_session_itself(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The session's own row: its key, its context, and how much of it was usable."""
+    streams = [make_stream(FRONT, perfect()), make_stream("/data/session/rear.mp4", perfect())]
+    run_id = _write(store_root, streams, session_metrics=_aligned_metrics())
+
+    (row,) = store.read_sessions(store_root)
+    assert row["session_id"] == identity.session_id(SESSION)
+    assert row["session_path"] == SESSION
+    assert row["locator_namespace"] == identity.NAMESPACE_LOCAL
+    assert row["run_id"] == run_id
+    assert row["num_streams"] == 2
+    assert row["num_unreadable"] == 0
+    assert row["error"] is None
+
+
+def test_a_single_stream_run_writes_no_session_rows(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """``di-check`` has no session to key a row on, so it must write none even if handed verdicts."""
+    _write(
+        store_root,
+        [make_stream("/data/front.mp4", perfect())],
+        session_path=None,
+        session_metrics=_aligned_metrics(),
+    )
+    assert store.read_sessions(store_root) == []
+    assert store.read_session_evaluations(store_root) == []
+    assert not (pathlib.Path(store_root) / store_schema.SESSION_DATASET).exists()
+
+
+def test_an_unreadable_stream_counts_against_its_session(
+    store_root: str,
+    make_stream: Callable[..., StreamResult],
+    make_errored_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """``num_unreadable`` is what makes a session's row legible without joining to its streams."""
+    streams = [make_stream(FRONT, perfect()), make_errored_stream("/data/session/rear.mp4")]
+    _write(store_root, streams, session_metrics=_aligned_metrics())
+    (row,) = store.read_sessions(store_root)
+    assert row["num_streams"] == 2
+    assert row["num_unreadable"] == 1
+
+
+def test_session_measurements_round_trip_as_typed_columns(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A session measurement survives Arrow field for field, like a per-stream one."""
+    _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_skewed_metrics())
+
+    (spread,) = store.read_session_measurements(store_root, "multi_sensor_spread")
+    assert spread["session_id"] == identity.session_id(SESSION)
+    assert spread["session_path"] == SESSION
+    assert spread["is_defined"] is True
+    assert spread["start_spread_ns"] == _SKEW_NS
+    assert spread["num_sensors"] == 2
+    # No source column, and deliberately: there is no one stream a session-grain
+    # measurement is about.
+    assert "source" not in spread
+
+    (overlap,) = store.read_session_measurements(store_root, "multi_sensor_overlap")
+    assert overlap["non_overlap_fraction"] is not None
+    assert float(overlap["non_overlap_fraction"]) > 0  # type: ignore[arg-type]
+
+
+def test_a_session_of_one_sensor_is_measured_and_undefined(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """Nothing to compare is a measurement with no verdict, not an absent measurement."""
+    _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_metrics_for([(0, 1_000_000_000)]))
+
+    (spread,) = store.read_session_measurements(store_root, "multi_sensor_spread")
+    assert spread["is_defined"] is False
+    assert spread["num_sensors"] == 1
+
+    verdict = next(row for row in store.read_session_evaluations(store_root) if row["metric_name"] == SPREAD)
+    assert verdict["check_status"] == "SKIPPED"
+    # Null together, which is what makes it impossible to store a verdict for
+    # something that was never judged.
+    assert verdict["margin"] is None
+    assert verdict["threshold"] is None
+
+
+def test_a_session_verdict_carries_its_policy_and_both_run_ids(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A stored session verdict explains itself on the same terms a per-stream one does."""
+    run_id = _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
+    verdict = next(row for row in store.read_session_evaluations(store_root) if row["metric_name"] == SPREAD)
+    assert verdict["session_id"] == identity.session_id(SESSION)
+    assert verdict["run_id"] == run_id
+    assert verdict["measurement_run_id"] == run_id
+    assert verdict["policy_id"] == store.policy_id(DEFAULT_THRESHOLDS)
+    assert verdict["check_status"] == "PASS"
+    assert verdict["threshold"] == DEFAULT_THRESHOLDS.max_sensor_spread_ns
+
+
+def test_re_running_a_session_supersedes_its_own_rows(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The session tables dedup on ``session_id`` by the same rule the stream tables use."""
+    first = _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
+    second = _write(
+        store_root,
+        [make_stream(FRONT, perfect())],
+        session_metrics=_skewed_metrics(),
+        created_at=datetime.datetime(2030, 1, 1, tzinfo=datetime.UTC),
+    )
+    assert first != second
+
+    assert len(store.read_sessions(store_root, latest=False)) == 2
+    (latest,) = store.read_sessions(store_root)
+    assert latest["run_id"] == second
+
+    (spread,) = store.read_session_measurements(store_root, "multi_sensor_spread")
+    assert spread["start_spread_ns"] == _SKEW_NS
+
+
+def test_a_session_run_that_never_committed_is_not_readable(
+    store_root: str,
+    monkeypatch: pytest.MonkeyPatch,
+    make_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """Session rows are gated by the same commit marker as everything else."""
+    _fail_the_commit(monkeypatch)
+    with pytest.raises(RuntimeError, match="killed before the commit"):
+        _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
+
+    assert store.read_sessions(store_root) == []
+    assert store.read_session_measurements(store_root, "multi_sensor_spread") == []
+    assert store.read_session_evaluations(store_root) == []
+    assert len(store.read_sessions(store_root, include_incomplete=True)) == 1
+
+
+def test_session_rollup_fails_on_a_stored_session_verdict(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The store-side twin of the bug the live report had: every stream passes, the session does not."""
+    thresholds = Thresholds(max_sensor_spread_ns=0)
+    streams = [make_stream(FRONT, perfect()), make_stream("/data/session/rear.mp4", perfect())]
+    _write(store_root, streams, thresholds=thresholds, session_metrics=_skewed_metrics(thresholds))
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["stream_status_counts"] == {"PASS": 2, "FAIL": 0, "ERROR": 0}
+    assert rollup["session_status_counts"] == {"PASS": 0, "FAIL": 1, "ERROR": 0}
+    assert rollup["status"] == "FAIL"
+
+
+def test_session_rollup_errors_on_a_session_that_could_not_be_listed(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A session never listed was never measured, which outranks any failure the way an errored stream does."""
+    _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
+    _append_session(store_root, "/data/gone", num_streams=0, error="prefix does not exist")
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["session_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 1}
+    assert rollup["status"] == "ERROR"
+
+
+def test_session_rollup_errors_on_a_session_the_run_did_not_measure_through(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A stream nobody could reach leaves no row, and must not leave its session reading PASS.
+
+    The unreachable-stream case: the run found two streams, reached one, and wrote no
+    row for the other, so nothing in ``stream.lance`` can force the session to ERROR.
+    What does is ``num_streams`` -- what the session was found to *hold* -- against the
+    rows the store actually has.
+    """
+    _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER, session_metrics=_aligned_metrics())
+    _append_session(store_root, SESSION, num_streams=2)
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["stream_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 0}
+    assert rollup["session_status_counts"] == {"PASS": 0, "FAIL": 0, "ERROR": 1}
+    assert rollup["status"] == "ERROR"
+
+
+def test_a_session_two_runs_measured_between_them_rolls_up_pass(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """Counting rows rather than storing a shortfall is what lets a re-run close the gap.
+
+    Coverage is a question about the store, not about any one run: the stream a first
+    run could not reach and a second one could is measured either way, and the session
+    completes without either run revising a column. A stored ``num_unreachable`` would
+    have pinned this session at ``ERROR`` for good.
+    """
+    _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER, session_metrics=_aligned_metrics())
+    _write(store_root, [make_stream("/data/session/rear.mp4", perfect())], created_at=_LATER)
+    _append_session(store_root, SESSION, num_streams=2)
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["stream_status_counts"] == {"PASS": 2, "FAIL": 0, "ERROR": 0}
+    assert rollup["session_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 0}
+    assert rollup["status"] == "PASS"
+
+
+def test_re_measuring_one_stream_under_a_wider_session_strands_neither(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """Coverage counts every row a session ever had, not the rows a reader resolves to now.
+
+    A ``stream_id`` is keyed on the source alone, so re-running at a different scope
+    moves that stream's newest row to the wider session. Both runs are legal --
+    ``_drop_nested`` only de-duplicates within one run -- and the earlier session was
+    genuinely measured through, so counting the resolved rows would have left it at
+    ``ERROR`` permanently on the strength of a re-run.
+    """
+    side = "/data/session/nested/side.mp4"
+    _write(store_root, [make_stream(side, perfect())], session_path="/data/session/nested", created_at=_EARLIER)
+    _write(
+        store_root,
+        [make_stream(FRONT, perfect()), make_stream(side, perfect())],
+        created_at=_LATER,
+        session_metrics=_aligned_metrics(),
+    )
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["stream_status_counts"] == {"PASS": 2, "FAIL": 0, "ERROR": 0}
+    assert rollup["session_status_counts"] == {"PASS": 2, "FAIL": 0, "ERROR": 0}
+    assert rollup["status"] == "PASS"
+
+
+def test_session_rollup_errors_on_a_session_that_held_nothing(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """An empty session is graded the way a live report grades one: nothing measured, so ERROR.
+
+    It costs the run nothing -- an empty session is a finding about the input, not a
+    failure -- but the session's own verdict cannot be ``PASS`` when there was nothing
+    to judge.
+    """
+    _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER)
+    _append_session(store_root, "/data/empty", num_streams=0)
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["session_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 1}
+    assert rollup["status"] == "ERROR"
+
+
+def test_session_rollup_of_a_store_without_session_rows_is_unchanged(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A store written before these tables existed still rolls up, and to what it did before."""
+    _write(store_root, [make_stream(FRONT, perfect())], session_path=None)
+    rollup = store.session_rollup(store_root)
+    assert rollup["status"] == "PASS"
+    assert rollup["num_sessions"] == 0
+
+
+def test_a_session_with_no_verdicts_is_not_an_error(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """Unlike a stream, a session row is written whether or not its writer had verdicts to offer."""
+    _write(store_root, [make_stream(FRONT, perfect())])
+    assert store.read_session_evaluations(store_root) == []
+    rollup = store.session_rollup(store_root)
+    assert rollup["session_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 0}
+    assert rollup["status"] == "PASS"
+
+
 def test_manifest_records_the_run(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> None:
@@ -399,7 +777,12 @@ def test_manifest_records_the_run(
     assert manifest["tool"] == "di-session"
     assert manifest["store_schema_version"] == store_schema.STORE_SCHEMA_VERSION
     assert manifest["policy_id"] == store.policy_id(DEFAULT_THRESHOLDS)
-    assert manifest["instruments"] == {spec.name: spec.version for spec in INSTRUMENTS}
+    assert manifest["instruments"] == {spec.name: spec.version for spec in (*INSTRUMENTS, *SESSION_INSTRUMENTS)}
+    datasets = manifest["datasets"]
+    assert isinstance(datasets, dict)
+    # Both grains, since a session run writes both.
+    assert set(datasets["measurements"]) == {spec.name for spec in INSTRUMENTS}
+    assert set(datasets["session_measurements"]) == {spec.name for spec in SESSION_INSTRUMENTS}
 
 
 def test_a_caller_can_assemble_a_run_from_the_public_builders(
@@ -573,8 +956,29 @@ def test_reading_a_store_that_was_never_written_yields_no_rows(tmp_path: pathlib
 
 def test_unknown_metric_is_rejected_before_any_io(store_root: str) -> None:
     """A typo should name the alternatives, not read an empty dataset and look fine."""
-    with pytest.raises(KeyError, match="known metrics"):
+    with pytest.raises(KeyError, match="known per-stream metrics"):
         store.read_measurements(store_root, "no_such_metric")
+    with pytest.raises(KeyError, match="known session-grain metrics"):
+        store.read_session_measurements(store_root, "no_such_metric")
+
+
+def test_a_metric_of_the_wrong_grain_is_rejected_by_the_reader(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The grains live in separate directories, so a name from the other one reads back as no rows.
+
+    Which is indistinguishable from a metric nobody has measured yet, and the reason
+    the readers cannot lean on :func:`instrument` for validation: it spans both
+    registries on purpose, so it accepts either name.
+    """
+    _write(store_root, [make_stream(FRONT, perfect())], session_metrics=_aligned_metrics())
+    assert store.read_measurements(store_root, "rate"), "the per-stream metric is there to be read"
+    assert store.read_session_measurements(store_root, SPREAD), "the session-grain one too"
+
+    with pytest.raises(KeyError, match=f"unknown per-stream metric '{SPREAD}'"):
+        store.read_measurements(store_root, SPREAD)
+    with pytest.raises(KeyError, match=f"session-grain metrics: multi_sensor_overlap, {SPREAD}"):
+        store.read_session_measurements(store_root, "rate")
 
 
 def test_azure_store_is_rejected_explicitly() -> None:

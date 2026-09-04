@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
-from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS
-from cosmos_curator.core.sensors.data_integrity.results import StreamResult
+from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, SESSION_INSTRUMENTS
+from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
 from cosmos_curator.next.recipes.data_integrity import processing, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 
@@ -36,7 +36,12 @@ CREATED_AT = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.UTC)
 NUM_METRICS = len(INSTRUMENTS)
 
 
-def _config(session: pathlib.Path, **execution: Any) -> ResolvedDataIntegrityConfig:  # noqa: ANN401
+def _config(
+    session: pathlib.Path,
+    *,
+    thresholds: dict[str, Any] | None = None,
+    **execution: Any,  # noqa: ANN401
+) -> ResolvedDataIntegrityConfig:
     """Resolve a config covering one local session."""
     return ResolvedDataIntegrityConfig.model_validate(
         {
@@ -44,6 +49,7 @@ def _config(session: pathlib.Path, **execution: Any) -> ResolvedDataIntegrityCon
             "kind": "data-integrity",
             "input": {"sessions": [str(session)]},
             "output": {"store_root": str(session.parent / "di-store")},
+            "checks": {"thresholds": thresholds or {}},
             "execution": execution,
         }
     )
@@ -59,11 +65,16 @@ def session(tmp_path: pathlib.Path, h264_video: Callable[..., bytes]) -> pathlib
     return path
 
 
-def _check(session: pathlib.Path, **execution: Any) -> dict[str, object]:  # noqa: ANN401
+def _check(
+    session: pathlib.Path,
+    *,
+    thresholds: dict[str, Any] | None = None,
+    **execution: Any,  # noqa: ANN401
+) -> dict[str, object]:
     """Measure one session the way the Ray stage does."""
     return processing.check_session(
         {"session_path": str(session)},
-        config=_config(session, **execution),
+        config=_config(session, thresholds=thresholds, **execution),
         run_id=RUN_ID,
         created_at=CREATED_AT,
     )
@@ -113,7 +124,13 @@ def test_a_session_that_cannot_be_listed_is_reported_rather_than_raised(tmp_path
 
     assert "absent" in str(record["listing_error"])
     assert record["streams"] == 0
-    assert _rows(record) == {}
+    # One row, and only one: nothing under the session was measured, so it has no
+    # measurements and no verdicts -- the shape an errored stream has.
+    rows = _rows(record)
+    (session_row,) = rows[store_schema.SESSION_DATASET]
+    assert "absent" in str(session_row["error"])
+    assert session_row["num_streams"] == 0
+    assert set(rows) == {store_schema.SESSION_DATASET}
 
 
 def test_an_unreachable_stream_leaves_no_row_and_does_not_cost_its_siblings(
@@ -175,6 +192,30 @@ def test_a_session_yields_the_rows_of_every_stream_it_holds(session: pathlib.Pat
     assert sum(len(rows[store_schema.metric_dataset_path(spec.name)]) for spec in INSTRUMENTS) == NUM_METRICS
 
 
+def test_a_failing_session_metric_is_counted_in_the_record(
+    tmp_path: pathlib.Path, h264_video: Callable[..., bytes]
+) -> None:
+    """The counter the driver sums into the run summary, which no store row states.
+
+    Two sensors that stopped a second apart, under a policy allowing no non-overlap at
+    all: every stream passes on its own, so the session's own verdict is the only thing
+    that fails, and ``failed_metrics`` beside it must not move.
+    """
+    ragged = tmp_path / "ragged"
+    ragged.mkdir()
+    (ragged / "front.mp4").write_bytes(h264_video(frames=30))
+    (ragged / "rear.mp4").write_bytes(h264_video(frames=60))
+
+    record = _check(ragged, thresholds={"max_non_overlap_percent": 0.0})
+    verdicts = {
+        row["metric_name"]: row["check_status"] for row in _rows(record)[store_schema.SESSION_EVALUATION_DATASET]
+    }
+
+    assert record["failed_metrics"] == 0
+    assert record["failed_session_metrics"] == 1
+    assert verdicts["multi_sensor_overlap"] == CheckStatus.FAIL.value
+
+
 def test_an_unreadable_stream_does_not_cost_its_siblings(session: pathlib.Path) -> None:
     """One broken video must not take out the rest of its session, or the run."""
     record = _check(session)
@@ -198,15 +239,34 @@ def test_every_row_carries_the_runs_identity_and_its_session(session: pathlib.Pa
             assert row["created_at"] == CREATED_AT
 
 
-def test_an_empty_session_produces_a_result_but_no_rows(tmp_path: pathlib.Path) -> None:
+def test_an_empty_session_produces_a_result_but_no_stream_rows(tmp_path: pathlib.Path) -> None:
     """An empty session is a fact about the input, not a failure of the task."""
     empty = tmp_path / "empty"
     empty.mkdir()
     record = _check(empty)
+    rows = _rows(record)
 
     assert record["streams"] == 0
     assert record["unreadable"] == 0
-    assert _rows(record) == {}
+    assert store_schema.STREAM_DATASET not in rows
+    # It was listed, though, and that is worth a row: a session found empty and a
+    # session never reached are different findings about the input.
+    (session_row,) = rows[store_schema.SESSION_DATASET]
+    assert session_row["error"] is None
+    assert session_row["num_streams"] == 0
+    # Its own metrics are still measured and judged, and come back SKIPPED for the
+    # reason a single-sensor session's do: a session metric needs two sensors to have
+    # anything to say. Nothing here forks on `num_streams == 0` -- both shapes go
+    # through `session_metrics`, which is what stops the pipeline and di-session from
+    # judging a session two ways.
+    assert record["failed_session_metrics"] == 0
+    for spec in SESSION_INSTRUMENTS:
+        (measurement,) = rows[store_schema.session_metric_dataset_path(spec.name)]
+        assert measurement["is_defined"] is False
+        assert measurement["num_sensors"] == 0
+    assert [row["check_status"] for row in rows[store_schema.SESSION_EVALUATION_DATASET]] == [
+        CheckStatus.SKIPPED.value
+    ] * len(SESSION_INSTRUMENTS)
 
 
 def test_the_configured_attempt_budget_reaches_every_stream(

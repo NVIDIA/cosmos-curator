@@ -38,7 +38,7 @@ from typing import Any, Literal, Self, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cosmos_curator.core.sensors.data_integrity.instruments import Thresholds
+from cosmos_curator.core.sensors.data_integrity.instruments import MAX_PERCENT, Thresholds
 from cosmos_curator.next.core.config import apply_dotted_overrides
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
@@ -131,6 +131,11 @@ class ThresholdsConfig(BaseModel):
     max_gaps: int = Field(default=0, ge=0)
     max_jitter_percent: float = Field(default=10.0, ge=0.0, allow_inf_nan=False)
     allow_frame_reordering: bool = False
+    # Session-grain, judging the rig rather than one stream. Here rather than only on
+    # di-session because a pipeline run measures sessions too, and a policy it cannot
+    # state is a policy it is stuck with.
+    max_sensor_spread_ns: int = Field(default=1_000_000_000, ge=0)
+    max_non_overlap_percent: float = Field(default=5.0, ge=0.0, le=MAX_PERCENT, allow_inf_nan=False)
 
     def to_thresholds(self) -> Thresholds:
         """Convert to the kernel policy object the instruments and store take."""
@@ -140,6 +145,8 @@ class ThresholdsConfig(BaseModel):
             max_gaps=self.max_gaps,
             max_jitter_percent=self.max_jitter_percent,
             allow_frame_reordering=self.allow_frame_reordering,
+            max_sensor_spread_ns=self.max_sensor_spread_ns,
+            max_non_overlap_percent=self.max_non_overlap_percent,
         )
 
 

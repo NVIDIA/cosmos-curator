@@ -376,10 +376,6 @@ def _run(
             # After the report, so the operator keeps the verdict even when persisting
             # fails -- but a failure is still exit code 2, because saving the results
             # was part of what was asked for.
-            #
-            # Streams only: the store is keyed per stream, so the session-grain verdicts
-            # printed above have no row to be written to yet (CVC-1244). Until they do,
-            # a stored run can read back PASS for a session this exited nonzero on.
             try:
                 persist_run(
                     args.store_path,
@@ -387,6 +383,9 @@ def _run(
                     session_path=report.session_path,
                     thresholds=thresholds,
                     tool="di-session",
+                    # The same verdicts the report printed, so what this exited on is
+                    # what reads back.
+                    session_metrics=report.metrics,
                     storage_stats=progress.stats if progress is not None else None,
                     s3_profile_name=args.s3_profile_name,
                     azure_profile_name=args.azure_profile_name,

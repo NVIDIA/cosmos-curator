@@ -33,6 +33,7 @@ from typing import cast
 
 from cosmos_curator.core.sensors.data_integrity.instruments import (
     INSTRUMENTS,
+    SESSION_INSTRUMENTS,
     InstrumentSpec,
     Thresholds,
     evaluate_metric,
@@ -84,6 +85,11 @@ def reevaluate(  # noqa: PLR0913 -- credentials plus provenance, all independent
 ) -> str:
     """Re-judge every stored measurement under ``thresholds`` and append the verdicts.
 
+    Both grains: per-stream measurements become ``evaluation.lance`` rows and
+    session-grain ones become ``session_evaluation.lance`` rows, so tightening a
+    policy moves a session's verdict and its streams' verdicts together rather than
+    leaving the two under different rules.
+
     Opens no source data: every input comes from the metric datasets. The written
     rows land under ``policy_id(thresholds)``, so re-running with an unchanged policy
     supersedes its own previous rows while a changed one opens a new generation
@@ -109,7 +115,7 @@ def reevaluate(  # noqa: PLR0913 -- credentials plus provenance, all independent
     created_at = created_at or datetime.datetime.now(datetime.UTC)
     storage_options = get_lance_storage_options(root, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
 
-    # One ledger read for all five metric datasets, rather than one per read below.
+    # One ledger read for every metric dataset, rather than one per read below.
     finished = store.completed_runs(root, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
 
     rows: list[dict[str, object]] = []
@@ -134,10 +140,39 @@ def reevaluate(  # noqa: PLR0913 -- credentials plus provenance, all independent
                 )
             )
 
+    # The session-grain half, on the same terms. It is why the session verdict is a
+    # table of its own rather than a column on the session row: a verdict welded to
+    # the row it judges cannot be re-judged without rewriting the facts beside it.
+    session_rows: list[dict[str, object]] = []
+    for spec in SESSION_INSTRUMENTS:
+        for measurement_row in store.read_session_measurements(
+            root, spec.name, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
+        ):
+            result = _reevaluate_row(spec, measurement_row, thresholds)
+            session_rows.append(
+                store.build_session_evaluation_row(
+                    spec,
+                    result,
+                    session_id=str(measurement_row["session_id"]),
+                    run_id=run_id,
+                    measurement_run_id=str(measurement_row["run_id"]),
+                    created_at=created_at,
+                    session_path=str(measurement_row["session_path"]),
+                    thresholds=thresholds,
+                    instrument_version=cast("int", measurement_row["instrument_version"]),
+                )
+            )
+
     store.append_rows(
         rows,
         store.join(root, store_schema.EVALUATION_DATASET),
         store_schema.EVALUATION_SCHEMA,
+        storage_options,
+    )
+    store.append_rows(
+        session_rows,
+        store.join(root, store_schema.SESSION_EVALUATION_DATASET),
+        store_schema.SESSION_EVALUATION_SCHEMA,
         storage_options,
     )
     # A re-judge is a run like any other, so it commits like one: without this its

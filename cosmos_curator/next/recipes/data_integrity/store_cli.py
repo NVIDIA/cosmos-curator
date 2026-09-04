@@ -26,7 +26,7 @@ import pathlib
 from collections.abc import Mapping
 
 from cosmos_curator.core.sensors.data_integrity.instruments import Thresholds
-from cosmos_curator.core.sensors.data_integrity.results import StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import CheckResult, StreamResult
 from cosmos_curator.core.utils.storage.azure_client import is_azure_path
 from cosmos_curator.core.utils.storage.s3_client import is_s3path
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
@@ -92,12 +92,16 @@ def persist_run(  # noqa: PLR0913 -- provenance plus credentials, all independen
     session_path: str | None,
     thresholds: Thresholds,
     tool: str,
+    session_metrics: list[CheckResult] | None = None,
     storage_stats: Mapping[str, StorageStat] | None = None,
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
     endpoint_url: str | None = None,
 ) -> str:
     """Append one run to the store at ``store_path`` and return its ``run_id``.
+
+    ``session_metrics`` carries the session's own verdicts, which only a whole-session
+    run has; see :func:`~.store.write_run`.
 
     Errors propagate: the operator asked for the results to be saved, so a store that
     could not be written is a failed run even when every check passed, and the CLIs
@@ -113,6 +117,7 @@ def persist_run(  # noqa: PLR0913 -- provenance plus credentials, all independen
         session_path=session_path,
         thresholds=thresholds,
         tool=tool,
+        session_metrics=session_metrics,
         storage_stats=storage_stats,
         s3_profile_name=s3_profile_name,
         azure_profile_name=azure_profile_name,

@@ -25,6 +25,7 @@ from collections.abc import Callable
 
 import pytest
 
+from cosmos_curator.core.sensors.data_integrity.instruments import MAX_PERCENT
 from cosmos_curator.core.sensors.data_integrity.results import (
     CheckResult,
     CheckStatus,
@@ -156,6 +157,14 @@ def test_session_threshold_flags_reach_the_session_runner(monkeypatch: pytest.Mo
     assert session_cli.main(argv) == PASS_EXIT_CODE
     assert seen["thresholds"] == Thresholds(max_sensor_spread_ns=250_000_000, max_non_overlap_percent=2.5)
 
+    # The ceiling is a legal policy, not a rejected one. Worth a case of its own
+    # because it is the only value that tells `> MAX_PERCENT` from `>= MAX_PERCENT`,
+    # and the rejections below can only ever pin the wrong side of that line.
+    assert session_cli.main(["--session-path", "s", "--max-non-overlap-percent", "100"]) == PASS_EXIT_CODE
+    assert seen["thresholds"] == Thresholds(max_non_overlap_percent=MAX_PERCENT)
+    assert session_cli.main(["--session-path", "s", "--max-non-overlap-percent", "0"]) == PASS_EXIT_CODE
+    assert seen["thresholds"] == Thresholds(max_non_overlap_percent=0.0)
+
 
 @pytest.mark.parametrize(
     ("flag", "value"),
@@ -164,6 +173,9 @@ def test_session_threshold_flags_reach_the_session_runner(monkeypatch: pytest.Mo
         ("--max-sensor-spread-ns", "nan"),
         ("--max-non-overlap-percent", "-0.5"),
         ("--max-non-overlap-percent", "inf"),
+        # A share cannot exceed 100, so this is a typo rather than a laxer policy:
+        # 100 already tolerates every session there is.
+        ("--max-non-overlap-percent", "101"),
     ],
 )
 def test_invalid_session_threshold_values_are_rejected_by_argparse(

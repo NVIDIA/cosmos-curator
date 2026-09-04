@@ -1,10 +1,10 @@
 # Data-Integrity Store — Lance Schema
 
-**Status:** proposed, for review. Persistence only — no new metric math, no pass/fail policy for sessions, no
-curation filter.
+**Status:** built, and this doc is its reference. Persistence only — no new metric math and no curation filter; the
+thresholds it names are the policy the metrics already carry.
 
-Right now the DI CLIs (`di-check` for one stream, `di-session` for a whole session) run the checks and print the
-results. Nothing is saved. This doc proposes where those results go.
+The DI CLIs (`di-check` for one stream, `di-session` for a whole session) and the Ray pipeline run the checks and
+print the results; given `--store-path` they also save them. This doc is where those results go, and why.
 
 ---
 
@@ -34,6 +34,11 @@ broken stream is exactly the thing curation most needs to know about. So we keep
 | `evaluation.lance` | policy × stream × metric | the verdicts |
 | `run.lance` | finished run | the commit marker, plus who wrote it and under what policy |
 
+The first three have a session-grain twin each, for the metrics whose subject is a whole session rather than one
+stream: `session.lance`, `session_measurements/<metric>.lance` and `session_evaluation.lance`, carrying `session_id`
+where the original carries `stream_id`. They are additive — everything in sections 1–4 keeps its shape, and a reader
+that does not care about sessions never learns they exist. Section 5 is their spec.
+
 ```text
 <store-root>/                 # a local dir or an s3:// path
 ├── stream.lance
@@ -44,6 +49,11 @@ broken stream is exactly the thing curation most needs to know about. So we keep
 │   ├── jitter.lance
 │   └── frame_reordering_present.lance
 ├── evaluation.lance
+├── session.lance             # session-grain; absent from a store di-check wrote
+├── session_measurements/
+│   ├── multi_sensor_spread.lance
+│   └── multi_sensor_overlap.lance
+├── session_evaluation.lance
 ├── run.lance                 # written last; a run's rows are invisible until its row lands
 └── manifest.json             # small provenance file: run id, timestamps, thresholds used, metric versions
 ```
@@ -52,10 +62,6 @@ Nothing here is video-specific by design. The metric kernel only ever sees times
 GPS and lidar streams fit these same tables; `codec_name` and `has_bframes` are the only video-shaped columns, and
 they're nullable for exactly that reason.
 
-Three more tables are specified but not yet written: `session.lance`, `session_measurements/<metric>.lance` and
-`session_evaluation.lance`, for the metrics whose subject is a session rather than a stream. They are additive —
-everything in sections 1–4 keeps its shape — and section 5 is their spec.
-
 ### Append-only
 
 Tables are **append-only** — we never edit rows in place. A re-run or a re-judge adds rows; readers asking "what's
@@ -63,9 +69,9 @@ the current state?" take the newest row per key. Keeps history, keeps it auditab
 
 ### One run, several tables — so a run needs a commit point
 
-A write touches `stream.lance`, five metric tables and `evaluation.lance` in sequence. Kill it halfway and the store
-holds a *newer* `run_id` for a run that never finished — which "newest row per key" would happily serve as current
-state.
+A write touches `stream.lance`, five metric tables and `evaluation.lance` in sequence — and, for a session run, the
+three session-grain tables beside them. Kill it halfway and the store holds a *newer* `run_id` for a run that never
+finished — which "newest row per key" would happily serve as current state.
 
 So `run.lance` gets its row **after** every other write, and readers drop rows whose `run_id` has no row there. A
 torn write leaves rows that are present but not believed; the previous complete run stays current. The filter runs
@@ -75,12 +81,21 @@ key empty. Re-evaluation commits the same way, so a partial generation of verdic
 `manifest.json` is *not* the commit point. It is overwritten on every run, so it only ever describes the latest one;
 `run.lance` is the history, and readers rely on it rather than on a file that a reader may find half-written.
 
+Its fields split two ways, and the split is worth knowing before reading one. `run_id`, `created_at`, `tool`,
+`session_path`, `num_streams` and the policy fields describe *that run*. `store_schema_version`, `datasets` and
+`instruments` describe *the layout and registry of the build that wrote it* — every dataset the schema defines and
+every metric it knows, not the subset whose rows the run happened to produce. So a `di-check` run lists the
+session datasets it could not have written, and a run whose only stream failed to open lists `measurements` while
+writing no measurement row. That is the useful way round for an overwritten file: the alternative is a store
+`di-session` filled and `di-check` later wrote to ending up with a manifest that denies the `session.lance` sitting
+next to it. What a *particular* run wrote is answered by `run_id` and the rows.
+
 | Column | Type | Null? | Meaning |
 |---|---|---|---|
 | `run_id` | `string` | no | the run this row completes |
 | `created_at` | `timestamp[us, UTC]` | no | the stamp every row of the run carries |
 | `committed_at` | `timestamp[us, UTC]` | no | when the run finished writing |
-| `tool` | `string` | no | `di-check` \| `di-session` \| `di-reevaluate` |
+| `tool` | `string` | no | `di-check` \| `di-session` \| `di-reevaluate` \| `data-integrity` (the Ray recipe) |
 | `session_path` | `string` | yes | `null` for a single-video run and for a re-judge |
 | `policy_id` | `string` | no | the policy the run's verdicts were produced under |
 | `num_streams` | `int64` | yes | `null` for a re-judge, which touches no stream |
@@ -95,7 +110,13 @@ key empty. Re-evaluation commits the same way, so a partial generation of verdic
 | `stream.lance` | (`stream_id`) | `created_at` DESC, then `run_id` DESC |
 | `measurements/<metric>.lance` | (`stream_id`) | `created_at` DESC, then `run_id` DESC |
 | `evaluation.lance` | (`stream_id`, `metric_name`, `policy_id`) | `created_at` DESC, then `run_id` DESC |
+| `session.lance` | (`session_id`) | `created_at` DESC, then `run_id` DESC |
+| `session_measurements/<metric>.lance` | (`session_id`) | `created_at` DESC, then `run_id` DESC |
+| `session_evaluation.lance` | (`session_id`, `metric_name`, `policy_id`) | `created_at` DESC, then `run_id` DESC |
 | `run.lance` | — | `committed_at`, then `run_id` |
+
+The session keys are the per-stream ones with `session_id` substituted, which is the other half of why the two
+grains are separate tables: one table holding both would carry two rules for picking its newest row.
 
 `run.lance` has no dedup key: a run is written once and never superseded, so every row stands.
 
@@ -144,9 +165,10 @@ streams into one row. Local paths are different — there `..` really does mean 
 being folded. The trailing slash is the one thing stripped from a key, because a prefix gets written both ways by
 hand and `s3://b/clips/` and `s3://b/clips` are the same session.
 
-`session_id`, `locator_namespace` and `relative_key` ride along on `stream.lance` as descriptive columns. They're
-chosen so a future `session.lance` is a pure projection of columns that already exist — no backfill needed if we
-decide a session deserves its own table later.
+`session_id`, `locator_namespace` and `relative_key` ride along on `stream.lance` as descriptive columns. They were
+chosen so that a `session.lance` would be a pure projection of columns that already existed, and that is how it
+turned out: section 5's table needed no backfill, and `session_id` on the stream rows is what lets a rollup count
+how much of a session was measured without joining on a path.
 
 ---
 
@@ -342,15 +364,15 @@ Join keys (distinct from the dedup keys in section 1 — these link tables, thos
 
 ## 5. Session-grain — `session.lance` and session verdicts
 
-**Agreed, not built.** The two metrics below are implemented and `di-session` prints them and exits on them today,
-but nothing writes these three tables yet — so a stored run can read back `PASS` for a session the CLI exited `1`
-on. Closing that is [CVC-1244](https://jirasw.nvidia.com/browse/CVC-1244). This section is the spec it builds to.
-
 Sections 1–4 all assume the subject of a measurement is a stream. That was true of the first five metrics and stops
 being true here: **how far apart a rig's sensors started, and how much of the session they were all recording for,
 are facts about the session, not about any one camera in it.** There is no stream to hang such a row on — picking one
 would blame it for the others — and `stream_id` / `source` are `nullable=False` on both the measurement identity
-prefix and `evaluation.lance`, so there is nowhere to put one today.
+prefix and `evaluation.lance`, so there is nowhere to put one among them.
+
+So the three tables below are parallel to sections 2–4 rather than folded into them. Both writers fill them: the
+`di-session` CLI writes the verdicts it just printed, and the Ray pipeline writes one set per session it measured.
+`reevaluate` re-judges them alongside the per-stream ones, so tightening a policy moves both grains together.
 
 ### `session.lance`
 
@@ -370,7 +392,21 @@ One row per session per run. Dedup on `session_id` by `(created_at DESC, run_id 
 
 `error` is the session-level analogue of `stream.error`, and it settles a question the pipeline review raised: a
 stale path in a thousand-path manifest gets a row saying so, rather than costing the run every measurement already
-taken. Until this table exists, the pipeline carries that as a run-level count instead.
+taken.
+
+There is deliberately **no `num_unreachable` column**. A stream that could not be *reached* — an expired token, a
+403 — gets no row anywhere, for the reason in [the pipeline doc](data-integrity-pipeline.md): a failure the
+environment manufactured must not be persisted as a finding about the data. So `num_streams` counts what the run
+*found*, and a session with unreachable streams has more of them than it has rows in `stream.lance`.
+
+That difference is the record of the gap, and `session_rollup` reads it: a session holding fewer stream rows than
+`num_streams` rolls up `ERROR`, on the same grounds an errored stream does — nothing was measured there, so there is
+nothing to call a pass. Counting rows rather than storing a shortfall is what keeps the answer true over time: a
+stream one run could not reach and a later one could is measured, and the session completes without either run
+having to revise a column. A stored `num_unreachable` would pin that session at `ERROR` for good, which is the
+concrete form of the reason not to have it — an unreachable stream is a fact about the run, not about the session,
+and the same session re-run with working credentials has a different number. The run says so too: the pipeline
+raises `IncompleteRunError` after committing, and its message carries the count.
 
 ### `session_measurements/<metric>.lance`
 
@@ -459,6 +495,12 @@ Only `rate` and `jitter` ever produce `NaN`. The other three carry real values e
 has `has_reordering = null`. So `is_defined = false` does not imply `NaN`.
 
 That last row is why `stream.lance` exists.
+
+The session-grain tables have the same states with `session.error` in place of `stream.error`, and one difference of
+emphasis: the "ran, but undefined" row is the *common* case rather than an edge one. A session of a single sensor has
+nothing to compare, so both metrics come back `is_defined = false` with `num_sensors = 1` and a `SKIPPED` verdict.
+"Never ran" is unreachable today, since neither session metric needs an expected rate — the shape is the table's,
+not the metric's.
 
 ---
 

@@ -23,7 +23,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS
+from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, MAX_PERCENT
 from cosmos_curator.next.recipes.data_integrity import config
 
 
@@ -59,6 +59,10 @@ def test_the_template_shows_every_setting() -> None:
         "max_gaps",
         "max_jitter_percent",
         "allow_frame_reordering",
+        # Session-grain, and settable here for the same reason the rest are: a pipeline
+        # run judges sessions too, so the policy it applies to them has to be stateable.
+        "max_sensor_spread_ns",
+        "max_non_overlap_percent",
     }
     assert template["execution"]["s3_profile_name"] is None
     assert yaml.safe_load(config.config_template_yaml()) == template
@@ -69,6 +73,34 @@ def test_thresholds_default_to_the_kernel_policy() -> None:
     resolved = config.resolve_config_data(_config_data())
 
     assert resolved.checks.thresholds.to_thresholds() == DEFAULT_THRESHOLDS
+
+
+def test_a_non_overlap_share_above_a_hundred_percent_is_rejected() -> None:
+    """The one threshold with a ceiling: a share of a session cannot exceed all of it.
+
+    So a limit above 100 describes no session that exists, and asking for one is a
+    typo rather than a laxer policy -- 100 already tolerates everything. The bound is
+    the same one ``--max-non-overlap-percent`` enforces, both read off ``MAX_PERCENT``.
+    """
+    assert config.resolve_config_data(
+        _config_data(checks={"thresholds": {"max_non_overlap_percent": 100.0}})
+    ).checks.thresholds.max_non_overlap_percent == pytest.approx(MAX_PERCENT)
+
+    with pytest.raises(ValidationError, match="less than or equal to 100"):
+        config.resolve_config_data(_config_data(checks={"thresholds": {"max_non_overlap_percent": 101}}))
+
+
+def test_a_negative_sensor_spread_limit_is_rejected() -> None:
+    """The other session threshold has a floor rather than a ceiling: a spread is a distance.
+
+    Zero is a real policy -- a rig that claims perfect synchronisation -- so the bound
+    is ``ge``, not ``gt``.
+    """
+    resolved = config.resolve_config_data(_config_data(checks={"thresholds": {"max_sensor_spread_ns": 0}}))
+    assert resolved.checks.thresholds.max_sensor_spread_ns == 0
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        config.resolve_config_data(_config_data(checks={"thresholds": {"max_sensor_spread_ns": -1}}))
 
 
 def test_dotted_overrides_apply_before_validation() -> None:

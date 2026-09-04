@@ -11,9 +11,11 @@ Where `di-check` measures one video and `di-session` measures one session, this 
 takes an input that identifies many sessions, fans out to one Ray task per session, and
 commits everything a single invocation measured under one `run_id`.
 
-It adds no metric, no modality, no evaluation policy and no schema. The metric kernel
-(`cosmos_curator/core/sensors/data_integrity/`) and the Lance store
-(`cosmos_curator/next/recipes/data_integrity/store.py`) are consumed as they are.
+It adds no metric, no modality and no evaluation policy: the metric kernel
+(`cosmos_curator/core/sensors/data_integrity/`) is consumed as it is. It does add to the
+Lance store (`cosmos_curator/next/recipes/data_integrity/store.py`), which grew the three
+session-grain tables this recipe writes alongside the per-stream ones — additively, so every
+reader of sections 1–4 of the [store schema][store-schema] is untouched.
 
 ---
 
@@ -23,9 +25,12 @@ It adds no metric, no modality, no evaluation policy and no schema. The metric k
 "measures and judges", and "everything needed to *run* it at recording scale is
 deliberately not designed here". Of the six open problems that section lists, `di-check` and
 `di-session` answered one — an end-to-end entry point — at single-input and single-session
-granularity. This recipe carries that same problem to many sessions, and resolves none of the
-other five: full-fidelity sensor input, composing metrics into checks, declaring checks as
-data, generalizing one-read-many-metrics past the camera path, and multi-sensor metrics.
+granularity. This recipe carries that same problem to many sessions. Of the other five it
+resolves none outright: full-fidelity sensor input, composing metrics into checks, declaring
+checks as data, and generalizing one-read-many-metrics past the camera path all stand. The
+fifth, multi-sensor metrics, is under way rather than untouched — two of them exist in the
+kernel, and this recipe computes and stores them per session — but the problem as the design
+doc states it is broader than two camera-timing checks.
 
 That same section also places three constraints on any solution, and all three are met
 without touching the kernel:
@@ -196,6 +201,8 @@ checks:
     max_gaps: 0
     max_jitter_percent: 10.0
     allow_frame_reordering: false
+    max_sensor_spread_ns: 1000000000  # session-grain, as is the key below
+    max_non_overlap_percent: 5.0
 
 output:
   store_root: s3://example-bucket/di_store/
@@ -315,12 +322,11 @@ Consuming it settles four smaller things:
 **One Ray Data record per session, not per stream.** A task lists its session and then
 measures every stream in it, in sequence.
 
-The session is the unit because a session is what a check is about. Every metric today
-judges one stream on its own, which is why the store's rows are per-stream, but the checks
-this store is heading for are cross-sensor: does the camera timeline agree with the IMU's,
-do the sensors of one recording cover the same interval. Those have no per-stream task to
-run in. Giving one worker the whole session is what makes them expressible without another
-change to the execution model.
+The session is the unit because a session is what a check is about. Most metrics judge one
+stream on its own, but the cross-sensor ones do not: how far apart the rig's sensors started,
+how much of the session they were all recording for. Those have no per-stream task to run
+in. Giving one worker the whole session is what makes them expressible without another
+change to the execution model — and it is what the two session-grain metrics now use.
 
 Throughput is a separate question from what the measurement is about, and it does not argue
 the other way in practice. A rig carries the same sensor suite from session to session, so
@@ -329,15 +335,11 @@ session to whichever worker frees up first. If a session ever does run long enou
 the lever is inside the task — `run_session` already takes `max_workers` for exactly this —
 not a different record.
 
-The Lance schema stays per-stream, so nothing about the store anticipates those checks yet —
-a session-grain verdict has no row to live on today. Aligning the unit of work now is what
-keeps that a schema change rather than a rewrite; the tables it needs are specified in
-[data-integrity-store-schema.md][store-schema] section 5, pending [CVC-1244][cvc1244].
-
-Two session-grain metrics now exist, and `di-session` reports and exits on them, but this
-pipeline does not compute them: with nowhere to write one, a task that measured a session
-would throw the answer away. So the two tools can disagree about a session until the tables
-land — the CLI can fail one the pipeline records as passing.
+Aligning the unit of work first is what kept the store's session-grain half a schema
+addition rather than a rewrite: each task now judges its session as well as its streams and
+emits the three tables in [data-integrity-store-schema.md][store-schema] section 5. Both
+tools reach that verdict through one function, `session_runner.session_metrics`, so a
+session the CLI fails is not one the pipeline records as passing.
 
 Within a session the kernel's requirement is unchanged: each stream is read once, through
 `run_checks`, which takes exactly one URI, and folded into every instrument.
@@ -358,6 +360,7 @@ every record shares one Arrow schema:
     "unreadable": int,      # of those, how many were read and found unreadable
     "unreachable": int,     # of those, how many could not be reached at all
     "failed_metrics": int,
+    "failed_session_metrics": int,  # of the session's own verdicts, how many failed
     "listing_error": str,   # "" unless the session could not be listed
     "rows": bytes,          # serialized {dataset_name: [store row, ...]}, the whole session
 }
@@ -424,6 +427,8 @@ pipeline.run(config)
   ├─ per batch, on the driver:
   │      sum the counters, then
   │      append_rows(...) → stream.lance, measurements/<metric>.lance (x5), evaluation.lance
+  │                         session.lance, session_measurements/<metric>.lance (x2),
+  │                         session_evaluation.lance
   │
   ├─ zero rows across every session         → error, before the commit; nothing visible
   ├─ commit_run(root, run_id=run_id, ...)   → run.lance; everything above becomes visible
@@ -527,7 +532,9 @@ the profile and endpoint themselves instead:
 1. `append_rows(rows, join(root, dataset), schema, storage_options)` per dataset, as
    batches of finished sessions arrive — `stream.lance`, five `measurements/<metric>.lance`
    (`store_schema.metric_dataset_path`, one per entry in `INSTRUMENTS`), and
-   `evaluation.lance`.
+   `evaluation.lance`; then the session-grain three, `session.lance`, two
+   `session_measurements/<metric>.lance` (`store_schema.session_metric_dataset_path`, one
+   per entry in `SESSION_INSTRUMENTS`) and `session_evaluation.lance`.
 2. `commit_run(...)` once, appending the single `run.lance` row that makes everything above
    visible. Its `num_streams` is every stream the invocation *recorded* across all sessions,
    unreadable ones included, since those are rows too — but not the unreachable ones, which
@@ -558,13 +565,16 @@ updated to the new names. `write_run` gathers a whole session before writing any
 a driver measuring thousands of streams across many sessions cannot do, so the builders it
 uses are the public seam a driver needs. Workers then build every row through public API —
 `content_identity` for provenance, `stream_key(result)` for the dedup key, `instrument` for
-each result's spec, and the three builders. `content_identity` has to be handed the run's
-`s3_profile_name` / `azure_profile_name` / `endpoint_url`, exactly as `write_run` hands them:
-it never raises, so an unprofiled `HEAD` records empty provenance instead of failing.
+each result's spec, and the three per-stream builders — plus `session_key` and the three
+session-grain builders for the session's own rows. `content_identity` has to be handed the
+run's `s3_profile_name` / `azure_profile_name` / `endpoint_url`, exactly as `write_run` hands
+them: it never raises, so an unprofiled `HEAD` records empty provenance instead of failing.
 
-No new function, no schema field, no dataset name, no dedup key and no commit rule changes.
-`write_run` keeps its one production call site, `store_cli.persist_run`, which is what both
-CLIs go through, so neither CLI changes.
+The session-grain half then added what it needed: three builders, `session_key`, three dataset
+names and a dedup key of their own, and `STORE_SCHEMA_VERSION` at 2 — all of it additive, so a
+version-1 store still reads (see [data-integrity-store-schema.md][store-schema] section 5).
+What did not change is the commit rule, or `write_run`'s one production call site,
+`store_cli.persist_run`, which is what both CLIs go through, so neither CLI changes.
 
 ### The run row's `session_path` is null
 
@@ -661,11 +671,13 @@ carries, because the alternative is importing botocore and azure.core to name tw
 belongs in a row.
 
 **We could not reach the session.** A listing failure — a stale path, a moved bucket, a
-denied prefix, an expired token — comes back as `listing_error` on that session's record.
-Symmetric with an unreachable stream: nothing was learned, so nothing is written. There is
-also nowhere to write it if we wanted to. `stream_id` and `source` are `nullable=False` on
-both the measurement and evaluation schemas, so a session-grain row has no home in today's
-schema; that is [CVC-1244][cvc1244]'s work, not this recipe's.
+denied prefix, an expired token — comes back as `listing_error` on that session's record
+*and* as a `session.lance` row with `error` set. Not symmetric with an unreachable stream,
+and deliberately: an unreachable stream has a healthy row from an earlier run that a
+manufactured error would supersede, while an unlisted session has a `session_id` nothing
+else will ever say a word about. Writing the row is the only way that path is recorded at
+all. The run still raises `IncompleteRunError` — the row explains the gap, it does not make
+the run complete.
 
 The last two are why a run has a third outcome: **completed, but did not cover its input.**
 The driver commits everything it measured, writes the manifest, and only *then* raises
@@ -682,20 +694,23 @@ well: the store dedups on `stream_id` and keeps the newest row, so the result is
 rather than cheap. Covering only what was missed is incremental restart, which stays a
 [non-goal](#non-goals).
 
-A session that lists cleanly and holds nothing is not a failure — an empty session is a
-legitimate finding about the input — but it is counted and reported, because a stale S3 prefix
-lists clean and empty too, and the count is the only thing that separates "the prefix moved"
-from "this session has no video in it".
+A session that lists cleanly and holds nothing is not a failure of the *run* — an empty
+session is a legitimate finding about the input — but it is counted and reported, because a
+stale S3 prefix lists clean and empty too, and the count is the only thing that separates
+"the prefix moved" from "this session has no video in it". Its own verdict is a different
+question: nothing was measured, so the session rolls up `ERROR`, exactly as a live report
+grades one.
 
 | Situation | Persisted as | Exit |
 | --- | --- | --- |
 | Metric FAIL against the thresholds | evaluation row | 0 |
+| Session-grain metric FAIL against the thresholds | `session_evaluation` row | 0 |
 | Unreadable or undecodable input | stream row with `error` | 0 |
 | Metric ran but was undefined on too little data | measurement row with `is_defined` false, plus a `SKIPPED` evaluation row | 0 |
 | Metric never ran, with no usable rate | measurement row with `is_defined` null, plus a `SKIPPED` evaluation row | 0 |
-| Session listed cleanly and held no streams | nothing; counted in the summary | 0 |
-| Stream unreachable: expired token, 403, 5xx, or an exhausted transport budget | nothing; counted, and reported by the failure | nonzero, after the commit |
-| Session that could not be listed | nothing; counted and named by the failure | nonzero, after the commit |
+| Session listed cleanly and held no streams | `session.lance` row with `num_streams` 0 and no `error`, plus a `SKIPPED` session measurement and verdict per session metric — the same rows a single-sensor session produces, a session metric needing two sensors to have anything to say; counted in the summary. Rolls up `ERROR`, matching a live report on an empty session | 0 |
+| Stream unreachable: expired token, 403, 5xx, or an exhausted transport budget | no stream row; counted, and reported by the failure. Its session's row still says how many streams were *found*, so the session rolls up `ERROR` rather than `PASS` | nonzero, after the commit |
+| Session that could not be listed | `session.lance` row with `error` set, and nothing else; counted and named by the failure | nonzero, after the commit |
 | Invalid config, or an input set expanding to zero sessions | nothing | nonzero |
 | Nothing measured anywhere | rows may exist, uncommitted and unread | nonzero |
 | Ray execution failure | rows may exist, uncommitted and unread | nonzero |
@@ -703,7 +718,8 @@ from "this session has no video in it".
 | Interrupted with Ctrl-C | rows may exist, uncommitted and unread | nonzero |
 
 A run that covered its input returns `{"run_id", "sessions", "streams", "unreadable",
-"unreachable", "unlisted_sessions", "empty_sessions", "failed_metrics", "store_root"}`, which
+"unreachable", "unlisted_sessions", "empty_sessions", "failed_metrics",
+"failed_session_metrics", "store_root"}`, which
 the kind's `prepare_run` wraps in a `PipelineRunOutput` — the dict as `json_payload`, plus a
 one-line `message` naming the run id, the stream count and the findings. Findings are counted
 there, never encoded in the exit status. `unreachable` and `unlisted_sessions` are always zero
@@ -777,10 +793,10 @@ this would need the decision reversed later rather than extended — see [Work
 Granularity](#work-granularity).
 
 **Session-grain store rows to match.** A `session.lance` table, and verdicts that hang off a
-session rather than a stream, is what a cross-sensor check ultimately needs. Deferred rather
-than rejected, and since specified: aligning the unit of work first is what kept it an
-additive schema change, and the three tables it adds are now written down in
-[data-integrity-store-schema.md][store-schema] section 5, pending [CVC-1244][cvc1244].
+session rather than a stream, is what a cross-sensor check ultimately needs. Deferred at the
+time and since built: aligning the unit of work first is what kept it an additive schema
+change, and the three tables are specified in [data-integrity-store-schema.md][store-schema]
+section 5.
 
 **Reuse `session_runner.run_session` inside a Ray task.** Attractive because it is the
 existing single-session orchestrator. Rejected for what surrounds the loop rather than the
@@ -803,10 +819,11 @@ fleet run would then discard every session already measured, which is the same t
 listing failure used to make and the reason it is being undone. Committing first and failing
 after keeps both halves: the measurements stand, and the run still says it fell short.
 
-**A per-session error row for an unlistable session.** The symmetric shape, and the one a
-reader could query. Deferred, not rejected: `stream_id` and `source` are `nullable=False` on
-the measurement and evaluation schemas, so there is no session-grain row to write today, which
-is [CVC-1244][cvc1244]. Until then the exception's message is where an unlisted path is named.
+**A per-session error row for an unlistable session.** Deferred while there was no
+session-grain table to write it to, and now what happens: the row carries `error` and the
+run still raises, so a reader can query the stale path instead of reading it out of an
+exception message. The count in that message stays, since a run's coverage is a fact about
+the run.
 
 **Validate the whole manifest up front, before Ray starts.** Attractive because it makes a
 stale path cheap to find. Rejected as the primary answer: proving a path listable is proving
@@ -844,8 +861,8 @@ Under `tests/cosmos_curator/next/recipes/data_integrity/`:
 | --- | --- |
 | `test_config.py` | resolution, dotted overrides, template completeness, and the rejections: an empty input block, an `az://` or bucketless store root, a deeper `session_depth`, the underscored kind |
 | `test_sessions.py` | all three input forms, S3 roots against a fake lister; empty expansion raises; overlapping roots and repeated entries collapse to distinct sessions; a nested session is dropped while a session merely sharing a name prefix is not |
-| `test_processing.py` | a session yields a row per stream it holds, plus five measurement and five evaluation rows for each readable one; an unreadable stream yields a stream row carrying `error` without costing its siblings; an empty session yields counters and no rows; an unlistable session is reported as `listing_error` rather than raised; a mode-`000` video -- a real read failure under a listing that succeeds, not an injected exception -- is counted and leaves no row; every record carries every column, at one type |
-| `test_pipeline.py` | local Ray over two sessions with one corrupt file: exit 0, exactly one committed `run_id`, each session's `session_path` present on its own rows, findings persisted, and the coverage counters zero; a third session path nested inside one of them is measured once, under the session enclosing it; a stale session path alongside good ones raises `IncompleteRunError` *after* the good sessions are committed and readable; a run where nothing could be listed commits nothing; an unreachable stream under sessions that all list cleanly raises `IncompleteRunError` while leaving the store's row count and the run row's `num_streams` unchanged; a session holding no streams is counted without failing the run; a run that measured nothing names every cause it had rather than the first, over both a mixed run and the message itself; an unwritable store root fails the run |
+| `test_processing.py` | a session yields a row per stream it holds, plus five measurement and five evaluation rows for each readable one, and its own `session.lance` row with two session measurements and two session verdicts; a failing session metric is counted in `failed_session_metrics`; an unreadable stream yields a stream row carrying `error` without costing its siblings; an empty session yields counters, a session row and `SKIPPED` session rows, but no stream row; an unlistable session is reported as `listing_error` rather than raised, persisting its `session.lance` row with `error` set and nothing beneath it; a mode-`000` video -- a real read failure under a listing that succeeds, not an injected exception -- is counted as *unreachable*, since the open raises `PermissionError`, and so leaves no stream row; every record carries every column, at one type |
+| `test_pipeline.py` | local Ray over two sessions with one corrupt file: exit 0, exactly one committed `run_id`, each session's `session_path` present on its own rows, findings persisted, and the coverage counters zero; a third session path nested inside one of them is measured once, under the session enclosing it; a stale session path alongside good ones raises `IncompleteRunError` *after* the good sessions are committed and readable; a run where nothing could be listed commits nothing; an unreachable stream under sessions that all list cleanly raises `IncompleteRunError` while leaving the store's row count and the run row's `num_streams` unchanged; a session holding no streams is counted without failing the run; a failing session metric reaches the store and is counted in the run's `failed_session_metrics`; a run that measured nothing names every cause it had rather than the first, over both a mixed run and the message itself; an unwritable store root fails the run |
 | `test_pipeline_kind.py` | the kind's seven callables, and a subprocess guard that registering it imports neither Ray nor Lance |
 | `test_store.py` (extend) | a caller can assemble a run from the public builders, `append_rows` and `commit_run` |
 | `test_session_runner.py` (extend) | `max_attempts` defaults to one attempt, retries a transport error, and never retries a malformed file or a missing path; an interrupt cuts the backoff short instead of waiting it out; and, under `raise_infrastructure_errors`, an unreachable stream raises with its source and cause while a genuinely missing or corrupt one still gets a verdict |
@@ -908,7 +925,8 @@ The first implementation is complete when:
   enclosing it, so no two rows in a run collide on `stream_id`
 - a store written by `di-session` is readable and appendable by the pipeline, and a store
   written by the pipeline is re-judgeable by `reevaluate.reevaluate()` (which stamps
-  `tool="di-reevaluate"` and keys off `measurement_run_id`), with no schema change
+  `tool="di-reevaluate"` and keys off `measurement_run_id`), across both grains and with
+  only additive schema change — a version-1 store still reads
 - `di-check` and `di-session` keep their current output and exit codes
 - `cosmos-curator pipeline template` and `pipeline schema` accept `data-integrity` as their
   kind argument, `pipeline validate` / `pipeline render` accept a `kind: data-integrity`
@@ -924,8 +942,9 @@ The first implementation is complete when:
 - new metrics or new modalities
 - distributed re-evaluation from stored measurements
 - restarts after failure, and idempotent re-runs
-- any change to the shared storage CLI helpers, to `di-check` / `di-session` behavior, or to
-  the Lance schema itself (the `tool` comment aside)
+- any change to the shared storage CLI helpers, or to `di-check` / `di-session` behavior
+- any *non-additive* change to the Lance schema: the session-grain tables were added at
+  `STORE_SCHEMA_VERSION` 2, and no existing dataset, column or dedup key moved
 
 [mr1104]: https://gitlab-master.nvidia.com/aidot/cosmos-curator-public/cosmos-curator/-/merge_requests/1104
 [cvc1244]: https://jirasw.nvidia.com/browse/CVC-1244

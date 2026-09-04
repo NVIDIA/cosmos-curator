@@ -19,7 +19,7 @@ v1 is the measurement + evaluation kernel: the metric instruments and the evalua
 - pure PASS/FAIL evaluators (`below_threshold`, `above_threshold`, `within_range`) over metric measurements
 - unit tests with synthetic fixtures
 
-The kernel deliberately stops at the metric/evaluator boundary. The orchestration that runs it, and the full-fidelity sensor input path it consumes, are left as open design problems for a later release (see [Future integration](#future-integration)). Multi-sensor metrics were out of scope for v1 and have since been added; what is still missing is somewhere to store their verdicts (see [Metric Categories](#metric-categories)). What is out of scope entirely is captured in [Non-Goals](#non-goals).
+The kernel deliberately stops at the metric/evaluator boundary. The orchestration that runs it, and the full-fidelity sensor input path it consumes, are left as open design problems for a later release (see [Future integration](#future-integration)). Multi-sensor metrics were out of scope for v1 and have since been added, along with the session-grain tables that store their measurements and verdicts (see [Metric Categories](#metric-categories)). What is out of scope entirely is captured in [Non-Goals](#non-goals).
 
 ## Design Principles
 
@@ -217,8 +217,9 @@ cost is a second registry — `SESSION_INSTRUMENTS` beside `INSTRUMENTS` — bec
 every caller that iterates the per-stream registry does so once per stream, and a
 session-arity spec in there would have each of them measure a session per stream.
 
-Where arity is still undecided is persistence: the store is keyed per stream, so a
-session-grain verdict has no row to live on yet. The tables for it are specified in
+Persistence cost the same split for the same reason: a session-grain verdict is keyed
+by session rather than by stream, so it lands in three tables parallel to the
+per-stream ones instead of widening them. See
 [data-integrity-store-schema.md](data-integrity-store-schema.md) section 5.
 
 ## Streaming and Windows
@@ -311,7 +312,6 @@ Open problems, in rough dependency order:
 - **Declaring and configuring checks** — how checks are described as data and loaded. Format and schema are undecided.
 - **Driving many metrics from one read** — large recordings (a lidar file can be tens of GB) mean a single pass over the windows must feed many instruments at once; how that pass resolves each metric's array inputs from a sensor and packages the results is open.
 - **An end-to-end entry point** — running a configured set of checks against a sensor (a CLI, or otherwise).
-- **Persisting multi-sensor verdicts** — the two multi-sensor metrics now exist and `di-session` reports them (see [Metric Categories](#metric-categories)), but the store is keyed per stream, so nothing writes them down.
 
 Constraints any solution must respect:
 

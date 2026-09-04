@@ -24,20 +24,39 @@ from fractions import Fraction
 
 import pytest
 
-from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, Thresholds
+from cosmos_curator.core.sensors.data_integrity import identity
+from cosmos_curator.core.sensors.data_integrity.engine import run_session_metrics
+from cosmos_curator.core.sensors.data_integrity.instruments import (
+    DEFAULT_THRESHOLDS,
+    SESSION_INSTRUMENTS,
+    Thresholds,
+)
 from cosmos_curator.core.sensors.data_integrity.results import StreamResult
 from cosmos_curator.next.recipes.data_integrity import reevaluate, store
 
 NO_HEADER_RATE = Fraction(0, 1)
-DRIFT = "/data/session/drift.mp4"
+SESSION = "/data/session"
+DRIFT = f"{SESSION}/drift.mp4"
 
 #: Tight enough to fail a 1% drift that the default 5% policy passes.
 STRICT = Thresholds(max_rate_deviation_percent=0.1)
+
+#: Tight enough to fail any skew at all, which the one-second default passes.
+NO_SKEW = Thresholds(max_sensor_spread_ns=0)
+
+_ONE_MINUTE_NS = 60_000_000_000
+_SKEW_NS = 1_000_000
 
 
 def _rate_verdicts(root: str) -> dict[str, dict[str, object]]:
     """Every stored rate verdict, keyed by the policy that produced it."""
     return {str(row["policy_id"]): row for row in store.read_evaluations(root) if row["metric_name"] == "rate"}
+
+
+def _spread_verdicts(root: str) -> dict[str, dict[str, object]]:
+    """Every stored sensor-spread verdict, keyed by the policy that produced it."""
+    spread = SESSION_INSTRUMENTS[0].name
+    return {str(row["policy_id"]): row for row in store.read_session_evaluations(root) if row["metric_name"] == spread}
 
 
 @pytest.fixture
@@ -48,9 +67,28 @@ def measured(
     run_id = store.write_run(
         store_root,
         [make_stream(DRIFT, drifting(percent=1.0))],
-        session_path="/data/session",
+        session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
         tool="di-session",
+    )
+    return store_root, run_id
+
+
+@pytest.fixture
+def session_measured(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> tuple[str, str]:
+    """Build a store holding two slightly-skewed sensors, with session metrics measured and judged."""
+    streams = [make_stream(DRIFT, perfect()), make_stream(f"{SESSION}/rear.mp4", perfect())]
+    run_id = store.write_run(
+        store_root,
+        streams,
+        session_path=SESSION,
+        thresholds=DEFAULT_THRESHOLDS,
+        tool="di-session",
+        session_metrics=run_session_metrics(
+            [(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)], thresholds=DEFAULT_THRESHOLDS
+        ),
     )
     return store_root, run_id
 
@@ -219,6 +257,88 @@ def test_re_evaluating_an_errored_stream_produces_nothing(
     )
     reevaluate.reevaluate(store_root, thresholds=STRICT)
     assert store.read_evaluations(store_root) == []
+
+
+def test_a_session_verdict_is_re_judged_too(session_measured: tuple[str, str]) -> None:
+    """Session-grain facts are stored to be re-judged; a policy is judged as a whole."""
+    root, _ = session_measured
+    assert _spread_verdicts(root)[store.policy_id(DEFAULT_THRESHOLDS)]["check_status"] == "PASS"
+
+    reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    rejudged = _spread_verdicts(root)[store.policy_id(NO_SKEW)]
+    assert rejudged["check_status"] == "FAIL"
+    assert rejudged["threshold"] == 0
+
+
+def test_a_re_judged_session_verdict_points_back_at_the_measuring_run(session_measured: tuple[str, str]) -> None:
+    """The provenance rule holds for session rows: they name the run that measured them."""
+    root, measurement_run = session_measured
+    rejudge_run = reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    rejudged = _spread_verdicts(root)[store.policy_id(NO_SKEW)]
+    assert rejudged["run_id"] == rejudge_run
+    assert rejudged["measurement_run_id"] == measurement_run
+    assert rejudged["session_id"] == identity.session_id(SESSION)
+
+
+def test_a_re_judged_session_verdict_moves_the_rollup(session_measured: tuple[str, str]) -> None:
+    """The point of storing the verdict: a re-judge changes what the store says about the session."""
+    root, _ = session_measured
+    reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    assert store.session_rollup(root, policy=store.policy_id(DEFAULT_THRESHOLDS))["status"] == "PASS"
+    assert store.session_rollup(root, policy=store.policy_id(NO_SKEW))["status"] == "FAIL"
+
+
+def test_every_session_metric_is_re_judged(session_measured: tuple[str, str]) -> None:
+    """Every session metric that was measured gets a fresh verdict, not just the one that moved."""
+    root, _ = session_measured
+    reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    rejudged = {
+        row["metric_name"]
+        for row in store.read_session_evaluations(root)
+        if row["policy_id"] == store.policy_id(NO_SKEW)
+    }
+    assert rejudged == {spec.name for spec in SESSION_INSTRUMENTS}
+
+
+def test_an_undefined_session_measurement_stays_skipped(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A session metric needs two sensors, and no policy can supply the second one.
+
+    The session-grain twin of :func:`test_an_undefined_measurement_stays_skipped`, and
+    the shape a single-sensor session has: the facts are stored and rebuilt, they are
+    simply undefined, so the re-judge has to leave the verdict ``SKIPPED`` with nothing
+    to compare rather than invent a threshold and a margin for a measurement that has
+    no value. The "never ran" shape below it -- ``is_defined`` null -- no session metric
+    can reach, neither of them needing an expected rate.
+    """
+    store.write_run(
+        store_root,
+        [make_stream(DRIFT, perfect())],
+        session_path=SESSION,
+        thresholds=DEFAULT_THRESHOLDS,
+        tool="di-session",
+        session_metrics=run_session_metrics([(0, _ONE_MINUTE_NS)], thresholds=DEFAULT_THRESHOLDS),
+    )
+    reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
+
+    rejudged = _spread_verdicts(store_root)[store.policy_id(NO_SKEW)]
+    assert rejudged["check_status"] == "SKIPPED"
+    assert rejudged["margin"] is None
+    assert rejudged["threshold"] is None
+    # Every session metric, not just the one this test reads back by name.
+    assert {
+        row["check_status"]
+        for row in store.read_session_evaluations(store_root)
+        if row["policy_id"] == store.policy_id(NO_SKEW)
+    } == {"SKIPPED"}
+
+
+def test_a_store_holding_no_session_measurements_re_judges_none(measured: tuple[str, str]) -> None:
+    """The per-stream loop must not invent session verdicts out of an older store."""
+    root, _ = measured
+    reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    assert store.read_session_evaluations(root) == []
 
 
 def test_rollup_reflects_the_policy_it_is_asked_about(measured: tuple[str, str]) -> None:

@@ -234,9 +234,9 @@ def test_registry_is_indexed_consistently() -> None:
     assert [instrument(spec.name) for spec in ALL_INSTRUMENTS] == list(ALL_INSTRUMENTS)
 
 
-def test_the_manifest_versions_only_what_a_run_writes() -> None:
-    """Session metrics are measured but not yet stored, so claiming a version for them would overstate the store."""
-    assert instrument_versions() == {spec.name: spec.version for spec in INSTRUMENTS}
+def test_the_manifest_versions_every_metric_a_run_writes() -> None:
+    """A run stores both grains, so a manifest that named one would understate what it describes."""
+    assert instrument_versions() == {spec.name: spec.version for spec in ALL_INSTRUMENTS}
 
 
 def test_the_two_grains_stay_in_separate_registries() -> None:

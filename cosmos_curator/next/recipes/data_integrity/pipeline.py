@@ -24,10 +24,10 @@ from many workers would race on create-or-append, which is a problem worth not
 having.
 
 Nothing a session hits fails the run before the commit. A session that could not be
-listed, or a stream that could not be reached, comes back as a count on that session's
-record; the driver commits what was measured and only then raises
-:class:`IncompleteRunError`, so short coverage costs the run its exit status but not
-its rows.
+listed comes back as its own ``session.lance`` error row, a stream that could not be
+reached as a count on that session's record; either way the driver commits what was
+measured and only then raises :class:`IncompleteRunError`, so short coverage costs the
+run its exit status but not its rows.
 
 Usage::
 
@@ -88,7 +88,8 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
     Returns:
         The run summary: ``run_id``, the session and stream counts, how many streams
         were unreadable or unreachable, how many sessions could not be listed or held
-        nothing, how many metric verdicts failed, and the store root.
+        nothing, how many per-stream and session-grain metric verdicts failed, and the
+        store root.
 
     Raises:
         ValueError: if the input expands to no sessions, or if nothing at all was
@@ -123,12 +124,22 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
     unreadable = 0
     unreachable = 0
     failed_metrics = 0
+    failed_session_metrics = 0
     empty_sessions = 0
     unlisted: list[str] = []
     for batch in _measured_batches(sessions, config, run_id=run_id, created_at=created_at):
         pending: dict[str, list[dict[str, object]]] = {}
         for record in batch:
             session_path = str(record["session_path"])
+            # Drained before the unlisted check below, not after it: a session that
+            # could not be listed still carries a session.lance row saying so, and
+            # that row is the only record the store will hold of the gap.
+            #
+            # Not untrusted input: the payload was pickled by this run's own workers,
+            # a few lines of Ray plumbing away. See processing.check_session for why the
+            # rows cannot travel as typed Arrow columns.
+            for dataset, rows in pickle.loads(record["rows"]).items():  # noqa: S301
+                pending.setdefault(dataset, []).extend(rows)
             if record["listing_error"]:
                 # Already logged in the worker, where the exception was live.
                 unlisted.append(session_path)
@@ -141,13 +152,9 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
             unreachable += missed
             unreadable += int(record["unreadable"])
             failed_metrics += int(record["failed_metrics"])
+            failed_session_metrics += int(record["failed_session_metrics"])
             empty_sessions += int(not found)
             logger.info("session {}: {} stream(s)", session_path, found)
-            # Not untrusted input: the payload was pickled by this run's own workers,
-            # a few lines of Ray plumbing away. See processing.check_session for why the
-            # rows cannot travel as typed Arrow columns.
-            for dataset, rows in pickle.loads(record["rows"]).items():  # noqa: S301
-                pending.setdefault(dataset, []).extend(rows)
         for dataset, rows in pending.items():
             store.append_rows(rows, store.join(root, dataset), processing.DATASET_SCHEMAS[dataset], storage_options)
         logger.info(
@@ -201,15 +208,18 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
         "unlisted_sessions": len(unlisted),
         "empty_sessions": empty_sessions,
         "failed_metrics": failed_metrics,
+        "failed_session_metrics": failed_session_metrics,
         "store_root": root,
     }
     logger.info(
-        "committed run {} over {} stream(s) in {} session(s): {} unreadable, {} failed metric(s)",
+        "committed run {} over {} stream(s) in {} session(s): "
+        "{} unreadable, {} failed metric(s), {} failed session metric(s)",
         run_id,
         num_streams,
         len(sessions),
         unreadable,
         failed_metrics,
+        failed_session_metrics,
     )
     if unlisted or unreachable:
         raise IncompleteRunError(

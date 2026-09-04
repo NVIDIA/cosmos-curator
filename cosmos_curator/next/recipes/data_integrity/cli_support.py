@@ -41,7 +41,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import BinaryIO, cast
 
-from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, Thresholds
+from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, MAX_PERCENT, Thresholds
 
 # Shared process exit codes for both CLIs. Keep them together so a wrapper can
 # depend on one contract: PASS / FAIL / ERROR / interrupted, never two variants
@@ -78,6 +78,26 @@ def non_negative_finite_float(raw: str) -> float:
     except ValueError:
         raise argparse.ArgumentTypeError(msg) from None
     if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
+def share_percent(raw: str) -> float:
+    """Argparse ``type=`` for a flag whose value is a share of something, in percent.
+
+    Distinct from :func:`non_negative_finite_float` by its ceiling: a share cannot
+    exceed :data:`~.instruments.MAX_PERCENT`, so a larger limit describes no session
+    that exists rather than a more lenient policy. ``100`` already tolerates
+    everything, which is what makes anything above it a typo rather than an intent.
+    The bound comes from the registry so this and the config model cannot disagree
+    about it.
+    """
+    msg = f"expected a number between 0 and {MAX_PERCENT:g}, got {raw!r}"
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(msg) from None
+    if not math.isfinite(value) or value < 0.0 or value > MAX_PERCENT:
         raise argparse.ArgumentTypeError(msg)
     return value
 
@@ -344,13 +364,13 @@ def add_session_threshold_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--max-non-overlap-percent",
-        type=non_negative_finite_float,
+        type=share_percent,
         default=DEFAULT_THRESHOLDS.max_non_overlap_percent,
         metavar="PCT",
         help=(
             "Share of the session tolerated during which some sensor was not recording, in percent "
-            f"(default: {DEFAULT_THRESHOLDS.max_non_overlap_percent}). Stated as the complement of the "
-            "overlap because every threshold here is a ceiling."
+            f"(default: {DEFAULT_THRESHOLDS.max_non_overlap_percent}, max: {MAX_PERCENT:g}). Stated as the "
+            "complement of the overlap because every threshold here is a ceiling."
         ),
     )
 

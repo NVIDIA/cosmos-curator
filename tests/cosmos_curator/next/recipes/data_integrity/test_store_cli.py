@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 import pytest
 
+from cosmos_curator.core.sensors.data_integrity.engine import run_session_metrics
 from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, Thresholds
 from cosmos_curator.core.sensors.data_integrity.results import (
     CheckResult,
@@ -47,6 +48,12 @@ SESSION = "/data/session"
 #: What argparse exits with when it rejects an argument, as opposed to the tool's own
 #: ERROR_EXIT_CODE for a run that started and then failed.
 USAGE_EXIT_CODE = 2
+
+#: A session-grain measurement needs sensors that differ, so these name a session whose
+#: two sensors started a millisecond apart.
+NO_SKEW = Thresholds(max_sensor_spread_ns=0)
+_ONE_MINUTE_NS = 60_000_000_000
+_SKEW_NS = 1_000_000
 
 EngineRun = tuple[list[CheckResult], VideoInfo, ResolvedConfig]
 
@@ -88,10 +95,11 @@ def stub_session(
 ) -> Callable[..., SessionReport]:
     """Make ``di-session`` return a prepared report instead of discovering real streams."""
 
-    def _install(streams: list[StreamResult] | None = None) -> SessionReport:
+    def _install(streams: list[StreamResult] | None = None, metrics: list[CheckResult] | None = None) -> SessionReport:
         report = SessionReport(
             session_path=SESSION,
             streams=[make_stream(f"{SESSION}/front.mp4", perfect())] if streams is None else streams,
+            metrics=[] if metrics is None else metrics,
         )
         monkeypatch.setattr(session_cli, "run_session", lambda *_args, **_kwargs: report)
         return report
@@ -224,6 +232,47 @@ def test_two_runs_share_one_store(
         f"{SESSION}/front.mp4",
         f"{SESSION}/rear.mp4",
     ]
+
+
+def test_session_persists_the_session_itself(stub_session: Callable[..., SessionReport], store_root: str) -> None:
+    """The session tool writes the session's own row, which the single-video one has none of."""
+    stub_session()
+    assert session_cli.main(_session_argv(store_root)) == PASS_EXIT_CODE
+
+    (row,) = store.read_sessions(store_root)
+    assert row["session_path"] == SESSION
+    assert row["num_streams"] == 1
+    assert row["num_unreadable"] == 0
+    assert row["error"] is None
+
+
+def test_what_the_session_tool_exited_on_is_what_reads_back(
+    stub_session: Callable[..., SessionReport],
+    make_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+    capsys: pytest.CaptureFixture[str],
+    store_root: str,
+) -> None:
+    """The regression this table exists to prevent.
+
+    Every stream passes and the session does not, so before session verdicts were
+    stored the store read back ``PASS`` for a run the CLI exited ``1`` on.
+    """
+    streams = [make_stream(f"{SESSION}/front.mp4", perfect()), make_stream(f"{SESSION}/rear.mp4", perfect())]
+    stub_session(
+        streams,
+        run_session_metrics([(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS)], thresholds=NO_SKEW),
+    )
+
+    assert session_cli.main([*_session_argv(store_root), "--max-sensor-spread-ns", "0"]) == FAIL_EXIT_CODE
+    assert "Session overall: FAIL" in capsys.readouterr().out
+
+    assert {row["check_status"] for row in store.read_evaluations(store_root)} == {"PASS"}
+    verdict = next(
+        row for row in store.read_session_evaluations(store_root) if row["metric_name"] == "multi_sensor_spread"
+    )
+    assert verdict["check_status"] == "FAIL"
+    assert store.session_rollup(store_root)["status"] == "FAIL"
 
 
 def test_session_prints_its_report_even_when_the_store_fails(

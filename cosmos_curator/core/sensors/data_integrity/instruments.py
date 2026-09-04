@@ -82,6 +82,15 @@ NAME_REORDERING = "frame_reordering_present"
 NAME_SENSOR_SPREAD = "multi_sensor_spread"
 NAME_SENSOR_OVERLAP = "multi_sensor_overlap"
 
+#: Ceiling for a threshold whose measurement is a *share* of something, and so cannot
+#: exceed 100 however bad the data is. Only ``max_non_overlap_percent`` is such a
+#: threshold: the deviation limits beside it (``max_rate_deviation_percent``,
+#: ``max_jitter_percent``) measure how far a value strayed from an expected one, which
+#: is genuinely unbounded -- a stream at a tenth of its nominal rate deviates by 900%.
+#: Stated here, next to the field it constrains, because both surfaces that accept a
+#: policy have to enforce it and neither should be the one that decides what it is.
+MAX_PERCENT = 100.0
+
 
 @attrs.define(frozen=True)
 class Thresholds:
@@ -106,7 +115,10 @@ class Thresholds:
             from what the rigs actually do.
         max_non_overlap_percent: max allowed share of a session during which some
             sensor was not recording, in percent. Stated as the complement because
-            every limit here is a ceiling, and an overlap is a floor.
+            every limit here is a ceiling, and an overlap is a floor. Being a share it
+            is meaningless above :data:`MAX_PERCENT`, where ``100`` already tolerates
+            everything -- a bound the surfaces that accept a policy enforce, since this
+            class validates nothing and takes whatever it is handed.
 
     """
 
@@ -438,13 +450,15 @@ def instrument(name: str) -> InstrumentSpec:
 
 
 def instrument_versions() -> dict[str, int]:
-    """Map every per-stream metric name to its current instrument version, for the manifest.
+    """Map every metric name, of either grain, to its current instrument version.
 
-    Session-grain metrics are absent because the manifest describes what a run wrote,
-    and nothing stores a session-grain measurement yet. They join this map with the
-    tables that hold them (CVC-1244).
+    For the store's manifest, whose ``instruments`` field records every metric the
+    build knows rather than the subset whose rows a run happened to write -- so a
+    ``di-check`` run, which has no session to measure, still lists the session-grain
+    metrics. Flat rather than split by grain, because a name is unique across the two
+    registries and the datasets they land in already say which is which.
     """
-    return {spec.name: spec.version for spec in INSTRUMENTS}
+    return {spec.name: spec.version for spec in (*INSTRUMENTS, *SESSION_INSTRUMENTS)}
 
 
 def evaluate_metric(spec: InstrumentSpec, measurement: Measurement, thresholds: Thresholds) -> CheckResult:

@@ -19,10 +19,10 @@ Deliberately Ray-free -- :func:`check_session` takes and returns plain dicts, so
 is testable by calling it, and :mod:`.pipeline` is the only module that knows about
 Ray.
 
-The session is the unit because a session is what a check is about. Today every metric
-judges one stream on its own, but the cross-sensor checks this store is heading for --
-does the camera timeline agree with the IMU's -- have no per-stream task to run in, and
-a whole session in one worker is what they need.
+The session is the unit because a session is what a check is about. Most metrics judge
+one stream on its own, but the session-grain ones -- how far apart the rig's sensors
+started, how much of the session they were all recording for -- have no per-stream task
+to run in, and a whole session in one worker is what they need.
 
 Nothing here raises. Every failure is classified by what it says, and the split is
 between the two things a failure can be evidence *of*:
@@ -30,12 +30,13 @@ between the two things a failure can be evidence *of*:
 * **The data is bad.** An unreadable or undecodable stream becomes that stream's
   ``error`` row, which is what keeps one corrupt video from failing a run over
   thousands of them.
-* **We could not reach the data.** An unlistable session and an unreachable stream are
-  both recorded as counts on the session's record rather than as rows, because neither
-  learned anything to write down (see
-  :class:`~.session_runner.InfrastructureError`). The driver commits what *was*
-  measured and then fails the run, so the answer is durable and the gap is still
-  reported.
+* **We could not reach the data.** An unlistable session becomes its own ``error`` row
+  in ``session.lance``, for the same reason: a stale path in a large manifest is a
+  finding about the input. An unreachable *stream* gets no row at all, because nothing
+  was learned about it and a fabricated error would supersede a healthy measurement
+  from an earlier run (see :class:`~.session_runner.InfrastructureError`). Both are
+  also counted, and the driver commits what *was* measured before failing the run, so
+  the answer is durable and the gap is still reported.
 
 Transient transport failures are retried inside
 :func:`~.session_runner.run_one_stream` before either verdict is reached.
@@ -52,12 +53,18 @@ from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, Stre
 from cosmos_curator.next.recipes.data_integrity import store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
-from cosmos_curator.next.recipes.data_integrity.session_runner import InfrastructureError, run_one_stream
+from cosmos_curator.next.recipes.data_integrity.session_runner import (
+    InfrastructureError,
+    run_one_stream,
+    session_metrics,
+)
 
 STREAM_DATASET = store_schema.STREAM_DATASET
 EVALUATION_DATASET = store_schema.EVALUATION_DATASET
+SESSION_DATASET = store_schema.SESSION_DATASET
+SESSION_EVALUATION_DATASET = store_schema.SESSION_EVALUATION_DATASET
 
-#: Every dataset one stream can contribute to, keyed by the store-relative name the
+#: Every dataset one session can contribute to, keyed by the store-relative name the
 #: ``rows`` payload uses. Defined here rather than on the driver because the payload's
 #: keys and the schemas they are written under are one contract: a worker that starts
 #: emitting a new dataset should not also need the driver to learn about it.
@@ -65,6 +72,12 @@ DATASET_SCHEMAS: dict[str, pa.Schema] = {
     STREAM_DATASET: store_schema.STREAM_SCHEMA,
     EVALUATION_DATASET: store_schema.EVALUATION_SCHEMA,
     **{store_schema.metric_dataset_path(name): schema for name, schema in store_schema.MEASUREMENT_SCHEMAS.items()},
+    SESSION_DATASET: store_schema.SESSION_SCHEMA,
+    SESSION_EVALUATION_DATASET: store_schema.SESSION_EVALUATION_SCHEMA,
+    **{
+        store_schema.session_metric_dataset_path(name): schema
+        for name, schema in store_schema.SESSION_MEASUREMENT_SCHEMAS.items()
+    },
 }
 
 
@@ -173,6 +186,88 @@ def build_rows(
     return rows
 
 
+def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows record
+    results: list[StreamResult],
+    *,
+    config: ResolvedDataIntegrityConfig,
+    run_id: str,
+    created_at: datetime.datetime,
+    session_path: str,
+    num_streams: int,
+    error: str | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    """Turn one session's measured streams into the session-grain store rows.
+
+    Reaches the session's verdict through :func:`~.session_runner.session_metrics`,
+    the same function ``di-session`` reports from, so the pipeline and the CLI cannot
+    judge one session two ways.
+
+    Args:
+        results: the session's measured streams. Excludes any that could not be
+            reached, which produced no bounds and so contribute nothing to judge.
+        config: the resolved config, for the threshold policy.
+        run_id: the id every row of this invocation shares.
+        created_at: the timestamp every row of this invocation shares.
+        session_path: the session these streams were discovered under.
+        num_streams: how many streams were *found* under it -- which exceeds
+            ``len(results)`` when some were unreachable. What the run found is the
+            honest count for a session row; the shortfall is the run-level
+            ``unreachable`` count and the reason the run exits nonzero.
+        error: why the session could not be listed, if it could not be.
+
+    Returns:
+        Store-relative dataset name to rows. An unlisted session yields only its
+        ``session.lance`` row -- nothing under it was measured, so there is nothing
+        to judge, exactly as for an errored stream.
+
+    """
+    key = store.session_key(session_path)
+    rows: dict[str, list[dict[str, object]]] = {
+        SESSION_DATASET: [
+            store.session_row(
+                session_id=key,
+                run_id=run_id,
+                created_at=created_at,
+                session_path=session_path,
+                num_streams=num_streams,
+                num_unreadable=sum(1 for result in results if result.error is not None),
+                error=error,
+            )
+        ]
+    }
+    if error is not None:
+        return rows
+
+    thresholds = config.checks.thresholds.to_thresholds()
+    evaluations: list[dict[str, object]] = []
+    for check in session_metrics(results, thresholds):
+        spec = instrument(check.name)
+        rows.setdefault(store_schema.session_metric_dataset_path(spec.name), []).append(
+            store.session_measurement_row(
+                spec,
+                check,
+                session_id=key,
+                run_id=run_id,
+                created_at=created_at,
+                session_path=session_path,
+            )
+        )
+        evaluations.append(
+            store.build_session_evaluation_row(
+                spec,
+                check,
+                session_id=key,
+                run_id=run_id,
+                measurement_run_id=run_id,
+                created_at=created_at,
+                session_path=session_path,
+                thresholds=thresholds,
+            )
+        )
+    rows[SESSION_EVALUATION_DATASET] = evaluations
+    return rows
+
+
 def check_session(
     record: dict[str, str],
     *,
@@ -194,13 +289,14 @@ def check_session(
 
     Returns:
         The session's flat columns -- its path, how many streams it held, how many
-        were unreadable, how many were unreachable, how many metric verdicts failed,
-        and the listing error if there was one -- plus ``rows``, the pickled
-        dataset-name-to-rows mapping for the whole session. ``rows`` is opaque
-        because the store keeps one Lance dataset per metric, each with its own
-        schema, so the rows do not share an Arrow type and cannot travel as typed
-        columns. Nothing reads it but the driver's append step; the flat columns
-        carry what logging, the run summary and the exit status need.
+        were unreadable, how many were unreachable, how many per-stream and
+        session-grain metric verdicts failed, and the listing error if there was one
+        -- plus ``rows``, the pickled dataset-name-to-rows mapping for the whole
+        session. ``rows`` is opaque because the store keeps one Lance dataset per
+        metric, each with its own schema, so the rows do not share an Arrow type and
+        cannot travel as typed columns. Nothing reads it but the driver's append
+        step; the flat columns carry what logging, the run summary and the exit
+        status need.
 
     """
     session_path = record["session_path"]
@@ -214,9 +310,25 @@ def check_session(
     except Exception as exc:  # noqa: BLE001 - see above
         logger.opt(exception=True).debug("data-integrity listing failed for {}", session_path)
         logger.warning("session {} could not be listed: {}", session_path, exc)
-        return _session_record(session_path, streams=0, listing_error=str(exc), rows={})
+        return _session_record(
+            session_path,
+            streams=0,
+            listing_error=str(exc),
+            # A row, not just a count: it is the only thing the store will say about
+            # this session, and saying nothing is what let a stale path go unrecorded.
+            rows=build_session_rows(
+                [],
+                config=config,
+                run_id=run_id,
+                created_at=created_at,
+                session_path=session_path,
+                num_streams=0,
+                error=str(exc),
+            ),
+        )
 
     rows: dict[str, list[dict[str, object]]] = {}
+    results: list[StreamResult] = []
     unreadable = 0
     failed_metrics = 0
     unreachable = 0
@@ -242,6 +354,9 @@ def check_session(
         if result.error is not None:
             unreadable += 1
         failed_metrics += sum(1 for check in result.metrics if check.status is CheckStatus.FAIL)
+        # Kept, not just consumed: the session-grain metrics below fold every stream's
+        # recording bounds, so they need the whole session's results at once.
+        results.append(result)
         for dataset, dataset_rows in build_rows(
             result,
             config=config,
@@ -251,11 +366,27 @@ def check_session(
         ).items():
             rows.setdefault(dataset, []).extend(dataset_rows)
 
+    session_rows = build_session_rows(
+        results,
+        config=config,
+        run_id=run_id,
+        created_at=created_at,
+        session_path=session_path,
+        num_streams=len(sources),
+    )
+    for dataset, dataset_rows in session_rows.items():
+        rows.setdefault(dataset, []).extend(dataset_rows)
+
     return _session_record(
         session_path,
         streams=len(sources),
         unreadable=unreadable,
         failed_metrics=failed_metrics,
+        failed_session_metrics=sum(
+            1
+            for row in session_rows.get(SESSION_EVALUATION_DATASET, [])
+            if row["check_status"] == CheckStatus.FAIL.value
+        ),
         unreachable=unreachable,
         rows=rows,
     )
@@ -267,6 +398,7 @@ def _session_record(  # noqa: PLR0913 -- one argument per column, all independen
     streams: int,
     unreadable: int = 0,
     failed_metrics: int = 0,
+    failed_session_metrics: int = 0,
     unreachable: int = 0,
     listing_error: str = "",
     rows: dict[str, list[dict[str, object]]],
@@ -283,6 +415,7 @@ def _session_record(  # noqa: PLR0913 -- one argument per column, all independen
         "streams": streams,
         "unreadable": unreadable,
         "failed_metrics": failed_metrics,
+        "failed_session_metrics": failed_session_metrics,
         "unreachable": unreachable,
         "listing_error": listing_error,
         "rows": pickle.dumps(rows),
