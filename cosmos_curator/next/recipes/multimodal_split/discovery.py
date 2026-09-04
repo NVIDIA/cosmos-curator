@@ -250,6 +250,15 @@ def _remote_object_exists(client: S3Client, prefix: S3Prefix, location: str) -> 
 
 
 def _require_s3_client(location: str, *, storage_profile: str) -> S3Client:
+    """Return the client for a location the caller has already read as remote.
+
+    Callers check the scheme before reaching this, and that order matters:
+    ``get_storage_client`` answers ``None`` both for a local path and for a
+    remote one it could not build a client for. Dispatching on the client alone
+    would collapse those, turning an unreachable bucket into a walk of a
+    directory that was never local -- which finds nothing, and reports a
+    recording that is absent rather than a credential that is.
+    """
     client = get_storage_client(location, profile_name=storage_profile)
     if not isinstance(client, S3Client):
         msg = f"Could not create an S3 client for {location}"

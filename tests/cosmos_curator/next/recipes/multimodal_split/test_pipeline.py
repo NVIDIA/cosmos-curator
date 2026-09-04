@@ -1,0 +1,394 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""End-to-end tests for the ``multimodal-split`` run path."""
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
+from cosmos_curator.next.recipes.multimodal_split import pipeline
+from cosmos_curator.next.recipes.multimodal_split.config import (
+    MultimodalSplitExecutionConfig,
+    ResolvedMultimodalSplitConfig,
+)
+from cosmos_curator.next.recipes.multimodal_split.pipeline import run_config
+from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri
+
+# The session-scoped cluster is the only one the Curator Next tree may start.
+# Without this the bare ``ray.init`` inside ``run_config`` claims the whole
+# machine and every later test in the run silently inherits that shape.
+pytestmark = pytest.mark.usefixtures("ray_local")
+
+
+def test_a_run_writes_one_clip_per_span_across_every_session(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Two sessions of three whole clips each produce six playable files and a matching count."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    make_session(root, "session-001")
+    media = tmp_path / "media"
+
+    summary = run_config(make_config(root, media))
+
+    assert summary["sessions"] == 2
+    assert summary["camera_clips_written"] == 6
+    assert summary["failures"] == 0
+    assert len(list(media.rglob("*.mp4"))) == 6
+
+
+def test_one_unusable_session_does_not_end_the_run(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A recording that cannot be opened is quarantined, and its neighbours still publish."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    (root / "session-001").mkdir(parents=True)
+    media = tmp_path / "media"
+
+    summary = run_config(make_config(root, media))
+
+    assert summary["sessions"] == 2
+    assert summary["camera_clips_written"] == 3
+    assert summary["failures"] == 1
+    assert len(list(media.rglob("*.mp4"))) == 3
+
+
+def test_a_run_that_finds_no_sessions_is_refused(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """An empty prefix is far more often a wrong path than a genuinely empty dataset."""
+    root = tmp_path / "recordings"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="0 candidate session"):
+        run_config(make_config(root, tmp_path / "media"))
+
+
+def test_execution_settings_reach_the_runtime_rather_than_being_accepted_and_ignored(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setting that never reaches what it configures is worse than no setting at all.
+
+    Both of these are execution-only: neither changes a written byte, which is
+    why they live outside the settings that decide clip identity.
+    """
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda *, progress: seen.update(progress=progress))
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    config = make_config(root, tmp_path / "media", progress=True, storage_profile="hyperion")
+
+    run_config(config)
+
+    assert seen["progress"] is True
+    assert config.execution.storage_profile == "hyperion"
+
+
+def test_the_progress_bar_is_off_unless_asked_for() -> None:
+    """A batch run writes to a log, where a redrawing progress bar is noise."""
+    assert MultimodalSplitExecutionConfig().progress is False
+    assert MultimodalSplitExecutionConfig().storage_profile == "default"
+
+
+def test_a_run_reports_elapsed_time_and_bytes_written(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Bytes are counted from what was written, not estimated from the config.
+
+    A run that reports a plausible total it did not measure is worse than one
+    that reports nothing, so this compares against the files on disk.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    media = tmp_path / "media"
+
+    summary = run_config(make_config(root, media))
+
+    on_disk = sum(path.stat().st_size for path in media.rglob("*.mp4"))
+    assert summary["clip_bytes"] == on_disk
+    assert summary["elapsed_seconds"] > 0
+
+
+def test_failures_are_summarized_by_category_rather_than_one_line_each(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A bad run produces thousands of failures, and a per-failure log buries the shape of them."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    for name in ("session-001", "session-002"):
+        (root / name).mkdir(parents=True)
+
+    summary = run_config(make_config(root, tmp_path / "media"))
+
+    assert summary["failures"] == 2
+    assert summary["failures_by_category"] == {"FileNotFoundError": 2}
+
+
+def _flat_map_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    config: ResolvedMultimodalSplitConfig,
+) -> dict[str, object]:
+    """Return the keyword arguments the recipe hands Ray Data for the session fan-out."""
+    seen: dict[str, object] = {}
+
+    class _FakeDataset:
+        def flat_map(self, _fn: object, **kwargs: object) -> object:
+            seen.update(kwargs)
+            return self
+
+    monkeypatch.setattr(pipeline.ray.data, "from_arrow", lambda *_a, **_k: _FakeDataset())
+    sessions = pa.table({"source_session_id": ["s"], "session_uri": ["u"]})
+    pipeline.clip_dataset(pipeline.plan_dataset(sessions, config), config)
+    return seen
+
+
+def _stage_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    config: ResolvedMultimodalSplitConfig,
+) -> list[dict[str, object]]:
+    """Return the keyword arguments each stage hands Ray Data, in stage order."""
+    calls: list[dict[str, object]] = []
+
+    class _FakeDataset:
+        def flat_map(self, _fn: object, **kwargs: object) -> object:
+            calls.append(dict(kwargs))
+            return self
+
+    monkeypatch.setattr(pipeline.ray.data, "from_arrow", lambda *_a, **_k: _FakeDataset())
+    sessions = pa.table({"source_session_id": ["s"], "session_uri": ["u"]})
+    pipeline.clip_dataset(pipeline.plan_dataset(sessions, config), config)
+    return calls
+
+
+@pytest.mark.parametrize("num_cpus", [0.125, 0.5])
+def test_the_planner_is_scheduled_on_the_cpu_the_config_states(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    num_cpus: float,
+) -> None:
+    """The setting has to reach Ray, not merely exist.
+
+    It once did not: the field, its default, its docstring and the template all
+    described a figure an operator could tune per storage backend, while the
+    planner scheduled on a constant. Two values here, so a reintroduced constant
+    fails rather than matching whichever one it happened to be.
+    """
+    config = make_config(tmp_path / "recordings", tmp_path / "media", planner_num_cpus=num_cpus)
+
+    planner, _splitter = _stage_kwargs(monkeypatch, config)
+
+    assert planner["num_cpus"] == num_cpus
+
+
+def test_a_declared_session_heap_is_what_ray_reserves(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ray schedules on declared memory, so an undeclared task gets a number invented for it.
+
+    Ray Data fills in 2.4 GiB per CPU for any map task that does not say, which
+    on a 75 GiB node stops the run at 31 concurrent sessions however high the
+    session cap is set. The number is a hyperscaler rule of thumb, not a
+    measurement of this recipe, and it is nowhere near what a streamed session
+    actually holds.
+    """
+    config = make_config(tmp_path / "recordings", tmp_path / "media", memory_gb=1.5)
+
+    seen = _flat_map_kwargs(monkeypatch, config)
+
+    assert seen["memory"] == int(1.5 * 1024**3)
+
+
+def test_an_undeclared_session_heap_leaves_ray_to_its_own_default(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No measurement, no reservation: a guess of ours would be worth no more than Ray's."""
+    config = make_config(tmp_path / "recordings", tmp_path / "media")
+
+    seen = _flat_map_kwargs(monkeypatch, config)
+
+    assert seen["memory"] is None
+
+
+def test_a_flood_of_failures_is_counted_without_being_collected(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A bad run must not hold every failure to count them, nor name them all.
+
+    The failure set is bounded by what the data did, not by anything this
+    process chose: a run whose every span was refused would otherwise assemble
+    one row per span in the driver and print a warning for each. The summary
+    streams them, keeping a few examples to make the cause actionable.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    for index in range(8):
+        (root / f"session-{index + 1:03d}").mkdir(parents=True)
+    config = make_config(root, tmp_path / "media")
+
+    summary = run_config(config)
+    failures = pipeline.read_failures(config)
+
+    assert summary["failures"] == 8
+    assert summary["failures_by_category"] == {"FileNotFoundError": 8}
+    assert failures.total == 8
+    # Named examples are capped; the count carries the rest.
+    assert len(failures.examples) == 5
+
+
+def test_a_damaged_plan_report_is_named_rather_than_counted_as_a_clean_session(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """An unreadable report and an absent one mean opposite things, so they cannot share a return.
+
+    A session that plans cleanly writes no report, so absence is the ordinary
+    case and says nothing. A report that exists but will not parse is a session
+    whose recorded failures are sitting on disk and missing from the total: the
+    summary under-reports, and the warning is the only thing that says so.
+    Returning None for both is what makes the log line load-bearing.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    for index in (1, 2):
+        (root / f"session-{index:03d}").mkdir(parents=True)
+    config = make_config(root, tmp_path / "media")
+    run_config(config)
+
+    damaged = Path(plan_error_uri(config.output.path, "session-001"))
+    assert damaged.is_file(), "the planner must have written the report this test then damages"
+    damaged.write_text('{"failures": [', encoding="utf-8")
+
+    failures = pipeline.read_failures(config)
+
+    # The intact report still counts; the damaged one is short by its own.
+    assert failures.total == 1
+
+
+def test_an_unreadable_report_is_logged_where_an_absent_one_is_not(
+    tmp_path: Path,
+    loguru_records: list[dict[str, Any]],
+) -> None:
+    """Both return nothing, so the log line is the only thing that tells them apart.
+
+    The count alone cannot: a session short by its own failures looks exactly
+    like a session that had none. Whoever is reconciling a total against the
+    errors tree gets the path and the parse error, or gets nothing at all.
+    """
+    damaged = tmp_path / "span_planner.json"
+    damaged.write_text('{"failures": [', encoding="utf-8")
+
+    assert pipeline._read_json(str(damaged), storage_profile="default") is None
+    assert pipeline._read_json(str(tmp_path / "absent.json"), storage_profile="default") is None
+
+    (warning,) = [record for record in loguru_records if "Could not read" in record["message"]]
+    assert warning["level"].name == "WARNING"
+    assert str(damaged) in warning["message"]
+    assert "JSONDecodeError" in warning["message"]
+
+
+def test_a_split_failure_reaches_the_summary(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A run that lost clips must not summarise as clean.
+
+    Planning and splitting write their reports into one tree, so counting what
+    is in it counts both. Asking each session for a planning report instead
+    would find only planning's, and a run whose spans died in the split would
+    report zero failures beside a clip count nobody could reconcile.
+
+    The failure is made rather than mocked, because splitting happens in a Ray
+    worker and a patch in this process would never reach it: a timeline
+    describing more observations than its container holds is discovered by the
+    walk, which is the one kind of split failure a test can arrange from outside.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", frames=90)
+    config = make_config(root, tmp_path / "media", duration_s=1.0)
+
+    timeline_path = next((root / "session-000").rglob("*.timestamps.npy"))
+    written = np.load(timeline_path)
+    step = int(written[1] - written[0])
+    with timeline_path.open("wb") as handle:
+        write_timestamps_ns(np.arange(int(written[0]), int(written[0]) + 180 * step, step, dtype=np.int64), handle)
+
+    summary = run_config(config)
+
+    assert summary["camera_clips_written"] > 0, "the servable spans should still have been written"
+    assert summary["failures"] > 0, "the spans the media could not serve are missing from the summary"
+    assert summary["failures_by_category"]
+
+
+def test_unreachable_storage_stops_the_run_before_ray_starts(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The point of checking is that it happens before a cluster exists.
+
+    A credential that cannot reach the input otherwise fails once per session
+    inside Ray: a thousand identical reports and a run that writes nothing and
+    exits successfully. Nothing else pins the ordering, so dropping the checks
+    or moving them after ``ensure_ray_initialized`` would pass every other test.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    started = {"ray": False}
+
+    def refuse(location: str, *, storage_profile: str) -> None:
+        del storage_profile
+        msg = f"Cannot read the input prefix {location}: no credentials"
+        raise RuntimeError(msg)
+
+    def note_ray_start(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        started["ray"] = True
+
+    monkeypatch.setattr(pipeline, "check_readable", refuse)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", note_ray_start)
+
+    with pytest.raises(RuntimeError, match="Cannot read the input prefix"):
+        run_config(make_config(root, tmp_path / "media"))
+
+    assert not started["ray"], "storage was checked after Ray had already started"

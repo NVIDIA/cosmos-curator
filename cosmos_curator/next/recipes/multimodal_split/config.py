@@ -16,6 +16,7 @@
 """Typed config and resolution for Curator Next ``multimodal-split``."""
 
 import json
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -27,11 +28,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cosmos_curator.next.core.config import apply_dotted_overrides
 
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
+_NS_PER_SECOND = 1_000_000_000
+_CAMERA_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 _BITRATE_SUFFIXES = frozenset({"K", "M"})
 _BITRATE_PATTERN = r"^[1-9][0-9]*(?:\.[0-9]+)?[KkMm]$"
 _SUPPORTED_SCHEMES = frozenset({"s3", "file"})
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _PARENT_SEGMENT = ".."
+_RESERVED_PATH_SEGMENTS = frozenset({".", _PARENT_SEGMENT})
 # ``urlsplit`` deletes these from a URI outright rather than rejecting it, which
 # WHATWG requires and RFC 3986 does not. All three are legal in POSIX filenames
 # and S3 keys.
@@ -89,9 +93,6 @@ class MultimodalSplitClipConfig(BaseModel):
     Clips are contiguous and non-overlapping: there is no stride setting, so the
     stride is the clip duration. A trailing span shorter than ``duration_s`` is
     dropped rather than kept short, because the runtime generates full spans only.
-
-    ``output_fps`` is the rate of the clip's own frame timeline. ``caption_fps``
-    is the rate of the subset of those frames that captioning sees.
     """
 
     model_config = _MODEL_CONFIG
@@ -115,14 +116,14 @@ class MultimodalSplitClipConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_clip_geometry(self) -> Self:
-        """Check the two rules that need more than one field to state.
+        """Check that a clip's duration is a whole number of frames.
 
         The rates must share one alignment grid. When ``caption_fps`` divides
         ``output_fps``, the captioned frames are every Nth point of the output
         grid, so subsampling picks exactly the frames that sampling at
-        ``caption_fps`` directly would have. Otherwise the two paths land on
-        different instants and disagree about which frame a caption describes.
-        Equal rates are the degenerate valid case.
+        ``caption_fps`` directly would have. Otherwise the two land on different
+        instants and disagree about which frame a caption describes. Equal rates
+        are the degenerate valid case.
 
         The duration must come to a whole number of output frames. A clip is a
         whole number of frames or it is not a valid clip, and 0.333 s at 30 fps is
@@ -155,18 +156,21 @@ class MultimodalSplitClipConfig(BaseModel):
         return self
 
 
-class MultimodalSplitTranscodeConfig(BaseModel):
-    """Video encode settings for the clips this pipeline writes.
+class EncoderOpenH264Config(BaseModel):
+    """Everything ``libopenh264`` needs to encode this recipe's clips.
 
-    Nothing reads these yet. The transcode stage is separate work, and this
-    section exists so a config can state its encode settings before that stage
-    does -- there is no consumer to go looking for.
+    Settings live on the encoder rather than on a shared section because they are
+    not shared. ``video_encoder`` is the discriminator: a second target -- NVENC
+    is the expected one -- becomes another class beside this one, selected by that
+    field, carrying whatever settings it actually has. NVENC has no bitrate-only
+    rate control and this has no ``preset``, so a common section would be a
+    section of fields half of which do not apply.
 
-    The section name and the ``video_`` prefix deliberately mirror
-    ``video_split``'s equivalent settings, so one vocabulary covers both recipes
-    and a reader moving between them recognizes the same concept. ``video_`` reads
-    as redundant inside a section already called ``transcode``; it is not, and
-    shortening it here would split that vocabulary again.
+    There is no quality setting, and that is a limit of the encoder rather than a
+    decision. ``libopenh264`` implements no constant-quality rate control:
+    ``crf``, a bare ``qp``, and ``rc_mode=quality`` are all accepted and then
+    silently ignored, encoding byte-identical output at every value. Bitrate is
+    the only lever it honours, and a quality target needs a different encoder.
 
     There is no ``audio_mode``. Audio is a deferred capability for this pipeline,
     so there is no stream to copy or re-encode.
@@ -179,6 +183,17 @@ class MultimodalSplitTranscodeConfig(BaseModel):
         default="4M",
         pattern=_BITRATE_PATTERN,
         description="Target video bitrate as a magnitude and a K or M suffix, such as 4M or 800K.",
+    )
+    gop_size: int = Field(
+        default=30,
+        ge=1,
+        description="Number of frames from one keyframe to the next, so 30 at 30 fps is a keyframe each "
+        "second. Smaller seeks more precisely and costs size: measured on 4K footage a clip is roughly "
+        "twice the nominal bitrate at 5, and one per second at 30.",
+    )
+    faststart: bool = Field(
+        default=True,
+        description="Write the MP4 index ahead of the media, so a reader finds it without a second fetch.",
     )
 
     @field_validator("video_bitrate", mode="before")
@@ -207,18 +222,227 @@ class MultimodalSplitTranscodeConfig(BaseModel):
         return f"{format(parsed.normalize(), 'f')}{suffix.upper()}"
 
 
+class MultimodalSplitCameraConfig(BaseModel):
+    """One camera artifact inside a session.
+
+    ``uri_pattern`` is relative to a session URI, because discovery stops at the
+    session boundary and this is the only place that knows a session has cameras
+    in it. Anything absolute or upward-reaching would resolve outside the session
+    it was joined to, so both are rejected rather than normalized.
+
+    A whole path segment may be ``*``, so a config can name a camera without
+    knowing which recorder a rig put it on.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    uri_pattern: str = Field(
+        min_length=1,
+        description="Path to the camera video relative to a session URI, such as camera/front.mp4.",
+    )
+
+    @field_validator("uri_pattern")
+    @classmethod
+    def _validate_uri_pattern(cls, pattern: str) -> str:
+        if pattern != pattern.strip():
+            msg = "camera uri_pattern cannot have leading or trailing whitespace"
+            raise ValueError(msg)
+        if "://" in pattern or pattern.startswith("/"):
+            msg = (
+                f"camera uri_pattern {pattern!r} must be relative to a session, so it can be joined "
+                f"onto any session URI. Drop the scheme or the leading slash"
+            )
+            raise ValueError(msg)
+        _reject_parent_segments(pattern, pattern)
+        for segment in pattern.split("/"):
+            # A whole segment may be a wildcard, so a config need not know which
+            # recorder holds a camera. Part of one may not: that matches on file
+            # names rather than on layout, and resolves differently as names
+            # change.
+            if "*" in segment and segment != "*":
+                msg = (
+                    f"camera uri_pattern {pattern!r} may use * as a whole path segment, not inside one. "
+                    f"Write */name.mp4 rather than rec*/name.mp4"
+                )
+                raise ValueError(msg)
+        return pattern
+
+
+class MultimodalSplitSensorsConfig(BaseModel):
+    """The sensors an episode is built from, and how closely they must agree.
+
+    ``max_delta_s`` belongs to the rig rather than to a camera in it. It decides
+    how far a source frame may sit from a grid timestamp and still be taken as
+    that moment, which is to say it defines what "the same moment" means for a
+    clip. Per-camera tolerances would let views disagree about simultaneity
+    inside one multiview clip, which is not a thing a clip can be.
+
+    Stated in the seconds every other duration on this surface uses, and
+    converted once to the nanoseconds the sampling policy takes, so the unit an
+    operator writes and the unit the sensor library works in never have to agree.
+
+    A camera's key names it in output paths and descriptors, which is why it has
+    to survive being a single path segment.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    cameras: dict[str, MultimodalSplitCameraConfig] = Field(
+        min_length=1,
+        description="Camera key to artifact. Every entry is written for every clip.",
+    )
+    max_delta_s: float = Field(
+        gt=0.0,
+        allow_inf_nan=False,
+        description="How far in seconds a source frame may sit from a grid timestamp and still be selected.",
+    )
+
+    @property
+    def max_delta_ns(self) -> int:
+        """Return the tolerance in the nanoseconds the sampling policy expects.
+
+        Rounded rather than truncated. The tolerance is a bound, and flooring a
+        sub-nanosecond remainder would make it quietly tighter than what was
+        configured.
+        """
+        return round(self.max_delta_s * _NS_PER_SECOND)
+
+    @field_validator("cameras")
+    @classmethod
+    def _validate_cameras(
+        cls, cameras: dict[str, MultimodalSplitCameraConfig]
+    ) -> dict[str, MultimodalSplitCameraConfig]:
+        for key in cameras:
+            # "." and "." * 2 match the character class but name a directory rather than sit in one.
+            if not _CAMERA_KEY_PATTERN.fullmatch(key) or key in _RESERVED_PATH_SEGMENTS:
+                msg = (
+                    f"camera key {key!r} is written into output paths, so it must be a single path "
+                    f"segment of letters, digits, dots, dashes, or underscores"
+                )
+                raise ValueError(msg)
+        return cameras
+
+
+class MultimodalSplitOutputConfig(BaseModel):
+    """Where written media goes.
+
+    Only media today. The Lance table and error report URIs that ``video_split``
+    carries belong to the publication ticket, and adding them here before
+    anything writes them would describe a surface that does not exist.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    path: str = Field(
+        min_length=1,
+        description="Local directory or s3:// prefix that written clips are placed beneath.",
+    )
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, path: str) -> str:
+        return _validate_location(path, strip_trailing_slash=True)
+
+
+class SpanPlannerResources(BaseModel):
+    """What one planning task reserves.
+
+    Planning reads a listing and one timeline per sensor and does almost nothing
+    with a CPU while it waits. Measured, a task keeps 0.13 of a core busy over
+    S3 and 0.29 over a local disk -- which is why this is a setting rather than
+    a constant: the right figure is a property of the storage a run reads from,
+    not of the code.
+
+    It also sets memory, since Ray Data scales its default reservation by the
+    CPU a task asks for. Declaring a whole CPU reserves 2.4 GiB for a task that
+    holds twelve small arrays, and it is the memory rather than the cores that
+    then binds: on a node with sixty-four cores and 124 GB of RAM that caps the
+    run near thirty tasks, and on the same cores with far more RAM it would not.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    num_cpus: float = Field(
+        default=0.125,
+        gt=0.0,
+        le=1.0,
+        description="CPU one planning task reserves; measured at 0.13 over S3.",
+    )
+
+
+class SplitSessionResources(BaseModel):
+    """What one splitting task reserves.
+
+    A task decodes one sensor of one session, which is where a run's memory
+    actually goes. Left unset, Ray Data invents a flat 2.4 GiB per CPU -- a
+    hyperscaler rule of thumb that describes nothing here -- and caps
+    concurrency by it however much headroom there is.
+
+    Unset by default because a guess of ours would be worth no more than Ray's:
+    peak depends on the footage, and the figure should come from measuring it.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    memory_gb: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Heap one splitting task reserves, in GiB, or null to accept Ray's own default.",
+    )
+
+
+class MultimodalSplitExecutionConfig(BaseModel):
+    """Settings that decide how a run is carried out, never what it produces.
+
+    Deliberately separate from everything a clip's identity hashes. Nothing here
+    changes a written byte, so retuning any of it must not relocate media that is
+    already correct -- which is exactly what would happen if these lived beside
+    the settings that do decide the output.
+
+    ``progress`` and ``storage_profile`` mirror ``video_split`` and
+    ``data_integrity``, which carry the same two, so one vocabulary covers the
+    recipes an operator moves between.
+
+    Resources are stated per stage, under the name the stage has in the code.
+    What a task reserves is a property of the work it does: planning waits on
+    storage and holds twelve small arrays, splitting decodes 4K video. One
+    figure for both would be wrong for whichever it was not measured against.
+
+    """
+
+    model_config = _MODEL_CONFIG
+
+    progress: bool = Field(
+        default=False,
+        description="Draw Ray Data progress bars. Off by default: a batch run writes to a log.",
+    )
+    storage_profile: str = Field(
+        default="default",
+        min_length=1,
+        description="Profile name used to build storage clients for reads and writes.",
+    )
+    read_buffer_bytes: int | None = Field(
+        default=None,
+        ge=1,
+        description="Bytes smart_open buffers per read from an S3 object, or null for its own 128 KiB default.",
+    )
+    span_planner: SpanPlannerResources = Field(default_factory=SpanPlannerResources)
+    split_session: SplitSessionResources = Field(default_factory=SplitSessionResources)
+
+
 class ResolvedMultimodalSplitConfig(BaseModel):
     """Canonical execution contract for Curator Next ``multimodal-split``.
 
-    ``input`` selects the candidate sessions, ``clip`` describes the geometry and
-    frame rates each session is split into, and ``transcode`` describes how
-    the resulting clips are encoded. Discovery is the only stage implemented, so
-    nothing reads ``clip`` or ``transcode`` yet. The splitting stage adds
-    sensor selection and output sections alongside these rather than replacing
-    them.
+    ``input`` selects the candidate sessions, ``sensors`` names the camera to
+    read from each one, ``clip`` describes the geometry and frame rates a session
+    is split into, ``encoder`` describes how the resulting clips are encoded,
+    and ``output`` says where they are written.
 
-    Both new sections are defaulted, so a config written before either existed
-    still resolves.
+    ``clip``, ``encoder`` and ``execution`` are fully defaulted, so a config written before
+    either existed still resolves. ``sensors`` and ``output`` are not: there is
+    no defensible default for which artifact inside a session holds the video, or
+    for where a run should write. Both are required, and a config predating them
+    has to name them.
     """
 
     model_config = _MODEL_CONFIG
@@ -226,14 +450,20 @@ class ResolvedMultimodalSplitConfig(BaseModel):
     schema_version: SchemaVersion
     kind: MultimodalSplitKind
     input: MultimodalSplitInputConfig
+    sensors: MultimodalSplitSensorsConfig
+    output: MultimodalSplitOutputConfig
     clip: MultimodalSplitClipConfig = Field(default_factory=MultimodalSplitClipConfig)
-    transcode: MultimodalSplitTranscodeConfig = Field(default_factory=MultimodalSplitTranscodeConfig)
+
+    encoder: EncoderOpenH264Config = Field(default_factory=EncoderOpenH264Config)
+    execution: MultimodalSplitExecutionConfig = Field(default_factory=MultimodalSplitExecutionConfig)
 
 
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
     "kind": "multimodal-split",
     "input": {"input_path_prefix": "s3://example-bucket/recordings"},
+    "sensors": {"cameras": {"front": {"uri_pattern": "*/camera_front.mp4"}}, "max_delta_s": 0.05},
+    "output": {"path": "s3://example-bucket/media"},
 }
 # Settings that default to null are dumped away by ``exclude_none``, so the two
 # that an operator would otherwise never discover are named here instead.

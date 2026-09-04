@@ -16,6 +16,7 @@
 """Tests for the ``multimodal-split`` config resolution and pipeline-kind surface."""
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -30,20 +31,23 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
 from cosmos_curator.next.recipes.multimodal_split.pipeline_kind import MULTIMODAL_SPLIT_KIND
 
 
-def _write_config(root: Path, prefix: str, **input_fields: object) -> Path:
+def _write_config(root: Path, prefix: str, *, clip: dict[str, object] | None = None, **input_fields: object) -> Path:
     path = root / "config.yaml"
     payload = {
         "schema_version": 1,
         "kind": "multimodal-split",
         "input": {"input_path_prefix": prefix, **input_fields},
+        "sensors": {"cameras": {"front": {"uri_pattern": "camera/front.mp4"}}, "max_delta_s": 0.05},
+        "output": {"path": str(root / "media")},
+        # Shorter than the 10 s default so a fixture session holds whole clips
+        # without encoding ten seconds of video per test. Pass ``clip={}`` to
+        # omit the section entirely.
+        "clip": {"duration_s": 1.0} if clip is None else clip,
     }
+    if not payload["clip"]:
+        del payload["clip"]
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     return path
-
-
-def _make_sessions(root: Path, names: list[str]) -> None:
-    for name in names:
-        (root / name).mkdir(parents=True)
 
 
 def test_the_kind_is_registered_under_its_hyphenated_name() -> None:
@@ -116,32 +120,12 @@ def test_validate_accepts_a_good_config_and_reports_the_failure_for_a_bad_one(tm
 
 def test_a_config_without_a_clip_section_resolves_to_the_clip_defaults(tmp_path: Path) -> None:
     """Configs written before the clip section existed must keep loading unchanged."""
-    path = _write_config(tmp_path, "s3://example-bucket/recordings")
+    path = _write_config(tmp_path, "s3://example-bucket/recordings", clip={})
 
     resolved = resolve_config(path)
 
     assert resolved.clip.duration_s == 10.0
     assert resolved.clip.output_fps == 30
-    assert resolved.clip.caption_fps == 2
-
-
-def test_an_invalid_rate_pair_fails_when_the_config_loads(tmp_path: Path) -> None:
-    """The divisibility rule is a config error, not something a stage discovers mid-run."""
-    path = tmp_path / "config.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "kind": "multimodal-split",
-                "input": {"input_path_prefix": "s3://example-bucket/recordings"},
-                "clip": {"output_fps": 30, "caption_fps": 4},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValidationError, match=r"must divide clip\.output_fps"):
-        MULTIMODAL_SPLIT_KIND.validate(path, [])
 
 
 def test_render_emits_the_canonicalized_config(tmp_path: Path) -> None:
@@ -151,6 +135,21 @@ def test_render_emits_the_canonicalized_config(tmp_path: Path) -> None:
     rendered = json.loads(MULTIMODAL_SPLIT_KIND.render(path, []))
 
     assert rendered["input"]["input_path_prefix"] == "s3://example-bucket/recordings"
+
+
+def test_render_prints_a_non_ascii_path_as_the_operator_typed_it(tmp_path: Path) -> None:
+    """Render exists to be read, so a prefix should come back looking like itself.
+
+    Escaped, the path is still correct JSON and still parses to the same string;
+    it just stops being greppable against the bucket it names, which is most of
+    what an operator is doing with this output.
+    """
+    path = _write_config(tmp_path, "s3://example-bucket/caf\u00e9")
+
+    rendered = MULTIMODAL_SPLIT_KIND.render(path, [])
+
+    assert "s3://example-bucket/caf\u00e9" in rendered
+    assert "caf\\u00e9" not in rendered
 
 
 def test_overrides_are_parsed_as_yaml_scalars_not_strings(tmp_path: Path) -> None:
@@ -229,37 +228,45 @@ def test_the_schema_documents_the_input_section() -> None:
     schema = json.loads(MULTIMODAL_SPLIT_KIND.schema_json())
 
     assert schema["$defs"]["MultimodalSplitInputConfig"]["required"] == ["input_path_prefix"]
-    assert {"duration_s", "output_fps", "caption_fps"} <= schema["$defs"]["MultimodalSplitClipConfig"][
-        "properties"
-    ].keys()
-    # ``clip`` is fully defaulted, so adding it must not make it mandatory.
-    assert set(schema["required"]) == {"schema_version", "kind", "input"}
+    assert {"duration_s", "output_fps"} <= schema["$defs"]["MultimodalSplitClipConfig"]["properties"].keys()
+    # ``clip`` and ``encoder`` are fully defaulted, so adding them must not make them mandatory.
+    # ``sensors`` and ``output`` have no defensible default and must stay required.
+    assert set(schema["required"]) == {"schema_version", "kind", "input", "sensors", "output"}
 
 
-def test_a_run_discovers_sessions_and_reports_the_count(tmp_path: Path) -> None:
-    """The run path exercises real discovery rather than standing in for it."""
+@pytest.mark.usefixtures("ray_local")
+def test_a_run_splits_the_sessions_it_discovers(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+) -> None:
+    """The kind's run path is the real pipeline, not a stand-in that reports a count."""
     sessions = tmp_path / "recordings"
-    sessions.mkdir()
-    _make_sessions(sessions, ["session-b", "session-a"])
+    make_session(sessions, "session-a")
+    make_session(sessions, "session-b")
     path = _write_config(tmp_path, str(sessions))
 
     output = MULTIMODAL_SPLIT_KIND.prepare_run(path, set_overrides=[])()
 
-    assert output.json_payload == {"input_path_prefix": str(sessions), "candidate_sessions": 2}
-    assert "discovered 2 candidate session(s)" in output.message
-    assert "not implemented yet" in output.message
+    assert output.json_payload["sessions"] == 2
+    assert output.json_payload["camera_clips_written"] == 6
+    assert output.json_payload["failures"] == 0
+    assert "6 camera clip(s)" in output.message
 
 
-def test_a_run_applies_overrides_before_discovering(tmp_path: Path) -> None:
+@pytest.mark.usefixtures("ray_local")
+def test_a_run_applies_overrides_before_discovering(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+) -> None:
     """--set must reach discovery, not just config validation."""
     sessions = tmp_path / "recordings"
-    sessions.mkdir()
-    _make_sessions(sessions, ["session-a", "session-b", "session-c"])
+    for name in ("session-a", "session-b", "session-c"):
+        make_session(sessions, name)
     path = _write_config(tmp_path, str(sessions))
 
     output = MULTIMODAL_SPLIT_KIND.prepare_run(path, set_overrides=["input.limit=1"])()
 
-    assert output.json_payload["candidate_sessions"] == 1
+    assert output.json_payload["sessions"] == 1
 
 
 def test_preparing_a_run_does_not_execute_it(tmp_path: Path) -> None:

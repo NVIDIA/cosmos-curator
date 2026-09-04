@@ -19,9 +19,13 @@ import pytest
 from pydantic import ValidationError
 
 from cosmos_curator.next.recipes.multimodal_split.config import (
+    EncoderOpenH264Config,
+    MultimodalSplitCameraConfig,
     MultimodalSplitClipConfig,
     MultimodalSplitInputConfig,
-    MultimodalSplitTranscodeConfig,
+    MultimodalSplitOutputConfig,
+    MultimodalSplitSensorsConfig,
+    ResolvedMultimodalSplitConfig,
 )
 
 
@@ -442,12 +446,12 @@ def test_the_frame_count_is_computed_exactly_rather_than_in_binary_floating_poin
     assert clip.duration_s == 0.28
 
 
-def test_transcode_defaults_to_the_shared_encoder_and_bitrate() -> None:
+def test_the_encoder_defaults_to_libopenh264_and_its_bitrate() -> None:
     """The defaults match ``video_split``'s, so a clip encodes the same way in either recipe."""
-    transcode = MultimodalSplitTranscodeConfig()
+    encoder = EncoderOpenH264Config()
 
-    assert transcode.video_encoder == "libopenh264"
-    assert transcode.video_bitrate == "4M"
+    assert encoder.video_encoder == "libopenh264"
+    assert encoder.video_bitrate == "4M"
 
 
 @pytest.mark.parametrize(
@@ -461,7 +465,7 @@ def test_equivalent_bitrate_spellings_canonicalize_to_one_value(written: str, ca
     different values to compare, log, or hash into an output identity, so the
     resolved config holds only the canonical spelling.
     """
-    assert MultimodalSplitTranscodeConfig(video_bitrate=written).video_bitrate == canonical
+    assert EncoderOpenH264Config(video_bitrate=written).video_bitrate == canonical
 
 
 @pytest.mark.parametrize("video_bitrate", ["4", "4G", "0.5M", "4MB", "four M", "0M"])
@@ -472,13 +476,13 @@ def test_a_malformed_bitrate_is_rejected(video_bitrate: str) -> None:
     the encoder as an argument it cannot read, long after config load.
     """
     with pytest.raises(ValidationError, match="should match pattern"):
-        MultimodalSplitTranscodeConfig(video_bitrate=video_bitrate)
+        EncoderOpenH264Config(video_bitrate=video_bitrate)
 
 
 def test_an_unknown_encoder_is_rejected() -> None:
     """The encoder is a closed set, so a typo fails at config load rather than at spawn time."""
     with pytest.raises(ValidationError, match="Input should be 'libopenh264'"):
-        MultimodalSplitTranscodeConfig(video_encoder="libx264")
+        EncoderOpenH264Config(video_encoder="libx264")
 
 
 def test_audio_mode_is_not_a_setting_here() -> None:
@@ -488,4 +492,161 @@ def test_audio_mode_is_not_a_setting_here() -> None:
     otherwise imply this pipeline handles audio, which it does not.
     """
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        MultimodalSplitTranscodeConfig(audio_mode="copy")
+        EncoderOpenH264Config(audio_mode="copy")
+
+
+def test_a_camera_names_a_relative_artifact() -> None:
+    """The one fact the split stage cannot infer: where in a session this camera's video is."""
+    camera = MultimodalSplitCameraConfig(uri_pattern="camera/front.mp4")
+
+    assert camera.uri_pattern == "camera/front.mp4"
+
+
+@pytest.mark.parametrize(
+    ("max_delta_s", "expected_ns"),
+    [(0.05, 50_000_000), (0.001, 1_000_000), (1.0, 1_000_000_000), (0.0335, 33_500_000)],
+)
+def test_a_tolerance_in_seconds_reaches_the_policy_as_whole_nanoseconds(max_delta_s: float, expected_ns: int) -> None:
+    """The config is stated in the seconds every other duration here uses; the policy takes nanoseconds.
+
+    Sub-millisecond values are the reason this rounds rather than truncates: the
+    tolerance is a bound, and flooring it would quietly make it tighter than the
+    operator asked for.
+    """
+    sensors = MultimodalSplitSensorsConfig(
+        cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=max_delta_s
+    )
+
+    assert sensors.max_delta_ns == expected_ns
+
+
+@pytest.mark.parametrize(
+    ("uri_pattern", "expected"),
+    [
+        ("/camera/front.mp4", "must be relative to a session"),
+        ("s3://bucket/front.mp4", "must be relative to a session"),
+        ("../front.mp4", "contains a '..' segment"),
+        ("camera/../../front.mp4", "contains a '..' segment"),
+        (" camera/front.mp4", "leading or trailing whitespace"),
+        ("camera/front.mp4\t", "leading or trailing whitespace"),
+        ("", "at least 1 character"),
+    ],
+)
+def test_a_camera_artifact_that_escapes_its_session_is_rejected(uri_pattern: str, expected: str) -> None:
+    """The pattern is joined onto a session URI, so anything absolute or upward leaves the session.
+
+    Each case names the rule that must reject it. A bare "something raised"
+    assertion would let one rule stand in for the others, so deleting any single
+    check would still look covered.
+    """
+    with pytest.raises(ValidationError, match=expected):
+        MultimodalSplitCameraConfig(uri_pattern=uri_pattern)
+
+
+@pytest.mark.parametrize("max_delta_s", [0.0, -1.0])
+def test_a_non_positive_tolerance_is_rejected(max_delta_s: float) -> None:
+    """A tolerance of zero demands an exact timestamp match, which no real recording provides."""
+    with pytest.raises(ValidationError, match="greater than 0"):
+        MultimodalSplitSensorsConfig(cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=max_delta_s)
+
+
+def test_exactly_one_camera_is_accepted() -> None:
+    """One camera is the whole of the current scope, and its key names its output."""
+    sensors = MultimodalSplitSensorsConfig(cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=0.05)
+
+    assert list(sensors.cameras) == ["front"]
+
+
+def test_no_cameras_is_rejected() -> None:
+    """A run with no camera produces no video, which is never what the caller meant."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        MultimodalSplitSensorsConfig(cameras={}, max_delta_s=0.05)
+
+
+def test_several_cameras_are_accepted() -> None:
+    """A clip is a moment across every configured view, so the map carries more than one."""
+    two = {
+        "front": {"uri_pattern": "camera/front.mp4"},
+        "left": {"uri_pattern": "camera/left.mp4"},
+    }
+
+    sensors = MultimodalSplitSensorsConfig(cameras=two, max_delta_s=0.05)
+
+    assert sorted(sensors.cameras) == ["front", "left"]
+
+
+@pytest.mark.parametrize("key", ["", "front/left", "..", ".", "front camera", "front\tleft"])
+def test_a_camera_key_that_cannot_be_a_path_segment_is_rejected(key: str) -> None:
+    """The key is written into the output layout, so it has to survive being a directory name.
+
+    "." and ".." match the allowed characters but name a directory rather than
+    sit in one, so both need rejecting separately from the character rule.
+    """
+    with pytest.raises(ValidationError, match="single path segment"):
+        MultimodalSplitSensorsConfig(cameras={key: {"uri_pattern": "camera/front.mp4"}}, max_delta_s=0.05)
+
+
+def test_the_output_path_is_canonicalized_like_the_input_prefix() -> None:
+    """Output joins are as position-sensitive as input joins, so the same rules apply."""
+    output = MultimodalSplitOutputConfig(path="s3://example-bucket/media///")
+
+    assert output.path == "s3://example-bucket/media"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("", "at least 1 character"),
+        ("s3://bucket/media/../escape", "contains a '..' segment"),
+        ("/data/media/../escape", "contains a '..' segment"),
+        ("ftp://bucket/media", "scheme"),
+        (" /data/media", "leading or trailing whitespace"),
+    ],
+)
+def test_an_unusable_output_path_is_rejected(path: str, expected: str) -> None:
+    """A bad output location should fail at load, not after a run has already decoded video."""
+    with pytest.raises(ValidationError, match=expected):
+        MultimodalSplitOutputConfig(path=path)
+
+
+def test_a_file_uri_output_path_is_accepted() -> None:
+    """``file://`` is a local path spelled out, and the recipe writes to local paths."""
+    output = MultimodalSplitOutputConfig(path="file:///data/media/")
+
+    assert output.path == "file:///data/media"
+
+
+@pytest.mark.parametrize("missing", ["sensors", "output"])
+def test_a_config_without_a_camera_or_an_output_location_is_rejected(missing: str) -> None:
+    """Neither has a defensible default, so omitting one has to fail rather than be guessed at."""
+    payload = {
+        "schema_version": 1,
+        "kind": "multimodal-split",
+        "input": {"input_path_prefix": "/data/recordings"},
+        "sensors": {"cameras": {"front": {"uri_pattern": "camera/front.mp4"}}, "max_delta_s": 0.05},
+        "output": {"path": "/data/media"},
+    }
+    del payload[missing]
+
+    with pytest.raises(ValidationError, match=missing):
+        ResolvedMultimodalSplitConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("pattern", ["*/camera_front.mp4", "recorder-00/*/front.mp4", "*/*/front.mp4"])
+def test_a_whole_path_segment_may_be_a_wildcard(pattern: str) -> None:
+    """A rig's recorder layout is the rig's business, so a pattern need not name it."""
+    camera = MultimodalSplitCameraConfig(uri_pattern=pattern)
+
+    assert camera.uri_pattern == pattern
+
+
+@pytest.mark.parametrize("pattern", ["recorder-*/front.mp4", "camera_*.mp4", "*.mp4", "rec*/cam*.mp4"])
+def test_a_wildcard_inside_a_segment_is_rejected(pattern: str) -> None:
+    """Whole segments only: a partial match invites a pattern that resolves differently per session.
+
+    "which recorder holds this camera" is the question worth answering. Matching
+    part of a name answers a different one, and answers it differently as file
+    names change.
+    """
+    with pytest.raises(ValidationError, match="whole path segment"):
+        MultimodalSplitCameraConfig(uri_pattern=pattern)

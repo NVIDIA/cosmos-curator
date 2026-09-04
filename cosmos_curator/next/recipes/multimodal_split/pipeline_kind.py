@@ -15,10 +15,9 @@
 
 """Config-backed pipeline-kind surface for the ``multimodal-split`` recipe.
 
-Only candidate session discovery is implemented, so a run enumerates sessions
-and reports how many were found. The splitting stage replaces the body of
-``run`` with real episode processing; the config, kind registration, and CLI
-surface are unchanged by that.
+A run discovers candidate sessions and splits each one into per-camera clips,
+one MP4 per configured camera. The non-camera modalities and Lance publication
+are separate work, and none of them changes this surface.
 """
 
 from collections.abc import Sequence
@@ -39,11 +38,14 @@ def _template_payload() -> dict[str, Any]:
 
     return {
         "kind": "multimodal-split",
-        "description": "Discover candidate AV recording sessions beneath a storage prefix.",
+        "description": "Split AV recording sessions beneath a storage prefix into per-camera clips.",
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-split"},
             {"path": "input.input_path_prefix", "example": "s3://example-bucket/recordings"},
+            {"path": "sensors.cameras", "example": {"front": {"uri_pattern": "*/camera_front.mp4"}}},
+            {"path": "sensors.max_delta_s", "example": 0.05},
+            {"path": "output.path", "example": "s3://example-bucket/media"},
         ],
         "config": yaml.safe_load(_template_yaml()),
     }
@@ -62,7 +64,7 @@ def _render(config: Path, overrides: Sequence[str]) -> str:
     from cosmos_curator.next.recipes.multimodal_split.config import resolve_config  # noqa: PLC0415
 
     resolved = resolve_config(config, overrides=list(overrides))
-    return json.dumps(resolved.model_dump(mode="json"), indent=2) + "\n"
+    return json.dumps(resolved.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n"
 
 
 def _schema_json() -> str:
@@ -72,7 +74,7 @@ def _schema_json() -> str:
         ResolvedMultimodalSplitConfig,
     )
 
-    return json.dumps(ResolvedMultimodalSplitConfig.model_json_schema(), indent=2) + "\n"
+    return json.dumps(ResolvedMultimodalSplitConfig.model_json_schema(), indent=2, ensure_ascii=False) + "\n"
 
 
 def _list_presets() -> list[PipelinePreset]:
@@ -89,19 +91,15 @@ def _prepare_run(
     resolved = resolve_config(config, overrides=set_overrides)
 
     def run() -> PipelineRunOutput:
-        from cosmos_curator.next.recipes.multimodal_split.discovery import (  # noqa: PLC0415
-            discover_candidate_sessions,
-        )
+        from cosmos_curator.next.recipes.multimodal_split.pipeline import run_config  # noqa: PLC0415
 
-        table = discover_candidate_sessions(resolved.input)
+        summary = run_config(resolved)
         return PipelineRunOutput(
-            json_payload={
-                "input_path_prefix": resolved.input.input_path_prefix,
-                "candidate_sessions": table.num_rows,
-            },
+            json_payload=summary,
             message=(
-                f"multimodal-split: discovered {table.num_rows} candidate session(s) under "
-                f"{resolved.input.input_path_prefix}. Episode splitting is not implemented yet."
+                f"multimodal-split: wrote {summary['camera_clips_written']} camera clip(s) from "
+                f"{summary['sessions']} session(s) to {summary['output_path']}, with "
+                f"{summary['failures']} failure(s)."
             ),
         )
 
