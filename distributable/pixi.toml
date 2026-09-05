@@ -93,7 +93,7 @@ PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.13.0"
 torchvision = "==0.28.0"
-vllm = "==0.27.1"
+vllm = "==0.28.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/" }
 paddleocr = "==2.10.*"
 
@@ -125,8 +125,11 @@ nvidia-nvjitlink = "*"
 nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
+[feature.vllm-omni.dependencies]
+transformers = "<5.15"
+
 [feature.vllm-omni.pypi-dependencies]
-vllm-omni = "==0.27.0rc1"
+vllm-omni = "==0.28.0"
 
 [feature.cuml]
 channels = ["nvidia"]

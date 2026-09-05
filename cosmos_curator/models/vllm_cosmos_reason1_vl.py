@@ -176,6 +176,8 @@ class VllmCosmosReason1VL(VllmPlugin):
             max_model_len=MAX_MODEL_LEN,
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             mm_processor_kwargs=mm_processor_kwargs,
+            # vLLM 0.28 can normalize again on the GPU despite the processor flags.
+            mm_device_do_normalize=None if config.model_preprocess_enabled else False,
             mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             tensor_parallel_size=config.num_gpus,
@@ -225,6 +227,7 @@ class VllmCosmosReason1VL(VllmPlugin):
                 "do_rescale": config.model_preprocess_enabled,
                 "do_normalize": config.model_preprocess_enabled,
             },
+            mm_device_do_normalize=None if config.model_preprocess_enabled else False,
             compilation_config=CompilationConfig(cudagraph_mode="piecewise"),  # type: ignore[arg-type]
             enable_prefix_caching=True,
             use_tqdm_on_load=False,

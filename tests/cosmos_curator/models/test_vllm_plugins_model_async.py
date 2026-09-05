@@ -102,6 +102,7 @@ def test_qwen_model_async_bakes_async_invariants() -> None:
     assert args.mm_processor_kwargs["do_resize"] is False
     assert args.mm_processor_kwargs["do_rescale"] is False
     assert args.mm_processor_kwargs["do_normalize"] is False
+    assert args.mm_device_do_normalize is False
     assert "size" not in args.mm_processor_kwargs
 
 
@@ -113,6 +114,7 @@ def test_qwen_model_async_model_preprocess_enables_vllm_resize() -> None:
     assert args.mm_processor_kwargs["do_resize"] is True
     assert args.mm_processor_kwargs["do_rescale"] is True
     assert args.mm_processor_kwargs["do_normalize"] is True
+    assert args.mm_device_do_normalize is None
     # Frame sampling is still owned by CPU prep -- ``preprocess_mode`` only
     # gates the in-engine pixel-space ops.
     assert args.mm_processor_kwargs["do_sample_frames"] is False
@@ -221,6 +223,7 @@ def test_cosmos_reason1_model_async_model_preprocess_enables_vllm_resize() -> No
     assert args.mm_processor_kwargs["do_rescale"] is True
     assert args.mm_processor_kwargs["do_normalize"] is True
     assert args.mm_processor_kwargs["do_sample_frames"] is False
+    assert args.mm_device_do_normalize is None
 
 
 def test_cosmos_reason1_model_async_default_preprocess_disables_vllm_resize() -> None:
@@ -232,6 +235,7 @@ def test_cosmos_reason1_model_async_default_preprocess_disables_vllm_resize() ->
     assert args.mm_processor_kwargs["do_rescale"] is False
     assert args.mm_processor_kwargs["do_normalize"] is False
     assert args.mm_processor_kwargs["do_sample_frames"] is False
+    assert args.mm_device_do_normalize is False
 
 
 def test_cosmos_reason2_inherits_model_async() -> None:
@@ -317,6 +321,7 @@ def test_cosmos3_omni_prefills_closed_thinking_tokens() -> None:
                 "max_num_batched_tokens",
                 "trust_remote_code",
                 "limit_mm_per_prompt",
+                "mm_device_do_normalize",
             ),
         ),
         (
@@ -338,14 +343,17 @@ def test_cosmos3_omni_prefills_closed_thinking_tokens() -> None:
                 "max_num_batched_tokens",
                 "trust_remote_code",
                 "limit_mm_per_prompt",
+                "mm_device_do_normalize",
             ),
         ),
     ],
 )
+@pytest.mark.parametrize("preprocess_mode", list(PreprocessMode))
 def test_model_async_matches_model_for_shared_engine_knobs(
     plugin_module: str,
     plugin_cls_name: str,
     compared_keys: tuple[str, ...],
+    preprocess_mode: PreprocessMode,
 ) -> None:
     """Drift tripwire: per-variant engine knobs match between sync and async paths.
 
@@ -362,11 +370,11 @@ def test_model_async_matches_model_for_shared_engine_knobs(
         patch.object(module, "LLM") as mock_llm,
         patch.object(plugin_cls, "model_path", return_value="/m"),
     ):
-        plugin_cls.model(_sync_cfg())
+        plugin_cls.model(_sync_cfg(preprocess_mode=preprocess_mode))
     sync_kwargs = mock_llm.call_args.kwargs
 
     with patch.object(plugin_cls, "model_path", return_value="/m"):
-        async_args = plugin_cls.model_async(_async_cfg())
+        async_args = plugin_cls.model_async(_async_cfg(preprocess_mode=preprocess_mode))
 
     for key in compared_keys:
         sync_value = sync_kwargs[key]

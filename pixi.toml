@@ -28,14 +28,14 @@ azure-identity = "*"
 azure-storage-blob = "*"
 cattrs = "*"
 easydict = "*"
-fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM 0.27 requires fastapi[standard]<0.137
+fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM 0.28 requires fastapi[standard]<0.137
 huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
 mcap = ">=1.3.1,<2.0.0"
 numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 nvidia-ml-py = "*"
-nvtx = "==0.2.15" # vllm==0.27.1 depends on nvtx==0.2.15
+nvtx = "==0.2.15" # vllm==0.28.0 depends on nvtx==0.2.15
 openssl = ">=3.6.2,<4.0a0" # default env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
 pandas = "*"
 pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
@@ -167,7 +167,7 @@ PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmp
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.13.0"
 torchvision = "==0.28.0"
-vllm = "==0.27.1" # not available on conda-forge
+vllm = "==0.28.0" # not available on conda-forge
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
@@ -206,9 +206,11 @@ nvidia-nvtx = "*"
 # Cosmos3 Generator Transfer runs in-process through vLLM-Omni's offline `Omni`
 # API. Keep it out of the shared runtime feature: its large, transfer-specific
 # dependency tree (including openai-whisper) is needed only by StyleTransferStage.
+[feature.vllm-omni.dependencies]
+transformers = "<5.15" # vllm-omni==0.28.0 depends on transformers<5.15
+
 [feature.vllm-omni.pypi-dependencies]
-# TODO: Replace with stable vllm-omni 0.27.x once published.
-vllm-omni = "==0.27.0rc1" # not available on conda-forge; latest vLLM 0.27-aligned release
+vllm-omni = "==0.28.0" # not available on conda-forge
 
 [feature.cuml]
 channels = ["nvidia"]
@@ -238,7 +240,7 @@ pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as cor
 pylance = ">=0.39.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
-transformers = ">=5.11.0,<6.0.0" # vLLM 0.27 + native Cosmos3 support require recent Transformers v5
+transformers = ">=5.11.0,<6.0.0" # vLLM 0.28 + native Cosmos3 support require recent Transformers v5
 
 [feature.transformers.pypi-dependencies]
 # sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
