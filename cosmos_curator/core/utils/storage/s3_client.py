@@ -883,10 +883,9 @@ def get_s3_client_config(
         S3ClientConfig: An initialized S3ClientConfig instance.
 
     """
-    # Deferred because ``nvcf_utils`` imports ``ray`` at module scope, and ray is absent from the
-    # client-only ``tools`` environment. Importing it here keeps the rest of this module -- notably
+    # Deferred: importing it here keeps the rest of this module -- notably
     # ``S3Prefix``, which is pure string validation -- usable from the CLI without a ray install.
-    from cosmos_curator.core.cf.nvcf_utils import (  # noqa: PLC0415
+    from cosmos_curator.core.cf.nvcf_secrets import (  # noqa: PLC0415
         NVCF_SECRETS_PATH,
         get_secrets_from_nvcf_secret_store,
     )

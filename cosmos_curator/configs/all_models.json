@@ -2,7 +2,12 @@
     "aesthetic_scorer": {
         "model_id": "ttj/sac-logos-ava1-l14-linearMSE",
         "version": "1e77fa05081323d99725fc40a9bf9f88180490e7",
-        "filelist": ["model.safetensors"],
+        "filelist": [
+            "model.safetensors"
+        ],
+        "sha256": {
+            "model.safetensors": "ca3d182bacb66cfb8b3062347d2656dbeae6f8ef90cec45f01775fcaf3e58c67"
+        },
         "precision": "FP32",
         "nvcf_model_id": "sac_logos_ava1_l14_linear_mse"
     },
@@ -16,6 +21,9 @@
             "tokenizer_config.json",
             "vocab.txt"
         ],
+        "sha256": {
+            "model.safetensors": "28349a5c57338d0dca591bb95de533897c2399095c69d61e09604b46f444a4c4"
+        },
         "precision": "FP32",
         "nvcf_model_id": "bert_large_uncased"
     },
@@ -23,6 +31,9 @@
         "model_id": "BAAI/bge-small-en-v1.5",
         "version": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
         "filelist": null,
+        "sha256": {
+            "model.safetensors": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad"
+        },
         "precision": "FP32",
         "nvcf_model_id": "bge_small_en_v1_5"
     },
@@ -39,6 +50,9 @@
             "tokenizer_config.json",
             "vocab.json"
         ],
+        "sha256": {
+            "model.safetensors": "a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb"
+        },
         "precision": "FP32",
         "nvcf_model_id": "clip_vit_large_patch14"
     },
@@ -46,6 +60,9 @@
         "model_id": "nvidia/Cosmos-Embed1-224p",
         "version": "85f56274be7ce439175b4587fa6e3525556d4832",
         "filelist": null,
+        "sha256": {
+            "model-00005-of-00005.safetensors": "2af664d97d8d73f4c91ee5a19556b76873b9264fdbc7778919e392e7ff7e12f1"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos_embed1_224p"
     },
@@ -53,6 +70,9 @@
         "model_id": "nvidia/Cosmos-Embed1-336p",
         "version": "5d8309dd5c9ec8f856b16d589693004c907c9a57",
         "filelist": null,
+        "sha256": {
+            "model-00005-of-00005.safetensors": "15ae8508a703e9dc113fdda5eadc115a4ecdac2a76b558f3eac550f21f7df0c5"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos_embed1_336p"
     },
@@ -60,6 +80,9 @@
         "model_id": "nvidia/Cosmos-Embed1-448p",
         "version": "9f4ff4d8d3df0968276b2191806344000d6752a9",
         "filelist": null,
+        "sha256": {
+            "model-00005-of-00005.safetensors": "4df327826a5ea4c539df1e0cfcc06a257f6d42eee4d3e3cdc2428c3f547ce867"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos_embed1_448p"
     },
@@ -67,6 +90,9 @@
         "model_id": "nvidia/Cosmos-Reason1-7B",
         "version": "0caf724f837efea5e25bf6d5818dcdeec0a36604",
         "filelist": null,
+        "sha256": {
+            "model-00004-of-00004.safetensors": "91bacbe1ad798e16daa05023b4e4bec70b53c8cd7d757db86c5bc76c4e0bbf15"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos_reason1_7b"
     },
@@ -75,12 +101,31 @@
         "version": "b9806227bdb6f9dce8d0fb9d832718dd8b5efdf5",
         "filelist": null,
         "precision": "BF16",
-        "nvcf_model_id": "cosmos_reason2_8b"
+        "nvcf_model_id": "cosmos_reason2_8b",
+        "sha256": {
+            "chat_template.json": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce",
+            "config.json": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661",
+            "generation_config.json": "8469742d1fce0de951c8909b26a2c0c0d8490837ce476efb114da9e0cefc4d44",
+            "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+            "model-00001-of-00004.safetensors": "4316265e5ef2200a1aba1e026b3dc303717baa3224446ff1ab5719fc93a46257",
+            "model-00002-of-00004.safetensors": "2949ab463be51aeef35725d94ed6ac02ae2785b4380ae17ab90efd4b4b0aa88a",
+            "model-00003-of-00004.safetensors": "6498d25016c20f22cd4248100391c49d838f736d6b59b9ab1c6a0e5c61864100",
+            "model-00004-of-00004.safetensors": "427ad3a495426085d69f46225f3eafdce6c2d9b0315eedcdbdf12534441ac49f",
+            "model.safetensors.index.json": "31e5064be5695aee8fc2721d45ac431875a964d6de0e3ff3de50dc38619f9d41",
+            "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+            "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+            "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+            "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+            "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
     },
     "cosmos3_nano": {
         "model_id": "nvidia/Cosmos3-Nano",
         "version": "138d071cee76860b0d2acd253dc6a07a11e3f3c1",
         "filelist": null,
+        "sha256": {
+            "transformer/diffusion_pytorch_model-00001-of-00007.safetensors": "7d0f718198cac14cf323d58568c78aa1290b4bd1dcced6481624b5b9c6d70dc2"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos3_nano_16b"
     },
@@ -88,6 +133,9 @@
         "model_id": "nvidia/Cosmos3-Super",
         "version": "3965ceeee07a23751d4f5625c6bee0635d24ecd2",
         "filelist": null,
+        "sha256": {
+            "transformer/diffusion_pytorch_model-00001-of-00027.safetensors": "040b6a68556e302edfbd3fd1de30d4e082cb9e5358ff7b32f9af114f9b1c9495"
+        },
         "precision": "BF16",
         "nvcf_model_id": "cosmos3_super_64b"
     },
@@ -99,6 +147,9 @@
             "model.safetensors",
             "preprocessor_config.json"
         ],
+        "sha256": {
+            "model.safetensors": "ae1e99fcefd534ed978cdeb8326f08030c96e28b7a81ffcbc98a857c84d14be1"
+        },
         "precision": "FP32",
         "nvcf_model_id": "dinov2_small"
     },
@@ -106,6 +157,13 @@
         "model_id": "openai-community/gpt2",
         "version": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
         "filelist": null,
+        "sha256": {
+            "merges.txt": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+            "model.safetensors": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707",
+            "tokenizer.json": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+            "tokenizer_config.json": "5e04eb606e3a1583530a42e36c2a6b6615c86f34fe77e44d9ddeb43ff940931f",
+            "vocab.json": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+        },
         "precision": "FP32",
         "nvcf_model_id": "gpt2"
     },
@@ -124,20 +182,31 @@
             "model-00001-of-00002.safetensors",
             "model-00002-of-00002.safetensors"
         ],
+        "sha256": {
+            "model-00002-of-00002.safetensors": "a18106b209e9ab35c3406db4f6f12a927364a058b21e9d1373d682e20674b303"
+        },
         "precision": "BF16",
         "nvcf_model_id": "gpt_oss_20b"
     },
     "internvideo2_mm": {
         "model_id": "OpenGVLab/InternVideo2-Stage2_1B-224p-f4",
         "version": "4362e1f88a992e7edbfd7696f7f78b7f79426dfd",
-        "filelist": ["InternVideo2-stage2_1b-224p-f4.pt"],
+        "filelist": [
+            "InternVideo2-stage2_1b-224p-f4.pt"
+        ],
         "precision": "BF16",
-        "nvcf_model_id": "internvideo2_stage2_1b_224p_f4"
+        "nvcf_model_id": "internvideo2_stage2_1b_224p_f4",
+        "sha256": {
+            "InternVideo2-stage2_1b-224p-f4.pt": "df8cdbe9c3c9f65fbba777afc9ee6fbf58e6d68c4aec2827cac8e2a98d0a8446"
+        }
     },
     "nemotron": {
         "model_id": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
         "version": "5f7b7fac031d1eb7b8b8f2266c305b3f2fcc6ff4",
         "filelist": null,
+        "sha256": {
+            "model-00007-of-00007.safetensors": "28c456af5e605d472277f69ec68c298ae39442f72f825f06cb1c2df5043a1ba0"
+        },
         "precision": "BF16",
         "nvcf_model_id": "nemotron_nano_12b_v2_vl_bf16"
     },
@@ -145,6 +214,9 @@
         "model_id": "Qwen/Qwen2.5-14B-Instruct",
         "version": "cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8",
         "filelist": null,
+        "sha256": {
+            "model-00008-of-00008.safetensors": "a77f603d8368749c19d3ac9cf2a300e476edcc794ea41af8e473ee12935eadb8"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen2_5_14b_instruct"
     },
@@ -152,6 +224,9 @@
         "model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
         "version": "cc594898137f460bfe9f0759e9844b3ce807cfb5",
         "filelist": null,
+        "sha256": {
+            "model-00005-of-00005.safetensors": "0c859795ad3a627a9b95bcb762e059d5b768a4a36fdd4affeff269d93fdecc67"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen2_5_vl_7b_instruct"
     },
@@ -159,6 +234,9 @@
         "model_id": "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "version": "4b184fbdab8886057d8d80c09f35bcfc65fe640e",
         "filelist": null,
+        "sha256": {
+            "model-00013-of-00013.safetensors": "e167e2806d63c404660b6d609a7eaef2e82bca478688ba6f83155128d8187539"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen3_vl_30b_a3b_instruct"
     },
@@ -166,6 +244,9 @@
         "model_id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
         "version": "d9748a51ae66354c4dad665aab2c71f26cf2c8cd",
         "filelist": null,
+        "sha256": {
+            "model-00004-of-00004.safetensors": "49d39cc48e99e733f77b48c4222bb12cd45e5c9c709cce37484ab081353a3eea"
+        },
         "precision": "FP8",
         "nvcf_model_id": "qwen3_vl_30b_a3b_instruct_fp8"
     },
@@ -173,6 +254,9 @@
         "model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct",
         "version": "326b2e35ea25798d32df16d16d0dba461959e931",
         "filelist": null,
+        "sha256": {
+            "model-00096-of-00096.safetensors": "93db8efcfef1d92475e220e0b35fc7c66913b9abec01a58c27fcd39cadf85d93"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen3_vl_235b_a22b_instruct"
     },
@@ -180,6 +264,9 @@
         "model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
         "version": "7fbcd8c9e2ad011808ed8a57d64c462605c3e381",
         "filelist": null,
+        "sha256": {
+            "model-00024-of-00024.safetensors": "fe6b8933e913779e898386a1f0412e39aa05f3e31770814be26bf32ce16f4eb9"
+        },
         "precision": "FP8",
         "nvcf_model_id": "qwen3_vl_235b_a22b_instruct_fp8"
     },
@@ -187,6 +274,9 @@
         "model_id": "Qwen/Qwen3.5-27B-FP8",
         "version": "97f5941bf617e31c5e237364a8602ce3f03a551a",
         "filelist": null,
+        "sha256": {
+            "model.safetensors-00011-of-00011.safetensors": "7b64e359bd951e90c8dcb609df16e1334cc68a8501f242b7fd483a4398f4b64a"
+        },
         "precision": "FP8",
         "nvcf_model_id": "qwen3_5_27b"
     },
@@ -194,6 +284,9 @@
         "model_id": "Qwen/Qwen3.6-27B",
         "version": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
         "filelist": null,
+        "sha256": {
+            "model-00015-of-00015.safetensors": "b84b5b1315e865c9a19a444045d422a73e3e2e31ce3766797cffd3507c68c9c9"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen3_6_27b"
     },
@@ -201,6 +294,9 @@
         "model_id": "Qwen/Qwen3.6-27B-FP8",
         "version": "e89b16ebf1988b3d6befa7de50abc2d76f26eb09",
         "filelist": null,
+        "sha256": {
+            "layers-7.safetensors": "2acb7e8d035d730a1c81c36c3b20ca15020b89d2bcd4462259f2ecb2a8dcb828"
+        },
         "precision": "FP8",
         "nvcf_model_id": "qwen3_6_27b_fp8"
     },
@@ -208,6 +304,9 @@
         "model_id": "Qwen/Qwen3.8-27B",
         "version": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
         "filelist": null,
+        "sha256": {
+            "model-00005-of-00018.safetensors": "635cb53446dc74f219740fc59e18b774f877b803b9722e289ca62575a6efa701"
+        },
         "precision": "BF16",
         "nvcf_model_id": "qwen3_8_27b"
     },
@@ -215,6 +314,9 @@
         "model_id": "Qwen/Qwen3.8-27B-FP8",
         "version": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
         "filelist": null,
+        "sha256": {
+            "layers-7.safetensors": "f2e0137e878016a7afdb2314972e0cbbe2461a67b00eb1d691b4de8ea2665da8"
+        },
         "precision": "FP8",
         "nvcf_model_id": "qwen3_8_27b_fp8"
     },
@@ -222,6 +324,12 @@
         "model_id": "ByteDance-Seed/SeedVR2-3B",
         "version": "37255ff8cccfb01071b87f635a5948ca8d53117c",
         "filelist": null,
+        "sha256": {
+            "ema_vae.pth": "c7df8a67e68b7f9aca3d5d2153d2ce8ab4373687741a0f9ce87cb356ace51cac",
+            "neg_emb.pt": "6a43e5800ef2354f1c156d27535834da055cbec8248298b8923492bba2076581",
+            "pos_emb.pt": "fa07a14844314772266b66c3b95deb0027696d8fe7065721263db5176f45d799",
+            "seedvr2_ema_3b.pth": "6bcc5ac59447e97b100477480aebb01be2ec724c8340bb83faae21f64848604b"
+        },
         "precision": "BF16",
         "nvcf_model_id": "seedvr2_3b"
     },
@@ -229,6 +337,9 @@
         "model_id": "ByteDance-Seed/SeedVR2-7B",
         "version": "eb0c4281d41ba3767d4f14370f0e37e9e9180c16",
         "filelist": null,
+        "sha256": {
+            "seedvr2_ema_7b.pth": "e1b2ae25505607e61f2a7dc7967ba778aaf3e3626d9969ce6e24c52d9ddebfcd"
+        },
         "precision": "BF16",
         "nvcf_model_id": "seedvr2_7b"
     },
@@ -236,6 +347,9 @@
         "model_id": "ByteDance-Seed/SeedVR2-7B",
         "version": "eb0c4281d41ba3767d4f14370f0e37e9e9180c16",
         "filelist": null,
+        "sha256": {
+            "seedvr2_ema_7b_sharp.pth": "ced5706c976d5879efcab9e108349d67abcbd8a9b36a1f48bf0f19c24164a264"
+        },
         "precision": "BF16",
         "nvcf_model_id": "seedvr2_7b_sharp"
     },
@@ -248,6 +362,9 @@
             "tokenizer.json",
             "spiece.model"
         ],
+        "sha256": {
+            "pytorch_model.bin": "5fdc64177b14b0f72437fea171a752c626733f67755842528c75b90cacd1c807"
+        },
         "precision": "FP32",
         "nvcf_model_id": "t5_efficient_xxl_11b_encoder"
     },
@@ -255,6 +372,9 @@
         "model_id": "Sn4kehead/TransNetV2",
         "version": "db6ceabeb692ec71ecc6beb6d00db67ad1412d7f",
         "filelist": null,
+        "sha256": {
+            "transnetv2-pytorch-weights.pth": "834b10f25ae9e1b4e4f2652fe2843bd2b1388057a435d68b7c52635578fcc04d"
+        },
         "precision": "FP32",
         "nvcf_model_id": "sn4kehead_transnetv2"
     },
@@ -262,6 +382,9 @@
         "model_id": "PaddlePaddle/PP-OCRv4_mobile_det",
         "version": "3cc09f3a5b424e8e010abc7a4271aea12999c2f7",
         "filelist": null,
+        "sha256": {
+            "inference.pdiparams": "54a85087b4d31fa3ea4e4aba100169a1ec3e3274cd3352b9068b3cfccbca7829"
+        },
         "precision": "FP32",
         "nvcf_model_id": "paddle_ocr_det"
     },
@@ -269,6 +392,9 @@
         "model_id": "PaddlePaddle/PP-OCRv4_mobile_rec",
         "version": "a2deb05cb05813be2da3365672881aa496d1452b",
         "filelist": null,
+        "sha256": {
+            "inference.pdiparams": "948b8d2ca6ad4bd7b64c0ee3fb838a06db87d4cf57137173ce409c995df21012"
+        },
         "precision": "FP32",
         "nvcf_model_id": "paddle_ocr_rec"
     },
@@ -276,6 +402,17 @@
         "model_id": "facebook/sam3",
         "version": "3c879f39826c281e95690f02c7821c4de09afae7",
         "filelist": null,
-        "precision": "BF16"
+        "precision": "BF16",
+        "sha256": {
+            "config.json": "4616385e4b21f2e5e22c875b65679185cbccfa95de42542b9166f7dc3d57160f",
+            "merges.txt": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+            "model.safetensors": "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
+            "processor_config.json": "6420cf2671fa9309ea95bc0144a8b9861666d1c5f43c8db09e410dacda974fce",
+            "sam3.pt": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e",
+            "special_tokens_map.json": "2cdb3b8331a60c92fc1e55a13e9fd61fd2293c5a51275fdcccd62b780052530e",
+            "tokenizer.json": "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35",
+            "tokenizer_config.json": "39670ad98457fe8f14ca59f6bb74591e9fc850974380a63993e5b8ffc865baa2",
+            "vocab.json": "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363"
+        }
     }
 }

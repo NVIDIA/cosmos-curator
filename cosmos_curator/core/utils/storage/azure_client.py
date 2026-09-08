@@ -661,11 +661,10 @@ def get_azure_client_config(
         AzureClientConfig: An initialized AzureClientConfig instance.
 
     """
-    # Deferred to match ``s3_client.get_s3_client_config``: ``nvcf_utils`` imports ``ray`` at module
-    # scope, and credential lookup is the only thing here that needs it. Unlike s3_client this does
-    # not yet make the module importable from the client-only ``tools`` environment, which also
-    # lacks the ``azure`` SDK -- it just stops ray from being the reason.
-    from cosmos_curator.core.cf.nvcf_utils import (  # noqa: PLC0415
+    # Deferred to match ``s3_client.get_s3_client_config``, and credential lookup is the only
+    # thing here that needs it. Unlike s3_client this does not yet make the module importable
+    # from the client-only ``tools`` environment, which also lacks the ``azure`` SDK.
+    from cosmos_curator.core.cf.nvcf_secrets import (  # noqa: PLC0415
         NVCF_SECRETS_PATH,
         get_secrets_from_nvcf_secret_store,
     )

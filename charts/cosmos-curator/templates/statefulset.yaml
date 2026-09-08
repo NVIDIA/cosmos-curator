@@ -238,6 +238,10 @@ spec:
             - name: HUGGING_FACE_HUB_TOKEN
               value: {{ .Values.huggingFaceHubToken | quote }}
             {{- end }}
+            {{- range $key, $value := .Values.extraEnv }}
+            - name: {{ $key | quote }}
+              value: {{ $value | quote }}
+            {{- end }}
           envFrom:
           - configMapRef:
               name: curator-config

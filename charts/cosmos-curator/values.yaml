@@ -181,6 +181,16 @@ logging:
 # Optional custom environment variables
 customEnvVars: {}
 
+# Extra env vars set as literal entries in the main container's env: list,
+# as opposed to customEnvVars above (which flows through the curator-config
+# ConfigMap via envFrom). Use this when something needs to see the variable
+# directly in containers[].env on the pod spec itself -- e.g. NVCF's
+# transparent proxy-cache only honors its opt-out flag as a literal env
+# entry, not one resolved from a ConfigMap at container-start time. Set
+# per-deployment (e.g. via the NVCF deploy JSON's "configuration.extraEnv"),
+# not defaulted here.
+extraEnv: {}
+
 # Optional extra volumes and mounts for the main curator StatefulSet pod.
 # Mounts are added to the curator container and, when logging.otlp.enabled is
 # true, to the OTLP log collector sidecar. Use the opentelemetry-collector

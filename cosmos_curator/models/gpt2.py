@@ -75,7 +75,13 @@ class GPT2(ModelInterface):
         # this runs in the specified conda environment on the actor
         logger.info(f"Setting up GPT2 model in env={pixi_utils.get_env_name()}")
         model_dir = model_utils.get_local_dir_for_weights_name(self.model_id_names[0])
-        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        # Load the tokenizer from model_dir, not from the repo name. Passing a name makes
+        # transformers resolve through the Hub, so it ignores the copy we just downloaded,
+        # verified and pinned to all_models.json's `version` -- it can resolve to different
+        # bytes than the weights it is paired with, and it reaches for the network when
+        # nothing is cached. tokenizer.json, vocab.json, merges.txt and tokenizer_config.json
+        # are all present in model_dir already.
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_dir)
         self.model = GPT2LMHeadModel.from_pretrained(model_dir)
         cast("Any", self.model).to("cuda")
 

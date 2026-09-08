@@ -73,6 +73,10 @@ webdataset = "*" # conda-forge package pulls in pytorch
 [feature.core.tasks]
 hello-world = "python -m cosmos_curator.pipelines.examples.hello_world_pipeline"
 model-download = "python -m cosmos_curator.core.managers.model_cli download"
+# COSMOS_CURATOR_CODE_DIR points all_models.json lookup at this checkout; without it these
+# resolve to the in-container /opt/cosmos-curator, which does not exist on a dev machine.
+model-checksums = { cmd = "python -m cosmos_curator.core.managers.model_cli checksums", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
+model-verify-ngc = { cmd = "python -m cosmos_curator.core.managers.model_cli verify-ngc", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
 run-pipeline = "python -m cosmos_curator.client.pipeline_cli.pipeline_runtime"
 video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
 gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models"

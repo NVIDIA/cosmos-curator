@@ -19,6 +19,9 @@
         "shmem": {
             "limit": "800Gi"
         },
+        "extraEnv": {
+            "NVCF_DISABLE_PROXY_CACHE": "true"
+        },
         "metrics": {
             "remoteWrite": {
                 "endpoint": null

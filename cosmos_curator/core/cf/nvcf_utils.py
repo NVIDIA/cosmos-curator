@@ -16,7 +16,6 @@
 """Provide utilities for interacting with the NVCF."""
 
 import base64
-import json
 import os
 import pathlib
 import shutil
@@ -26,13 +25,44 @@ from typing import Any
 import ray
 from loguru import logger
 
-from cosmos_curator.core.cf.nvcf_model_manager import NvcfModelManager
+from cosmos_curator.core.cf.nvcf_model_manager import get_nvcf_download_manager
+from cosmos_curator.core.cf.nvcf_secrets import NVCF_SECRETS_PATH, get_secrets_from_nvcf_secret_store
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.infra import ray_cluster_utils
+from cosmos_curator.core.utils.model.model_checksums import (
+    ChecksumVerificationError,
+    describe_verification_failure,
+    verify_local_files,
+)
 from cosmos_curator.models.all_models import get_all_models_by_id
 
-NVCF_SECRETS_PATH = "/var/secrets/secrets.json"
+# Re-exported for callers that have always imported them from here. The definitions moved to
+# nvcf_secrets / nvcf_model_manager so they can be imported without pulling in ray.
+__all__ = [
+    "NVCF_SECRETS_PATH",
+    "create_s3_profile",
+    "download_model_weight_from_nvcf",
+    "download_model_weights_from_nvcf_to_workspace",
+    "get_nvcf_download_manager",
+    "get_secrets_from_nvcf_secret_store",
+    "is_nvcf_container_deployment",
+    "is_nvcf_helm_deployment",
+    "remove_s3_profile",
+]
+
 _NVCF_MISC_RUNNER_CPU_REQUEST = 1
+
+# Escape hatch for a recorded checksum that is wrong or stale -- a registry version bumped
+# without all_models.json catching up would otherwise block every run with no way out short
+# of a code change. This downgrades a mismatch from fatal to a loud log line; it does NOT
+# skip the comparison, so the diagnostic is preserved either way. Hashing files already on
+# local disk costs a read, not a re-download, and only runs on a fresh download.
+_CHECKSUM_WARN_ONLY_ENV = "COSMOS_CURATOR_MODEL_CHECKSUM_WARN_ONLY"
+
+
+def _checksum_mismatch_is_fatal() -> bool:
+    """Return whether a checksum mismatch should abort the download."""
+    return os.getenv(_CHECKSUM_WARN_ONLY_ENV, "").strip().lower() not in {"1", "true", "yes", "on"}
 
 
 def is_nvcf_container_deployment() -> bool:
@@ -53,39 +83,6 @@ def is_nvcf_helm_deployment() -> bool:
 
     """
     return os.getenv("NVCF_MULTI_NODE", "false").lower() == "true"
-
-
-def get_secrets_from_nvcf_secret_store() -> dict[str, str]:
-    """Return the NVCF secrets as a dictionary."""
-    data: dict[str, str] = {}
-    nsp = pathlib.Path(NVCF_SECRETS_PATH)
-    if nsp.exists():
-        with nsp.open(encoding="utf-8") as f:
-            data = json.load(f)
-    return data
-
-
-def get_nvcf_download_manager() -> NvcfModelManager:
-    """Return a NvcfModelManager instance."""
-    data = get_secrets_from_nvcf_secret_store()
-    api_key = data.get("NGC_NVCF_API_KEY", os.getenv("NGC_NVCF_API_KEY", ""))
-    if not api_key:
-        error_msg = "NGC_NVCF_API_KEY not found in NVCF secrets or environment variable"
-        raise ValueError(error_msg)
-
-    org = data.get("NGC_NVCF_ORG", os.getenv("NGC_NVCF_ORG", ""))
-    if not org:
-        error_msg = "NGC_NVCF_ORG not found in NVCF secrets or environment variable"
-        raise ValueError(error_msg)
-
-    team = data.get("NGC_NVCF_TEAM", os.getenv("NGC_NVCF_TEAM", "no-team"))
-    cache_dir = os.getenv("NVCF_MODEL_CACHE_DIR")
-    return NvcfModelManager(
-        api_key=api_key,
-        org=org,
-        team=team,
-        cache_dir=cache_dir,
-    )
 
 
 def download_model_weight_from_nvcf(
@@ -110,6 +107,8 @@ def download_model_weight_from_nvcf(
     nvcf_model_version = model_details.get("version", None)
     assert isinstance(nvcf_model_name, str)
     assert isinstance(nvcf_model_version, str)
+    raw_checksums = model_details.get("sha256")
+    expected_checksums: dict[str, str] = raw_checksums if isinstance(raw_checksums, dict) else {}
 
     local_download_dir = pathlib.Path(download_dir)
     local_download_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +120,30 @@ def download_model_weight_from_nvcf(
 
     renamed_model_path = local_download_dir / model_weights_name
     downloaded_model_path = local_download_dir / f"{nvcf_model_name}_v{nvcf_model_version}"
+
+    # Verify before promoting: a download that failed silently leaves correctly-sized,
+    # zero-filled files, and moving those into the model cache makes them look valid to
+    # every later stage. Models without recorded checksums are left as-is.
+    if expected_checksums:
+        mismatches = verify_local_files(downloaded_model_path, expected_checksums)
+        if not mismatches:
+            logger.info(f"Verified {len(expected_checksums)} file(s) for {model_weights_name}")
+        elif _checksum_mismatch_is_fatal():
+            error_msg = (
+                f"Downloaded {model_weights_name} failed checksum verification: "
+                f"{describe_verification_failure(downloaded_model_path, mismatches)}. "
+                f"Set {_CHECKSUM_WARN_ONLY_ENV}=1 to continue anyway if the recorded "
+                "checksum is known to be stale."
+            )
+            raise ChecksumVerificationError(error_msg)
+        else:
+            # Comparison still ran, so the diagnostic survives; only the abort is suppressed.
+            logger.error(
+                f"Downloaded {model_weights_name} failed checksum verification: "
+                f"{describe_verification_failure(downloaded_model_path, mismatches)}. "
+                f"Continuing because {_CHECKSUM_WARN_ONLY_ENV} is set -- these weights may "
+                "be corrupt or zero-filled.",
+            )
 
     if renamed_model_path.exists():
         if renamed_model_path.is_symlink():

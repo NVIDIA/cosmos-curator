@@ -19,6 +19,9 @@
         "shmem": {
             "limit": "${HELM_SHMEM_LIMIT}"
         },
+        "extraEnv": {
+            "NVCF_DISABLE_PROXY_CACHE": "true"
+        },
         "metrics": {
           "remoteWrite": {
             "endpoint": "${HELM_THANOS_RECEIVER_URL}"

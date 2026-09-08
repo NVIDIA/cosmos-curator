@@ -32,8 +32,10 @@ CURATOR_IO_RESOURCE_NAME = "curator_io"
 CURATOR_IO_SLOTS_PER_NODE_ENV_VAR = "COSMOS_CURATOR_RAY_IO_SLOTS_PER_NODE"
 DEFAULT_CURATOR_IO_SLOTS_PER_NODE = 16
 
-# Where pipeline code is located.
-CONTAINER_PATHS_CODE_DIR = pathlib.Path("/opt/cosmos-curator")
+# Where pipeline code is located. Overridable so tooling can run against a local checkout
+# (e.g. `COSMOS_CURATOR_CODE_DIR=$(pwd) python -m cosmos_curator.core.managers.model_cli ...`)
+# instead of requiring a symlink or bind mount at /opt/cosmos-curator.
+CONTAINER_PATHS_CODE_DIR = pathlib.Path(os.getenv("COSMOS_CURATOR_CODE_DIR", "/opt/cosmos-curator"))
 
 # Local cosmos_curator config file path.
 LOCAL_COSMOS_CURATOR_CONFIG_FILE = pathlib.Path("~/.config/cosmos_curator/config.yaml").expanduser()
