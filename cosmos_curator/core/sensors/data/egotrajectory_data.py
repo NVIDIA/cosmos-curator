@@ -102,6 +102,11 @@ class EgoTrajectory:
     ``frame``. ``as_homogeneous_matrices`` provides the equivalent row-major
     ``(N, 4, 4)`` transforms for matrix-based consumers.
 
+    Quaternion signs are preserved from the source and are not guaranteed to
+    be hemisphere-aligned across rows: ``q`` and ``-q`` represent the same
+    rotation. Consumers that interpolate, differentiate, or otherwise operate
+    directly in quaternion space must align consecutive valid rows themselves.
+
     Satisfies ``SensorData`` (``cosmos_curator.core.sensors.data.sensor_data``).
     """
 

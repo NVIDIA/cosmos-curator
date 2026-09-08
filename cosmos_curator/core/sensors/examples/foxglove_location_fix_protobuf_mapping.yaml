@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Mapping for a valid-only ``foxglove.LocationFix`` MCAP channel. The MCAP
-# ``log_time`` is the sensor timestamp; ``align_timestamp_ns`` is intentionally
-# omitted so the GPS sensor defaults it to that mapped timestamp.
+# Mapping for a valid-only ``foxglove.LocationFix`` MCAP channel. The embedded
+# Foxglove ``timestamp`` is the sensor timestamp; ``align_timestamp_ns`` is
+# intentionally omitted so the GPS sensor defaults it to that mapped timestamp.
 #
 # The Foxglove writer only emits usable position fixes, so every output position
 # component is marked valid. LocationFix covariance, heading, velocity, and
@@ -24,9 +24,8 @@
 
 fields:
   sensor_timestamp_ns:
-    from: $mcap.logtime
-    type: timestamp
-    unit: ns
+    from: timestamp
+    type: protobuf_timestamp
 
   latitude_deg:
     from: latitude

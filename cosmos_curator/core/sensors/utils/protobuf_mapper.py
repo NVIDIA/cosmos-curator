@@ -31,11 +31,15 @@ _OUTPUT_TYPES: Mapping[str, type[object]] = {
     "int": int,
     "bool": bool,
     "timestamp": int,
+    "protobuf_timestamp": int,
 }
 _SUPPORTED_TYPES = frozenset(_OUTPUT_TYPES)
 _TIMESTAMP_UNITS_TO_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
 _MCAP_LOGTIME_SOURCE = "$mcap.logtime"
+_PROTOBUF_TIMESTAMP_FULL_NAME = "google.protobuf.Timestamp"
 _SENSOR_TIMESTAMP_FIELDS = ("sensor_timestamp_ns", "sensor_timestamps_ns")
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 PROTOBUF_NUMERIC_TYPES = frozenset(
     {
         FieldDescriptor.TYPE_DOUBLE,
@@ -205,6 +209,15 @@ class ProtobufRowMapper[Target]:
                     allow_terminal_repeated=not mapping.is_group,
                 )
                 validate_valid_when_source(mapping, source_name, source_field.type)
+                if mapping.value_type == "protobuf_timestamp" and (
+                    source_field.message_type is None
+                    or source_field.message_type.full_name != _PROTOBUF_TIMESTAMP_FULL_NAME
+                ):
+                    msg = (
+                        f"fields.{mapping.target_name} uses type 'protobuf_timestamp', but source "
+                        f"{source_name!r} is not {_PROTOBUF_TIMESTAMP_FULL_NAME}"
+                    )
+                    raise ValueError(msg)
                 if (
                     mapping.value_type == "bool"
                     and mapping.valid_when_equals is MISSING
@@ -365,6 +378,9 @@ def parse_one_mapping(target_name: str, raw_mapping: object) -> FieldMapping:
             raise ValueError(msg)
     elif unit is not None:
         msg = f"fields.{target_name}.unit is only valid for timestamp mappings"
+        raise ValueError(msg)
+    if value_type == "protobuf_timestamp" and (group is not None or has_default or source_name == _MCAP_LOGTIME_SOURCE):
+        msg = f"fields.{target_name} type 'protobuf_timestamp' requires one protobuf message source, not MCAP metadata"
         raise ValueError(msg)
     valid_when_equals = _parse_valid_when_equals(
         raw_spec.get("valid_when"),
@@ -572,20 +588,25 @@ def _materialize_collection(values: Sequence[object], annotation: object, target
 
 def _convert_value(value: object, mapping: FieldMapping) -> object:
     if mapping.value_type is None:
-        return value
-    if mapping.valid_when_equals is not MISSING:
-        return value == mapping.valid_when_equals
-    if mapping.value_type == "float":
-        return _convert_float(value, mapping.target_name)
-    if mapping.value_type == "int":
-        return _convert_int(value, mapping.target_name)
-    if mapping.value_type == "bool":
+        converted = value
+    elif mapping.valid_when_equals is not MISSING:
+        converted = value == mapping.valid_when_equals
+    elif mapping.value_type == "float":
+        converted = _convert_float(value, mapping.target_name)
+    elif mapping.value_type == "int":
+        converted = _convert_int(value, mapping.target_name)
+    elif mapping.value_type == "bool":
         if isinstance(value, bool):
-            return value
-        msg = f"fields.{mapping.target_name} requires a bool value; use valid_when for numeric validity fields"
-        raise ValueError(msg)
-    unit = cast("str", mapping.unit)
-    return _timestamp_to_ns(value, unit, mapping.target_name)
+            converted = value
+        else:
+            msg = f"fields.{mapping.target_name} requires a bool value; use valid_when for numeric validity fields"
+            raise ValueError(msg)
+    elif mapping.value_type == "protobuf_timestamp":
+        converted = _protobuf_timestamp_to_ns(value, mapping.target_name)
+    else:
+        unit = cast("str", mapping.unit)
+        converted = _timestamp_to_ns(value, unit, mapping.target_name)
+    return converted
 
 
 def _convert_float(value: object, target_name: str) -> float:
@@ -640,6 +661,23 @@ def _timestamp_to_ns(value: object, unit: str, target_name: str) -> int:
         )
         raise ValueError(msg)
     return result
+
+
+def _protobuf_timestamp_to_ns(value: object, target_name: str) -> int:
+    """Convert one ``google.protobuf.Timestamp`` message to integer nanoseconds."""
+    if not isinstance(value, Message) or value.DESCRIPTOR.full_name != _PROTOBUF_TIMESTAMP_FULL_NAME:
+        msg = f"fields.{target_name} requires a {_PROTOBUF_TIMESTAMP_FULL_NAME} value"
+        raise ValueError(msg)
+    seconds = cast("int", value.seconds)
+    nanos = cast("int", value.nanos)
+    if not 0 <= nanos < _TIMESTAMP_UNITS_TO_NS["s"]:
+        msg = f"fields.{target_name} protobuf timestamp nanos must be in [0, 1000000000), got {nanos}"
+        raise ValueError(msg)
+    timestamp_ns = seconds * _TIMESTAMP_UNITS_TO_NS["s"] + nanos
+    if not _INT64_MIN <= timestamp_ns <= _INT64_MAX:
+        msg = f"fields.{target_name} protobuf timestamp does not fit int64 nanoseconds"
+        raise ValueError(msg)
+    return timestamp_ns
 
 
 def _prepare_target_defaults(

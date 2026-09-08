@@ -272,6 +272,10 @@ def test_gps_sensor_reads_foxglove_location_fix_with_yaml_mapping(tmp_path: Path
     path = tmp_path / "foxglove_location_fix.mcap"
     first = LocationFix(latitude=37.402255555555556, longitude=-122.25870916666666, altitude=79.14180564880371)
     second = LocationFix(latitude=37.4023, longitude=-122.2588, altitude=79.2)
+    first.timestamp.seconds = 1_696_434_500
+    first.timestamp.nanos = 123
+    second.timestamp.seconds = 1_696_434_501
+    second.timestamp.nanos = 456
     _write_custom_gps_mcap(
         path,
         [
@@ -298,7 +302,7 @@ def test_gps_sensor_reads_foxglove_location_fix_with_yaml_mapping(tmp_path: Path
 
     np.testing.assert_array_equal(
         batch.sensor_timestamps_ns,
-        np.array([1_696_434_428_000_000_000, 1_696_434_429_000_000_000], dtype=np.int64),
+        np.array([1_696_434_500_000_000_123, 1_696_434_501_000_000_456], dtype=np.int64),
     )
     np.testing.assert_array_equal(batch.align_timestamps_ns, batch.sensor_timestamps_ns)
     np.testing.assert_allclose(batch.latitude_deg, np.array([37.402255555555556, 37.4023]))

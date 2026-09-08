@@ -22,6 +22,7 @@ from typing import Any
 import attrs
 import pytest
 import yaml
+from foxglove_schemas_protobuf.PoseInFrame_pb2 import PoseInFrame
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.message import Message
 
@@ -679,6 +680,91 @@ def test_protobuf_row_mapper_preserves_integer_timestamp_precision() -> None:
     row = mapper(_message(epoch_ns=epoch_ns))
 
     assert row.sensor_timestamp_ns == epoch_ns
+
+
+@pytest.mark.parametrize(
+    ("seconds", "nanos", "expected_ns"),
+    [
+        (1, 23, 1_000_000_023),
+        (-1, 999_999_999, -1),
+    ],
+)
+def test_protobuf_row_mapper_converts_protobuf_timestamp_to_nanoseconds(
+    seconds: int,
+    nanos: int,
+    expected_ns: int,
+) -> None:
+    """A standard Timestamp message should preserve second/nanosecond precision."""
+    mapper = ProtobufRowMapper(
+        {"fields": {"sensor_timestamp_ns": {"from": "timestamp", "type": "protobuf_timestamp"}}},
+        target_cls=_TimestampRow,
+        message_cls=PoseInFrame,
+    )
+    message = PoseInFrame()
+    message.timestamp.seconds = seconds
+    message.timestamp.nanos = nanos
+
+    assert mapper(message) == _TimestampRow(sensor_timestamp_ns=expected_ns)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "nanos", "error"),
+    [
+        (1, 1_000_000_000, r"nanos must be in \[0, 1000000000\)"),
+        (9_223_372_037, 0, "does not fit int64 nanoseconds"),
+        (-9_223_372_037, 0, "does not fit int64 nanoseconds"),
+    ],
+)
+def test_protobuf_row_mapper_rejects_invalid_protobuf_timestamp_values(
+    seconds: int,
+    nanos: int,
+    error: str,
+) -> None:
+    """Malformed or unrepresentable Timestamp values should fail clearly."""
+    mapper = ProtobufRowMapper(
+        {"fields": {"sensor_timestamp_ns": {"from": "timestamp", "type": "protobuf_timestamp"}}},
+        target_cls=_TimestampRow,
+        message_cls=PoseInFrame,
+    )
+    message = PoseInFrame()
+    message.timestamp.seconds = seconds
+    message.timestamp.nanos = nanos
+
+    with pytest.raises(ValueError, match=error):
+        mapper(message)
+
+
+def test_protobuf_row_mapper_rejects_non_timestamp_protobuf_timestamp_source() -> None:
+    """The protobuf timestamp conversion accepts only the standard message type."""
+    with pytest.raises(ValueError, match=r"is not google\.protobuf\.Timestamp"):
+        ProtobufRowMapper(
+            {
+                "fields": {
+                    "sensor_timestamp_ns": {
+                        "from": "sensor_timestamp_us",
+                        "type": "protobuf_timestamp",
+                    }
+                }
+            },
+            target_cls=_TimestampRow,
+            message_cls=_message_class(),
+        )
+
+
+def test_protobuf_row_mapper_rejects_mcap_metadata_protobuf_timestamp_source() -> None:
+    """Protobuf timestamp conversion must not be configured with MCAP log time."""
+    with pytest.raises(ValueError, match="requires one protobuf message source, not MCAP metadata"):
+        ProtobufRowMapper(
+            {
+                "fields": {
+                    "sensor_timestamp_ns": {
+                        "from": "$mcap.logtime",
+                        "type": "protobuf_timestamp",
+                    }
+                }
+            },
+            target_cls=_TimestampRow,
+        )
 
 
 @pytest.mark.parametrize(

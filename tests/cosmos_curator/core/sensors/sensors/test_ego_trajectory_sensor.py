@@ -18,7 +18,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from foxglove_schemas_protobuf.PoseInFrame_pb2 import PoseInFrame
 from google.protobuf import descriptor_pb2
+from google.protobuf.descriptor import FileDescriptor
 
 from cosmos_curator.core.sensors.sensors.ego_trajectory_sensor import (
     DEFAULT_FRAME,
@@ -40,11 +42,64 @@ _REFERENCE_MAPPING_PATH = (
 )
 _REFERENCE_PROTO_PATH = _REPO_ROOT / "cosmos_curator" / "core" / "sensors" / "schemas" / "egotrajectory.proto"
 _IDENTITY_ORIENTATION_XYZW = (0.0, 0.0, 0.0, 1.0)
+_FOXGLOVE_SCHEMA_NAME = "foxglove.PoseInFrame"
+_FOXGLOVE_TOPIC = "/foxglove/egotrajectory"
+_FOXGLOVE_MAPPING_PATH = (
+    _REPO_ROOT
+    / "cosmos_curator"
+    / "core"
+    / "sensors"
+    / "examples"
+    / "foxglove_pose_in_frame_egotrajectory_mapping.yaml"
+)
 
 
 def _reference_descriptor_set() -> descriptor_pb2.FileDescriptorSet:
     """Build the descriptor set for the checked-in reference ego-trajectory schema."""
     return protobuf_descriptor_set_from_proto(_REFERENCE_PROTO_PATH)
+
+
+def _foxglove_pose_in_frame_descriptor_set() -> descriptor_pb2.FileDescriptorSet:
+    """Build a complete descriptor set from Foxglove's official definition."""
+    descriptor_set = descriptor_pb2.FileDescriptorSet()
+    added_files: set[str] = set()
+
+    def add_file_descriptor(file_descriptor: FileDescriptor) -> None:
+        file_name = file_descriptor.name
+        if file_name in added_files:
+            return
+        for dependency in file_descriptor.dependencies:
+            add_file_descriptor(dependency)
+        file_descriptor.CopyToProto(descriptor_set.file.add())
+        added_files.add(file_name)
+
+    add_file_descriptor(PoseInFrame.DESCRIPTOR.file)
+    return descriptor_set
+
+
+def _foxglove_pose_in_frame_payload(
+    *,
+    timestamp_ns: int,
+    frame_id: str,
+    position_m: tuple[float, float, float],
+    orientation_xyzw: tuple[float, float, float, float],
+) -> bytes:
+    """Serialize one official Foxglove PoseInFrame message."""
+    message = PoseInFrame(frame_id=frame_id)
+    message.timestamp.seconds = timestamp_ns // 1_000_000_000
+    message.timestamp.nanos = timestamp_ns % 1_000_000_000
+    message.pose.position.x, message.pose.position.y, message.pose.position.z = position_m
+    message.pose.orientation.x, message.pose.orientation.y = orientation_xyzw[:2]
+    message.pose.orientation.z, message.pose.orientation.w = orientation_xyzw[2:]
+    return bytes(message.SerializeToString())
+
+
+def _foxglove_pose_in_frame_without_pose_payload(*, timestamp_ns: int, frame_id: str) -> bytes:
+    """Serialize a Foxglove message with its proto3-default pose left unset."""
+    message = PoseInFrame(frame_id=frame_id)
+    message.timestamp.seconds = timestamp_ns // 1_000_000_000
+    message.timestamp.nanos = timestamp_ns % 1_000_000_000
+    return bytes(message.SerializeToString())
 
 
 def _reference_payload(
@@ -65,7 +120,7 @@ def _reference_payload(
     sample.position_m.extend(position_m)
     sample.orientation_xyzw.extend(orientation_xyzw)
     sample.pose_valid = pose_valid
-    return sample.SerializeToString()
+    return bytes(sample.SerializeToString())
 
 
 def _write_reference_mcap(path: Path, samples: list[McapSample]) -> None:
@@ -144,6 +199,87 @@ def test_ego_trajectory_sensor_reads_reference_schema_with_checked_in_mapping(tm
         np.array([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, half_sqrt, half_sqrt]]),
     )
     assert batch.frame == DEFAULT_FRAME
+
+
+def test_ego_trajectory_sensor_reads_foxglove_pose_in_frame_with_checked_in_mapping(tmp_path: Path) -> None:
+    """The Foxglove YAML maps one PoseInFrame message into one trajectory row."""
+    path = tmp_path / "foxglove_pose_in_frame.mcap"
+    write_protobuf_mcap(
+        path,
+        [
+            McapSample(
+                log_time_ns=100,
+                data=_foxglove_pose_in_frame_payload(
+                    timestamp_ns=10_000,
+                    frame_id="arbitrary_upstream_frame",
+                    position_m=(1.0, 2.0, 3.0),
+                    orientation_xyzw=(0.0, 0.0, float(np.sqrt(0.5)), float(np.sqrt(0.5))),
+                ),
+            ),
+            McapSample(
+                log_time_ns=200,
+                data=_foxglove_pose_in_frame_payload(
+                    timestamp_ns=20_000,
+                    frame_id="another_upstream_frame",
+                    position_m=(4.0, 5.0, 6.0),
+                    orientation_xyzw=_IDENTITY_ORIENTATION_XYZW,
+                ),
+            ),
+        ],
+        topic=_FOXGLOVE_TOPIC,
+        schema_name=_FOXGLOVE_SCHEMA_NAME,
+        schema_data=_foxglove_pose_in_frame_descriptor_set().SerializeToString(),
+        library="cosmos_curator Foxglove PoseInFrame sensor test",
+    )
+
+    sensor = EgoTrajectorySensor(
+        path,
+        topic=_FOXGLOVE_TOPIC,
+        schema_name=_FOXGLOVE_SCHEMA_NAME,
+        protobuf_mapping=_FOXGLOVE_MAPPING_PATH,
+    )
+    batch = next(sensor.sample(one_window_spec(100, 300)))
+
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([10_000, 20_000], dtype=np.int64))
+    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([10_000, 20_000], dtype=np.int64))
+    np.testing.assert_allclose(batch.positions_m, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+    half_sqrt = float(np.sqrt(0.5))
+    np.testing.assert_allclose(
+        batch.orientations_xyzw,
+        np.array([[0.0, 0.0, half_sqrt, half_sqrt], _IDENTITY_ORIENTATION_XYZW]),
+    )
+    np.testing.assert_array_equal(batch.pose_valid, np.array([True, True], dtype=np.bool_))
+    assert batch.frame == DEFAULT_FRAME
+
+
+def test_ego_trajectory_sensor_rejects_foxglove_pose_in_frame_without_pose(tmp_path: Path) -> None:
+    """An unset Foxglove pose must not be silently converted to a trajectory row."""
+    path = tmp_path / "foxglove_pose_in_frame_without_pose.mcap"
+    write_protobuf_mcap(
+        path,
+        [
+            McapSample(
+                log_time_ns=100,
+                data=_foxglove_pose_in_frame_without_pose_payload(
+                    timestamp_ns=10_000,
+                    frame_id="arbitrary_upstream_frame",
+                ),
+            ),
+        ],
+        topic=_FOXGLOVE_TOPIC,
+        schema_name=_FOXGLOVE_SCHEMA_NAME,
+        schema_data=_foxglove_pose_in_frame_descriptor_set().SerializeToString(),
+        library="cosmos_curator Foxglove PoseInFrame sensor test",
+    )
+    sensor = EgoTrajectorySensor(
+        path,
+        topic=_FOXGLOVE_TOPIC,
+        schema_name=_FOXGLOVE_SCHEMA_NAME,
+        protobuf_mapping=_FOXGLOVE_MAPPING_PATH,
+    )
+
+    with pytest.raises(ValueError, match=r"fields\.position_m path 'pose\.position\.x' was not found"):
+        next(sensor.sample(one_window_spec(100, 200)))
 
 
 def test_ego_trajectory_sensor_preserves_invalid_identity_poses(tmp_path: Path) -> None:
