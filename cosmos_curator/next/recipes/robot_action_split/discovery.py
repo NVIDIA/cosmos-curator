@@ -24,7 +24,8 @@ Discovery phases
 2. Per-shard prep     -- read meta/info.json, subtasks.parquet, tasks.parquet;
                          discover videos/ view dirs; list data chunk files.
 3. Segment build      -- per data file: read data parquet + episode parquets;
-                         numpy diff-based subtask boundary detection.
+                         project episode metadata; numpy diff-based subtask
+                         boundary detection.
 4. Filter + dedup     -- duration bounds, label skip, per-episode dedup.
 """
 
@@ -96,9 +97,10 @@ class SpanWorkItem:
     subtask_name: str
     task_index: int
     task_name: str
+    task_description: str | None
     # False when subtask_name stands in from task_name because the shard offers no
     # subtask label. Such spans share one name without describing one action, so
-    # per-description dedup must not read them as repeats of each other.
+    # per-subtask-label dedup must not read them as repeats of each other.
     subtask_label_resolved: bool
 
     # Episode identity
@@ -499,17 +501,45 @@ def _synthetic_episode_id(shard_name: str, episode_index: int) -> str:
     return f"{shard_name}:{episode_index}"
 
 
+def _validate_task_description_field(
+    schema: pa.Schema,
+    source: str | io.BytesIO,
+    shard_name: str,
+) -> None:
+    """Require an optional ``task_description`` field to carry Arrow text."""
+    if "task_description" not in schema.names:
+        return
+    description_type = schema.field("task_description").type
+    if _holds_text(description_type):
+        return
+    source_name = source if isinstance(source, str) else f"{shard_name}/meta/episodes parquet"
+    msg = (
+        f"{source_name}: task_description must use an Arrow text type "
+        f"(string, large_string, string_view, or dictionary thereof), got {description_type}"
+    )
+    raise ValueError(msg)
+
+
 def _parse_episode_parquet(
     source: str | io.BytesIO,
     view_names: list[str],
     meta: dict[int, dict[str, Any]],
     shard_name: str = "",
 ) -> dict[int, dict[str, Any]]:
-    """Parse one episode parquet file and merge its rows into *meta*."""
-    schema_names = set(pq.read_schema(source).names)
+    """Parse one episode parquet file and merge its rows into *meta*.
+
+    Preserve nullable ``task_description`` text exactly and reject non-text columns.
+    """
+    schema = pq.read_schema(source)
+    schema_names = set(schema.names)
+    _validate_task_description_field(schema, source, shard_name)
     if isinstance(source, io.BytesIO):
         source.seek(0)
-    cols = [c for c in ("episode_index", "episode_id", "camera_intrinsics", "dataset_from_index") if c in schema_names]
+    cols = [
+        c
+        for c in ("episode_index", "episode_id", "camera_intrinsics", "dataset_from_index", "task_description")
+        if c in schema_names
+    ]
     for v in view_names:
         for suffix in ("chunk_index", "file_index", "from_timestamp"):
             col = f"videos/{v}/{suffix}"
@@ -542,6 +572,7 @@ def _parse_episode_parquet(
             "episode_id": str(d["episode_id"][i]) if "episode_id" in d else _synthetic_episode_id(shard_name, ep),
             "camera_intrinsics": [float(x) for x in intrinsics] if intrinsics is not None else None,
             "dataset_from_index": int(d["dataset_from_index"][i]) if "dataset_from_index" in d else 0,
+            "task_description": d["task_description"][i] if "task_description" in d else None,
             "views": views_info,
         }
     return meta
@@ -755,6 +786,7 @@ def _build_segments_for_file(  # noqa: PLR0913
                         subtask_name=subtask_name,
                         task_index=t_idx,
                         task_name=task_name,
+                        task_description=meta.get("task_description"),
                         subtask_label_resolved=subtask_labels is not None,
                         episode_id=str(meta["episode_id"]),
                         camera_intrinsics=meta.get("camera_intrinsics"),
@@ -793,9 +825,9 @@ def _filter_by_duration(items: list[SpanWorkItem], cfg: SpanFilterConfig) -> lis
 
 
 def _dedup(items: list[SpanWorkItem], cfg: SpanFilterConfig) -> list[SpanWorkItem]:
-    """Per-episode dedup: keep at most max_keep_per_description spans per description.
+    """Keep at most ``max_keep_per_description`` spans per episode and subtask label.
 
-    Two subtask indices sharing one label are one description and compete for the
+    Two subtask indices sharing one label are one dedup group and compete for the
     same allowance. A span whose label only stands in for a missing subtask label
     describes nothing, so it competes with no one.
     """

@@ -42,6 +42,7 @@ CLIP_SCHEMA = pa.schema(
         pa.field("subtask_name", pa.string(), nullable=False),
         pa.field("task_index", pa.int32(), nullable=False),
         pa.field("task_name", pa.string(), nullable=False),
+        pa.field("task_description", pa.large_string(), nullable=True),
         pa.field("frame_start", pa.int32(), nullable=False),
         pa.field("frame_end", pa.int32(), nullable=False),
         pa.field("start_ns", pa.int64(), nullable=False),

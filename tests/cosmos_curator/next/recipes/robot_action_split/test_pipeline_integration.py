@@ -50,6 +50,7 @@ import pickle
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import lance
@@ -63,15 +64,21 @@ from cosmos_curator.next.recipes.robot_action_split.contracts import (
     CLIP_RECORD_SCHEMA_VERSION,
     MEDIA_CONTRACT_VERSION,
 )
-from cosmos_curator.next.recipes.robot_action_split.discovery import discover_spans
+from cosmos_curator.next.recipes.robot_action_split.discovery import SpanWorkItem, discover_spans
 from cosmos_curator.next.recipes.robot_action_split.lance_sink import (
     append_clip_fragment,
     open_or_create_clip_table,
     write_clip_fragment,
 )
 from cosmos_curator.next.recipes.robot_action_split.pipeline import _publish_outcomes, run
-from cosmos_curator.next.recipes.robot_action_split.processing import process_batch
+from cosmos_curator.next.recipes.robot_action_split.processing import (
+    _build_sidecar_bytes,
+    _make_base_fields,
+    process_batch,
+)
 from cosmos_curator.next.recipes.robot_action_split.records import clip_table
+
+_SOURCE_TASK_DESCRIPTION = "  A person prepares coffee by loading a pod and opening the machine.\n"
 
 
 def _write_outcomes(outcomes: list[dict], *, lance_uri: str) -> int:
@@ -194,6 +201,10 @@ def _write_dataset(root: Path) -> Path:
             {
                 "episode_index": pa.array([0], type=pa.int64()),
                 "episode_id": pa.array(["ep_000"]),
+                "task_description": pa.array(
+                    [_SOURCE_TASK_DESCRIPTION],
+                    type=pa.large_string(),
+                ),
                 "videos/observation.images.main/chunk_index": pa.array([0], type=pa.int64()),
                 "videos/observation.images.main/file_index": pa.array([0], type=pa.int64()),
                 "videos/observation.images.main/from_timestamp": pa.array([0.0]),
@@ -294,6 +305,51 @@ def output_path(tmp_path: Path) -> Path:
     return out
 
 
+@pytest.fixture
+def span_work_item_fields() -> dict[str, Any]:
+    """Return fields for one item carrying a whitespace-sensitive description."""
+    return {
+        "source_id": "source-0",
+        "span_group_id": "span-0",
+        "clip_id": "clip-0",
+        "view_name": "observation.images.main",
+        "chunk_mp4_uri": "chunk.mp4",
+        "data_parquet_uri": "data.parquet",
+        "episode_index": 0,
+        "episode_frame_base": 0,
+        "frame_start": 0,
+        "frame_end": 100,
+        "native_fps": 24.0,
+        "episode_from_timestamp": 0.0,
+        "subtask_index": 0,
+        "subtask_name": "pick up coffee pod",
+        "task_index": 0,
+        "task_name": "make coffee",
+        "task_description": "  Prepare coffee without spilling.\n",
+        "subtask_label_resolved": True,
+        "episode_id": "ep_000",
+        "camera_intrinsics": None,
+    }
+
+
+def test_base_outcome_fields_include_task_description(span_work_item_fields: dict[str, Any]) -> None:
+    """Verify common outcome fields carry descriptions to success and failure rows."""
+    span_work_item = SpanWorkItem(**span_work_item_fields)
+    fields = _make_base_fields(span_work_item, "test_dataset")
+
+    assert fields["task_description"] == span_work_item.task_description
+
+
+def test_sidecar_places_task_description_after_task_name(span_work_item_fields: dict[str, Any]) -> None:
+    """Verify the JSON sidecar preserves the description and its key position."""
+    span_work_item = SpanWorkItem(**span_work_item_fields)
+    sidecar = json.loads(_build_sidecar_bytes(span_work_item, "clip.mp4", "action.bin"))
+    keys = list(sidecar)
+
+    assert sidecar["task_description"] == span_work_item.task_description
+    assert keys.index("task_description") == keys.index("task_name") + 1
+
+
 def test_discovery_finds_two_spans(dataset: Path, output_path: Path) -> None:
     """Stage 1: parquet discovery emits exactly two spans with correct geometry.
 
@@ -309,6 +365,7 @@ def test_discovery_finds_two_spans(dataset: Path, output_path: Path) -> None:
 
     subtask_names = {item.subtask_name for item in items}
     assert subtask_names == {"pick up coffee pod", "open machine lid"}
+    assert all(item.task_description == _SOURCE_TASK_DESCRIPTION for item in items)
 
     # Geometry: each span covers _FRAMES_PER_SUBTASK frames.
     for item in items:
@@ -367,6 +424,7 @@ def test_cut_produces_clips_and_action_files(dataset: Path, output_path: Path) -
     failed = [o for o in outcomes if o["status"] != "success"]
     assert not failed, f"Unexpected failures: {failed}"
     assert len(succeeded) == 2
+    assert all(outcome["task_description"] == _SOURCE_TASK_DESCRIPTION for outcome in succeeded)
 
     for outcome in succeeded:
         # Clip MP4 exists and is non-empty.
@@ -384,6 +442,7 @@ def test_cut_produces_clips_and_action_files(dataset: Path, output_path: Path) -
         sidecar = json.loads(sidecar_path.read_text())
         assert sidecar["clip_uuid"] == outcome["clip_id"]
         assert sidecar["span_group_uuid"] == outcome["span_group_id"]
+        assert sidecar["task_description"] == _SOURCE_TASK_DESCRIPTION
 
     # Action data contains the correct frame count.
     for outcome in succeeded:
@@ -437,6 +496,8 @@ def test_lance_write_produces_correct_rows(dataset: Path, output_path: Path) -> 
     # subtask names are what we put in the parquet.
     subtask_names = set(table.column("subtask_name").to_pylist())
     assert subtask_names == {"pick up coffee pod", "open machine lid"}
+    assert table.column("task_description").to_pylist() == [_SOURCE_TASK_DESCRIPTION, _SOURCE_TASK_DESCRIPTION]
+    assert table.column("record_schema_version").to_pylist() == [4, 4]
 
     # The transaction identifies the producing recipe and operation.
     txn = ds.read_transaction(version)

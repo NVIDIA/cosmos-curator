@@ -72,6 +72,7 @@ VIEW = "observation.images.main"
 TASK_INDEX = 0
 DEFAULT_TASKS: Mapping[int, str] = {TASK_INDEX: "make coffee"}
 DEFAULT_SUBTASKS: Mapping[int, str] = {0: "pick up coffee pod", 1: "open machine lid"}
+DEFAULT_TASK_DESCRIPTION = "A person makes coffee at a counter."
 
 LabelWriter = Callable[[Path, Mapping[int, str], str], None]
 
@@ -119,6 +120,8 @@ def _write_shard(
     tasks: Mapping[int, str] = DEFAULT_TASKS,
     subtasks: Mapping[int, str] | None = DEFAULT_SUBTASKS,
     span_subtask_indices: Sequence[int] | None = None,
+    task_description: str | None = DEFAULT_TASK_DESCRIPTION,
+    include_task_description: bool = True,
 ) -> Path:
     """Write one video-free LeRobot/Mecka shard and return its directory.
 
@@ -132,6 +135,9 @@ def _write_shard(
         span_subtask_indices: One contiguous span per entry, in order. Defaults
             to one span per key of *subtasks*. Naming an index absent from
             *subtasks* builds a span no label can resolve.
+        task_description: Episode-level description value, including ``None``.
+        include_task_description: Whether the episode parquet declares the
+            optional ``task_description`` column.
 
     Returns:
         The shard directory.
@@ -147,20 +153,21 @@ def _write_shard(
 
     episodes = meta / "episodes" / "chunk-000"
     episodes.mkdir(parents=True)
+    episode_columns = {
+        "episode_index": pa.array([0], type=pa.int64()),
+        # Distinct per shard: span_group_id hashes (source_id, episode_id,
+        # subtask_index, frame_start) and source_id covers the whole
+        # dataset root, so a shared episode_id would collide span_group_id
+        # and clip_id between shards.
+        "episode_id": pa.array([f"{shard_dir.name}_ep_000"]),
+        f"videos/{VIEW}/chunk_index": pa.array([0], type=pa.int64()),
+        f"videos/{VIEW}/file_index": pa.array([0], type=pa.int64()),
+        f"videos/{VIEW}/from_timestamp": pa.array([0.0]),
+    }
+    if include_task_description:
+        episode_columns["task_description"] = pa.array([task_description], type=pa.large_string())
     pq.write_table(
-        pa.table(
-            {
-                "episode_index": pa.array([0], type=pa.int64()),
-                # Distinct per shard: span_group_id hashes (source_id, episode_id,
-                # subtask_index, frame_start) and source_id covers the whole
-                # dataset root, so a shared episode_id would collide span_group_id
-                # and clip_id between shards.
-                "episode_id": pa.array([f"{shard_dir.name}_ep_000"]),
-                f"videos/{VIEW}/chunk_index": pa.array([0], type=pa.int64()),
-                f"videos/{VIEW}/file_index": pa.array([0], type=pa.int64()),
-                f"videos/{VIEW}/from_timestamp": pa.array([0.0]),
-            }
-        ),
+        pa.table(episode_columns),
         str(episodes / "file-000.parquet"),
     )
 
@@ -247,6 +254,15 @@ def _renumber_the_only_episode(shard: Path, episode_index: int) -> None:
         pa.array([episode_index], type=pa.int64()),
     )
     pq.write_table(renumbered, str(path))
+
+
+def _replace_episode_task_description(shard: Path, values: pa.Array) -> None:
+    """Replace the only episode parquet's ``task_description`` column."""
+    path = shard / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(path)
+    field_index = table.schema.get_field_index("task_description")
+    replaced = table.set_column(field_index, "task_description", values)
+    pq.write_table(replaced, str(path))
 
 
 @every_writer_shape
@@ -444,6 +460,91 @@ def test_same_task_index_in_two_shards_resolves_against_its_own_shard(tmp_path: 
     items = _discovered(_make_config(root))
 
     assert {item.task_name for item in items} == {"applying stickers", "applying nail polish"}
+
+
+@pytest.mark.parametrize("description", ["", "  Keep source whitespace.\n"])
+def test_episode_task_description_preserves_exact_text(description: str, tmp_path: Path) -> None:
+    """Verify discovery preserves description text without stripping or substitution."""
+    shard = _write_shard(
+        tmp_path / "dataset" / "shard_00",
+        task_description=description,
+    )
+
+    items = _discovered(_make_config(shard.parent))
+
+    assert {item.task_description for item in items} == {description}
+
+
+def test_episode_without_task_description_column_emits_none(tmp_path: Path) -> None:
+    """Verify a missing optional description column emits ``None``."""
+    shard = _write_shard(
+        tmp_path / "dataset" / "shard_00",
+        include_task_description=False,
+    )
+
+    items = _discovered(_make_config(shard.parent))
+
+    assert {item.task_description for item in items} == {None}
+
+
+def test_null_episode_task_description_emits_none(tmp_path: Path) -> None:
+    """Verify a source-null episode description remains ``None`` on every span."""
+    shard = _write_shard(
+        tmp_path / "dataset" / "shard_00",
+        task_description=None,
+    )
+
+    items = _discovered(_make_config(shard.parent))
+
+    assert {item.task_description for item in items} == {None}
+
+
+def test_non_text_episode_task_description_raises(tmp_path: Path) -> None:
+    """Verify a non-text episode description column fails clearly."""
+    shard = _write_shard(tmp_path / "dataset" / "shard_00")
+    _replace_episode_task_description(shard, pa.array([7], type=pa.int64()))
+
+    with pytest.raises(ValueError, match=r"task_description.*Arrow text"):
+        _discovered(_make_config(shard.parent))
+
+
+def test_episode_task_descriptions_are_isolated_per_shard(tmp_path: Path) -> None:
+    """Verify each shard resolves episode descriptions against its own metadata."""
+    root = tmp_path / "dataset"
+    _write_shard(root / "shard_00", task_description="First shard description.")
+    _write_shard(root / "shard_01", task_description="Second shard description.")
+
+    items = _discovered(_make_config(root))
+
+    assert len(items) == 4
+    descriptions_by_row = {
+        (item.episode_id, item.subtask_index, item.view_name): item.task_description for item in items
+    }
+    assert len(descriptions_by_row) == len(items)
+    assert descriptions_by_row == {
+        ("shard_00_ep_000", 0, VIEW): "First shard description.",
+        ("shard_00_ep_000", 1, VIEW): "First shard description.",
+        ("shard_01_ep_000", 0, VIEW): "Second shard description.",
+        ("shard_01_ep_000", 1, VIEW): "Second shard description.",
+    }
+
+
+def test_changing_only_task_description_leaves_ids_unchanged(tmp_path: Path) -> None:
+    """Verify descriptive metadata does not participate in span or clip identity."""
+    shard = _write_shard(
+        tmp_path / "dataset" / "shard_00",
+        task_description="Original description.",
+    )
+    original = _discovered(_make_config(shard.parent))
+
+    _replace_episode_task_description(shard, pa.array(["Revised description."], type=pa.large_string()))
+    revised = _discovered(_make_config(shard.parent))
+
+    assert {item.task_description for item in original} == {"Original description."}
+    assert {item.task_description for item in revised} == {"Revised description."}
+    assert [(item.span_group_id, item.clip_id) for item in revised] == [
+        (item.span_group_id, item.clip_id) for item in original
+    ]
 
 
 def test_default_filters_drop_their_configured_labels(tmp_path: Path) -> None:

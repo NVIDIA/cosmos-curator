@@ -56,17 +56,24 @@ from cosmos_curator.next.recipes.robot_action_split.lance_sink import (
     open_or_create_clip_table,
     write_clip_fragment,
 )
-from cosmos_curator.next.recipes.robot_action_split.records import clip_table
+from cosmos_curator.next.recipes.robot_action_split.records import CLIP_SCHEMA, clip_table, error_records
 
 
-def _make_outcome(clip_id: str, *, clip_uri: str | None = None, action_data_uri: str | None = None) -> dict[str, Any]:
+def _make_outcome(
+    clip_id: str,
+    *,
+    task_description: str | None = "A person prepares coffee.",
+    clip_uri: str | None = None,
+    action_data_uri: str | None = None,
+) -> dict[str, Any]:
     """Build one minimal successful outcome dict conforming to ``CLIP_SCHEMA``.
 
-    Only ``clip_id`` and the two optional URIs vary between rows; every other
-    required field gets a deterministic placeholder. ``status`` is ``success``
-    so ``clip_table`` writes the row (it drops non-success rows) — every clip
-    row is successful in practice, so ``clip_uri``/``action_data_uri`` default
-    to deterministic placeholders rather than ``None``.
+    Only ``clip_id``, ``task_description``, and the two optional URIs vary
+    between rows; every other required field gets a deterministic placeholder.
+    ``status`` is ``success`` so ``clip_table`` writes the row (it drops
+    non-success rows) — every clip row is successful in practice, so
+    ``clip_uri``/``action_data_uri`` default to deterministic placeholders
+    rather than ``None``.
     """
     return {
         "clip_id": clip_id,
@@ -80,6 +87,7 @@ def _make_outcome(clip_id: str, *, clip_uri: str | None = None, action_data_uri:
         "subtask_name": "pick up coffee pod",
         "task_index": 0,
         "task_name": "make coffee",
+        "task_description": task_description,
         "frame_start": 0,
         "frame_end": 100,
         "start_ns": 0,
@@ -159,6 +167,47 @@ def _image_data_file_paths(uri: str) -> set[str]:
             if image_field_id in data_file.field_ids():
                 paths.add(data_file.path())
     return paths
+
+
+def test_clip_schema_declares_nullable_large_string_task_description() -> None:
+    """Verify the published description field's type, position, and nullability."""
+    field = CLIP_SCHEMA.field("task_description")
+
+    assert field.type == pa.large_string()
+    assert field.nullable
+    assert CLIP_SCHEMA.names.index("task_description") == CLIP_SCHEMA.names.index("task_name") + 1
+
+
+def test_clip_record_schema_version_is_published_literal_four() -> None:
+    """Pin the description schema migration to literal version 4."""
+    assert CLIP_RECORD_SCHEMA_VERSION == 4
+
+
+def test_clip_table_preserves_task_description() -> None:
+    """Verify the Lance projection carries the exact episode description value."""
+    description = "  Prepare coffee without spilling.\n"
+
+    table = clip_table(
+        [_make_outcome("c0", task_description=description)],
+        record_schema_version=CLIP_RECORD_SCHEMA_VERSION,
+        media_contract_version=MEDIA_CONTRACT_VERSION,
+    )
+
+    assert table.column("task_description").to_pylist() == [description]
+
+
+def test_error_records_preserves_task_description() -> None:
+    """Verify failure reports retain pre-cut episode descriptions."""
+    description = "  Prepare coffee without spilling.\n"
+    failed = _make_outcome("c0", task_description=description) | {
+        "status": "failed",
+        "clip_uri": None,
+        "action_data_uri": None,
+        "error_stage": "cut",
+        "error_message": "synthetic cut failure",
+    }
+
+    assert error_records([failed])[0]["task_description"] == description
 
 
 def test_append_before_widening_grows_clip_rows(tmp_path: pathlib.Path) -> None:

@@ -38,7 +38,7 @@ model, giving it:
   meta/info.json                         # fps, feature shapes, view list
   meta/subtasks.parquet                  # subtask_index -> subtask label
   meta/tasks.parquet                     # task_index -> task label
-  meta/episodes/chunk-NNN/file-MMM.parquet
+  meta/episodes/chunk-NNN/file-MMM.parquet  # episode/view locations, optional task_description
   data/chunk-NNN/file-MMM.parquet        # per-frame: episode_index, frame_index,
                                          #   subtask_index, observation.state.*, action
   videos/<view>/chunk-NNN/file-MMM.mp4   # one dir per camera view
@@ -53,7 +53,13 @@ its siblings keep the run reporting success, so the loss is invisible.
 Episodes can span multiple shards. A single episode's video and its data parquet
 may live in different chunk files (multi-file layout). `meta/episodes/*/` records,
 per episode and per view, which `chunk_index`/`file_index` holds that episode's
-frames and the `from_timestamp` offset within that MP4.
+frames and the `from_timestamp` offset within that MP4. Its optional
+`task_description` is episode metadata: discovery resolves it by `(shard,
+episode_index)` and copies it into every span for that episode. The exact Python
+string is preserved, including whitespace and the empty string; a missing column
+or source null becomes `None`. A present column must use an Arrow text type.
+Discovery does not join descriptions through `tasks.parquet`, because numeric
+task indices are shard-local and need not identify one description.
 
 ### Label Resolution
 
@@ -133,11 +139,11 @@ relabel a fragment as the entire task — quietly, and in the field, at whatever
 rate the meta file is incomplete.
 
 A fallback label also carries no dedup weight. Per-episode dedup caps spans per
-description, so spans sharing one stand-in label would compete for a single
+subtask label, so spans sharing one stand-in label would compete for a single
 allowance and lose every run past it — deleting a label table would then cost
 spans that the geometry still supports. Fallback spans are bucketed by
 `subtask_index` instead; two indices resolving to the same real text stay one
-description and share one allowance.
+subtask-label bucket and share one allowance.
 
 The enumeration is deliberately no narrower than what it replaced. The previous
 reader resolved `tasks.parquet` with a wildcard — *any* column that was not
@@ -247,6 +253,7 @@ class SpanWorkItem:
     subtask_name: str
     task_index: int
     task_name: str
+    task_description: str | None
 
     # Source episode identity
     episode_id: str
@@ -262,10 +269,10 @@ Discovery phases:
    `tasks.parquet`; discover `videos/` view dirs; list `data/chunk-*/file-*.parquet`.
 3. **Per-data-file segment build** (thread pool) — read each
    `data/chunk-*/file-*.parquet` + `meta/episodes/*/` parquet; run numpy
-   change-detection to emit segments; resolve per-view video file from episode
-   metadata.
+   change-detection to emit segments; resolve the per-view video file and optional
+   `task_description` from episode metadata.
 4. **Filter + dedup** — apply `split.*` config (duration bounds, label skip,
-   per-episode dedup per description).
+   per-episode dedup per subtask label).
 5. **Batch assembly** — group `SpanWorkItem` objects by `(chunk_mp4_uri, data_parquet_uri)`.
 
 No source media is touched during discovery.
@@ -358,6 +365,8 @@ view name:
 
 All views of the same span share the same `action/<action_id>.bin` file.
 Per-view clips and JSON sidecars use the per-view `clip_id` as their filename stem.
+The sidecar places the episode's nullable `task_description` directly after
+`task_name`.
 
 ---
 
@@ -407,6 +416,7 @@ exactly (`curator-next-video-split.md`, "Outputs" and "Cross-Run Recovery").
 | `subtask_name` | `string` | yes | Human-readable subtask label |
 | `task_index` | `int32` | yes | Task index |
 | `task_name` | `string` | yes | Human-readable task label |
+| `task_description` | `large_string` | no | Exact episode description from `meta/episodes`, when present |
 | `frame_start` | `int32` | yes | Episode-local start frame index (inclusive) |
 | `frame_end` | `int32` | yes | Episode-local end frame index (exclusive) |
 | `start_ns` | `int64` | yes | Span start as nanoseconds within the chunk MP4 |
@@ -417,15 +427,20 @@ exactly (`curator-next-video-split.md`, "Outputs" and "Cross-Run Recovery").
 | `action_data_uri` | `large_string` | yes | Written action `.bin`/`.pickle` URI |
 | `camera_motion_annotation` | `large_string` | no | Computed motion description, when available |
 
-The `errors.json` report carries the same identity/geometry columns as `CLIP_SCHEMA` plus
-non-null `error_stage` and `error_message`; it has no `clip_uri`/`action_data_uri`/
-`camera_motion_annotation`, and it is never diffed for dedup — a rerun simply replaces it.
+The `errors.json` report carries the same identity, labels, episode metadata, and
+geometry columns as `CLIP_SCHEMA` plus non-null `error_stage` and `error_message`;
+it has no `clip_uri`/`action_data_uri`/`camera_motion_annotation`, and it is never
+diffed for dedup — a rerun simply replaces it.
 
 `clip_id` and `span_group_id` are SHA-256 digests. `span_group_id` hashes
 `(source_id, episode_id, subtask_index, frame_start)`. `clip_id` always hashes
 `(media_contract_version, span_group_id, video_bitrate)`, plus `view_name` for
 multi-view sources. `action_data_uri` is keyed by `action_id`, which hashes
 `(action_contract_version, span_group_id, action_format, source_dataset)`.
+`task_description` participates in none of these identities. Record schema
+version 4 adds that nullable metadata field; reconciliation rejects rows stamped
+with version 3. `MEDIA_CONTRACT_VERSION` remains unchanged because it versions
+generated MP4 bytes and clip identity, not metadata-only Lance or sidecar fields.
 
 **Downstream — embeddings.** The embed leg
 ([curator-next-embeddings.md](curator-next-embeddings.md)) consumes a projection
@@ -443,6 +458,17 @@ The recovery protocol follows [Curator Next Incremental Curation](curator-next-i
 mirrors `video-split`'s (`curator-next-video-split.md`, "Cross-Run Recovery") — a canonical Lance table that
 is both published output and cross-run checkpoint, deterministic identities, idempotent fragment-scoped
 commits, and driver-side reconciliation before any expensive work starts.
+
+**v3-to-v4 rollout.** Record schema v4 adds nullable `task_description`.
+The recipe intentionally provides no in-place migration. Strict schema
+validation refuses an existing v3 table that lacks the field before
+reconciliation starts. Manually adding the field is not enough: reconciliation
+separately refuses old rows still stamped with `record_schema_version = 3`.
+Recreating the table is the simplest rollout, but rerunning this recipe recuts
+and republishes the media. For an expensive existing table, use a separate
+metadata-only backfill keyed by `(source_id, episode_id)` to populate
+`task_description` for every matching span/view row and stamp the completed
+rows with schema version 4.
 
 **Recovery unit.** `source_id` here hashes the *whole dataset root*, which can span many shards, chunk MP4s,
 and thousands of spans — too coarse a unit to check "is this already done" against. The natural recovery unit

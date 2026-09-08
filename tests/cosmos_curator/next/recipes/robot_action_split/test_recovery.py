@@ -25,7 +25,11 @@ _PARQUET_URI = "s3://example-bucket/dataset/data/chunk-000/file-000.parquet"
 
 
 def _item(
-    clip_id: str, *, span_group_id: str | None = None, view_name: str = "observation.images.main"
+    clip_id: str,
+    *,
+    span_group_id: str | None = None,
+    view_name: str = "observation.images.main",
+    task_description: str | None = "A person prepares coffee.",
 ) -> SpanWorkItem:
     return SpanWorkItem(
         source_id="source-0",
@@ -45,6 +49,7 @@ def _item(
         subtask_label_resolved=True,
         task_index=0,
         task_name="make coffee",
+        task_description=task_description,
         episode_id="ep_000",
         camera_intrinsics=None,
     )
@@ -63,6 +68,7 @@ def _outcome_row(item: SpanWorkItem) -> dict:
         "subtask_name": item.subtask_name,
         "task_index": item.task_index,
         "task_name": item.task_name,
+        "task_description": item.task_description,
         "frame_start": item.frame_start,
         "frame_end": item.frame_end,
         "start_ns": item.start_ns,
@@ -186,6 +192,26 @@ def test_reconciliation_rejects_contract_drift(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(recovery_mod, "MEDIA_CONTRACT_VERSION", MEDIA_CONTRACT_VERSION + 1)
 
     with pytest.raises(ValueError, match="media_contract_version"):
+        reconcile_batches([batch], dataset=dataset)
+
+
+def test_reconciliation_rejects_v3_record_schema_rows(tmp_path: Path) -> None:
+    """Verify a schema-v3 row cannot silently reconcile under the current schema."""
+    uri = str(tmp_path / "clips.lance")
+    item = _item("v3-row")
+    open_or_create_clip_table(uri=uri, storage_profile="default")
+    stale_table = clip_table(
+        [_outcome_row(item)],
+        record_schema_version=3,
+        media_contract_version=MEDIA_CONTRACT_VERSION,
+    )
+    stale_candidate = write_clip_fragment(stale_table, uri=uri, storage_profile="default")
+    assert stale_candidate is not None
+    append_clip_fragment(stale_candidate, uri=uri, storage_profile="default", attempts=1)
+    dataset = open_or_create_clip_table(uri=uri, storage_profile="default")
+    batch = ChunkSpanBatch(chunk_mp4_uri=_CHUNK_URI, data_parquet_uri=_PARQUET_URI, items=[item])
+
+    with pytest.raises(ValueError, match="record_schema_version"):
         reconcile_batches([batch], dataset=dataset)
 
 
