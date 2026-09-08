@@ -66,7 +66,16 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #:
 #: 2 added the three session-grain datasets. Additive: a version-1 store is read by
 #: this code unchanged, since a dataset that was never written reads as no rows.
-STORE_SCHEMA_VERSION = 2
+#:
+#: 3 added ``timestamp_source`` to :data:`STREAM_SCHEMA` and to :data:`SESSION_SCHEMA`
+#: -- one clock per stream, and the roll-up of them per session. Unlike 2, this one is *not*
+#: additive: :func:`~.store.append_rows` appends with a plain
+#: ``lance.write_dataset(..., mode="append")``, which requires the incoming schema to
+#: match the dataset's, so a store written at version 1 or 2 cannot take new rows and
+#: needs a fresh root. Deliberate rather than mitigated -- migration machinery for a
+#: store whose only readers are the two CLIs and the rollup would cost more than
+#: re-measuring, and re-measuring is cheap because the sources are unchanged.
+STORE_SCHEMA_VERSION = 3
 
 STREAM_DATASET = "stream.lance"
 EVALUATION_DATASET = "evaluation.lance"
@@ -133,6 +142,11 @@ STREAM_SCHEMA: pa.Schema = pa.schema(
         pa.field("end_ns", pa.int64()),
         pa.field("expected_hz", pa.float64()),
         pa.field("expected_hz_source", pa.string()),
+        # Which clock every timing column above was measured on. Persisted rather than
+        # derived at read time because it cannot be recovered later: the row keeps the
+        # numbers, not the sidecar that explains them. A query for streams whose
+        # cadence is real has to filter on this.
+        pa.field("timestamp_source", pa.string()),
         # Non-null means the source could not be read; this stream has no rows in any
         # metric dataset.
         pa.field("error", pa.string()),
@@ -251,6 +265,14 @@ SESSION_SCHEMA: pa.Schema = pa.schema(
         # A session listed but empty is 0 and 0, which is a finding about the input.
         pa.field("num_streams", pa.int64(), nullable=False),
         pa.field("num_unreadable", pa.int64(), nullable=False),
+        # Which clock this session's streams were measured on, rolled up by
+        # :func:`~cosmos_curator.core.sensors.data_integrity.results.session_timestamp_source`:
+        # ``capture`` only when every contributing stream had one, else ``container_pts``
+        # or ``mixed``. Null means no stream contributed bounds -- an unlisted or empty
+        # session has no clock rather than a bad one. This is what makes a never-ran
+        # session-grain measurement legible: the metric row says only that it did not
+        # run, and this column says why.
+        pa.field("timestamp_source", pa.string()),
         # Non-null means the session itself could not be listed: no streams were
         # found, so it has no rows in any other dataset. The session-level analogue
         # of stream.error, and the reason one stale path in a large manifest costs a

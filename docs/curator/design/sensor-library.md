@@ -165,6 +165,39 @@ The offset changes timestamp positions, not durations. In particular,
 `NearestTimestampPolicy.max_delta_ns` remains an unshifted tolerance in
 nanoseconds; no offset is added to it.
 
+### Camera capture timeline
+
+`origin_ns` shifts the container's timeline; it does not replace it. That is
+enough only when PTS spacing is itself trustworthy. A constant-frame-rate mux
+discards the real sample times and regenerates them on a fixed grid, so no
+single offset can recover them -- the intervals themselves are synthetic.
+
+`CameraSensor(capture_timestamps_ns=...)` takes the recording's own capture
+times instead: one `int64` nanosecond entry per displayable frame, which must
+be 1-D, non-empty, strictly increasing, and exactly as long as the stream has
+displayable frames. A length that disagrees is rejected rather than padded or
+truncated, because entries are matched to frames by position, so a wrong count
+leaves every frame's time in doubt rather than only the missing ones'.
+
+It is mutually exclusive with `origin_ns`: an origin anchors a timeline the
+sensor is about to discard, so accepting both would silently ignore one.
+
+The supplied timeline replaces the reported one everywhere -- `start_ns`,
+`end_ns`, `timestamps_ns`, `stream_timestamps()`, and
+`CameraData.sensor_timestamps_ns`, including the window selection behind
+`sample()`, so a sampled payload's clock matches the one the sensor advertises.
+As with `origin_ns`, `pts_stream`, `kf_pts_stream` and `time_base` stay native,
+so seeking and decode planning are unchanged; the container's numbers keep
+doing the job they are actually for.
+
+`CameraSensor.timestamp_source` reports which of the two is in effect
+(`TimestampSource.CAPTURE` or `TimestampSource.CONTAINER_PTS`). Consumers that
+draw conclusions from timing need it: the two are indistinguishable from the
+timestamps alone, and one of them may be an artifact of the encoder. Reading
+the timeline out of a file is deliberately not the sensor's job -- the sensor
+takes an array, and locating and parsing whatever carries it belongs to the
+caller.
+
 ### Reference-Grid Sampling Contract
 
 `SamplingGrid` defines the canonical reference timeline for alignment. It is

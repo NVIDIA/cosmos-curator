@@ -67,7 +67,9 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     CheckResult,
     CheckStatus,
     OverallStatus,
+    SessionTimestampSource,
     StreamResult,
+    session_clock,
 )
 from cosmos_curator.core.utils.storage.s3_client import is_s3path
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
@@ -223,6 +225,7 @@ def stream_row(  # noqa: PLR0913 -- one argument per fact the row records
         "end_ns": stream.end_ns,
         "expected_hz": stream.expected_hz,
         "expected_hz_source": (stream.expected_hz_source.value if stream.expected_hz_source is not None else None),
+        "timestamp_source": (stream.timestamp_source.value if stream.timestamp_source is not None else None),
         "error": stream.error,
     }
 
@@ -345,6 +348,7 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
     session_path: str,
     num_streams: int,
     num_unreadable: int,
+    timestamp_source: SessionTimestampSource | None = None,
     error: str | None = None,
 ) -> dict[str, object]:
     """Build the ``session.lance`` row for one session, listed or not.
@@ -353,6 +357,10 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
     not be listed, so it found no streams and has no rows in any other dataset. It
     is still a row, because a stale path in a large manifest is a finding about the
     input, and the alternative is a run that says nothing about it at all.
+
+    ``timestamp_source`` defaults to null for the same reason: a session with no
+    contributing streams was measured on no clock at all. Callers holding streams
+    should pass :func:`session_clock` over them rather than deriving it again.
     """
     return {
         "session_id": session_id,
@@ -362,6 +370,7 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
         "locator_namespace": identity.locator_namespace(session_path),
         "num_streams": num_streams,
         "num_unreadable": num_unreadable,
+        "timestamp_source": None if timestamp_source is None else timestamp_source.value,
         "error": error,
     }
 
@@ -379,9 +388,10 @@ def session_measurement_row(  # noqa: PLR0913 -- a metric row is its identity pr
 
     The same "never ran" shape as :func:`measurement_row`, and for the same reason:
     ``is_defined = null`` with every metric column null says the metric was
-    considered and could not run, which an absent row could not say. No session
-    metric reaches it today -- neither needs an expected rate -- but the shape is the
-    dataset's, not the metric's.
+    considered and could not run, which an absent row could not say. Both session
+    metrics reach it whenever their sensors were not all on capture times, and the
+    null columns are the point: a stored zero spread would be re-judged into a pass.
+    ``session.lance``'s ``timestamp_source`` says which of the causes it was.
     """
     measurement = result.raw_measurement
     row: dict[str, object] = {
@@ -713,6 +723,7 @@ def _write_session_rows(  # noqa: PLR0913 -- a session's rows need its provenanc
                 session_path=session_path,
                 num_streams=len(streams),
                 num_unreadable=sum(1 for stream in streams if stream.error is not None),
+                timestamp_source=session_clock(streams),
             )
         ],
         join(root, store_schema.SESSION_DATASET),

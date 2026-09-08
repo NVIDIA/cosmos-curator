@@ -18,6 +18,8 @@
 import json
 from typing import cast
 
+import pytest
+
 from cosmos_curator.core.sensors.data_integrity.results import (
     CheckResult,
     CheckStatus,
@@ -26,6 +28,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     SessionReport,
     StreamResult,
 )
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.data_integrity.report import render_text, report_to_dict, to_json
 
 
@@ -46,6 +49,7 @@ def _stream(
     error: str | None = None,
     expected_hz: float | None = 30.0,
     expected_hz_source: ExpectedHzSource | None = ExpectedHzSource.HEADER,
+    timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS,
 ) -> StreamResult:
     metrics = [] if error is not None else [_metric(f"m{i}", s) for i, s in enumerate(statuses or [])]
     return StreamResult(
@@ -59,6 +63,7 @@ def _stream(
         error=error,
         expected_hz=None if error else expected_hz,
         expected_hz_source=None if error else expected_hz_source,
+        timestamp_source=None if error else timestamp_source,
     )
 
 
@@ -153,8 +158,9 @@ def test_render_text_puts_the_session_metrics_under_the_session_heading() -> Non
     )
     lines = [line for line in render_text(report).splitlines() if line]
 
-    assert lines[-4].startswith("Data-integrity report for session:")
-    assert lines[-3].startswith("  streams: 1")
+    assert lines[-5].startswith("Data-integrity report for session:")
+    assert lines[-4].startswith("  streams: 1")
+    assert lines[-3].startswith("  timestamps:")
     assert "multi_sensor_overlap" in lines[-2]
     assert lines[-1] == "Session overall: FAIL"
 
@@ -208,9 +214,10 @@ def test_render_text_puts_the_session_summary_after_the_streams() -> None:
     lines = [line for line in render_text(report).splitlines() if line]
 
     assert lines[0] == "Stream: a"
-    assert lines[-3:] == [
+    assert lines[-4:] == [
         "Data-integrity report for session: s3://bucket/clips/uuid/",
         "  streams: 2   pass: 2   fail: 0   error: 0",
+        "  timestamps: container_pts",
         "Session overall: PASS",
     ]
 
@@ -235,6 +242,74 @@ def test_render_text_reports_unavailable_expected_hz() -> None:
         ],
     )
     assert "expected_hz: N/A (source: unavailable)" in render_text(report)
+
+
+@pytest.mark.parametrize("source", list(TimestampSource))
+def test_render_text_reports_the_clock_each_stream_was_measured_on(source: TimestampSource) -> None:
+    """The reader's only way to tell a steady rig from a re-timestamped mux.
+
+    Both produce near-zero jitter, so the metric lines below cannot distinguish them
+    and the report has to say which it is.
+    """
+    report = SessionReport(
+        session_path="s",
+        streams=[_stream("a", statuses=[CheckStatus.PASS], timestamp_source=source)],
+    )
+    assert f"timestamps: {source.value}" in render_text(report)
+
+
+def test_errored_stream_omits_the_timestamp_source_line() -> None:
+    """Nothing was measured, so there is no clock to name -- as with the rate line.
+
+    Neither per stream nor for the session: with no stream contributing, the session
+    was measured on no clock rather than on a bad one.
+    """
+    report = SessionReport(session_path="s", streams=[_stream("b", error="could not open")])
+    assert "timestamps:" not in render_text(report)
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        ([TimestampSource.CAPTURE, TimestampSource.CAPTURE], "capture"),
+        ([TimestampSource.CONTAINER_PTS, TimestampSource.CONTAINER_PTS], "container_pts"),
+        ([TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS], "mixed"),
+    ],
+)
+def test_render_text_reports_the_clock_the_session_as_a_whole_was_measured_on(
+    sources: list[TimestampSource], expected: str
+) -> None:
+    """Under the session heading because it decides whether the session metrics ran at all.
+
+    Rolled up from the streams rather than carried on the report, so it cannot disagree
+    with the per-stream lines above it or with the store row written beside it.
+    """
+    report = SessionReport(
+        session_path="s",
+        streams=[
+            _stream(f"cam{i}", statuses=[CheckStatus.PASS], timestamp_source=source) for i, source in enumerate(sources)
+        ],
+    )
+    lines = [line for line in render_text(report).splitlines() if line]
+
+    assert f"  timestamps: {expected}" in lines
+    assert cast("str", report_to_dict(report)["timestamp_source"]) == expected
+
+
+def test_a_session_no_stream_contributed_to_reports_no_clock() -> None:
+    """Null rather than a name, on the same terms the store column uses."""
+    report = SessionReport(session_path="s", streams=[_stream("b", error="could not open")])
+    assert report_to_dict(report)["timestamp_source"] is None
+
+
+def test_report_to_dict_exposes_the_timestamp_source() -> None:
+    """The JSON payload carries provenance under the same name the store column uses."""
+    report = SessionReport(
+        session_path="s",
+        streams=[_stream("a", statuses=[CheckStatus.PASS], timestamp_source=TimestampSource.CAPTURE)],
+    )
+    stream = cast("list[dict[str, object]]", report_to_dict(report)["streams"])[0]
+    assert stream["timestamp_source"] == "capture"
 
 
 def test_errored_stream_omits_expected_hz_line() -> None:

@@ -19,6 +19,7 @@ This is the requirement the whole store exists to satisfy: change a threshold, g
 new verdicts, open no source data.
 """
 
+import datetime
 from collections.abc import Callable
 from fractions import Fraction
 
@@ -31,7 +32,8 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
     SESSION_INSTRUMENTS,
     Thresholds,
 )
-from cosmos_curator.core.sensors.data_integrity.results import StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import SensorBounds, StreamResult
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.data_integrity import reevaluate, store
 
 NO_HEADER_RATE = Fraction(0, 1)
@@ -46,6 +48,16 @@ NO_SKEW = Thresholds(max_sensor_spread_ns=0)
 
 _ONE_MINUTE_NS = 60_000_000_000
 _SKEW_NS = 1_000_000
+
+
+def _capture_bounds(*pairs: tuple[int, int]) -> list[SensorBounds]:
+    """Build bounds on the rigs' own capture clocks, which is what makes them measurable.
+
+    Every test here is about re-judging *stored numbers*, and a session measured on
+    container PTS stores none: its metrics never run. So these say ``capture``, and the
+    streams whose rows sit beside them say the same.
+    """
+    return [SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.CAPTURE) for start, end in pairs]
 
 
 def _rate_verdicts(root: str) -> dict[str, dict[str, object]]:
@@ -79,7 +91,10 @@ def session_measured(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> tuple[str, str]:
     """Build a store holding two slightly-skewed sensors, with session metrics measured and judged."""
-    streams = [make_stream(DRIFT, perfect()), make_stream(f"{SESSION}/rear.mp4", perfect())]
+    streams = [
+        make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CAPTURE),
+        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
+    ]
     run_id = store.write_run(
         store_root,
         streams,
@@ -87,7 +102,8 @@ def session_measured(
         thresholds=DEFAULT_THRESHOLDS,
         tool="di-session",
         session_metrics=run_session_metrics(
-            [(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)], thresholds=DEFAULT_THRESHOLDS
+            _capture_bounds((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)),
+            thresholds=DEFAULT_THRESHOLDS,
         ),
     )
     return store_root, run_id
@@ -309,16 +325,17 @@ def test_an_undefined_session_measurement_stays_skipped(
     the shape a single-sensor session has: the facts are stored and rebuilt, they are
     simply undefined, so the re-judge has to leave the verdict ``SKIPPED`` with nothing
     to compare rather than invent a threshold and a margin for a measurement that has
-    no value. The "never ran" shape below it -- ``is_defined`` null -- no session metric
-    can reach, neither of them needing an expected rate.
+    no value. Distinct from the "never ran" shape below it -- ``is_defined`` null --
+    which the same metric reaches when its sensors were not on capture times; see
+    :func:`test_a_session_metric_that_never_ran_names_the_clock_instead`.
     """
     store.write_run(
         store_root,
-        [make_stream(DRIFT, perfect())],
+        [make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CAPTURE)],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
         tool="di-session",
-        session_metrics=run_session_metrics([(0, _ONE_MINUTE_NS)], thresholds=DEFAULT_THRESHOLDS),
+        session_metrics=run_session_metrics(_capture_bounds((0, _ONE_MINUTE_NS)), thresholds=DEFAULT_THRESHOLDS),
     )
     reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
 
@@ -332,6 +349,95 @@ def test_an_undefined_session_measurement_stays_skipped(
         for row in store.read_session_evaluations(store_root)
         if row["policy_id"] == store.policy_id(NO_SKEW)
     } == {"SKIPPED"}
+
+
+def test_a_session_metric_that_never_ran_names_the_clock_instead(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The payoff for storing the clock on the session row.
+
+    Two aligned sensors on container PTS store a never-ran row: all nulls, nothing to
+    rebuild, so no policy can produce a verdict from it -- which is the point, since
+    the numbers it would have stored were the mux's. What the null row cannot do is
+    explain itself, so the re-judge reads the cause off ``session.lance`` and reports
+    the clock rather than the rate-shaped wording, which would name the wrong thing.
+    """
+    streams = [
+        make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CONTAINER_PTS),
+        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CONTAINER_PTS),
+    ]
+    store.write_run(
+        store_root,
+        streams,
+        session_path=SESSION,
+        thresholds=DEFAULT_THRESHOLDS,
+        tool="di-session",
+        session_metrics=run_session_metrics(
+            [
+                SensorBounds(start_ns=0, end_ns=_ONE_MINUTE_NS, timestamp_source=TimestampSource.CONTAINER_PTS)
+                for _ in range(2)
+            ],
+            thresholds=DEFAULT_THRESHOLDS,
+        ),
+    )
+    reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
+
+    rejudged = _spread_verdicts(store_root)[store.policy_id(NO_SKEW)]
+    assert rejudged["check_status"] == "SKIPPED"
+    assert rejudged["margin"] is None
+    assert rejudged["threshold"] is None
+    assert "container PTS" in str(rejudged["reason"])
+    assert reevaluate.REASON_NEVER_RAN not in str(rejudged["reason"])
+
+
+def test_a_never_ran_row_is_explained_by_the_run_that_measured_it(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A later run that records a session without measuring it must not re-explain it.
+
+    A session that could not be listed writes its ``session.lance`` row and nothing
+    else, so the newest row for that session names no clock while the stored
+    measurement still belongs to the run before it. Read per session, the re-judge
+    would take that newer null and report "no sensor reported a clock" over a session
+    whose sensors did report one; read per measuring run, it reports what was true
+    when the numbers were taken.
+    """
+    measured_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    store.write_run(
+        store_root,
+        [
+            make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CONTAINER_PTS),
+            make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CONTAINER_PTS),
+        ],
+        session_path=SESSION,
+        thresholds=DEFAULT_THRESHOLDS,
+        tool="di-session",
+        created_at=measured_at,
+        session_metrics=run_session_metrics(
+            [
+                SensorBounds(start_ns=0, end_ns=_ONE_MINUTE_NS, timestamp_source=TimestampSource.CONTAINER_PTS)
+                for _ in range(2)
+            ],
+            thresholds=DEFAULT_THRESHOLDS,
+        ),
+    )
+    store.write_run(
+        store_root,
+        [],
+        session_path=SESSION,
+        thresholds=DEFAULT_THRESHOLDS,
+        tool="di-session",
+        created_at=measured_at + datetime.timedelta(hours=1),
+    )
+    # The precondition the test turns on: the session's newest row names no clock, so
+    # anything still reading it per session would have the wrong cause to hand.
+    assert [row["timestamp_source"] for row in store.read_sessions(store_root)] == [None]
+
+    reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
+
+    rejudged = _spread_verdicts(store_root)[store.policy_id(NO_SKEW)]
+    assert rejudged["check_status"] == "SKIPPED"
+    assert "container PTS" in str(rejudged["reason"])
 
 
 def test_a_store_holding_no_session_measurements_re_judges_none(measured: tuple[str, str]) -> None:

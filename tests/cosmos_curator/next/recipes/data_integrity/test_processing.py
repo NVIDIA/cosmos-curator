@@ -193,18 +193,22 @@ def test_a_session_yields_the_rows_of_every_stream_it_holds(session: pathlib.Pat
 
 
 def test_a_failing_session_metric_is_counted_in_the_record(
-    tmp_path: pathlib.Path, h264_video: Callable[..., bytes]
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    capture_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """The counter the driver sums into the run summary, which no store row states.
 
     Two sensors that stopped a second apart, under a policy allowing no non-overlap at
     all: every stream passes on its own, so the session's own verdict is the only thing
-    that fails, and ``failed_metrics`` beside it must not move.
+    that fails, and ``failed_metrics`` beside it must not move. Capture timelines make
+    the session measurable in the first place.
     """
     ragged = tmp_path / "ragged"
     ragged.mkdir()
-    (ragged / "front.mp4").write_bytes(h264_video(frames=30))
-    (ragged / "rear.mp4").write_bytes(h264_video(frames=60))
+    for name, frames in (("front.mp4", 30), ("rear.mp4", 60)):
+        (ragged / name).write_bytes(h264_video(frames=frames))
+        capture_timeline(ragged / name, frames=frames)
 
     record = _check(ragged, thresholds={"max_non_overlap_percent": 0.0})
     verdicts = {
@@ -254,16 +258,19 @@ def test_an_empty_session_produces_a_result_but_no_stream_rows(tmp_path: pathlib
     (session_row,) = rows[store_schema.SESSION_DATASET]
     assert session_row["error"] is None
     assert session_row["num_streams"] == 0
-    # Its own metrics are still measured and judged, and come back SKIPPED for the
-    # reason a single-sensor session's do: a session metric needs two sensors to have
-    # anything to say. Nothing here forks on `num_streams == 0` -- both shapes go
-    # through `session_metrics`, which is what stops the pipeline and di-session from
-    # judging a session two ways.
+    # No stream contributed bounds, so the session was measured on no clock at all --
+    # which is a null column rather than a named one.
+    assert session_row["timestamp_source"] is None
+    # Its own metrics are still considered and judged, and come back SKIPPED. Nothing
+    # here forks on `num_streams == 0` -- both shapes go through `session_metrics`,
+    # which is what stops the pipeline and di-session from judging a session two ways.
+    # The rows are the "never ran" shape rather than a measured-but-undefined one:
+    # with no clock to compare on, the metrics were never reachable.
     assert record["failed_session_metrics"] == 0
     for spec in SESSION_INSTRUMENTS:
         (measurement,) = rows[store_schema.session_metric_dataset_path(spec.name)]
-        assert measurement["is_defined"] is False
-        assert measurement["num_sensors"] == 0
+        assert measurement["is_defined"] is None
+        assert measurement["num_sensors"] is None
     assert [row["check_status"] for row in rows[store_schema.SESSION_EVALUATION_DATASET]] == [
         CheckStatus.SKIPPED.value
     ] * len(SESSION_INSTRUMENTS)

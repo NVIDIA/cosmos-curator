@@ -29,6 +29,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     OverallStatus,
     SessionReport,
     StreamResult,
+    session_clock,
 )
 
 
@@ -52,6 +53,16 @@ def _metrics_to_dicts(metrics: list[CheckResult]) -> list[dict[str, object]]:
     ]
 
 
+def _session_clock_value(report: SessionReport) -> str | None:
+    """Name the clock the session's contributing streams shared, if they shared one.
+
+    The same roll-up the store records, so a report and its ``session.lance`` row
+    cannot disagree about which clock a session was measured on.
+    """
+    clock = session_clock(report.streams)
+    return None if clock is None else clock.value
+
+
 def report_to_dict(report: SessionReport) -> dict[str, object]:
     """Convert a :class:`SessionReport` to a plain JSON-serializable dict."""
     return {
@@ -59,6 +70,10 @@ def report_to_dict(report: SessionReport) -> dict[str, object]:
         "status": report.status.value,
         "num_streams": len(report.streams),
         "stream_status_counts": _count_by_status(report.streams),
+        # Derived from the streams below rather than carried on the report, because it
+        # is not an independent fact: it is the roll-up of their clocks, and a field
+        # could disagree with them.
+        "timestamp_source": _session_clock_value(report),
         # Beside the streams rather than inside them: these judge the session, and a
         # consumer that walks "streams" must not see them as one stream's verdict.
         "metrics": _metrics_to_dicts(report.metrics),
@@ -75,6 +90,7 @@ def report_to_dict(report: SessionReport) -> dict[str, object]:
                 "expected_hz_source": (
                     stream.expected_hz_source.value if stream.expected_hz_source is not None else None
                 ),
+                "timestamp_source": (stream.timestamp_source.value if stream.timestamp_source is not None else None),
                 "error": stream.error,
                 "metrics": _metrics_to_dicts(stream.metrics),
             }
@@ -105,6 +121,11 @@ def _render_stream(stream: StreamResult) -> list[str]:
         # Same wording as the single-video report so the two outputs stay comparable.
         value = f"{stream.expected_hz:.3f}" if stream.expected_hz is not None else "N/A"
         lines.append(f"  expected_hz: {value} (source: {stream.expected_hz_source.value})")
+    if stream.timestamp_source is not None:
+        # Beside the rate's provenance rather than among the numbers above, because it
+        # qualifies all of them: on container PTS every timing metric below describes
+        # the mux rather than the recording.
+        lines.append(f"  timestamps: {stream.timestamp_source.value}")
     lines.append("")
     lines.extend(
         f"  {metric.name:<{_METRIC_NAME_WIDTH}}{metric.status.value:<{_METRIC_STATUS_WIDTH}}{metric.reason}"
@@ -126,6 +147,11 @@ def render_text(report: SessionReport) -> str:
         f"  streams: {len(report.streams)}   "
         + "   ".join(f"{name.lower()}: {counts[name]}" for name in (s.value for s in OverallStatus))
     )
+    clock = _session_clock_value(report)
+    if clock is not None:
+        # Above the session metrics because it decides whether they ran at all: the two
+        # cross-sensor checks skip unless every contributing stream reported `capture`.
+        lines.append(f"  timestamps: {clock}")
     # Under the session heading, in the same columns the per-stream metrics use, so the
     # two read alike -- what differs is only which line they sit beneath.
     lines.extend(

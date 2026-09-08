@@ -31,10 +31,12 @@ from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRES
 from cosmos_curator.core.sensors.data_integrity.results import (
     CheckResult,
     ResolvedConfig,
+    SensorBounds,
     SessionReport,
     StreamResult,
     VideoInfo,
 )
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.data_integrity import cli, session_cli, store, store_cli
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     ERROR_EXIT_CODE,
@@ -258,10 +260,21 @@ def test_what_the_session_tool_exited_on_is_what_reads_back(
     Every stream passes and the session does not, so before session verdicts were
     stored the store read back ``PASS`` for a run the CLI exited ``1`` on.
     """
-    streams = [make_stream(f"{SESSION}/front.mp4", perfect()), make_stream(f"{SESSION}/rear.mp4", perfect())]
+    # On capture times, because a session on container PTS never reaches a verdict at
+    # all -- and it is the verdict, not the skip, that this table exists to record.
+    streams = [
+        make_stream(f"{SESSION}/front.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
+        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
+    ]
     stub_session(
         streams,
-        run_session_metrics([(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS)], thresholds=NO_SKEW),
+        run_session_metrics(
+            [
+                SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.CAPTURE)
+                for start, end in ((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS))
+            ],
+            thresholds=NO_SKEW,
+        ),
     )
 
     assert session_cli.main([*_session_argv(store_root), "--max-sensor-spread-ns", "0"]) == FAIL_EXIT_CODE

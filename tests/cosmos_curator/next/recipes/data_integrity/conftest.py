@@ -46,6 +46,9 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     VideoInfo,
     stream_result,
 )
+from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
+from cosmos_curator.next.recipes.data_integrity.sources import CAPTURE_TIMELINE_SUFFIX
 
 HZ_100_PERIOD_NS = 10_000_000  # one sample every 10 ms at 100 Hz
 
@@ -64,17 +67,28 @@ class FakeSensor:
         has_bframes: bool = False,
         codec_name: str = "h264",
         avg_frame_rate: Fraction = Fraction(100, 1),
+        timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS,
     ) -> None:
         """Hold a synthetic timeline and the container facts the engine reads off it."""
         self._ts = np.array(timestamps, dtype=np.int64)
         self.has_bframes = has_bframes
         self.codec_name = codec_name
         self.video_metadata = SimpleNamespace(avg_frame_rate=avg_frame_rate)
+        self._timestamp_source = timestamp_source
 
     @property
     def timestamps_ns(self) -> NDArray[np.int64]:
         """The full synthetic timeline."""
         return self._ts
+
+    @property
+    def timestamp_source(self) -> TimestampSource:
+        """Which clock the synthetic timeline stands for.
+
+        Defaults to the container's, which is what a bare list of integers honestly
+        is: a timeline given no provenance. A test about capture timestamps says so.
+        """
+        return self._timestamp_source
 
     @property
     def start_ns(self) -> int:
@@ -127,8 +141,14 @@ def make_stream() -> Callable[..., StreamResult]:
         avg_frame_rate: Fraction = Fraction(100, 1),
         has_bframes: bool = False,
         selector_value: str = identity.DEFAULT_SELECTOR_VALUE,
+        timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS,
     ) -> StreamResult:
-        sensor = FakeSensor(timestamps, avg_frame_rate=avg_frame_rate, has_bframes=has_bframes)
+        sensor = FakeSensor(
+            timestamps,
+            avg_frame_rate=avg_frame_rate,
+            has_bframes=has_bframes,
+            timestamp_source=timestamp_source,
+        )
         metrics, info, resolved = run_metrics(sensor, expected_hz=expected_hz, thresholds=thresholds)
         return stream_result(source, metrics, info, resolved, selector_value=selector_value)
 
@@ -149,8 +169,9 @@ def run_engine() -> Callable[..., tuple[list[CheckResult], VideoInfo, ResolvedCo
         expected_hz: float | None = 100.0,
         thresholds: Thresholds = DEFAULT_THRESHOLDS,
         avg_frame_rate: Fraction = Fraction(100, 1),
+        timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS,
     ) -> tuple[list[CheckResult], VideoInfo, ResolvedConfig]:
-        sensor = FakeSensor(timestamps, avg_frame_rate=avg_frame_rate)
+        sensor = FakeSensor(timestamps, avg_frame_rate=avg_frame_rate, timestamp_source=timestamp_source)
         return run_metrics(sensor, expected_hz=expected_hz, thresholds=thresholds)
 
     return _make
@@ -229,6 +250,43 @@ def h264_video() -> Callable[..., bytes]:
         return buffer.getvalue()
 
     return _make
+
+
+#: Epoch-scale, so a capture timeline cannot be mistaken for a container's own: PTS is
+#: counted from the start of one file and starts at or near zero.
+_CAPTURE_EPOCH_NS = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z
+
+#: One frame at 30 fps, matching what :func:`h264_video` encodes.
+_FRAME_PERIOD_NS = 33_333_333
+
+
+@pytest.fixture
+def capture_timeline() -> Callable[..., pathlib.Path]:
+    """Return a factory writing a capture timeline beside a video.
+
+    The sidecar is what makes a session-grain metric run at all: without it every
+    camera is measured on container PTS, the mux has already put them on one
+    regenerated grid, and the two cross-sensor checks skip rather than report a rig
+    that looks flawless by construction. So any test whose subject is a session
+    *verdict* has to write these, and one whose subject is the skip must not.
+
+    ``frames`` has to match the video's frame count exactly -- a timeline that does not
+    fit its video is a hard error, not something to fall back from.
+    """
+
+    def _write(
+        video: pathlib.Path,
+        *,
+        frames: int,
+        start_ns: int = _CAPTURE_EPOCH_NS,
+        period_ns: int = _FRAME_PERIOD_NS,
+    ) -> pathlib.Path:
+        sidecar = pathlib.Path(f"{video}{CAPTURE_TIMELINE_SUFFIX}")
+        with sidecar.open("wb") as stream:
+            write_timestamps_ns(start_ns + np.arange(frames, dtype=np.int64) * period_ns, stream)
+        return sidecar
+
+    return _write
 
 
 @pytest.fixture

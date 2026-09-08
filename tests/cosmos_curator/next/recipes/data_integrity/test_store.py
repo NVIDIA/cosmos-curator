@@ -35,7 +35,13 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
     Thresholds,
     instrument,
 )
-from cosmos_curator.core.sensors.data_integrity.results import CheckResult, StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import (
+    CheckResult,
+    SensorBounds,
+    SessionTimestampSource,
+    StreamResult,
+)
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
 from cosmos_curator.core.utils.storage_cli import StorageCliError
 from cosmos_curator.next.recipes.data_integrity import storage_io, store, store_schema
@@ -88,14 +94,26 @@ _LATEST = datetime.datetime(2031, 1, 1, tzinfo=datetime.UTC)
 SPREAD = SESSION_INSTRUMENTS[0].name
 
 
-def _metrics_for(bounds: list[tuple[int, int]], thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
+def _metrics_for(
+    bounds: list[tuple[int, int]],
+    thresholds: Thresholds = DEFAULT_THRESHOLDS,
+    *,
+    source: TimestampSource = TimestampSource.CAPTURE,
+) -> list[CheckResult]:
     """Judge one session from its sensors' recording bounds, through the real kernel.
 
     Straight to :func:`run_session_metrics` rather than through ``session_runner``,
     both because the store sits below it and because bounds stated outright are how a
     test says which session shape it is about.
+
+    ``source`` defaults to ``CAPTURE`` because a store test wants rows with numbers in
+    them, and only a session measured on capture times produces any: the two session
+    metrics do not run at all on container PTS. Tests of *that* pass it explicitly.
     """
-    return run_session_metrics(bounds, thresholds=thresholds)
+    return run_session_metrics(
+        [SensorBounds(start_ns=start, end_ns=end, timestamp_source=source) for start, end in bounds],
+        thresholds=thresholds,
+    )
 
 
 def _aligned_metrics(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
@@ -245,6 +263,33 @@ def test_stream_row_carries_identity_and_session_context(
     assert row["locator_namespace"] == identity.NAMESPACE_LOCAL
     assert row["selector_type"] == identity.SELECTOR_VIDEO_STREAM
     assert row["selector_value"] == "0"
+
+
+@pytest.mark.parametrize("source", list(TimestampSource))
+def test_a_stream_row_records_the_clock_it_was_measured_on(
+    source: TimestampSource,
+    store_root: str,
+    make_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """Provenance is persisted, not re-derived: the row keeps the numbers, not the sidecar.
+
+    Without this column a stored jitter of nearly zero is unreadable -- a rig that is
+    genuinely steady and a constant-frame-rate mux that invented the timeline both
+    look like that, and only one of them is a measurement.
+    """
+    _write(store_root, [make_stream(FRONT, perfect(), timestamp_source=source)])
+    (row,) = store.read_streams(store_root)
+    assert row["timestamp_source"] == source.value
+
+
+def test_an_errored_stream_row_claims_no_clock(
+    store_root: str, make_errored_stream: Callable[..., StreamResult]
+) -> None:
+    """Null, like every other sensor-level column on a stream that was never read."""
+    _write(store_root, [make_errored_stream("/data/session/rear.mp4")])
+    (row,) = store.read_streams(store_root)
+    assert row["timestamp_source"] is None
 
 
 def test_two_stream_indices_of_one_file_are_two_streams(
@@ -516,6 +561,125 @@ def test_a_session_run_records_the_session_itself(
     assert row["num_streams"] == 2
     assert row["num_unreadable"] == 0
     assert row["error"] is None
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        ([TimestampSource.CAPTURE, TimestampSource.CAPTURE], "capture"),
+        ([TimestampSource.CONTAINER_PTS, TimestampSource.CONTAINER_PTS], "container_pts"),
+        ([TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS], "mixed"),
+    ],
+)
+def test_a_session_records_which_clock_its_streams_shared(
+    store_root: str,
+    make_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+    sources: list[TimestampSource],
+    expected: str,
+) -> None:
+    """The column that makes a skipped session-grain metric legible.
+
+    A never-ran measurement row is all nulls and cannot say why it never ran, so the
+    session's row carries the cause -- and it carries it as the roll-up of the streams
+    beside it, not as an independent claim.
+    """
+    streams = [
+        make_stream(f"/data/session/cam{i}.mp4", perfect(), timestamp_source=source) for i, source in enumerate(sources)
+    ]
+    _write(store_root, streams)
+
+    (row,) = store.read_sessions(store_root)
+    assert row["timestamp_source"] == expected
+
+
+def test_a_session_no_stream_contributed_to_names_no_clock(
+    store_root: str, make_errored_stream: Callable[..., StreamResult]
+) -> None:
+    """No clock is null, not a bad clock: an unreachable stream reported neither bounds nor provenance."""
+    _write(store_root, [make_errored_stream("/data/session/broken.mp4")])
+
+    (row,) = store.read_sessions(store_root)
+    assert row["timestamp_source"] is None
+
+
+def test_a_session_metric_that_never_ran_stores_null_columns(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """The shape that stops a mux's artifact from being re-judged into a pass.
+
+    Two aligned sensors on container PTS: measured, they would store a zero spread
+    that every threshold accepts. Stored as never-ran, there is nothing for
+    ``di-reevaluate`` to rebuild.
+    """
+    streams = [make_stream(FRONT, perfect()), make_stream("/data/session/rear.mp4", perfect())]
+    _write(
+        store_root,
+        streams,
+        session_metrics=_metrics_for(
+            [(0, _ONE_MINUTE_NS), (0, _ONE_MINUTE_NS)],
+            source=TimestampSource.CONTAINER_PTS,
+        ),
+    )
+
+    for spec in SESSION_INSTRUMENTS:
+        (measurement,) = store.read_session_measurements(store_root, spec.name)
+        assert measurement["is_defined"] is None
+        assert all(measurement[name] is None for name in spec.field_names)
+
+    verdicts = {row["metric_name"]: row for row in store.read_session_evaluations(store_root)}
+    assert {row["check_status"] for row in verdicts.values()} == {"SKIPPED"}
+    assert "container PTS" in str(verdicts[SPREAD]["reason"])
+    # And the session's own row names the cause the metric rows cannot.
+    (session,) = store.read_sessions(store_root)
+    assert session["timestamp_source"] == "container_pts"
+
+
+def test_a_row_from_a_newer_schema_is_refused_rather_than_half_written(store_root: str) -> None:
+    """The whole enforcement of the non-additive version 2 to 3 bump, pinned.
+
+    ``timestamp_source`` joined a schema that :func:`store.append_rows` writes with a
+    plain ``mode="append"``, so a store laid down before it cannot take new rows and
+    needs a fresh root -- a cost taken deliberately over migration machinery (see
+    :data:`store_schema.STORE_SCHEMA_VERSION`). That trade only holds while the
+    refusal is loud. A Lance that quietly dropped the column, or wrote the row into a
+    partial file first, would leave an operator with a store whose clocks are absent
+    rather than one that stopped and asked for a new root.
+
+    Held on ``session.lance``. ``stream.lance`` gained the column through the same
+    function and the same call, so one dataset pins the mechanism for both.
+
+    The two runs differ only in ``run_id``, and that is what makes the aftermath
+    legible: read newest-per-session, a row half-written under the same key would be
+    collapsed into the row it was meant to supersede and the dataset would look
+    untouched either way. Read as full history, a partial write has somewhere to show.
+    """
+
+    def _run(timestamp_source: SessionTimestampSource | None) -> dict[str, object]:
+        return store.session_row(
+            session_id=store.session_key(SESSION),
+            run_id=store.new_run_id(),
+            created_at=_LATEST,
+            session_path=SESSION,
+            num_streams=2,
+            num_unreadable=0,
+            timestamp_source=timestamp_source,
+        )
+
+    uri = store.join(store_root, store_schema.SESSION_DATASET)
+    # ``from_pylist`` keeps only the fields the schema it is handed names, so writing a
+    # row under a schema without ``timestamp_source`` lays the dataset down exactly as
+    # version 2 left it -- no hand-built legacy row required.
+    legacy = store_schema.SESSION_SCHEMA.remove(store_schema.SESSION_SCHEMA.get_field_index("timestamp_source"))
+    settled = _run(None)
+    store.append_rows([settled], uri, legacy, None)
+
+    with pytest.raises(OSError, match="Append with different schema"):
+        store.append_rows([_run(SessionTimestampSource.CAPTURE)], uri, store_schema.SESSION_SCHEMA, None)
+
+    history = store.read_sessions(store_root, latest=False, include_incomplete=True)
+    assert [row["run_id"] for row in history] == [settled["run_id"]], "the refused row reached the dataset anyway"
+    assert "timestamp_source" not in history[0], "the append was refused, so the column cannot be there"
 
 
 def test_a_single_stream_run_writes_no_session_rows(

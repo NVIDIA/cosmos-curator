@@ -37,7 +37,7 @@ already-open sensor, packaging its output as a :class:`StreamResult`.
 
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO
 
@@ -56,11 +56,12 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     IntegritySensor,
     SessionReport,
     StreamResult,
+    contributing_bounds,
     stream_result,
 )
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader, raise_if_interrupted
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
-from cosmos_curator.next.recipes.data_integrity.sources import run_checks
+from cosmos_curator.next.recipes.data_integrity.sources import error_code, http_status, run_checks
 
 
 def run_stream(
@@ -187,45 +188,21 @@ _UNAUTHORIZED_STATUSES = frozenset({401, 403})
 _SERVER_ERROR_STATUS = 500
 
 
-def _error_code(exc: BaseException) -> str | None:
-    """Read the backend's error code off an exception shaped like ``botocore``'s ``ClientError``."""
-    response = getattr(exc, "response", None)
-    if not isinstance(response, Mapping):
-        return None
-    error = response.get("Error")
-    if not isinstance(error, Mapping):
-        return None
-    code = error.get("Code")
-    return code if isinstance(code, str) else None
-
-
-def _http_status(exc: BaseException) -> int | None:
-    """Read the HTTP status of a failed cloud call, from either SDK's shape for it."""
-    response = getattr(exc, "response", None)
-    if isinstance(response, Mapping):
-        metadata = response.get("ResponseMetadata")
-        if isinstance(metadata, Mapping):
-            status = metadata.get("HTTPStatusCode")
-            if isinstance(status, int):
-                return status
-    # azure.core.exceptions.HttpResponseError carries it directly.
-    status = getattr(exc, "status_code", None)
-    return status if isinstance(status, int) else None
-
-
 def is_infrastructure_error(exc: BaseException) -> bool:
     """Report whether ``exc`` means the data was unreachable rather than bad.
 
     Three signals, in order: the class hierarchy, the backend's error code, and the
-    HTTP status. The last two are read defensively off whatever attributes the
-    exception happens to carry, because the alternative is importing botocore and
-    azure.core here to name two exception types.
+    HTTP status. The last two come from :func:`~.sources.error_code` and
+    :func:`~.sources.http_status`, which read them defensively off whatever attributes
+    the exception carries, the alternative being to import botocore and azure.core to
+    name two exception types. Shared with the sidecar reader, which asks the opposite
+    question -- was the object absent -- of the same two attributes.
     """
     if any(cls.__name__ in _INFRASTRUCTURE_ERRORS for cls in type(exc).__mro__):
         return True
-    if _error_code(exc) in _INFRASTRUCTURE_S3_CODES:
+    if error_code(exc) in _INFRASTRUCTURE_S3_CODES:
         return True
-    status = _http_status(exc)
+    status = http_status(exc)
     if status is None:
         return False
     return status in _UNAUTHORIZED_STATUSES or status >= _SERVER_ERROR_STATUS
@@ -358,17 +335,13 @@ def session_metrics(streams: list[StreamResult], thresholds: Thresholds = DEFAUL
     pipeline measures a session's streams itself, and must reach the session's verdict
     by the same path as the CLI rather than growing a second one.
 
-    A stream contributes bounds only if it has both. An errored stream has none, and
-    neither does one whose timeline came back empty, so both drop out here and the
-    session is judged on the sensors that did report. With fewer than two left, every
-    session metric comes back ``SKIPPED``.
+    Which streams contribute is :func:`contributing_bounds`' call, shared with the
+    store so the recorded clock describes the streams the metrics were computed over.
+    With fewer than two contributors every session metric comes back ``SKIPPED``; so
+    does one whose contributors were not all on capture times, which is the engine's
+    call to make rather than this seam's.
     """
-    bounds = [
-        (stream.start_ns, stream.end_ns)
-        for stream in streams
-        if stream.start_ns is not None and stream.end_ns is not None
-    ]
-    return run_session_metrics(bounds, thresholds=thresholds)
+    return run_session_metrics(contributing_bounds(streams), thresholds=thresholds)
 
 
 def run_session(  # noqa: PLR0913

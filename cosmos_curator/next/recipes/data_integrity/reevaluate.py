@@ -31,6 +31,7 @@ than measured.
 import datetime
 from typing import cast
 
+from cosmos_curator.core.sensors.data_integrity.engine import reason_without_capture
 from cosmos_curator.core.sensors.data_integrity.instruments import (
     INSTRUMENTS,
     SESSION_INSTRUMENTS,
@@ -38,7 +39,11 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
     Thresholds,
     evaluate_metric,
 )
-from cosmos_curator.core.sensors.data_integrity.results import CheckResult, CheckStatus
+from cosmos_curator.core.sensors.data_integrity.results import (
+    CheckResult,
+    CheckStatus,
+    SessionTimestampSource,
+)
 from cosmos_curator.core.utils.storage_cli import get_lance_storage_options
 from cosmos_curator.next.recipes.data_integrity import store, store_schema
 
@@ -48,12 +53,12 @@ from cosmos_curator.next.recipes.data_integrity import store, store_schema
 REASON_NEVER_RAN = "skipped: metric did not run (no usable expected rate recorded)"
 
 
-def _skipped_never_ran(spec: InstrumentSpec) -> CheckResult:
+def _skipped_never_ran(spec: InstrumentSpec, reason: str = REASON_NEVER_RAN) -> CheckResult:
     """Build the verdict for a stored row whose metric never ran."""
     return CheckResult(
         name=spec.name,
         status=CheckStatus.SKIPPED,
-        reason=REASON_NEVER_RAN,
+        reason=reason,
         measurement=None,
         evaluation=None,
         raw_measurement=None,
@@ -72,6 +77,56 @@ def _reevaluate_row(spec: InstrumentSpec, row: dict[str, object], thresholds: Th
         return _skipped_never_ran(spec)
     measurement = spec.from_row(row)
     return evaluate_metric(spec, measurement, thresholds)
+
+
+def _reevaluate_session_row(
+    spec: InstrumentSpec,
+    row: dict[str, object],
+    thresholds: Thresholds,
+    session_source: SessionTimestampSource | None,
+) -> CheckResult:
+    """Rebuild and re-judge one session-grain row, naming the clock when it never ran.
+
+    Only the never-ran branch differs from :func:`_reevaluate_row`, and only for a
+    capture-gated metric: the rate-shaped default wording would be the wrong cause,
+    since no session metric needs an expected rate. A session that *was* measured is
+    never asked for the phrase at all -- there is no missing clock to describe.
+    """
+    if row.get("is_defined") is None and spec.requires_capture_timestamps:
+        return _skipped_never_ran(spec, reason_without_capture(session_source))
+    return _reevaluate_row(spec, row, thresholds)
+
+
+def _session_timestamp_sources(
+    root: str,
+    completed: frozenset[str],
+    *,
+    s3_profile_name: str | None,
+    endpoint_url: str | None,
+) -> dict[tuple[str, str], SessionTimestampSource | None]:
+    """Map each stored session *as one run measured it* to the clock it was measured on.
+
+    One extra read, and it buys the only explanation a never-ran session-grain row
+    can have: the row itself is all nulls, so without ``session.lance`` a re-judge
+    could say a metric did not run but not why.
+
+    Keyed on the run as well as the session, and so read as full history rather than
+    newest-per-session. A later run can write a session row without writing any
+    measurements beside it -- a session that could not be listed does exactly that
+    (see :func:`~.processing.build_session_rows`) -- and the newest clock would then
+    explain measurements taken under a different one.
+    """
+    return {
+        (str(row["session_id"]), str(row["run_id"])): _as_session_source(row.get("timestamp_source"))
+        for row in store.read_sessions(
+            root, latest=False, completed=completed, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
+        )
+    }
+
+
+def _as_session_source(value: object) -> SessionTimestampSource | None:
+    """Read the stored clock back as its enum, or ``None`` when no stream reported one."""
+    return None if value is None else SessionTimestampSource(str(value))
 
 
 def reevaluate(  # noqa: PLR0913 -- credentials plus provenance, all independent
@@ -143,17 +198,23 @@ def reevaluate(  # noqa: PLR0913 -- credentials plus provenance, all independent
     # The session-grain half, on the same terms. It is why the session verdict is a
     # table of its own rather than a column on the session row: a verdict welded to
     # the row it judges cannot be re-judged without rewriting the facts beside it.
+    session_sources = _session_timestamp_sources(
+        root, finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
+    )
     session_rows: list[dict[str, object]] = []
     for spec in SESSION_INSTRUMENTS:
         for measurement_row in store.read_session_measurements(
             root, spec.name, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
         ):
-            result = _reevaluate_row(spec, measurement_row, thresholds)
+            session_id = str(measurement_row["session_id"])
+            # The clock the *measuring* run was on, not the newest one recorded since.
+            session_source = session_sources.get((session_id, str(measurement_row["run_id"])))
+            result = _reevaluate_session_row(spec, measurement_row, thresholds, session_source)
             session_rows.append(
                 store.build_session_evaluation_row(
                     spec,
                     result,
-                    session_id=str(measurement_row["session_id"]),
+                    session_id=session_id,
                     run_id=run_id,
                     measurement_run_id=str(measurement_row["run_id"]),
                     created_at=created_at,

@@ -220,17 +220,23 @@ def test_every_session_contributes_a_row_per_session_metric(summary: dict[str, o
     assert len(store.read_session_evaluations(root)) == NUM_SESSIONS * len(SESSION_INSTRUMENTS)
 
 
-def test_a_failing_session_metric_reaches_the_store(tmp_path: pathlib.Path, h264_video: Callable[..., bytes]) -> None:
+def test_a_failing_session_metric_reaches_the_store(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    capture_timeline: Callable[..., pathlib.Path],
+) -> None:
     """The regression this MR exists to prevent: a session verdict that only the report knew.
 
     Two sensors that stopped a second apart, judged by a policy that allows no
     non-overlap at all. Every stream passes on its own, so a store reconstructing the
-    session from stream rows alone would read back ``PASS``.
+    session from stream rows alone would read back ``PASS``. Capture timelines beside
+    the clips are what let the session be judged rather than skipped.
     """
     clips = tmp_path / "clips"
     (clips / "ragged").mkdir(parents=True)
-    (clips / "ragged" / "front.mp4").write_bytes(h264_video(frames=30))
-    (clips / "ragged" / "rear.mp4").write_bytes(h264_video(frames=60))
+    for name, frames in (("front.mp4", 30), ("rear.mp4", 60)):
+        (clips / "ragged" / name).write_bytes(h264_video(frames=frames))
+        capture_timeline(clips / "ragged" / name, frames=frames)
     store_root = tmp_path / "di-store"
 
     summary = pipeline.run_config(

@@ -222,6 +222,14 @@ by session rather than by stream, so it lands in three tables parallel to the
 per-stream ones instead of widening them. See
 [data-integrity-store-schema.md](data-integrity-store-schema.md) section 5.
 
+Arity also turned out to decide what a metric needs of its input. Both multi-sensor
+metrics declare `requires_capture_timestamps` and do not run unless every contributing
+sensor was measured on real capture times — a spec-level flag, in the same shape as
+`requires_expected_hz`, rather than special-casing in the engine. Comparing sensors is
+the one thing container presentation timestamps cannot support at all, since a mux puts
+every camera on one regenerated grid; see
+[The session grain skips without a shared capture clock](data-integrity-metrics.md#the-session-grain-skips-without-a-shared-capture-clock).
+
 ## Streaming and Windows
 
 A sensor recording can be far larger than memory (a lidar file may be tens of GB), so metrics must measure over a stream of windows rather than one in-memory array — and a single read should be able to feed many metrics at once.
@@ -307,7 +315,6 @@ This section names the **problems** that layer must solve, and the **constraints
 Open problems, in rough dependency order:
 
 - **Full-fidelity sensor input** — producing a stream of consecutive, in-order, full-fidelity windows (distinct from lossy sampling) from a concrete sensor, for the instruments to fold. This is separate sensor-library work, and the prerequisite for any recording-level check.
-- **Capture timestamps in preference to container PTS** — `CameraSensor.timestamps_ns` returns presentation timestamps, which a constant-frame-rate mux synthesizes on a fixed grid starting at `0` per file. Against such a source the timing metrics and both multi-sensor metrics report a perfect score whatever the hardware did, so the result says nothing was measurable rather than that the data is healthy (see [Timestamp provenance](data-integrity-metrics.md#timestamp-provenance) for the measured comparison). Also sensor-library work, and what makes the timing suite meaningful on video.
 - **Composing metrics into runnable units** — how a metric, an evaluator, and a sensor selection combine into something nameable and reusable (a "check").
 - **Declaring and configuring checks** — how checks are described as data and loaded. Format and schema are undecided.
 - **Driving many metrics from one read** — large recordings (a lidar file can be tens of GB) mean a single pass over the windows must feed many instruments at once; how that pass resolves each metric's array inputs from a sensor and packages the results is open.

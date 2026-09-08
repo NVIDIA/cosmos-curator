@@ -37,6 +37,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     OverallStatus,
     StreamResult,
 )
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.utils.storage_cli import StorageCliError
 from cosmos_curator.next.recipes.data_integrity import session_runner
 from cosmos_curator.next.recipes.data_integrity.session_runner import (
@@ -59,15 +60,21 @@ class _FakeSensor:
         has_bframes: bool = False,
         codec_name: str = "h264",
         avg_frame_rate: Fraction = Fraction(100, 1),
+        timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS,
     ) -> None:
         self._ts = np.array(timestamps, dtype=np.int64)
         self.has_bframes = has_bframes
         self.codec_name = codec_name
         self.video_metadata = SimpleNamespace(avg_frame_rate=avg_frame_rate)
+        self._timestamp_source = timestamp_source
 
     @property
     def timestamps_ns(self) -> NDArray[np.int64]:
         return self._ts
+
+    @property
+    def timestamp_source(self) -> TimestampSource:
+        return self._timestamp_source
 
     @property
     def start_ns(self) -> int:
@@ -124,6 +131,41 @@ def test_run_stream_records_unavailable_expected_hz() -> None:
     assert _statuses(result)["rate"] is CheckStatus.SKIPPED
 
 
+@pytest.mark.parametrize("source", list(TimestampSource))
+def test_run_stream_records_the_clock_it_measured_on(source: TimestampSource) -> None:
+    """Provenance travels sensor -> engine -> result, beside the rate's own provenance.
+
+    Read off the sensor rather than defaulted anywhere along the way: a default would
+    report container PTS as though the sensor had said so, which is the one answer a
+    reader must be able to trust here.
+    """
+    result = run_stream(
+        _FakeSensor(_perfect_cadence(), timestamp_source=source),
+        source="x",
+        expected_hz=100.0,
+    )
+    assert result.timestamp_source is source
+
+
+def test_a_stream_that_could_not_be_opened_claims_no_clock() -> None:
+    """An errored stream has no provenance, for the same reason it has no bounds.
+
+    Nothing was measured, so naming a clock would describe a measurement that does
+    not exist.
+    """
+    errored = StreamResult(
+        source="x",
+        codec_name=None,
+        has_bframes=None,
+        num_samples=None,
+        start_ns=None,
+        end_ns=None,
+        metrics=[],
+        error="moov atom not found",
+    )
+    assert errored.timestamp_source is None
+
+
 def test_run_stream_bframes_fail_the_stream() -> None:
     """A frame-reordering flag fails the frame-reordering metric and the stream."""
     sensor = _FakeSensor(_perfect_cadence(), has_bframes=True)
@@ -171,7 +213,16 @@ def test_run_stream_batched_matches_one_shot() -> None:
     assert result.status is OverallStatus.PASS
 
 
-def _canned(source: str, status: CheckStatus) -> StreamResult:
+def _canned(
+    source: str, status: CheckStatus, *, timestamp_source: TimestampSource = TimestampSource.CAPTURE
+) -> StreamResult:
+    """Build a finished per-stream result, on capture times unless a test says otherwise.
+
+    ``capture`` rather than the ``StreamResult`` default of ``None`` because these
+    stand in for streams that *were* measured, and a stream reporting no clock at all
+    contributes nothing to a session verdict -- which would leave the session tests
+    below asserting a skip they did not mean to arrange.
+    """
     return StreamResult(
         source=source,
         codec_name="h264",
@@ -180,6 +231,7 @@ def _canned(source: str, status: CheckStatus) -> StreamResult:
         start_ns=0,
         end_ns=1,
         metrics=[CheckResult("m", status, "m=ok", measurement=None, evaluation=None)],
+        timestamp_source=timestamp_source,
     )
 
 
@@ -199,14 +251,18 @@ def test_run_session_aggregates_streams(monkeypatch: pytest.MonkeyPatch) -> None
 def test_run_session_judges_the_session_as_well_as_its_streams(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
+    capture_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """A session whose sensors stopped at different times fails on the session's own verdict.
 
     Real files rather than canned results: the bounds a session metric folds are read
-    off each decode, so a fake would be measuring the fake.
+    off each decode, so a fake would be measuring the fake. Capture timelines beside
+    them for the same reason -- without those the cameras are on container PTS, where
+    a ragged session is unmeasurable rather than failing.
     """
-    (tmp_path / "front.mp4").write_bytes(h264_video(frames=30))
-    (tmp_path / "rear.mp4").write_bytes(h264_video(frames=15))
+    for name, frames in (("front.mp4", 30), ("rear.mp4", 15)):
+        (tmp_path / name).write_bytes(h264_video(frames=frames))
+        capture_timeline(tmp_path / name, frames=frames)
 
     report = run_session(str(tmp_path), expected_hz=30.0)
 
@@ -214,6 +270,39 @@ def test_run_session_judges_the_session_as_well_as_its_streams(
     overlap = next(m for m in report.metrics if m.name == "multi_sensor_overlap")
     assert overlap.status is CheckStatus.FAIL
     assert report.status is OverallStatus.FAIL, "a session verdict has to be able to fail a passing set of streams"
+
+
+def test_a_session_of_resampled_clips_is_not_graded_as_a_rig(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    capture_timeline: Callable[..., pathlib.Path],
+) -> None:
+    """The shape a ``multimodal_split`` clip directory has, end to end through the runner.
+
+    That recipe cuts every camera to one span and resamples them onto one evenly spaced
+    grid, so the clips really are flawlessly aligned -- and the grid is written under the
+    recorder's own filename, with the observed instants beside it. Graded as a recording,
+    this session reports zero spread and total overlap no matter how ragged the rig
+    behind it was, because the alignment is the splitter's and the original skew is
+    already gone. Graded honestly, there is nothing here to grade: the marker disowns
+    both grids, both clips fall to container PTS, and the session grain skips.
+
+    The two clips are deliberately the same length on the same grid, since that is what
+    the splitter produces and what would otherwise pass.
+    """
+    for name in ("front.mp4", "rear.mp4"):
+        (tmp_path / name).write_bytes(h264_video(frames=30))
+        capture_timeline(tmp_path / name, frames=30)
+        # What multimodal_split writes beside a clip, and what the runner reads as
+        # "the timeline next door is a grid" -- contents never opened.
+        with pathlib.Path(f"{tmp_path / name}.observations.npy").open("wb") as stream:
+            np.save(stream, np.arange(30, dtype=np.int64), allow_pickle=False)
+
+    report = run_session(str(tmp_path), expected_hz=30.0)
+
+    assert {s.timestamp_source for s in report.streams} == {TimestampSource.CONTAINER_PTS}
+    assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
+    assert report.status is OverallStatus.PASS, "a skip is not a finding, and neither is a derived tree"
 
 
 def test_session_metrics_are_skipped_for_a_session_of_one_stream(
@@ -268,6 +357,45 @@ def test_a_session_of_one_readable_stream_has_nothing_to_compare() -> None:
         ]
     )
     assert {m.status for m in metrics} == {CheckStatus.SKIPPED}
+
+
+def test_a_session_without_capture_timelines_is_skipped_rather_than_passed(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """What a vendor's clips look like when no sidecar was ever produced beside them.
+
+    Two cameras, both muxed at a constant frame rate, so their container timelines
+    agree perfectly and the session would report a flawless rig. The whole session
+    grain is skipped instead, which is what makes the tool honest about a dataset it
+    cannot say anything about -- and the reason names the clock, so an operator knows
+    what to supply rather than that "something" was insufficient.
+    """
+    for name in ("front.mp4", "rear.mp4"):
+        (tmp_path / name).write_bytes(h264_video(frames=30))
+
+    report = run_session(str(tmp_path), expected_hz=30.0)
+
+    assert {s.status for s in report.streams} == {OverallStatus.PASS}, "the per-stream grain is unaffected"
+    assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
+    assert all("container PTS" in m.reason for m in report.metrics)
+    assert report.status is OverallStatus.PASS, "a skipped session metric is not a finding"
+
+
+def test_a_session_where_only_some_cameras_have_capture_timelines_is_skipped_too(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    capture_timeline: Callable[..., pathlib.Path],
+) -> None:
+    """Half a rig's real clock is not half an answer: the comparison needs one clock, not a better one."""
+    for name in ("front.mp4", "rear.mp4"):
+        (tmp_path / name).write_bytes(h264_video(frames=30))
+    capture_timeline(tmp_path / "front.mp4", frames=30)
+
+    report = run_session(str(tmp_path), expected_hz=30.0)
+
+    assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
+    assert all("disagree" in m.reason for m in report.metrics)
 
 
 def test_run_session_captures_open_errors(tmp_path: pathlib.Path) -> None:

@@ -102,7 +102,8 @@ def _render_human(
         f"   num_samples: {video_info.num_samples}"
         f"   start_ns: {video_info.start_ns}"
         f"   end_ns: {video_info.end_ns}\n"
-        f"{_format_expected_hz_line(resolved_cfg)}\n"
+        f"{_format_expected_hz_line(resolved_cfg)}"
+        f"  timestamps: {video_info.timestamp_source.value}\n\n"
     )
     name_width = max(len(r.name) for r in results)
     lines = [f"  {r.name.ljust(name_width)}  {r.status.value:<7}  {r.reason}\n" for r in results]

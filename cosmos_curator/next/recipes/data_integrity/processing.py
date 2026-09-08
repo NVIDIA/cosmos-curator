@@ -49,7 +49,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from loguru import logger
 
 from cosmos_curator.core.sensors.data_integrity.instruments import instrument
-from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult, session_clock
 from cosmos_curator.next.recipes.data_integrity import store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
@@ -231,6 +231,7 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
                 session_path=session_path,
                 num_streams=num_streams,
                 num_unreadable=sum(1 for result in results if result.error is not None),
+                timestamp_source=session_clock(results),
                 error=error,
             )
         ]

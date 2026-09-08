@@ -15,6 +15,7 @@
 """Camera sensor for the curator package."""
 
 from collections.abc import Generator, Iterator
+from fractions import Fraction
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -31,7 +32,9 @@ from cosmos_curator.core.sensors.data.video import (
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy, require_nearest_timestamp_policy
 from cosmos_curator.core.sensors.sampling.sampler import sample_window_indices
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
-from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
+from cosmos_curator.core.sensors.types.types import DataSource, TimestampSource, VideoIndexCreationMethod
+from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
+from cosmos_curator.core.sensors.utils.validation import require_1d, require_strictly_increasing
 from cosmos_curator.core.sensors.utils.video import (
     DEFAULT_VIDEO_DECODE_CONFIG,
     CpuVideoDecodeConfig,
@@ -46,6 +49,22 @@ from cosmos_curator.core.sensors.utils.video import (
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+
+
+def _validate_capture_timeline(timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+    """Reject a capture timeline that cannot describe a recording.
+
+    The same bounds :class:`StreamingCameraSensor` puts on its own timeline, checked
+    here for the same reason: an array that is empty or out of order gives an answer no
+    recording could have produced. Whether it describes *this* recording is a separate
+    question, answered against the frame count once the container has been indexed.
+    """
+    require_1d("capture_timestamps_ns", timestamps_ns, np.int64)
+    if timestamps_ns.size == 0:
+        msg = "capture_timestamps_ns must describe at least one observation"
+        raise ValueError(msg)
+    require_strictly_increasing("capture_timestamps_ns", timestamps_ns)
+    return timestamps_ns
 
 
 class CameraSensor:
@@ -74,6 +93,7 @@ class CameraSensor:
         intrinsics: CameraIntrinsics | None = None,
         extrinsics: SensorExtrinsics | None = None,
         origin_ns: int | None = None,
+        capture_timestamps_ns: npt.NDArray[np.int64] | None = None,
     ) -> None:
         """Initialize the camera sensor.
 
@@ -104,12 +124,42 @@ class CameraSensor:
                 knows when it started but not what PTS the container gave that
                 instant, so the sensor subtracts its own first PTS rather than
                 asking the caller to. Stream-native PTS values remain unchanged
-                for decode planning and seeking.
+                for decode planning and seeking. Cannot be combined with
+                *capture_timestamps_ns*, which carries its own origin.
+            capture_timestamps_ns: The recording's own capture times, one per
+                displayable frame, in ascending int64 nanoseconds, or ``None`` to
+                report the container's presentation timestamps. Supplied rather
+                than read, because the library never accepts URIs and so cannot
+                go looking for whatever the recorder wrote beside the media (see
+                :data:`~cosmos_curator.core.sensors.types.types.DataSource`);
+                :func:`~cosmos_curator.core.sensors.utils.timestamps.read_timestamps_ns`
+                is what turns that artifact into this argument. Worth supplying
+                wherever it exists: a constant-frame-rate mux regenerates PTS on a
+                fixed grid, and a timeline measured off that grid describes the
+                encoder rather than the hardware.
+
+        Raises:
+            ValueError: If *origin_ns* is out of range, if *capture_timestamps_ns*
+                is not a non-empty ascending int64 array, if it holds a different
+                number of observations than the container has displayable frames,
+                if both it and *origin_ns* are given, or if the stream has no
+                displayable frames.
 
         """
         # Before indexing, so an unusable origin costs nothing to reject.
         if origin_ns is not None:
+            if capture_timestamps_ns is not None:
+                # Both answer "where is this recording on the caller's clock", and a
+                # capture timeline answers it for every frame rather than just the
+                # first, so honouring one would have to mean ignoring the other.
+                msg = (
+                    "origin_ns and capture_timestamps_ns are mutually exclusive: "
+                    "a capture timeline carries its own origin"
+                )
+                raise ValueError(msg)
             origin_ns = validate_timestamp_offset_ns(origin_ns, name="origin_ns")
+        if capture_timestamps_ns is not None:
+            capture_timestamps_ns = _validate_capture_timeline(capture_timestamps_ns)
         self._source = source
         self._stream_idx = stream_idx
         self._decode_config = decode_config
@@ -125,7 +175,36 @@ class CameraSensor:
             self._video_index = self._video_index.with_timestamp_offset(
                 origin_ns - int(self._video_index.display_pts_ns[0])
             )
+        # One resolved timeline, so every timestamp this sensor reports -- its bounds,
+        # its stream, and the payloads it samples -- is on a single clock. The index
+        # keeps its stream-native PTS regardless: those address frames in the file, and
+        # seeking and decode planning still go through them.
+        self._timeline_ns: npt.NDArray[np.int64]
+        if capture_timestamps_ns is None:
+            self._timeline_ns = self._video_index.display_pts_ns
+            self._timestamp_source = TimestampSource.CONTAINER_PTS
+        else:
+            self._timeline_ns = as_readonly_view(self._require_matching_length(capture_timestamps_ns))
+            self._timestamp_source = TimestampSource.CAPTURE
         self._empty_camera_data: CameraData | None = None
+
+    def _require_matching_length(self, capture_timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+        """Raise unless the capture timeline has one entry per displayable frame.
+
+        Rejected rather than trimmed or padded to fit. The two are matched by position
+        -- frame *i* was captured at entry *i* -- so a count that disagrees means the
+        alignment is unknown, not that the overlap is usable: whether the missing
+        entries are at the front, the back, or scattered changes which frame every
+        entry belongs to, and nothing here can tell those apart.
+        """
+        frames = len(self._video_index.display_pts_ns)
+        if len(capture_timestamps_ns) != frames:
+            msg = (
+                f"capture_timestamps_ns describes {len(capture_timestamps_ns)} observations "
+                f"but the stream has {frames} displayable frames"
+            )
+            raise ValueError(msg)
+        return capture_timestamps_ns
 
     @property
     def video_index(self) -> VideoIndex:
@@ -143,14 +222,19 @@ class CameraSensor:
         return self._video_index.timestamp_offset_ns
 
     @property
+    def timestamp_source(self) -> TimestampSource:
+        """Which clock this sensor's reported timeline came from."""
+        return self._timestamp_source
+
+    @property
     def start_ns(self) -> int:
         """Return the canonical starting timestamp for this sensor (nanoseconds)."""
-        return int(self._video_index.display_pts_ns[0])
+        return int(self._timeline_ns[0])
 
     @property
     def end_ns(self) -> int:
         """Return the canonical ending timestamp for this sensor (nanoseconds)."""
-        return int(self._video_index.display_pts_ns[-1])
+        return int(self._timeline_ns[-1])
 
     @property
     def max_gap_ns(self) -> int:
@@ -165,17 +249,22 @@ class CameraSensor:
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
         """Get the timestamps in nanoseconds.
 
+        The capture timeline when one was supplied, and the container's presentation
+        timestamps otherwise; :attr:`timestamp_source` says which, and the two do not
+        mean the same thing.
+
         Returns:
             Numpy array of timestamps in nanoseconds as int64.
 
         """
-        return self._video_index.display_pts_ns
+        return self._timeline_ns
 
     def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
-        """Stream the camera's presentation timeline in nanoseconds.
+        """Stream the camera's timeline in nanoseconds.
 
-        Reads the timeline directly from the ``VideoIndex`` (``display_pts_ns``,
-        strictly increasing by construction); no frames are decoded. With
+        Reads the timeline already resolved in the constructor -- the supplied capture
+        times, or the ``VideoIndex``'s ``display_pts_ns`` -- so no frames are decoded
+        and the batches are strictly increasing either way. With
         ``VideoIndexCreationMethod.AUTO`` — the default — B-frame streams are
         indexed via ``FULL_DEMUX``, so decode-order (DTS) reordering never reaches
         the index and the streamed timeline is already in presentation order.
@@ -197,7 +286,7 @@ class CameraSensor:
             raise ValueError(msg)
         # The constructor rejects streams with no displayable frames, so the
         # timeline is always non-empty here; step is therefore always >= 1.
-        timestamps = self._video_index.display_pts_ns
+        timestamps = self._timeline_ns
         # batch_size == 0 means "one batch spanning the whole timeline".
         step = batch_size or len(timestamps)
         return (timestamps[start : start + step] for start in range(0, len(timestamps), step))
@@ -246,6 +335,25 @@ class CameraSensor:
                 extrinsics=self._extrinsics,
             )
         return self._empty_camera_data
+
+    def _sampled_timestamps_ns(
+        self,
+        indices: npt.NDArray[np.int64],
+        counts: npt.NDArray[np.int64],
+        pts_stream_expanded: npt.NDArray[np.int64],
+        time_base: Fraction,
+    ) -> npt.NDArray[np.int64]:
+        """Timestamp each served frame on the clock this sensor reports.
+
+        A capture timeline is positional, so a served frame's capture time is simply the
+        entry at the index that selected it. Without one, the frame's own PTS is
+        converted from the decoder's time base rather than read back out of the index:
+        that is the value the decoder returned for the frame it actually served, and
+        keeping it is what leaves every existing caller's payloads bit-for-bit unchanged.
+        """
+        if self._timestamp_source is TimestampSource.CAPTURE:
+            return np.repeat(self._timeline_ns[indices], counts)
+        return pts_to_ns(pts_stream_expanded, time_base) + self._video_index.timestamp_offset_ns
 
     def sample(
         self,
@@ -302,7 +410,9 @@ class CameraSensor:
                     yield self._get_empty_camera_data()
                     continue
 
-                indices, counts = sample_window_indices(self.video_index.display_pts_ns, window, policy=policy)
+                # Selected against the reported timeline, so a window means the same
+                # instants here as it does to a caller reading start_ns / end_ns.
+                indices, counts = sample_window_indices(self._timeline_ns, window, policy=policy)
                 sampled_pts_stream = self.video_index.display_pts_stream[indices]
                 decode_plan = make_decode_plan(self.video_index.kf_pts_stream, sampled_pts_stream, counts)
                 frames, motion_vectors = decoder.decode(decode_plan)
@@ -310,8 +420,9 @@ class CameraSensor:
 
                 yield CameraData(
                     align_timestamps_ns=window.timestamps_ns,
-                    sensor_timestamps_ns=pts_to_ns(pts_stream_expanded, decoder.time_base)
-                    + self._video_index.timestamp_offset_ns,
+                    sensor_timestamps_ns=self._sampled_timestamps_ns(
+                        indices, counts, pts_stream_expanded, decoder.time_base
+                    ),
                     pts_stream=pts_stream_expanded,
                     frames=frames,
                     metadata=self._video_metadata,

@@ -43,6 +43,27 @@ from pathlib import Path
 type DataSource = Path | bytes | io.BufferedIOBase
 
 
+class TimestampSource(enum.Enum):
+    """Which clock a sensor's reported timeline came from.
+
+    ``CAPTURE`` -- the recording's own capture times, supplied by the caller from
+    whatever the recorder wrote beside the media. These are what every timing question
+    is actually about.
+
+    ``CONTAINER_PTS`` -- the container's presentation timestamps, which reflect capture
+    only when the file was muxed at a variable frame rate. A constant-frame-rate mux
+    discards the capture times and regenerates them on a fixed grid restarting at ``0``
+    per file, so a timeline from this source can be a metronome that says nothing about
+    what the hardware did.
+
+    Reported so a reader can tell those two apart, because their timing numbers do not
+    mean the same thing and nothing in the numbers themselves gives it away.
+    """
+
+    CAPTURE = "capture"
+    CONTAINER_PTS = "container_pts"
+
+
 class VideoIndexCreationMethod(enum.Enum):
     """How packet-level metadata is collected when building a video index.
 

@@ -101,6 +101,24 @@ next to it. What a *particular* run wrote is answered by `run_id` and the rows.
 | `num_streams` | `int64` | yes | `null` for a re-judge, which touches no stream |
 | `store_schema_version` | `int32` | no | layout version at write time |
 
+### Layout versions
+
+`store_schema_version` counts changes to the store *as a whole* — a dataset added, moved or renamed. A change inside
+one metric's schema needs no number here, because Lance records that table's own schema.
+
+| Version | Change | Reads an older store? | Takes new rows in an older store? |
+|---|---|---|---|
+| 1 | the original per-stream tables | — | — |
+| 2 | added the three session-grain tables | yes | yes |
+| 3 | added `timestamp_source` to `stream.lance` and to `session.lance` | yes | **no** |
+
+Version 2 was additive: a dataset that was never written reads as no rows, so nothing had to change. Version 3 is
+not. Appends go through `lance.write_dataset(..., mode="append")`, which requires the incoming schema to match the
+dataset's, so a root written at version 1 or 2 rejects new `stream.lance` or `session.lance` rows and needs a fresh
+one. That is a deliberate choice rather than an oversight: migration machinery for a store whose only readers are the
+two CLIs and the rollup would cost more than re-measuring, and re-measuring is cheap because the sources have not
+changed.
+
 ### Dedup keys
 
 "Newest per key" only works if everyone agrees on the key, so it's defined per table:
@@ -197,10 +215,17 @@ One row per stream a run touched, **including ones that failed to open**.
 | `start_ns` / `end_ns` | `int64` | yes | first / last timestamp |
 | `expected_hz` | `float64` | yes | the rate we judged against |
 | `expected_hz_source` | `string` | yes | `user` \| `header` \| `unavailable` |
+| `timestamp_source` | `string` | yes | `capture` \| `container_pts` — which clock the timing columns were measured on |
 | `error` | `string` | yes | if set, the source couldn't be read and has no measurements |
 
 `expected_hz` is worked out per stream and saved because it explains the results — if it's `unavailable`, that's
 *why* the rate/gap/jitter checks got skipped.
+
+`timestamp_source` is saved for a stronger reason: it can't be recovered later. The row keeps the numbers, not the
+sidecar that explains them, and a stored jitter of nearly zero is ambiguous without it — a rig that is genuinely
+steady and a constant-frame-rate mux that regenerated the timeline both look like that. Only one is a measurement.
+A query for streams whose cadence is real filters on this column. See
+[Timestamp provenance](data-integrity-metrics.md#timestamp-provenance).
 
 ### Content identity is free
 
@@ -248,8 +273,8 @@ Every metric table starts with the same identity prefix:
 
 (`?` marks nullable. Metric columns are additionally all-null on a "never ran" row — see below.)
 
-`expected_hz_source` lives only on `stream.lance`. It's per-stream context, not a measured fact, so metric tables
-reach it by joining on `stream_id` rather than carrying a copy.
+`expected_hz_source` and `timestamp_source` live only on `stream.lance`. Both are per-stream context, not measured
+facts, so metric tables reach them by joining on `stream_id` rather than carrying a copy.
 
 ### Why one table per metric
 
@@ -388,7 +413,20 @@ One row per session per run. Dedup on `session_id` by `(created_at DESC, run_id 
 | `locator_namespace` | `string` | no | `local` \| `s3` \| `az` |
 | `num_streams` | `int64` | no | how many streams the run found under it |
 | `num_unreadable` | `int64` | no | how many of those could not be opened |
+| `timestamp_source` | `string` | yes | `capture` \| `container_pts` \| `mixed` — the clock rolled up across the session's streams; `null` when none contributed |
 | `error` | `string` | yes | if set, the session itself could not be listed and has no streams and no measurements |
+
+`timestamp_source` is the session-grain counterpart of the `stream.lance` column, rolled up by one rule: `capture`
+only when *every* contributing stream reported it, `container_pts` only when every one did, and `mixed` when they
+disagree. A stream that contributed no bounds — unreachable, or read with an empty timeline — belongs to neither
+answer and is left out, so a session no stream contributed to has `null` rather than a name: it was measured on no
+clock, which is not the same as a bad one.
+
+The column exists because it is the *only* thing that can explain a skipped session-grain metric. Both session metrics
+declare `requires_capture_timestamps`, so on anything but `capture` they never run, and a never-ran row is all nulls
+by construction — it can say the metric did not run but not why. Writing the cause here also makes the fleet
+queryable: "which sessions have real alignment numbers" is a filter on this column rather than a join against every
+camera's row. `di-reevaluate` reads it back to phrase the same reason the original run gave.
 
 `error` is the session-level analogue of `stream.error`, and it settles a question the pipeline review raised: a
 stale path in a thousand-path manifest gets a row saying so, rather than costing the run every measurement already
@@ -433,6 +471,18 @@ The identity prefix is `MEASUREMENT_IDENTITY_FIELDS` with `session_id` where `st
 
 `num_sensors` is on both because it is what makes an undefined row legible: a session of one camera has nothing to
 compare, and the count is the whole explanation.
+
+The third `is_defined` state is reachable here too, and by only one route. Both session metrics declare
+`requires_capture_timestamps`, so unless the session's rolled-up `timestamp_source` is `capture` they never run and
+the row is written all-null. That shape is load-bearing rather than incidental: on container PTS the numbers would be
+a zero spread and total overlap that every threshold accepts, and if those were *stored*, `di-reevaluate` would
+rebuild them and produce a `PASS` the rig never earned. There is nothing to rebuild from a null row. The cause is on
+`session.lance.timestamp_source`, since the row itself cannot carry it.
+
+Note which skip is which: one camera on capture times gives `is_defined = false` with `num_sensors = 1` — measured,
+nothing to compare — while one camera on container PTS gives all nulls. The first is a fact a later policy can
+re-judge; the second never was one. See
+[The session grain skips without a shared capture clock](data-integrity-metrics.md#the-session-grain-skips-without-a-shared-capture-clock).
 
 ### `session_evaluation.lance`
 
@@ -527,11 +577,11 @@ One session, three streams: a good one, one with a single frame and no known rat
 
 `stream.lance` (abridged — `stream_id` shortened for readability)
 
-| stream_id | source | selector | codec_name | num_samples | expected_hz | expected_hz_source | content_etag | error |
-|---|---|---|---|---|---|---|---|---|
-| `s_a1b2` | `camera_front.mp4` | `video_stream`/`0` | `h264` | 600 | 30.0 | `header` | `"9f8e..."` | `null` |
-| `s_c3d4` | `camera_left.mp4` | `video_stream`/`0` | `h264` | 1 | `null` | `unavailable` | `"1a2b..."` | `null` |
-| `s_e5f6` | `camera_rear.mp4` | `video_stream`/`0` | `null` | `null` | `null` | `null` | `"7c8d..."` | `moov atom not found` |
+| stream_id | source | selector | codec_name | num_samples | expected_hz | expected_hz_source | timestamp_source | content_etag | error |
+|---|---|---|---|---|---|---|---|---|---|
+| `s_a1b2` | `camera_front.mp4` | `video_stream`/`0` | `h264` | 600 | 30.0 | `header` | `capture` | `"9f8e..."` | `null` |
+| `s_c3d4` | `camera_left.mp4` | `video_stream`/`0` | `h264` | 1 | `null` | `unavailable` | `container_pts` | `"1a2b..."` | `null` |
+| `s_e5f6` | `camera_rear.mp4` | `video_stream`/`0` | `null` | `null` | `null` | `null` | `null` | `"7c8d..."` | `moov atom not found` |
 
 `measurements/rate.lance`
 

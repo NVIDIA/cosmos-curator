@@ -15,11 +15,15 @@
 
 """Unit tests for the single-video data-integrity CLI (main + exit codes)."""
 
+import json
 import signal
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
+from cosmos_curator.core.sensors.data_integrity.results import CheckResult, ResolvedConfig, VideoInfo
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.data_integrity import cli
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     DEFAULT_THRESHOLDS,
@@ -29,6 +33,8 @@ from cosmos_curator.next.recipes.data_integrity.cli_support import (
     Thresholds,
     interrupt_guard,
 )
+
+EngineRun = tuple[list[CheckResult], VideoInfo, ResolvedConfig]
 
 
 def _stub_checks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,6 +46,55 @@ def _stub_checks(monkeypatch: pytest.MonkeyPatch) -> None:
 def _raise_render(*_args: object, **_kwargs: object) -> str:
     msg = "unserializable measurement"
     raise ValueError(msg)
+
+
+def _stub_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    run_engine: Callable[..., EngineRun],
+    perfect: Callable[..., list[int]],
+    *,
+    timestamp_source: TimestampSource,
+) -> None:
+    """Run the real engine over a synthetic timeline measured on *timestamp_source*."""
+
+    def _run_checks(_source: str, **kwargs: object) -> EngineRun:
+        return run_engine(perfect(), expected_hz=kwargs["expected_hz"], timestamp_source=timestamp_source)
+
+    monkeypatch.setattr(cli, "validate_source", lambda _source: None)
+    monkeypatch.setattr(cli, "run_checks", _run_checks)
+
+
+@pytest.mark.parametrize("timestamp_source", list(TimestampSource))
+def test_the_human_report_names_the_clock_it_measured_on(
+    timestamp_source: TimestampSource,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_engine: Callable[..., EngineRun],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """Beside the rate's origin, in the same header and for the same reason.
+
+    A perfect cadence reads as PASS either way, so the verdict lines cannot tell the
+    reader whether that cadence was recorded or manufactured by the mux.
+    """
+    _stub_engine(monkeypatch, run_engine, perfect, timestamp_source=timestamp_source)
+
+    assert cli.main(["--source", "clip.mp4"]) == PASS_EXIT_CODE
+    assert f"timestamps: {timestamp_source.value}" in capsys.readouterr().out
+
+
+def test_the_json_report_carries_the_clock_it_measured_on(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_engine: Callable[..., EngineRun],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """Under ``video``, so the field name matches the session report and the store column."""
+    _stub_engine(monkeypatch, run_engine, perfect, timestamp_source=TimestampSource.CAPTURE)
+
+    assert cli.main(["--source", "clip.mp4", "--json"]) == PASS_EXIT_CODE
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["video"]["timestamp_source"] == "capture"
 
 
 @pytest.mark.parametrize(

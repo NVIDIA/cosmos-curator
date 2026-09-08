@@ -30,7 +30,7 @@ first -- otherwise the store ends up importing the CLI to learn what a verdict i
 
 import enum
 import math
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Protocol
 
 import attrs
@@ -41,6 +41,7 @@ from cosmos_curator.core.sensors.data.video import VideoMetadata
 from cosmos_curator.core.sensors.data_integrity import identity
 from cosmos_curator.core.sensors.data_integrity.evaluation import EvaluationResult
 from cosmos_curator.core.sensors.data_integrity.metrics import Measurement
+from cosmos_curator.core.sensors.types.types import TimestampSource
 
 
 class CheckStatus(enum.Enum):
@@ -92,6 +93,86 @@ class ExpectedHzSource(enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
+class SessionTimestampSource(enum.Enum):
+    """Which clock a whole session was measured on, rolled up from its streams.
+
+    Distinct from :class:`~cosmos_curator.core.sensors.types.types.TimestampSource`
+    because the two answer different questions: a sensor has one clock, a session has
+    one per camera. Rolling twelve of those into one value needs a third variant that
+    a single stream could never take.
+
+    Variants:
+
+    * ``CAPTURE`` -- every contributing stream reported real capture times. The only
+      value on which a cross-sensor comparison means anything.
+    * ``CONTAINER_PTS`` -- every contributing stream was measured on container PTS.
+    * ``MIXED`` -- the streams disagree. Not a lesser ``CAPTURE``: comparing a rig's
+      real capture times against another camera's synthesized grid produces a spread
+      that is an artifact of the mux, which is the same defect as ``CONTAINER_PTS``
+      and is why both skip.
+
+    See :func:`session_timestamp_source` for the roll-up, and
+    ``docs/curator/design/data-integrity-metrics.md`` for why it gates the
+    session-grain metrics at all.
+    """
+
+    CAPTURE = "capture"
+    CONTAINER_PTS = "container_pts"
+    MIXED = "mixed"
+
+
+def session_timestamp_source(sources: Iterable[TimestampSource]) -> SessionTimestampSource | None:
+    """Roll each contributing stream's clock into the session's own.
+
+    The single home of the all-or-nothing rule. Two callers need this answer -- the
+    engine, to decide whether a session-grain metric may run, and the store, to fill
+    ``session.lance.timestamp_source`` -- and two implementations of it could disagree
+    about the same session, which is exactly the drift a shared helper exists to stop.
+
+    Args:
+        sources: one clock per *contributing* stream. A stream that produced no
+            bounds contributes nothing to judge and so belongs to neither answer;
+            filtering it out is the caller's, since only the caller knows which
+            streams it expected.
+
+    Returns:
+        The shared clock, ``MIXED`` when the streams disagree, or ``None`` when
+        nothing contributed at all -- an unlisted or empty session, which has no
+        clock rather than a bad one.
+
+    """
+    distinct = set(sources)
+    if not distinct:
+        return None
+    if distinct == {TimestampSource.CAPTURE}:
+        return SessionTimestampSource.CAPTURE
+    if distinct == {TimestampSource.CONTAINER_PTS}:
+        return SessionTimestampSource.CONTAINER_PTS
+    return SessionTimestampSource.MIXED
+
+
+@attrs.define(frozen=True)
+class SensorBounds:
+    """One sensor's recording bounds and the clock they were measured on.
+
+    What a caller hands :func:`~.engine.run_session_metrics`, in place of the bare
+    ``(start_ns, end_ns)`` pair it used to take. The clock travels attached to the
+    bounds rather than alongside them in a second sequence, so a session's cameras
+    cannot end up labelled with each other's provenance.
+
+    Attributes:
+        start_ns: first timestamp, in nanoseconds.
+        end_ns: last timestamp, in nanoseconds.
+        timestamp_source: which clock the two above came from. A cross-sensor
+            comparison is only meaningful when every sensor shares one.
+
+    """
+
+    start_ns: int
+    end_ns: int
+    timestamp_source: TimestampSource
+
+
 @attrs.define(frozen=True)
 class CheckResult:
     """Result of one metric on one stream.
@@ -136,13 +217,20 @@ class ResolvedConfig:
 
 @attrs.define(frozen=True)
 class VideoInfo:
-    """Small snapshot of sensor-level facts shared by both reports."""
+    """Small snapshot of sensor-level facts shared by both reports.
+
+    ``timestamp_source`` names the clock every timing number here was measured on
+    (see :class:`~cosmos_curator.core.sensors.types.types.TimestampSource`). Carried
+    beside the measurements for the same reason as ``expected_hz_source``: the
+    numbers alone do not say how much they are worth.
+    """
 
     codec_name: str
     has_bframes: bool
     num_samples: int
     start_ns: int | None
     end_ns: int | None
+    timestamp_source: TimestampSource = TimestampSource.CONTAINER_PTS
 
     def to_dict(self) -> dict[str, object]:
         """Return a plain JSON-serialisable dict of the fields."""
@@ -152,6 +240,7 @@ class VideoInfo:
             "num_samples": self.num_samples,
             "start_ns": self.start_ns,
             "end_ns": self.end_ns,
+            "timestamp_source": self.timestamp_source.value,
         }
 
 
@@ -181,6 +270,16 @@ class IntegritySensor(Protocol):  # pragma: no cover
     @property
     def timestamps_ns(self) -> NDArray[np.int64]:
         """The full decoded timeline in ``int64`` nanoseconds."""
+        ...
+
+    @property
+    def timestamp_source(self) -> TimestampSource:
+        """Which clock :attr:`timestamps_ns` came from.
+
+        Widened onto the protocol rather than read with a ``getattr`` fallback: a
+        default would make this silently inert the day the sensor renames it, and
+        report container PTS as though the sensor had said so.
+        """
         ...
 
     @property
@@ -252,6 +351,11 @@ class StreamResult:
         expected_hz_source: where ``expected_hz`` came from, or ``None`` on error.
             Reported because it explains the rate / gap / jitter verdicts: an
             ``UNAVAILABLE`` rate is why those three checks SKIP.
+        timestamp_source: which clock this stream's timing numbers were measured
+            on, or ``None`` on error. Reported because it bounds what every timing
+            result is worth: a constant-frame-rate mux regenerates its timestamps
+            on a fixed grid, and metrics measured against that grid describe the
+            encoder rather than the recording.
         selector_type / selector_value: which stream *inside* ``source`` this is
             (see :mod:`~cosmos_curator.core.sensors.data_integrity.identity`).
             Carried so the store can key on it: two runs of ``di-check`` over one
@@ -270,6 +374,7 @@ class StreamResult:
     error: str | None = None
     expected_hz: float | None = None
     expected_hz_source: ExpectedHzSource | None = None
+    timestamp_source: TimestampSource | None = None
     selector_type: str = identity.DEFAULT_SELECTOR_TYPE
     selector_value: str = identity.DEFAULT_SELECTOR_VALUE
 
@@ -310,8 +415,38 @@ def stream_result(
         metrics=metrics,
         expected_hz=resolved_cfg.expected_hz,
         expected_hz_source=resolved_cfg.expected_hz_source,
+        timestamp_source=video_info.timestamp_source,
         selector_value=selector_value,
     )
+
+
+def contributing_bounds(streams: Iterable[StreamResult]) -> list[SensorBounds]:
+    """Select the streams a session-grain metric has anything to say about.
+
+    One definition of "contributed", because three callers depend on it agreeing: the
+    session runner feeding the engine, and the two store row builders filling
+    ``session.lance.timestamp_source``. If the column described a different set of
+    streams than the metrics were computed over, it would explain the wrong skip.
+
+    A stream qualifies only with both bounds and the clock they were measured on. An
+    unreachable stream has neither, and one whose timeline came back empty has no
+    bounds -- in both cases there is no interval to compare, which is a different
+    finding from a late one and belongs to the stream's own row.
+    """
+    return [
+        SensorBounds(start_ns=stream.start_ns, end_ns=stream.end_ns, timestamp_source=stream.timestamp_source)
+        for stream in streams
+        if stream.start_ns is not None and stream.end_ns is not None and stream.timestamp_source is not None
+    ]
+
+
+def session_clock(streams: Iterable[StreamResult]) -> SessionTimestampSource | None:
+    """Roll one session's measured streams into the clock they shared, if they shared one.
+
+    :func:`session_timestamp_source` over :func:`contributing_bounds`, named once so
+    the two store row builders cannot spell it two ways.
+    """
+    return session_timestamp_source(bound.timestamp_source for bound in contributing_bounds(streams))
 
 
 @attrs.define(frozen=True)
