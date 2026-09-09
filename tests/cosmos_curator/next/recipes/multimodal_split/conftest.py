@@ -119,7 +119,6 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         *,
         duration_s: float = 1.0,
         output_fps: int = 30,
-        caption_fps: int = 2,
         max_delta_s: float = 0.05,
         uri_pattern: str = "camera/front.mp4",
         camera_key: str = "front",
@@ -139,16 +138,14 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                 "kind": "multimodal-split",
                 "input": {"input_path_prefix": str(input_root)},
                 "sensors": {
-                    "cameras": {key: {"uri_pattern": pattern} for key, pattern in camera_map.items()},
-                    "max_delta_s": max_delta_s,
+                    key: {"sensor_type": "camera", "uri_pattern": pattern} for key, pattern in camera_map.items()
                 },
                 "output": {"path": str(media_root)},
-                "clip": {
-                    "duration_s": duration_s,
-                    "output_fps": output_fps,
-                    "caption_fps": caption_fps,
+                "clip": {"duration_s": duration_s, "sampling_fps": output_fps},
+                "video": {
+                    "max_delta_s": max_delta_s,
+                    "encoder": {"video_bitrate": video_bitrate, "gop_size": gop_size},
                 },
-                "encoder": {"video_bitrate": video_bitrate, "gop_size": gop_size},
                 "execution": {
                     "progress": progress,
                     "storage_profile": storage_profile,

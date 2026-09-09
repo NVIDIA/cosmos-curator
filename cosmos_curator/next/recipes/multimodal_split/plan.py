@@ -98,7 +98,7 @@ def span_planner(
     """
     session_id = str(item["source_session_id"])
     session_uri = str(item["session_uri"])
-    cameras = config.sensors.cameras
+    cameras = config.cameras
 
     # One listing for the whole rig. Resolving twelve wildcard patterns one at a
     # time lists the same session twelve times, which the previous comment here
@@ -160,7 +160,7 @@ def span_planner(
 
     planned = [
         {
-            "clip_id": make_clip_id(source_id, span, config),
+            "clip_id": make_clip_id(source_id, span),
             "start_ns": span.start_ns,
             "exclusive_end_ns": span.end_ns,
         }
@@ -176,7 +176,7 @@ def span_planner(
             span,
             sorted(cameras),
             output_path=config.output.path,
-            output_fps=config.clip.output_fps,
+            sampling_fps=config.clip.sampling_fps,
             storage_profile=storage_profile,
         )
 
@@ -230,7 +230,7 @@ def partition_by_coverage(
     refused: list[dict[str, Any]] = []
     for span in spans:
         references = sampling_grid_ns(span, config)
-        missing = first_uncovered(references, timelines, config.sensors.max_delta_ns)
+        missing = first_uncovered(references, timelines, config.video.max_delta_ns)
         if missing is None:
             servable.append(span)
             continue
@@ -238,11 +238,11 @@ def partition_by_coverage(
         error = AlignmentError(
             AlignmentFailureReason.TOLERANCE_EXCEEDED,
             f"camera {key!r} cannot serve this moment: its nearest observation is {worst_ns} ns from a "
-            f"reference, further than the {config.sensors.max_delta_ns} ns the rig was given",
+            f"reference, further than the {config.video.max_delta_ns} ns the rig was given",
             sensor_id=key,
             align_timestamps_ns=references,
         )
-        refused.append(failure(session_id, key, span, "coverage", error, make_clip_id(source_id, span, config)))
+        refused.append(failure(session_id, key, span, "coverage", error, make_clip_id(source_id, span)))
     return tuple(servable), refused
 
 

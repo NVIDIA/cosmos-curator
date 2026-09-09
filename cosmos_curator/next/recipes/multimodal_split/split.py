@@ -137,11 +137,11 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
             written = encode_frames_to_path(
                 provide_frames(span, row_count, selected),
                 local,
-                fps=config.clip.output_fps,
-                encoder=config.encoder.video_encoder,
-                bitrate=config.encoder.video_bitrate,
-                gop_size=config.encoder.gop_size,
-                faststart=config.encoder.faststart,
+                fps=config.clip.sampling_fps,
+                encoder=config.video.encoder.video_encoder,
+                bitrate=config.video.encoder.video_bitrate,
+                gop_size=config.video.encoder.gop_size,
+                faststart=config.video.encoder.faststart,
             )
             if written != row_count:
                 msg = f"encoded {written} frames for a clip whose grid has {row_count}"
@@ -408,7 +408,7 @@ def _open_frame_feed(
 ) -> _FrameFeed:
     """Open one forward pass over a camera, serving the planned spans in order."""
     sensor = StreamingCameraSensor(source, timestamps_ns=timestamps_ns)
-    policy = NearestTimestampPolicy(max_delta_ns=config.sensors.max_delta_ns)
+    policy = NearestTimestampPolicy(max_delta_ns=config.video.max_delta_ns)
     payloads = sensor.sample(_spec_for_spans(spans, config), policy=policy)
     return _FrameFeed(row for payload in payloads for row in payload.frames())
 

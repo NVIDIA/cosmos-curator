@@ -166,7 +166,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
     cameras: list[str],
     *,
     output_path: str,
-    output_fps: int,
+    sampling_fps: int,
     storage_profile: str,
 ) -> None:
     """Write what a clip needs to place itself, for a reader holding only the directory.
@@ -189,7 +189,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
         "parent_id": session_id,
         "start_ns": span.start_ns,
         "exclusive_end_ns": span.end_ns,
-        "output_fps": output_fps,
+        "sampling_fps": sampling_fps,
         "planned_cameras": sorted(cameras),
     }
     destination = f"{clip_dir_uri(output_path, session_id, clip_id)}/{_MANIFEST_NAME}"

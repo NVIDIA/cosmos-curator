@@ -20,11 +20,11 @@ from pydantic import ValidationError
 
 from cosmos_curator.next.recipes.multimodal_split.config import (
     EncoderOpenH264Config,
-    MultimodalSplitCameraConfig,
     MultimodalSplitClipConfig,
     MultimodalSplitInputConfig,
     MultimodalSplitOutputConfig,
-    MultimodalSplitSensorsConfig,
+    MultimodalSplitSensorConfig,
+    MultimodalSplitVideoConfig,
     ResolvedMultimodalSplitConfig,
 )
 
@@ -315,13 +315,30 @@ def test_stripped_whitespace_is_rejected_in_an_s3_uri(whitespace: str) -> None:
         MultimodalSplitInputConfig(input_path_prefix=f"s3://example-bucket/rec{whitespace}ord")
 
 
+def _resolved(**sections: object) -> ResolvedMultimodalSplitConfig:
+    """Build a minimal valid config, overriding whichever sections a test is about.
+
+    The whole-frame rule and the at-least-one-camera rule are facts about two
+    sections together, so they can only be exercised through the resolved config
+    rather than through either section alone.
+    """
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "multimodal-split",
+        "input": {"input_path_prefix": "/data/recordings"},
+        "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"}},
+        "output": {"path": "/data/media"},
+    }
+    payload.update(sections)
+    return ResolvedMultimodalSplitConfig.model_validate(payload)
+
+
 def test_clip_defaults_describe_ten_second_clips_at_thirty_fps() -> None:
     """The defaults are the contract for a config that omits the clip section entirely."""
     clip = MultimodalSplitClipConfig()
 
     assert clip.duration_s == 10.0
-    assert clip.output_fps == 30
-    assert clip.caption_fps == 2
+    assert clip.sampling_fps == 30
 
 
 def test_clip_config_is_frozen() -> None:
@@ -332,47 +349,22 @@ def test_clip_config_is_frozen() -> None:
         clip.duration_s = 5.0
 
 
-@pytest.mark.parametrize(("output_fps", "caption_fps"), [(30, 30), (30, 2), (30, 15), (30, 1), (1, 1)])
-def test_a_caption_rate_that_divides_the_output_rate_is_accepted(output_fps: int, caption_fps: int) -> None:
-    """Every proper divisor is a valid subsample, and equal rates are the degenerate case."""
-    clip = MultimodalSplitClipConfig(output_fps=output_fps, caption_fps=caption_fps)
-
-    assert clip.output_fps == output_fps
-    assert clip.caption_fps == caption_fps
-
-
-@pytest.mark.parametrize(("output_fps", "caption_fps"), [(30, 4), (30, 7), (10, 3), (30, 60), (2, 3)])
-def test_a_caption_rate_that_does_not_divide_the_output_rate_is_rejected(output_fps: int, caption_fps: int) -> None:
-    """Two rates off one grid disagree about which frame a caption describes.
-
-    Captioned frames are meant to be every Nth frame of the clip timeline. When
-    the rates do not divide, subsampling and sampling directly at ``caption_fps``
-    land on different instants, so the caption and the frame it names come apart.
-    ``(30, 60)`` covers the likely authoring mistake of captioning faster than the
-    clip has frames.
-    """
-    with pytest.raises(ValidationError, match=r"must divide clip\.output_fps"):
-        MultimodalSplitClipConfig(output_fps=output_fps, caption_fps=caption_fps)
-
-
-@pytest.mark.parametrize("field", ["output_fps", "caption_fps"])
 @pytest.mark.parametrize("value", [0, -1])
-def test_frame_rates_must_be_positive(field: str, value: int) -> None:
+def test_sampling_fps_must_be_positive(value: int) -> None:
     """A rate of zero or less names no frames at all."""
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
-        MultimodalSplitClipConfig(**{field: value})
+        MultimodalSplitClipConfig(sampling_fps=value)
 
 
-@pytest.mark.parametrize("field", ["output_fps", "caption_fps"])
 @pytest.mark.parametrize("value", [30.0, 2.5, "30"])
-def test_frame_rates_must_be_integers(field: str, value: object) -> None:
+def test_sampling_fps_must_be_an_integer(value: object) -> None:
     """Strict typing rejects a fractional or quoted rate instead of rounding it.
 
     The episode timeline is built from a positive integer FPS, so ``30.0`` is not
     silently narrowed and ``"30"`` is not silently parsed.
     """
     with pytest.raises(ValidationError, match="valid integer"):
-        MultimodalSplitClipConfig(**{field: value})
+        MultimodalSplitClipConfig(sampling_fps=value)
 
 
 @pytest.mark.parametrize("duration_s", [0.0, -1.0])
@@ -408,8 +400,8 @@ def test_stride_and_minimum_duration_are_not_settings_here(field: str) -> None:
         MultimodalSplitClipConfig(**{field: 2.0})
 
 
-@pytest.mark.parametrize(("duration_s", "output_fps"), [(0.333, 30), (0.05, 30), (1.001, 30), (0.1, 24)])
-def test_a_duration_that_is_not_a_whole_number_of_frames_is_rejected(duration_s: float, output_fps: int) -> None:
+@pytest.mark.parametrize(("duration_s", "sampling_fps"), [(0.333, 30), (0.05, 30), (1.001, 30), (0.1, 24)])
+def test_a_duration_that_is_not_a_whole_number_of_frames_is_rejected(duration_s: float, sampling_fps: int) -> None:
     """A clip is a whole number of output frames or it is not a valid clip.
 
     0.333 s at 30 fps is 9.99 frames. This is deliberately stricter than the
@@ -418,17 +410,17 @@ def test_a_duration_that_is_not_a_whole_number_of_frames_is_rejected(duration_s:
     frame during a run.
     """
     with pytest.raises(ValidationError, match="frames, which is not a whole number"):
-        MultimodalSplitClipConfig(duration_s=duration_s, output_fps=output_fps)
+        MultimodalSplitClipConfig(duration_s=duration_s, sampling_fps=sampling_fps)
 
 
-@pytest.mark.parametrize(("duration_s", "output_fps"), [(10.0, 30), (0.5, 30), (2.5, 24), (0.04, 50)])
-def test_a_fractional_duration_yielding_whole_frames_is_accepted(duration_s: float, output_fps: int) -> None:
+@pytest.mark.parametrize(("duration_s", "sampling_fps"), [(10.0, 30), (0.5, 30), (2.5, 24), (0.04, 50)])
+def test_a_fractional_duration_yielding_whole_frames_is_accepted(duration_s: float, sampling_fps: int) -> None:
     """The rule counts frames, not seconds, so a sub-second clip is fine when it lands on one.
 
     0.5 s at 30 fps is exactly 15 frames. Requiring a whole number of seconds
     instead would reject it for no reason.
     """
-    clip = MultimodalSplitClipConfig(duration_s=duration_s, output_fps=output_fps)
+    clip = MultimodalSplitClipConfig(duration_s=duration_s, sampling_fps=sampling_fps)
 
     assert clip.duration_s == duration_s
 
@@ -441,9 +433,9 @@ def test_the_frame_count_is_computed_exactly_rather_than_in_binary_floating_poin
     test would reject clips that are exact. The same hazard applies to the
     nanosecond rule below it.
     """
-    clip = MultimodalSplitClipConfig(duration_s=0.28, output_fps=25, caption_fps=5)
+    config = _resolved(clip={"duration_s": 0.28, "sampling_fps": 25})
 
-    assert clip.duration_s == 0.28
+    assert config.clip.duration_s == 0.28
 
 
 def test_the_encoder_defaults_to_libopenh264_and_its_bitrate() -> None:
@@ -497,7 +489,7 @@ def test_audio_mode_is_not_a_setting_here() -> None:
 
 def test_a_camera_names_a_relative_artifact() -> None:
     """The one fact the split stage cannot infer: where in a session this camera's video is."""
-    camera = MultimodalSplitCameraConfig(uri_pattern="camera/front.mp4")
+    camera = MultimodalSplitSensorConfig(sensor_type="camera", uri_pattern="camera/front.mp4")
 
     assert camera.uri_pattern == "camera/front.mp4"
 
@@ -513,11 +505,9 @@ def test_a_tolerance_in_seconds_reaches_the_policy_as_whole_nanoseconds(max_delt
     tolerance is a bound, and flooring it would quietly make it tighter than the
     operator asked for.
     """
-    sensors = MultimodalSplitSensorsConfig(
-        cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=max_delta_s
-    )
+    video = MultimodalSplitVideoConfig(max_delta_s=max_delta_s)
 
-    assert sensors.max_delta_ns == expected_ns
+    assert video.max_delta_ns == expected_ns
 
 
 @pytest.mark.parametrize(
@@ -540,39 +530,51 @@ def test_a_camera_artifact_that_escapes_its_session_is_rejected(uri_pattern: str
     check would still look covered.
     """
     with pytest.raises(ValidationError, match=expected):
-        MultimodalSplitCameraConfig(uri_pattern=uri_pattern)
+        MultimodalSplitSensorConfig(sensor_type="camera", uri_pattern=uri_pattern)
 
 
 @pytest.mark.parametrize("max_delta_s", [0.0, -1.0])
 def test_a_non_positive_tolerance_is_rejected(max_delta_s: float) -> None:
     """A tolerance of zero demands an exact timestamp match, which no real recording provides."""
     with pytest.raises(ValidationError, match="greater than 0"):
-        MultimodalSplitSensorsConfig(cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=max_delta_s)
+        MultimodalSplitVideoConfig(max_delta_s=max_delta_s)
 
 
 def test_exactly_one_camera_is_accepted() -> None:
     """One camera is the whole of the current scope, and its key names its output."""
-    sensors = MultimodalSplitSensorsConfig(cameras={"front": {"uri_pattern": "camera/front.mp4"}}, max_delta_s=0.05)
+    config = _resolved()
 
-    assert list(sensors.cameras) == ["front"]
+    assert list(config.cameras) == ["front"]
 
 
 def test_no_cameras_is_rejected() -> None:
     """A run with no camera produces no video, which is never what the caller meant."""
     with pytest.raises(ValidationError, match="at least 1 item"):
-        MultimodalSplitSensorsConfig(cameras={}, max_delta_s=0.05)
+        _resolved(sensors={})
+
+
+def test_a_sensor_must_say_what_kind_it_is() -> None:
+    """A suffix names a container, so it can say an artifact is an MCAP but not what is in it."""
+    with pytest.raises(ValidationError, match="sensor_type"):
+        _resolved(sensors={"front": {"uri_pattern": "camera/front.mp4"}})
+
+
+def test_a_sensor_kind_the_recipe_cannot_process_is_refused_at_load() -> None:
+    """Refused here rather than after a discovery pass has already listed every session."""
+    with pytest.raises(ValidationError, match="camera"):
+        _resolved(sensors={"imu": {"sensor_type": "imu", "uri_pattern": "*/imu.mcap"}})
 
 
 def test_several_cameras_are_accepted() -> None:
     """A clip is a moment across every configured view, so the map carries more than one."""
     two = {
-        "front": {"uri_pattern": "camera/front.mp4"},
-        "left": {"uri_pattern": "camera/left.mp4"},
+        "front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"},
+        "left": {"sensor_type": "camera", "uri_pattern": "camera/left.mp4"},
     }
 
-    sensors = MultimodalSplitSensorsConfig(cameras=two, max_delta_s=0.05)
+    config = _resolved(sensors=two)
 
-    assert sorted(sensors.cameras) == ["front", "left"]
+    assert sorted(config.cameras) == ["front", "left"]
 
 
 @pytest.mark.parametrize("key", ["", "front/left", "..", ".", "front camera", "front\tleft"])
@@ -583,7 +585,7 @@ def test_a_camera_key_that_cannot_be_a_path_segment_is_rejected(key: str) -> Non
     sit in one, so both need rejecting separately from the character rule.
     """
     with pytest.raises(ValidationError, match="single path segment"):
-        MultimodalSplitSensorsConfig(cameras={key: {"uri_pattern": "camera/front.mp4"}}, max_delta_s=0.05)
+        _resolved(sensors={key: {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"}})
 
 
 def test_the_output_path_is_canonicalized_like_the_input_prefix() -> None:
@@ -623,7 +625,7 @@ def test_a_config_without_a_camera_or_an_output_location_is_rejected(missing: st
         "schema_version": 1,
         "kind": "multimodal-split",
         "input": {"input_path_prefix": "/data/recordings"},
-        "sensors": {"cameras": {"front": {"uri_pattern": "camera/front.mp4"}}, "max_delta_s": 0.05},
+        "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"}},
         "output": {"path": "/data/media"},
     }
     del payload[missing]
@@ -635,7 +637,7 @@ def test_a_config_without_a_camera_or_an_output_location_is_rejected(missing: st
 @pytest.mark.parametrize("pattern", ["*/camera_front.mp4", "recorder-00/*/front.mp4", "*/*/front.mp4"])
 def test_a_whole_path_segment_may_be_a_wildcard(pattern: str) -> None:
     """A rig's recorder layout is the rig's business, so a pattern need not name it."""
-    camera = MultimodalSplitCameraConfig(uri_pattern=pattern)
+    camera = MultimodalSplitSensorConfig(sensor_type="camera", uri_pattern=pattern)
 
     assert camera.uri_pattern == pattern
 
@@ -649,4 +651,4 @@ def test_a_wildcard_inside_a_segment_is_rejected(pattern: str) -> None:
     names change.
     """
     with pytest.raises(ValidationError, match="whole path segment"):
-        MultimodalSplitCameraConfig(uri_pattern=pattern)
+        MultimodalSplitSensorConfig(sensor_type="camera", uri_pattern=pattern)

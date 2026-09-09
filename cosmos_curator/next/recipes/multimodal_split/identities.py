@@ -21,12 +21,15 @@ is produced cannot quietly change where it lands.
 """
 
 from cosmos_curator.next.media.spans import Span
-from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.utils.identity import canonical_digest
 
 # Bump when the meaning of written media changes in a way the settings do not
 # express, so corrected clips re-key instead of overwriting the old ones.
-MEDIA_CONTRACT_VERSION = 1
+#
+# 2: the identity stopped covering settings and became geometry alone. The
+# digest inputs changed, so a version left at 1 would name two different
+# identity schemes -- ids from either would be version 1 and indistinguishable.
+MEDIA_CONTRACT_VERSION = 2
 
 
 def make_source_id(session_uri: str) -> str:
@@ -44,45 +47,45 @@ def make_source_id(session_uri: str) -> str:
     return canonical_digest(session_uri.rstrip("/"))
 
 
-def make_clip_id(source_id: str, span: Span, config: ResolvedMultimodalSplitConfig) -> str:
+def make_clip_id(source_id: str, span: Span) -> str:
     """Identify one aligned clip independently of run order, so a retry addresses the same object.
 
     Takes the session's ``source_id`` rather than its name, so the same
     directory name under two input prefixes does not name the same clip; see
     :func:`make_source_id`.
 
-    A clip is one session and one span of it, and its cameras are files inside
-    it rather than clips of their own. So the identity carries no camera key: it
-    names the directory every camera writes into, and the file name tells two
-    views apart.
+    A clip is one session and one span of it, and its sensors are files inside it
+    rather than clips of their own. So the identity carries no sensor key: it
+    names the directory every sensor writes into, and the file name tells two
+    views apart. That is ``robot_action_split``'s ``span_group_id`` -- the moment,
+    shared across views -- and like it, this carries geometry alone.
 
-    It covers everything that decides what the written bytes *are*, because the
-    identity is also the object key. That includes the whole camera map, since
-    ``uri_pattern`` decides which artifact is read and ``max_delta_s`` decides
-    which source frame serves each grid timestamp -- both change the pixels while
-    still naming the same camera. The cost is that changing the camera set
-    re-keys every clip, which is the honest outcome: a five-camera dataset is not
-    the four-camera one with a file added.
+    Settings are deliberately absent. The rate a clip was sampled at, the encoder
+    it was written with, which cameras a rig had: all of them change the bytes,
+    and none of them change *which moment* this is. Folding them in meant
+    re-keying every clip in a dataset to change a bitrate, scattering two
+    encodings of one moment under two names.
 
-    The ``execution`` section is deliberately absent. How much heap a task
-    declares, how large a read is, how many cores planning takes -- none of them
-    change a written byte, and folding them in would scatter identical media
-    across different keys.
+    What that gave up is a side effect the identity was never the right place to
+    provide: while settings were in the key, a rerun under new ones could not
+    land on the old media because it addressed a different object. It can now,
+    and the recipe has no overwrite contract to replace it -- ``output`` carries
+    a path and nothing else, and ``write_media`` replaces an object in place. So
+    rerunning into a populated path rewrites what it produces and leaves behind
+    whatever it no longer produces, such as a camera dropped from the config.
+    Making that safe is an overwrite-and-cleanup contract on ``output``, not a
+    property to recover by putting settings back in the key.
 
-    ``MEDIA_CONTRACT_VERSION`` is the lever for everything the settings cannot
-    express. When the meaning of the output changes -- a fix to which frame a
-    timestamp selects, say -- bumping it re-keys every clip, so corrected media
-    lands beside the old rather than overwriting it in place.
+    ``MEDIA_CONTRACT_VERSION`` is the lever for when the meaning of a clip
+    changes rather than its settings -- a fix to which frame a timestamp selects,
+    say. Bumping it re-keys every clip, so corrected media lands beside the old
+    rather than overwriting it in place.
     """
     return canonical_digest(
         {
             "source_id": source_id,
             "start_ns": span.start_ns,
             "end_ns": span.end_ns,
-            "output_fps": config.clip.output_fps,
-            "encoder": config.encoder.model_dump(mode="json"),
-            "cameras": {key: camera.uri_pattern for key, camera in config.sensors.cameras.items()},
-            "max_delta_s": config.sensors.max_delta_s,
             "media_contract_version": MEDIA_CONTRACT_VERSION,
         }
     )

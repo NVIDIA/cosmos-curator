@@ -81,12 +81,12 @@ def test_write_clip_manifest_records_where_and_how_fast_a_clip_was_cut(tmp_path:
         span,
         ["front", "left"],
         output_path=str(tmp_path),
-        output_fps=30,
+        sampling_fps=30,
         storage_profile="default",
     )
 
     manifest_path = tmp_path / "sessions" / "session-000" / "clip-abc" / "clip.json"
     written = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert written["parent_id"] == "session-000"
-    assert written["output_fps"] == 30
+    assert written["sampling_fps"] == 30
     assert written["planned_cameras"] == ["front", "left"]

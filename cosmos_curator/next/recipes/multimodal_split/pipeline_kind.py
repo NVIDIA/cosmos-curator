@@ -43,8 +43,10 @@ def _template_payload() -> dict[str, Any]:
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-split"},
             {"path": "input.input_path_prefix", "example": "s3://example-bucket/recordings"},
-            {"path": "sensors.cameras", "example": {"front": {"uri_pattern": "*/camera_front.mp4"}}},
-            {"path": "sensors.max_delta_s", "example": 0.05},
+            {
+                "path": "sensors",
+                "example": {"front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"}},
+            },
             {"path": "output.path", "example": "s3://example-bucket/media"},
         ],
         "config": yaml.safe_load(_template_yaml()),

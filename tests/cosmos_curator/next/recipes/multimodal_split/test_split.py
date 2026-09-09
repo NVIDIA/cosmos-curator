@@ -29,11 +29,9 @@ import pytest
 from cosmos_curator.core.sensors.sensors import camera_sensor
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, write_timestamps_ns
-from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans
-from cosmos_curator.next.recipes.multimodal_split.identities import make_clip_id
 from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri, sensor_error_uri
 
@@ -149,7 +147,7 @@ def _errors(config: ResolvedMultimodalSplitConfig, session_id: str = "session-00
     found: list[dict[str, Any]] = []
     for uri in (
         plan_error_uri(config.output.path, session_id),
-        *(sensor_error_uri(config.output.path, session_id, key) for key in config.sensors.cameras),
+        *(sensor_error_uri(config.output.path, session_id, key) for key in config.cameras),
     ):
         report = Path(uri)
         if report.is_file():
@@ -305,50 +303,6 @@ def test_a_descriptor_carries_what_publication_will_need(
     assert clip["clip_id"]
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("output_fps", 60),
-        ("video_bitrate", "8M"),
-        ("gop_size", 30),
-        ("uri_pattern", "camera/other.mp4"),
-        ("max_delta_s", 0.02),
-    ],
-)
-def test_settings_that_change_the_written_bytes_change_the_clip_id(
-    tmp_path: Path,
-    make_config: Callable[..., ResolvedMultimodalSplitConfig],
-    field: str,
-    value: object,
-) -> None:
-    """A clip's identity is also its object key, so two different clips may not share one.
-
-    ``output_fps`` changes how many frames the clip holds and the encoder settings
-    change the bytes of every one of them. ``uri_pattern`` decides which artifact
-    is read at all, and ``max_delta_s`` decides which source frame serves each
-    grid timestamp -- both change the pixels while naming the same camera. If any
-    of that misses the id, a rerun under new settings overwrites the old object in
-    place and the tree holds media matching no config anyone still has.
-    """
-    root = tmp_path / "recordings"
-    span = Span(start_ns=0, end_ns=1_000_000_000)
-    baseline = make_config(root, tmp_path / "media")
-    changed = make_config(root, tmp_path / "media", **{field: value})
-
-    assert make_clip_id("session-000", span, baseline) != make_clip_id("session-000", span, changed)
-
-
-def test_a_clip_id_distinguishes_its_session(
-    tmp_path: Path,
-    make_config: Callable[..., ResolvedMultimodalSplitConfig],
-) -> None:
-    """Two sessions cannot collide on one key even at identical spans and settings."""
-    config = make_config(tmp_path / "recordings", tmp_path / "media")
-    span = Span(start_ns=0, end_ns=1_000_000_000)
-
-    assert make_clip_id("session-000", span, config) != make_clip_id("other-session", span, config)
-
-
 def test_a_clip_is_written_under_its_session_and_clip_in_the_output_path(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -413,8 +367,6 @@ def test_a_clip_duration_converts_to_nanoseconds_exactly(
         tmp_path / "media",
         duration_s=duration_s,
         output_fps=output_fps,
-        # 25 fps needs a divisor other than the default 2.
-        caption_fps=1,
     )
 
     assert clip_duration_ns(config) == expected_ns
@@ -785,7 +737,7 @@ def test_a_clip_names_the_session_and_span_it_came_from(
     assert manifest["clip_id"] == clip["clip_id"]
     assert manifest["start_ns"] == clip["start_ns"]
     assert manifest["exclusive_end_ns"] == clip["exclusive_end_ns"]
-    assert manifest["output_fps"] == 30
+    assert manifest["sampling_fps"] == 30
     assert sorted(manifest["planned_cameras"]) == ["front", "left"]
 
 

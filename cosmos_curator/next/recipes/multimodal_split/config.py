@@ -29,7 +29,7 @@ from cosmos_curator.next.core.config import apply_dotted_overrides
 
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 _NS_PER_SECOND = 1_000_000_000
-_CAMERA_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+_SENSOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 _BITRATE_SUFFIXES = frozenset({"K", "M"})
 _BITRATE_PATTERN = r"^[1-9][0-9]*(?:\.[0-9]+)?[KkMm]$"
 _SUPPORTED_SCHEMES = frozenset({"s3", "file"})
@@ -45,6 +45,10 @@ SchemaVersion = Literal[1]
 MultimodalSplitKind = Literal["multimodal-split"]
 # One member today. Supporting another encoder is adding it here and nowhere else.
 MultimodalSplitVideoEncoder = Literal["libopenh264"]
+
+# Widened as each kind lands. A config naming a kind the recipe cannot process
+# yet is refused at load, rather than discovering it after a listing pass.
+MultimodalSplitSensorType = Literal["camera"]
 
 
 class MultimodalSplitInputConfig(BaseModel):
@@ -88,7 +92,18 @@ class MultimodalSplitInputConfig(BaseModel):
 
 
 class MultimodalSplitClipConfig(BaseModel):
-    """Clip geometry and the two frame rates a clip is sampled at.
+    """The episode timeline: how long a clip is, and at what rate it is sampled.
+
+    Both belong to the clip because both are what every sensor obeys. The design
+    document is explicit that one configured rate defines the episode timeline
+    and every modality is sampled or derived against it -- a camera selects the
+    nearest frame to each grid timestamp, an IMU preintegrates over adjacent
+    ones, a GPS interpolates onto them. So the rate is not a camera setting that
+    the video happens to inherit; it is the grid, and the video inherits it.
+
+    ``sampling_fps`` names what it is. The grid is built with it as
+    ``sample_rate_hz``, and a clip plays at that rate as a consequence of having
+    been sampled at it -- the old ``output_fps`` named the consequence.
 
     Clips are contiguous and non-overlapping: there is no stride setting, so the
     stride is the clip duration. A trailing span shorter than ``duration_s`` is
@@ -103,54 +118,37 @@ class MultimodalSplitClipConfig(BaseModel):
         allow_inf_nan=False,
         description="Duration of one clip in seconds.",
     )
-    output_fps: int = Field(
+    sampling_fps: int = Field(
         default=30,
         ge=1,
-        description="Frame rate of the clip timeline, as a positive integer FPS.",
-    )
-    caption_fps: int = Field(
-        default=2,
-        ge=1,
-        description="Frame rate of the captioned subset of the clip timeline; must divide output_fps.",
+        description="Rate the episode timeline is sampled at; every sensor is sampled or derived against it.",
     )
 
     @model_validator(mode="after")
     def _validate_clip_geometry(self) -> Self:
-        """Check that a clip's duration is a whole number of frames.
+        """Check that a clip's duration is a whole number of sampled frames.
 
-        The rates must share one alignment grid. When ``caption_fps`` divides
-        ``output_fps``, the captioned frames are every Nth point of the output
-        grid, so subsampling picks exactly the frames that sampling at
-        ``caption_fps`` directly would have. Otherwise the two land on different
-        instants and disagree about which frame a caption describes. Equal rates
-        are the degenerate valid case.
-
-        The duration must come to a whole number of output frames. A clip is a
-        whole number of frames or it is not a valid clip, and 0.333 s at 30 fps is
-        9.99 of them. This is deliberately stricter than the design document,
-        whose ``row_count = floor(duration_ns * output_fps / 1_000_000_000)``
-        would truncate that tail: refusing the config beats silently dropping a
-        partial frame at runtime.
+        A clip is a whole number of frames or it is not a valid clip, and 0.333 s
+        at 30 fps is 9.99 of them. Deliberately stricter than the design
+        document, whose ``row_count = floor(duration_ns * sampling_fps /
+        1_000_000_000)`` would truncate that tail -- refusing the config beats
+        silently dropping a partial frame at runtime.
 
         Every arithmetic check here goes through ``Decimal`` rather than float.
         The two diverge on ordinary durations -- ``65.693362 * 1e9`` is
         ``65693361999.99999`` in binary floating point -- which would make a
         remainder test reject a clip that is exact.
-        """
-        if self.output_fps % self.caption_fps != 0:
-            msg = (
-                f"clip.caption_fps ({self.caption_fps}) must divide clip.output_fps ({self.output_fps}) exactly, "
-                f"so captioned frames stay a subset of the clip's frames instead of falling on a second, "
-                f"misaligned grid"
-            )
-            raise ValueError(msg)
 
-        frames_per_clip = Decimal(str(self.duration_s)) * self.output_fps
+        Raises:
+            ValueError: If the duration is not a whole number of sampled frames.
+
+        """
+        frames_per_clip = Decimal(str(self.duration_s)) * self.sampling_fps
         if frames_per_clip % 1 != 0:
             msg = (
-                f"clip.duration_s ({self.duration_s}) at clip.output_fps ({self.output_fps}) is "
+                f"clip.duration_s ({self.duration_s}) at clip.sampling_fps ({self.sampling_fps}) is "
                 f"{format(frames_per_clip.normalize(), 'f')} frames, which is not a whole number. A clip is a "
-                f"whole number of output frames, so adjust the duration or the rate"
+                f"whole number of sampled frames, so adjust the duration or the rate"
             )
             raise ValueError(msg)
         return self
@@ -222,80 +220,33 @@ class EncoderOpenH264Config(BaseModel):
         return f"{format(parsed.normalize(), 'f')}{suffix.upper()}"
 
 
-class MultimodalSplitCameraConfig(BaseModel):
-    """One camera artifact inside a session.
+class MultimodalSplitVideoConfig(BaseModel):
+    """How a camera becomes the video inside a clip.
 
-    ``uri_pattern`` is relative to a session URI, because discovery stops at the
-    session boundary and this is the only place that knows a session has cameras
-    in it. Anything absolute or upward-reaching would resolve outside the session
-    it was joined to, so both are rejected rather than normalized.
-
-    A whole path segment may be ``*``, so a config can name a camera without
-    knowing which recorder a rig put it on.
-    """
-
-    model_config = _MODEL_CONFIG
-
-    uri_pattern: str = Field(
-        min_length=1,
-        description="Path to the camera video relative to a session URI, such as camera/front.mp4.",
-    )
-
-    @field_validator("uri_pattern")
-    @classmethod
-    def _validate_uri_pattern(cls, pattern: str) -> str:
-        if pattern != pattern.strip():
-            msg = "camera uri_pattern cannot have leading or trailing whitespace"
-            raise ValueError(msg)
-        if "://" in pattern or pattern.startswith("/"):
-            msg = (
-                f"camera uri_pattern {pattern!r} must be relative to a session, so it can be joined "
-                f"onto any session URI. Drop the scheme or the leading slash"
-            )
-            raise ValueError(msg)
-        _reject_parent_segments(pattern, pattern)
-        for segment in pattern.split("/"):
-            # A whole segment may be a wildcard, so a config need not know which
-            # recorder holds a camera. Part of one may not: that matches on file
-            # names rather than on layout, and resolves differently as names
-            # change.
-            if "*" in segment and segment != "*":
-                msg = (
-                    f"camera uri_pattern {pattern!r} may use * as a whole path segment, not inside one. "
-                    f"Write */name.mp4 rather than rec*/name.mp4"
-                )
-                raise ValueError(msg)
-        return pattern
-
-
-class MultimodalSplitSensorsConfig(BaseModel):
-    """The sensors an episode is built from, and how closely they must agree.
-
-    ``max_delta_s`` belongs to the rig rather than to a camera in it. It decides
-    how far a source frame may sit from a grid timestamp and still be taken as
-    that moment, which is to say it defines what "the same moment" means for a
-    clip. Per-camera tolerances would let views disagree about simultaneity
-    inside one multiview clip, which is not a thing a clip can be.
+    Camera-specific, which is what separates these from the episode timeline in
+    ``clip``. The rate a clip is sampled at is shared by every modality; how far
+    a *frame* may sit from a sample point is not -- the design document gives an
+    IMU its own support-gap threshold and a GPS its own policy. ``max_delta_s``
+    belongs to the rig rather than to a camera in it. It decides how far a
+    source frame may sit from a grid timestamp and still be taken as that
+    moment, which is to say it defines what "the same moment" means for a clip.
+    Per-camera tolerances would let views disagree about simultaneity inside one
+    multiview clip, which is not a thing a clip can be.
 
     Stated in the seconds every other duration on this surface uses, and
     converted once to the nanoseconds the sampling policy takes, so the unit an
     operator writes and the unit the sensor library works in never have to agree.
-
-    A camera's key names it in output paths and descriptors, which is why it has
-    to survive being a single path segment.
     """
 
     model_config = _MODEL_CONFIG
 
-    cameras: dict[str, MultimodalSplitCameraConfig] = Field(
-        min_length=1,
-        description="Camera key to artifact. Every entry is written for every clip.",
-    )
     max_delta_s: float = Field(
+        default=0.05,
         gt=0.0,
         allow_inf_nan=False,
         description="How far in seconds a source frame may sit from a grid timestamp and still be selected.",
     )
+    encoder: EncoderOpenH264Config = Field(default_factory=EncoderOpenH264Config)
 
     @property
     def max_delta_ns(self) -> int:
@@ -307,20 +258,65 @@ class MultimodalSplitSensorsConfig(BaseModel):
         """
         return round(self.max_delta_s * _NS_PER_SECOND)
 
-    @field_validator("cameras")
+
+class MultimodalSplitSensorConfig(BaseModel):
+    """One sensor inside a session, whatever kind it is.
+
+    Sensors are one flat map rather than a block per kind. Grouping them by kind
+    means every kind after the first is defined by not being a camera, which is a
+    leftovers drawer rather than a taxonomy -- and it cannot express two IMUs, or
+    a sensor whose artifact the recipe reads the same way but means something
+    different by.
+
+    ``sensor_type`` is declared rather than inferred. A file's suffix names its
+    container, so it can say an artifact is an MCAP but never whether that MCAP
+    holds IMU or GPS. Only the types this recipe can actually process are
+    accepted, so a config naming one it cannot is refused at load rather than at
+    the end of a discovery pass.
+
+    ``uri_pattern`` is relative to a session URI, because discovery stops at the
+    session boundary and this is the only place that knows a session has sensors
+    in it. Anything absolute or upward-reaching would resolve outside the session
+    it was joined to, so both are rejected rather than normalized.
+
+    A whole path segment may be ``*``, so a config can name a sensor without
+    knowing which recorder a rig put it on.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    sensor_type: MultimodalSplitSensorType = Field(
+        description="What kind of sensor this is. Only 'camera' is processed today.",
+    )
+    uri_pattern: str = Field(
+        min_length=1,
+        description="Path to the artifact relative to a session URI, such as */camera_front.mp4.",
+    )
+
+    @field_validator("uri_pattern")
     @classmethod
-    def _validate_cameras(
-        cls, cameras: dict[str, MultimodalSplitCameraConfig]
-    ) -> dict[str, MultimodalSplitCameraConfig]:
-        for key in cameras:
-            # "." and "." * 2 match the character class but name a directory rather than sit in one.
-            if not _CAMERA_KEY_PATTERN.fullmatch(key) or key in _RESERVED_PATH_SEGMENTS:
+    def _validate_uri_pattern(cls, pattern: str) -> str:
+        if pattern != pattern.strip():
+            msg = "sensor uri_pattern cannot have leading or trailing whitespace"
+            raise ValueError(msg)
+        if "://" in pattern or pattern.startswith("/"):
+            msg = (
+                f"sensor uri_pattern {pattern!r} must be relative to a session, so it can be joined "
+                f"onto any session URI. Drop the scheme or the leading slash"
+            )
+            raise ValueError(msg)
+        _reject_parent_segments(pattern, pattern)
+        for segment in pattern.split("/"):
+            # A whole segment may be a wildcard, so a config need not know which
+            # recorder holds a sensor. Part of one may not: that matches on file
+            # names rather than on layout, and resolves differently as names change.
+            if "*" in segment and segment != "*":
                 msg = (
-                    f"camera key {key!r} is written into output paths, so it must be a single path "
-                    f"segment of letters, digits, dots, dashes, or underscores"
+                    f"sensor uri_pattern {pattern!r} may use * as a whole path segment, not inside one. "
+                    f"Write */name.mp4 rather than rec*/name.mp4"
                 )
                 raise ValueError(msg)
-        return cameras
+        return pattern
 
 
 class MultimodalSplitOutputConfig(BaseModel):
@@ -433,16 +429,14 @@ class MultimodalSplitExecutionConfig(BaseModel):
 class ResolvedMultimodalSplitConfig(BaseModel):
     """Canonical execution contract for Curator Next ``multimodal-split``.
 
-    ``input`` selects the candidate sessions, ``sensors`` names the camera to
-    read from each one, ``clip`` describes the geometry and frame rates a session
-    is split into, ``encoder`` describes how the resulting clips are encoded,
-    and ``output`` says where they are written.
+    ``input`` selects the candidate sessions, ``sensors`` names the artifacts to
+    read from each one, ``clip`` says how long a clip is, ``video`` describes how
+    a camera becomes a clip's media, and ``output`` says where it is written.
 
-    ``clip``, ``encoder`` and ``execution`` are fully defaulted, so a config written before
-    either existed still resolves. ``sensors`` and ``output`` are not: there is
-    no defensible default for which artifact inside a session holds the video, or
-    for where a run should write. Both are required, and a config predating them
-    has to name them.
+    ``clip``, ``video`` and ``execution`` are fully defaulted, so a config written
+    before any of them existed still resolves. ``sensors`` and ``output`` are not:
+    there is no defensible default for which artifact inside a session holds the
+    video, or for where a run should write. Both are required.
     """
 
     model_config = _MODEL_CONFIG
@@ -450,19 +444,47 @@ class ResolvedMultimodalSplitConfig(BaseModel):
     schema_version: SchemaVersion
     kind: MultimodalSplitKind
     input: MultimodalSplitInputConfig
-    sensors: MultimodalSplitSensorsConfig
+    sensors: dict[str, MultimodalSplitSensorConfig] = Field(
+        min_length=1,
+        description="Sensor key to artifact. Every entry is written for every clip.",
+    )
     output: MultimodalSplitOutputConfig
     clip: MultimodalSplitClipConfig = Field(default_factory=MultimodalSplitClipConfig)
-
-    encoder: EncoderOpenH264Config = Field(default_factory=EncoderOpenH264Config)
+    video: MultimodalSplitVideoConfig = Field(default_factory=MultimodalSplitVideoConfig)
     execution: MultimodalSplitExecutionConfig = Field(default_factory=MultimodalSplitExecutionConfig)
+
+    @property
+    def cameras(self) -> dict[str, MultimodalSplitSensorConfig]:
+        """Return the sensors this recipe reads as video, keyed as configured.
+
+        The camera/not-camera split is real inside the pipeline -- cameras define
+        the grid every other sensor is cut against -- so it is derived here from
+        what each sensor says it is, rather than being a shape an operator has to
+        express by choosing which block to write a sensor in.
+        """
+        return {key: sensor for key, sensor in self.sensors.items() if sensor.sensor_type == "camera"}
+
+    @field_validator("sensors")
+    @classmethod
+    def _validate_sensor_keys(
+        cls, sensors: dict[str, MultimodalSplitSensorConfig]
+    ) -> dict[str, MultimodalSplitSensorConfig]:
+        for key in sensors:
+            # "." and "." * 2 match the character class but name a directory rather than sit in one.
+            if not _SENSOR_KEY_PATTERN.fullmatch(key) or key in _RESERVED_PATH_SEGMENTS:
+                msg = (
+                    f"sensor key {key!r} is written into output paths, so it must be a single path "
+                    f"segment of letters, digits, dots, dashes, or underscores"
+                )
+                raise ValueError(msg)
+        return sensors
 
 
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
     "kind": "multimodal-split",
     "input": {"input_path_prefix": "s3://example-bucket/recordings"},
-    "sensors": {"cameras": {"front": {"uri_pattern": "*/camera_front.mp4"}}, "max_delta_s": 0.05},
+    "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"}},
     "output": {"path": "s3://example-bucket/media"},
 }
 # Settings that default to null are dumped away by ``exclude_none``, so the two

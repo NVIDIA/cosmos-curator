@@ -18,12 +18,14 @@
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
 from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
+from cosmos_curator.next.recipes.multimodal_split import pipeline_kind
 from cosmos_curator.next.recipes.multimodal_split.config import (
     ResolvedMultimodalSplitConfig,
     resolve_config,
@@ -37,7 +39,7 @@ def _write_config(root: Path, prefix: str, *, clip: dict[str, object] | None = N
         "schema_version": 1,
         "kind": "multimodal-split",
         "input": {"input_path_prefix": prefix, **input_fields},
-        "sensors": {"cameras": {"front": {"uri_pattern": "camera/front.mp4"}}, "max_delta_s": 0.05},
+        "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"}},
         "output": {"path": str(root / "media")},
         # Shorter than the 10 s default so a fixture session holds whole clips
         # without encoding ten seconds of video per test. Pass ``clip={}`` to
@@ -118,6 +120,27 @@ def test_validate_accepts_a_good_config_and_reports_the_failure_for_a_bad_one(tm
         MULTIMODAL_SPLIT_KIND.validate(bad, [])
 
 
+def test_the_template_documents_a_config_the_recipe_actually_accepts() -> None:
+    """The CLI hands these to an operator, so they cannot describe a shape that is refused.
+
+    ``required_fields`` is prose the model does not derive, so it drifts silently
+    when the config surface moves -- and ``extra="forbid"`` turns that drift from
+    a stale example into a config the recipe rejects outright.
+    """
+    payload = pipeline_kind._template_payload()
+
+    built: dict[str, Any] = {}
+    for field in payload["required_fields"]:
+        node = built
+        parts = str(field["path"]).split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = field["example"]
+
+    ResolvedMultimodalSplitConfig.model_validate(built)
+    ResolvedMultimodalSplitConfig.model_validate(payload["config"])
+
+
 def test_a_config_without_a_clip_section_resolves_to_the_clip_defaults(tmp_path: Path) -> None:
     """Configs written before the clip section existed must keep loading unchanged."""
     path = _write_config(tmp_path, "s3://example-bucket/recordings", clip={})
@@ -125,7 +148,7 @@ def test_a_config_without_a_clip_section_resolves_to_the_clip_defaults(tmp_path:
     resolved = resolve_config(path)
 
     assert resolved.clip.duration_s == 10.0
-    assert resolved.clip.output_fps == 30
+    assert resolved.clip.sampling_fps == 30
 
 
 def test_render_emits_the_canonicalized_config(tmp_path: Path) -> None:
@@ -228,7 +251,7 @@ def test_the_schema_documents_the_input_section() -> None:
     schema = json.loads(MULTIMODAL_SPLIT_KIND.schema_json())
 
     assert schema["$defs"]["MultimodalSplitInputConfig"]["required"] == ["input_path_prefix"]
-    assert {"duration_s", "output_fps"} <= schema["$defs"]["MultimodalSplitClipConfig"]["properties"].keys()
+    assert {"duration_s", "sampling_fps"} <= schema["$defs"]["MultimodalSplitClipConfig"]["properties"].keys()
     # ``clip`` and ``encoder`` are fully defaulted, so adding them must not make them mandatory.
     # ``sensors`` and ``output`` have no defensible default and must stay required.
     assert set(schema["required"]) == {"schema_version", "kind", "input", "sensors", "output"}

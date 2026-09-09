@@ -18,11 +18,10 @@
 from collections.abc import Callable
 from pathlib import Path
 
-import pytest
-
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.identities import make_clip_id, make_source_id
+from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
 
 from .conftest import split_all
 
@@ -48,54 +47,66 @@ def test_clip_ids_are_stable_across_runs(
     assert [clip["clip_id"] for clip in first] == [clip["clip_id"] for clip in second]
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("memory_gb", 4.0),
-        ("read_buffer_bytes", 1 << 22),
-        ("progress", True),
-        ("planner_num_cpus", 0.5),
-    ],
-)
-def test_execution_settings_leave_the_clip_id_alone(
+def test_no_setting_changes_the_clip_id(
     tmp_path: Path,
+    make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
-    field: str,
-    value: object,
 ) -> None:
-    """A setting that changes no written byte must not change where the bytes land.
+    """A clip id names a moment, so nothing about how the moment was rendered reaches it.
 
-    The complement of the tests that pin what *does* re-key a clip: those would
-    all still pass if the id hashed the whole config, which would scatter
-    identical media across keys every time an operator retuned a run.
+    Exercised through ``span_planner``, which is the only caller that holds a
+    config at all. Calling ``make_clip_id`` directly under two configs would
+    prove nothing now that it takes none -- the assertion has to run through the
+    code that could still pass one.
+
+    Settings used to be folded in so a rerun under new settings could not
+    overwrite the old media. That made the identity double as overwrite
+    protection, which is ``output.overwrite``'s job, and meant changing a bitrate
+    re-keyed a whole dataset.
     """
-    config = make_config(tmp_path / "recordings", tmp_path / "media")
-    retuned = make_config(tmp_path / "recordings", tmp_path / "media", **{field: value})
-    span = Span(start_ns=_EPOCH, end_ns=_EPOCH + _S)
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
 
+    def clip_ids(**overrides: object) -> list[str]:
+        config = make_config(root, tmp_path / "media", **overrides)
+        return [str(entry["clip_id"]) for row in span_planner(item, config=config) for entry in row["spans"]]
+
+    baseline = clip_ids()
+    assert baseline, "the fixture session has to plan at least one clip for this to assert anything"
+    for field, value in (
+        ("video_bitrate", "8M"),
+        ("gop_size", 30),
+        ("max_delta_s", 0.02),
+        ("memory_gb", 8.0),
+        ("read_buffer_bytes", 1 << 20),
+    ):
+        assert clip_ids(**{field: value}) == baseline, f"{field} reached the clip id"
+
+
+def test_a_different_span_is_a_different_clip() -> None:
+    """The moment is the identity, so two spans of one session cannot collide."""
     source_id = make_source_id("s3://bucket/recordings/session-000")
+    first = Span(start_ns=_EPOCH, end_ns=_EPOCH + _S)
+    second = Span(start_ns=_EPOCH + _S, end_ns=_EPOCH + 2 * _S)
 
-    assert make_clip_id(source_id, span, config) == make_clip_id(source_id, span, retuned)
+    assert make_clip_id(source_id, first) != make_clip_id(source_id, second)
 
 
-def test_the_same_session_name_under_two_prefixes_is_two_sources(
-    tmp_path: Path,
-    make_config: Callable[..., ResolvedMultimodalSplitConfig],
-) -> None:
+def test_the_same_session_name_under_two_prefixes_is_two_sources() -> None:
     """A session ID is a directory name, so two datasets can each hold a ``session-000``.
 
     Named alone they key the same clips into the same place, and one run's media
     lands on the other's. Keying on where the session is keeps them apart, which
     is the contract ``robot_action_split`` already works under.
     """
-    config = make_config(tmp_path / "recordings", tmp_path / "media")
     span = Span(start_ns=_EPOCH, end_ns=_EPOCH + _S)
 
     one = make_source_id("s3://bucket/recordings-a/session-000")
     other = make_source_id("s3://bucket/recordings-b/session-000")
 
     assert one != other
-    assert make_clip_id(one, span, config) != make_clip_id(other, span, config)
+    assert make_clip_id(one, span) != make_clip_id(other, span)
 
 
 def test_a_trailing_slash_does_not_make_a_second_source(tmp_path: Path) -> None:

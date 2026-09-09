@@ -86,7 +86,7 @@ def sampling_spec(span: Span, config: ResolvedMultimodalSplitConfig) -> Sampling
     start_ns, exclusive_end_ns, timestamps_ns = make_ts_grid(
         span.start_ns,
         exclusive_end_ns=span.end_ns,
-        sample_rate_hz=config.clip.output_fps,
+        sample_rate_hz=config.clip.sampling_fps,
     )
     grid = SamplingGrid(
         start_ns,
