@@ -27,6 +27,11 @@
 #   di-session --session-path s3://bucket/clips/<uuid>/ --s3-profile-name my-profile --json
 #   di-session --session-path s3://hyperion8/clips/<uuid>/ --endpoint-url <endpoint-url> --limit 5
 #
+# Where a session prefix holds copies of its cameras beside the originals, name the
+# subprefixes that hold the real streams:
+#
+#   di-session --session-path s3://bucket/clips/<uuid>/ --stream-glob 'recorder-*/*'
+#
 
 """Run every data-integrity metric against every stream of a single session.
 
@@ -61,6 +66,7 @@ from cosmos_curator.next.recipes.data_integrity.cli_support import (
     add_threshold_args,
     available_cpu_count,
     interrupt_guard,
+    non_empty_str,
     non_negative_int,
     positive_finite_float,
     positive_int,
@@ -127,6 +133,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=0,
         metavar="N",
         help="Cap the number of streams checked; 0 (default) means all. Useful for sampling a large session.",
+    )
+    parser.add_argument(
+        "--stream-glob",
+        action="append",
+        type=non_empty_str,
+        default=None,
+        metavar="GLOB",
+        help=(
+            "Check only streams whose path below the session matches this glob; repeatable, and every "
+            "video is checked when it is omitted. '*' does not cross '/', '**' spans subdirectories. "
+            "Pass --stream-glob 'recorder-*/*' where a session prefix also holds copies of its own "
+            "cameras, which would otherwise be measured twice and inflate the session's sensor count."
+        ),
     )
     default_max_workers = available_cpu_count()
     parser.add_argument(
@@ -354,6 +373,7 @@ def _run(
             thresholds=thresholds,
             batch_size=args.batch_size,
             limit=args.limit,
+            stream_globs=tuple(args.stream_glob or ()),
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
             endpoint_url=endpoint_url,

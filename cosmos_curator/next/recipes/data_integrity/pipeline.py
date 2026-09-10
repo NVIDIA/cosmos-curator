@@ -76,7 +76,7 @@ class IncompleteRunError(RuntimeError):
 
 #: How many unmeasured session paths to name in that message before summarising the
 #: rest. Enough to act on, few enough not to bury the counts above them.
-_PATHS_NAMED = 5
+_PATHS_NAMED: int = 5
 
 
 def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
@@ -118,7 +118,12 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
 
     ensure_ray_initialized()
     configure_ray_data_progress(progress=config.execution.progress)
-    configure_ray_data_stability()
+    # Widened past Ray's 30 minutes, and configurable, because the window has to fit
+    # the slowest session an operator points this at rather than the slowest one seen
+    # so far: a session's streams are measured in sequence, and neither how many it
+    # holds nor how large they are is bounded. Losing the run to it is expensive --
+    # the commit comes last, so a timeout discards every session already measured.
+    configure_ray_data_stability(no_progress_timeout_s=config.execution.no_progress_timeout_s)
 
     num_streams = 0
     unreadable = 0

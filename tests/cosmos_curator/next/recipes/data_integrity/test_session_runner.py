@@ -248,6 +248,39 @@ def test_run_session_aggregates_streams(monkeypatch: pytest.MonkeyPatch) -> None
     assert report.status is OverallStatus.FAIL
 
 
+def test_run_session_forwards_the_stream_globs_to_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The globs decide which streams a session even has, so dropping them changes its verdict."""
+    captured: dict[str, object] = {}
+
+    def _discover(session_path: str, **kwargs: object) -> list[str]:
+        captured["session_path"] = session_path
+        captured.update(kwargs)
+        return ["x"]
+
+    monkeypatch.setattr(session_runner, "discover_streams", _discover)
+    monkeypatch.setattr(session_runner, "run_one_stream", lambda source, **_k: _canned(source, CheckStatus.PASS))
+
+    run_session("sess", stream_globs=("recorder-*/*",))
+
+    assert captured["stream_globs"] == ("recorder-*/*",)
+
+
+def test_run_session_defaults_to_discovering_every_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting the globs must mean no filter rather than a filter that matches nothing."""
+    captured: dict[str, object] = {}
+
+    def _discover(_session_path: str, **kwargs: object) -> list[str]:
+        captured.update(kwargs)
+        return ["x"]
+
+    monkeypatch.setattr(session_runner, "discover_streams", _discover)
+    monkeypatch.setattr(session_runner, "run_one_stream", lambda source, **_k: _canned(source, CheckStatus.PASS))
+
+    run_session("sess")
+
+    assert captured["stream_globs"] == ()
+
+
 def test_run_session_judges_the_session_as_well_as_its_streams(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],

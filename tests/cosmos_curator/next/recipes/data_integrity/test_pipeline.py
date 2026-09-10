@@ -291,6 +291,43 @@ def test_a_config_override_reaches_the_run(dataset: pathlib.Path, tmp_path: path
     assert len(store.read_streams(str(tmp_path / "di-store"))) == NUM_SESSIONS
 
 
+def test_the_run_widens_rays_no_progress_window_to_the_configured_one(
+    dataset: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Left at Ray's own 30 minutes, a slow session fails the run after everything else was measured.
+
+    Asserted at this call site rather than only on the helper: the widening is a
+    property of what this recipe asks for, and a call that stopped passing the window
+    would restore the default silently.
+    """
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        pipeline,
+        "configure_ray_data_stability",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    pipeline.run_config(resolve_config_data(_config_data(dataset, tmp_path / "di-store")))
+
+    assert captured["no_progress_timeout_s"] == 2 * 60 * 60
+
+
+def test_an_operator_can_widen_the_no_progress_window_further(
+    dataset: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default fits the sessions seen so far, not every session anyone will point this at."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        pipeline,
+        "configure_ray_data_stability",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    pipeline.run_config(resolve_config_data(_config_data(dataset, tmp_path / "di-store", no_progress_timeout_s=-1)))
+
+    assert captured["no_progress_timeout_s"] == -1
+
+
 def test_a_stale_session_path_costs_the_run_its_exit_status_but_not_its_rows(
     dataset: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:

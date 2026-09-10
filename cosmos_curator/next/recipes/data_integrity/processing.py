@@ -86,7 +86,8 @@ def discover_session(session_path: str, *, config: ResolvedDataIntegrityConfig) 
 
     Args:
         session_path: the session to list.
-        config: the resolved config, for the per-session stream cap and credentials.
+        config: the resolved config, for the per-session stream cap, the stream globs
+            that select which subprefixes of a session hold its streams, and credentials.
 
     Returns:
         The session's stream sources. A session holding no videos yields an empty
@@ -97,6 +98,7 @@ def discover_session(session_path: str, *, config: ResolvedDataIntegrityConfig) 
     return discover_streams(
         session_path,
         limit=config.input.limit or 0,
+        stream_globs=config.input.stream_globs,
         s3_profile_name=config.execution.s3_profile_name,
         azure_profile_name=config.execution.azure_profile_name,
         endpoint_url=config.execution.endpoint_url,

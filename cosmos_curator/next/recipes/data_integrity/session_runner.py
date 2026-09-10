@@ -351,6 +351,7 @@ def run_session(  # noqa: PLR0913
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     batch_size: int = 0,
     limit: int = 0,
+    stream_globs: tuple[str, ...] = (),
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
     endpoint_url: str | None = None,
@@ -369,6 +370,11 @@ def run_session(  # noqa: PLR0913
         thresholds: pass/fail policy applied to every stream.
         batch_size: window size for streaming timestamps; ``0`` = one batch.
         limit: cap on the number of streams (``0`` = all), for sampling large sessions.
+        stream_globs: keep only streams whose path below ``session_path`` matches one of
+            these globs; empty (default) keeps every video found. See
+            :func:`~cosmos_curator.next.recipes.data_integrity.discovery.discover_streams`
+            for the semantics, and for why a session holding copies of its own cameras
+            needs it.
         s3_profile_name: optional AWS profile for ``s3://`` sources.
         azure_profile_name: Azure profile for ``az://`` sources.
         endpoint_url: optional S3 endpoint override for S3-compatible stores.
@@ -413,6 +419,7 @@ def run_session(  # noqa: PLR0913
     sources = discover_streams(
         session_path,
         limit=limit,
+        stream_globs=stream_globs,
         s3_profile_name=s3_profile_name,
         azure_profile_name=azure_profile_name,
         endpoint_url=endpoint_url,

@@ -71,7 +71,7 @@ without touching the kernel:
 | Symbol | Location | Purpose |
 | --- | --- | --- |
 | `run_checks` | `sources.py:90` | measure one stream URI, returning check results, video info and the resolved config |
-| `discover_streams` | `discovery.py:48` | expand one session path into sorted stream URIs |
+| `discover_streams` | `discovery.py:86` | expand one session path into sorted stream URIs |
 | `new_run_id` | `store.py:100` | `uuid4().hex`, shared by every row in one run |
 | `content_identity` | `store.py:130` | provenance `HEAD` / `stat` for one source; best-effort, never raises |
 | `stream_key` | `store.py:171` | the dedup key one stream's rows agree on |
@@ -89,7 +89,10 @@ imports nothing from `cli.py` or `session_cli.py`.
 `discover_streams` expands exactly one session path — local directories via a recursive
 `rglob`, cloud prefixes via `storage_cli.list_storage_objects` — filtered to
 `VIDEO_SUFFIXES = (".mp4", ".mov", ".m4v", ".mkv")` and returned sorted. Its `limit` caps
-streams per session, where 0 means no cap.
+streams per session, where 0 means no cap. Its `stream_globs` narrows the recursion to the
+subprefixes that hold the session's real streams (see [What a session
+is](#what-a-session-is)); with globs set the cloud listing is issued uncapped, since a cap
+spent before filtering would come back holding mostly excluded keys.
 
 ### What a session is
 
@@ -97,6 +100,21 @@ The session layout is already settled, and already exercised against the target 
 `session_cli.py` defines a session as "one recording -- typically a `clips/<uuid>/`
 directory (or cloud prefix) holding one video per camera", and its usage block gives
 `--session-path s3://<bucket>/clips/<uuid>/` as a worked example.
+
+One recording can span several capture computers: a car with multiple Orins writes a
+`recorder-<NN>/` directory per Orin under one session uuid, and their clocks are expected
+to be synchronized. So the session is the uuid, not the recorder — splitting it per
+recorder would ask `multi_sensor_spread` and `multi_sensor_overlap` whether each Orin
+agrees with itself, which is not the question those metrics exist to answer.
+
+That makes `input.stream_globs` load-bearing rather than a convenience. Discovery recurses,
+and an observed bucket kept copies of the same cameras beside the recorders (`__original/`,
+`triage/`, `derived/` siblings), which unfiltered would measure every camera several times
+and present one rig as having twenty sensors. `stream_globs: ["recorder-*/*"]` keeps the
+session whole while measuring each camera once. Patterns are matched against the path below
+the session with `PurePosixPath.full_match`, anchored there: `*` stops at a `/`, so
+`recorder-*/*` does not reach `triage/recorder-00/front.mp4`, and `**` spans depth for a
+recorder that nests its cameras further down.
 
 ### Nothing enumerates sessions
 
@@ -191,6 +209,7 @@ input:
   session_roots: []         # dataset roots to expand into session paths
   session_depth: 1          # prefix levels below each root that name a session
   limit: null               # max streams per session; null maps to discover_streams limit=0
+  stream_globs: []          # keep only streams matching these globs, relative to the session
 
 checks:
   expected_hz: null         # null = per-stream header rate, or unavailable (see below)
@@ -215,7 +234,18 @@ execution:                  # all fields optional; shown with defaults
   stream_attempts: 3          # attempts per stream when the failure looks transient
   append_batch_size: 512      # sessions per driver-side append
   progress: false             # Ray Data progress bars
+  no_progress_timeout_s: 7200 # how long one session may run before Ray calls it wedged; -1 disables
 ```
+
+`execution.no_progress_timeout_s` widens Ray Data's own 30-minute window, which is far too
+short here: one task measures a session's streams in sequence, emitting nothing until the
+whole session is done, and a recorder holding several multi-gigabyte videos that need a full
+packet scan takes over an hour of cloud reads. At Ray's default such a run dies on its
+slowest session — after every other one was measured, and before the commit that would have
+made them readable. The two-hour default is not a bound anyone can prove, since neither the
+stream count nor the stream size is capped, so the field is configurable: raise it for larger
+sessions, or set `-1` to drop the check entirely. It stays finite by default so a genuine
+deadlock is still reported rather than waited on.
 
 `checks:` carries only the knobs `run_checks` already takes. It is not the check-declaration
 format that [Data Integrity Design](data-integrity-design.md) leaves open, and taking the

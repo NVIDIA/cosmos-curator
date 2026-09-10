@@ -55,6 +55,10 @@ KIND_NAME = "data-integrity"
 #: alongside ``di-check`` / ``di-session`` / ``di-reevaluate``.
 TOOL_NAME = KIND_NAME
 
+#: The value Ray Data reads as "do not watch for progress at all", and so the one
+#: non-positive ``no_progress_timeout_s`` this config accepts.
+_NO_PROGRESS_TIMEOUT_DISABLED: float = -1.0
+
 
 class DataIntegrityInputConfig(BaseModel):
     """Which sessions the run covers, as any combination of three forms.
@@ -93,17 +97,26 @@ class DataIntegrityInputConfig(BaseModel):
         ge=1,
         description="Max streams per session; null means no cap. Caps streams, never sessions.",
     )
+    stream_globs: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Keep only streams whose path below the session matches one of these globs; "
+            "empty (default) keeps every video found. '*' does not cross '/', '**' spans "
+            "subdirectories. Set it where a session prefix also holds copies of its own cameras."
+        ),
+        examples=[["recorder-*/*"]],
+    )
 
-    @field_validator("sessions", "session_roots", mode="before")
+    @field_validator("sessions", "session_roots", "stream_globs", mode="before")
     @classmethod
     def _coerce_sequence(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
 
-    @field_validator("sessions", "session_roots")
+    @field_validator("sessions", "session_roots", "stream_globs")
     @classmethod
     def _reject_blank_entries(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
         if any(not path.strip() for path in paths):
-            msg = "session paths and roots must be non-empty"
+            msg = "session paths, roots and stream globs must be non-empty"
             raise ValueError(msg)
         return paths
 
@@ -249,6 +262,32 @@ class DataIntegrityExecutionConfig(BaseModel):
     # once, and how many Lance fragments a run leaves behind.
     append_batch_size: int = Field(default=512, ge=1)
     progress: bool = False
+    no_progress_timeout_s: float = Field(
+        default=2 * 60 * 60,
+        description=(
+            "Seconds one session may go without finishing before Ray Data calls the execution "
+            "wedged; -1 disables the check. The default is well past Ray's own 30 minutes, "
+            "because a session is not a short task here: its streams are measured in sequence "
+            "on one CPU, and a recorder holding several multi-gigabyte videos that need a full "
+            "packet scan takes over an hour of cloud reads. Raise it for sessions larger than "
+            "that -- neither the stream count nor the stream size is bounded -- since the run "
+            "commits last, so the timeout costs every session already measured."
+        ),
+    )
+
+    @field_validator("no_progress_timeout_s")
+    @classmethod
+    def _reject_a_timeout_that_is_neither_a_window_nor_off(cls, timeout_s: float) -> float:
+        # ``-1`` is Ray's own spelling of "no check"; anything else at or below zero
+        # would be a window no session can meet, failing the run on its first task
+        # rather than doing what whoever typed it meant.
+        if timeout_s != _NO_PROGRESS_TIMEOUT_DISABLED and timeout_s <= 0:
+            msg = (
+                f"execution.no_progress_timeout_s must be positive, or {_NO_PROGRESS_TIMEOUT_DISABLED} "
+                f"to disable the check; got {timeout_s}"
+            )
+            raise ValueError(msg)
+        return timeout_s
 
 
 class ResolvedDataIntegrityConfig(BaseModel):

@@ -126,6 +126,21 @@ def positive_int(raw: str) -> int:
     return value
 
 
+def non_empty_str(raw: str) -> str:
+    """Argparse ``type=`` for flags whose empty value would be taken for a real one.
+
+    A blank pattern is the case worth catching: argparse would accept it, discovery
+    would match nothing against it, and the session would be reported as holding no
+    streams -- a finding about the data rather than the input error it is. The config
+    block rejects blanks for the same reason, so the two entrypoints agree.
+    """
+    value = raw.strip()
+    if not value:
+        msg = f"expected a non-empty value, got {raw!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
 @contextmanager
 def interrupt_guard() -> Generator[threading.Event]:
     """Turn SIGINT into a cooperative stop request, yielding the event that carries it.

@@ -55,7 +55,11 @@ def configure_ray_data_progress(*, progress: bool) -> None:
     ctx.use_ray_tqdm = False
 
 
-def configure_ray_data_stability(*, disable_high_memory_detector: bool = False) -> None:
+def configure_ray_data_stability(
+    *,
+    disable_high_memory_detector: bool = False,
+    no_progress_timeout_s: float | None = None,
+) -> None:
     """Enable Ray 2.56 stability knobs for map-heavy Ray Data pipelines.
 
     - ``default_map_logical_memory_enabled`` (PR ray-project/ray#63814) gives
@@ -72,6 +76,14 @@ def configure_ray_data_stability(*, disable_high_memory_detector: bool = False) 
     - ``disable_high_memory_detector`` suppresses reservation-based warnings
       for pipelines that intentionally hold large payloads in memory. The
       detector keeps its existing Ray configuration by default.
+    - ``no_progress_timeout_s`` raises (or with ``-1`` removes) the window Ray
+      Data waits for one task to finish before failing the execution. Ray's
+      default is 30 minutes, which reads a slow task as a wedged one; a recipe
+      whose single task legitimately runs longer than that -- one whose map
+      function streams gigabytes per item, say -- must widen it or lose the
+      whole run to its slowest item. Left alone by default, because a recipe
+      with short tasks wants the deadlock detection at Ray's window and not
+      hours later.
 
     Attributes are guarded with ``hasattr`` so importing this module on a
     stale (pre-2.56) Ray wheel still works.
@@ -79,6 +91,8 @@ def configure_ray_data_stability(*, disable_high_memory_detector: bool = False) 
     ctx = ray.data.DataContext.get_current()
     if hasattr(ctx, "default_map_logical_memory_enabled"):
         ctx.default_map_logical_memory_enabled = True  # type: ignore[attr-defined]
+    if no_progress_timeout_s is not None and hasattr(ctx, "execution_no_progress_timeout_s"):
+        ctx.execution_no_progress_timeout_s = no_progress_timeout_s  # type: ignore[attr-defined]
     # retried_map_errors and max_map_retries both shipped in ray-project/ray#63023;
     # gate them together so a partial-implementation Ray build can't end up with
     # the error list set but no retry cap (or vice versa).

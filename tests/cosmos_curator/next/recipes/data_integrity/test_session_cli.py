@@ -320,6 +320,40 @@ def test_forwards_cloud_and_sampling_args(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["s3_profile_name"] == "prof"
 
 
+def test_repeated_stream_globs_reach_run_session_as_a_tuple(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--stream-glob is repeatable, and omitting it must mean no filter rather than an empty one."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_session(session_path: str, **kwargs: object) -> SessionReport:
+        captured.update(kwargs)
+        return SessionReport(session_path, [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _fake_run_session)
+
+    session_cli.main(["--session-path", "s3://bucket/clips/uuid/"])
+    assert captured["stream_globs"] == ()
+
+    session_cli.main(
+        [
+            "--session-path",
+            "s3://bucket/clips/uuid/",
+            "--stream-glob",
+            "recorder-*/*",
+            "--stream-glob",
+            "*.mp4",
+        ]
+    )
+    assert captured["stream_globs"] == ("recorder-*/*", "*.mp4")
+
+
+def test_a_blank_stream_glob_is_rejected_at_parse_time(capsys: pytest.CaptureFixture[str]) -> None:
+    """A blank pattern would match nothing and report the session as empty, hiding the typo."""
+    with pytest.raises(SystemExit):
+        session_cli.main(["--session-path", "s3://bucket/clips/uuid/", "--stream-glob", "  "])
+
+    assert "non-empty" in capsys.readouterr().err
+
+
 def test_max_workers_defaults_to_the_usable_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
     """Omitting --max-workers scales concurrency to the host rather than a fixed number."""
     captured: dict[str, object] = {}

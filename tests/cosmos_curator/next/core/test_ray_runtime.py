@@ -51,6 +51,57 @@ def test_stability_configuration_can_disable_expected_video_memory_warnings(
     assert high_memory_detector_config.detection_time_interval_s == -1
 
 
+def test_stability_configuration_keeps_rays_no_progress_window_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recipe with short tasks keeps deadlock detection at Ray's own window."""
+    context = SimpleNamespace(
+        default_map_logical_memory_enabled=False,
+        retried_map_errors=[],
+        max_map_retries=0,
+        execution_no_progress_timeout_s=1800,
+        issue_detectors_config=SimpleNamespace(high_memory_detector_config=None),
+    )
+    monkeypatch.setattr(ray_runtime.ray.data.DataContext, "get_current", lambda: context)
+
+    ray_runtime.configure_ray_data_stability()
+
+    assert context.execution_no_progress_timeout_s == 1800
+
+
+def test_stability_configuration_can_widen_the_no_progress_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A legitimately slow task must not be mistaken for a wedged one."""
+    context = SimpleNamespace(
+        default_map_logical_memory_enabled=False,
+        retried_map_errors=[],
+        max_map_retries=0,
+        execution_no_progress_timeout_s=1800,
+        issue_detectors_config=SimpleNamespace(high_memory_detector_config=None),
+    )
+    monkeypatch.setattr(ray_runtime.ray.data.DataContext, "get_current", lambda: context)
+
+    ray_runtime.configure_ray_data_stability(no_progress_timeout_s=7200)
+
+    assert context.execution_no_progress_timeout_s == 7200
+
+
+def test_stability_configuration_tolerates_a_ray_without_the_no_progress_knob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widening the window on a Ray build that lacks it is a no-op, not an error."""
+    context = SimpleNamespace(
+        default_map_logical_memory_enabled=False,
+        retried_map_errors=[],
+        max_map_retries=0,
+        issue_detectors_config=SimpleNamespace(high_memory_detector_config=None),
+    )
+    monkeypatch.setattr(ray_runtime.ray.data.DataContext, "get_current", lambda: context)
+
+    ray_runtime.configure_ray_data_stability(no_progress_timeout_s=7200)
+
+    assert not hasattr(context, "execution_no_progress_timeout_s")
+
+
 def test_eager_actor_autoscaling_removes_conservative_growth_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     """Model-loading actor pools can grow geometrically while resources and their own ceiling still cap them."""
     autoscaling_config = SimpleNamespace(

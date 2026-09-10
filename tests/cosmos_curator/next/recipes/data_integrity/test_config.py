@@ -169,6 +169,41 @@ def test_an_s3_store_root_is_left_verbatim() -> None:
     assert resolved.output.store_root == "s3://bucket/di-store/"
 
 
+def test_stream_globs_reach_the_resolved_input_as_a_tuple() -> None:
+    """A YAML list becomes the tuple discovery takes, so the filter survives resolution."""
+    resolved = config.resolve_config_data(
+        _config_data(input={"sessions": ["/data/clips/one"], "stream_globs": ["recorder-*/*"]})
+    )
+
+    assert resolved.input.stream_globs == ("recorder-*/*",)
+
+
+def test_a_blank_stream_glob_is_rejected() -> None:
+    """An empty pattern matches nothing, so it would silently empty every session."""
+    with pytest.raises(ValidationError, match="non-empty"):
+        config.resolve_config_data(_config_data(input={"sessions": ["/data/clips/one"], "stream_globs": [" "]}))
+
+
+def test_the_no_progress_window_defaults_well_past_rays_own() -> None:
+    """Ray's 30 minutes reads a session measuring a multi-gigabyte stream as a wedged one."""
+    assert config.resolve_config_data(_config_data()).execution.no_progress_timeout_s == 2 * 60 * 60
+
+
+@pytest.mark.parametrize("timeout_s", [7200 * 4, -1])
+def test_the_no_progress_window_can_be_widened_or_disabled(timeout_s: float) -> None:
+    """Neither the stream count nor the stream size is bounded, so the default cannot fit everyone."""
+    resolved = config.resolve_config_data(_config_data(execution={"no_progress_timeout_s": timeout_s}))
+
+    assert resolved.execution.no_progress_timeout_s == timeout_s
+
+
+@pytest.mark.parametrize("timeout_s", [0, -2])
+def test_a_no_progress_window_no_session_could_meet_is_rejected(timeout_s: float) -> None:
+    """``-1`` is Ray's spelling of off; other non-positive values would fail the first task."""
+    with pytest.raises(ValidationError, match="no_progress_timeout_s"):
+        config.resolve_config_data(_config_data(execution={"no_progress_timeout_s": timeout_s}))
+
+
 def test_a_deeper_session_depth_is_rejected() -> None:
     """Only immediate children are supported today, and silently ignoring depth would lie."""
     with pytest.raises(ValidationError):

@@ -107,6 +107,22 @@ def test_listing_honours_the_per_session_stream_cap(session: pathlib.Path) -> No
     assert processing.discover_session(str(session), config=config) == [str(session / "front.mp4")]
 
 
+def test_listing_honours_the_configured_stream_globs(session: pathlib.Path) -> None:
+    """A session prefix holding copies of its cameras measures only the ones the config names."""
+    (session / "recorder-00").mkdir()
+    (session / "recorder-00" / "front.mp4").write_bytes(b"")
+    config = ResolvedDataIntegrityConfig.model_validate(
+        {
+            "schema_version": 1,
+            "kind": "data-integrity",
+            "input": {"sessions": [str(session)], "stream_globs": ["recorder-*/*"]},
+            "output": {"store_root": str(session.parent / "di-store")},
+        }
+    )
+
+    assert processing.discover_session(str(session), config=config) == [str(session / "recorder-00" / "front.mp4")]
+
+
 def test_a_session_that_cannot_be_listed_is_reported_rather_than_raised(tmp_path: pathlib.Path) -> None:
     """Raising would abort the dataset and discard every session already measured.
 
