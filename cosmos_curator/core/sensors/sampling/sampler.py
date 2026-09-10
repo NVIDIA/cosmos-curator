@@ -17,28 +17,11 @@
 import numpy as np
 import numpy.typing as npt
 
+from cosmos_curator.core.sensors.alignment.nearest import nearest_timestamp_indices, timestamp_distance_ns
 from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sampling.grid import SamplingWindow
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
 from cosmos_curator.core.sensors.utils.validation import require_strictly_increasing
-
-# Flips the sign bit, which maps int64 onto uint64 in the same order: INT64_MIN
-# to 0 and INT64_MAX to 2**64 - 1.
-_SIGN_BIT = np.uint64(0x8000000000000000)
-
-
-def _distance_ns(left: npt.NDArray[np.int64], right: npt.NDArray[np.int64]) -> npt.NDArray[np.uint64]:
-    """Return ``|left - right|`` elementwise, exactly, however far apart they are.
-
-    Subtracting int64 wraps once two timestamps are more than int64 apart, which
-    makes the furthest candidate look adjacent and selects it. Ordering survives
-    the move to uint64, and a difference between two uint64 values always fits in
-    one, so the answer is exact without leaving numpy for Python integers -- which
-    measured 18x slower on a window and 98x on a timeline.
-    """
-    unsigned_left = np.ascontiguousarray(left).view(np.uint64) ^ _SIGN_BIT
-    unsigned_right = np.ascontiguousarray(right).view(np.uint64) ^ _SIGN_BIT
-    return np.where(unsigned_left > unsigned_right, unsigned_left - unsigned_right, unsigned_right - unsigned_left)
 
 
 def find_closest_indices(canonical: npt.NDArray[np.int64], grid: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
@@ -62,31 +45,11 @@ def find_closest_indices(canonical: npt.NDArray[np.int64], grid: npt.NDArray[np.
     if len(canonical) == 0:
         msg = "canonical must be non-empty"
         raise ValueError(msg)
-
     if len(grid) == 0:
         msg = "grid must be non-empty"
         raise ValueError(msg)
 
-    require_strictly_increasing("canonical", canonical)
-    require_strictly_increasing("grid", grid)
-
-    if len(canonical) == 1:
-        return np.zeros_like(grid, dtype=np.int64)
-
-    # Rightmost indices are the insertion points into sorted array
-    right_idx = np.searchsorted(canonical, grid)
-    right_idx = np.clip(right_idx, 1, len(canonical) - 1)
-
-    # leftmost elements now, becomes closest index later
-    closest_idx = right_idx - 1
-
-    # Compare distances to left and right neighbors
-    left = canonical[closest_idx]
-    right = canonical[right_idx]
-    right_closest = _distance_ns(grid, right) < _distance_ns(grid, left)
-    closest_idx[right_closest] = right_idx[right_closest]
-
-    return closest_idx.astype(np.int64)
+    return nearest_timestamp_indices(canonical, grid, source_name="canonical", requested_name="grid")
 
 
 def sample_window_indices(
@@ -167,11 +130,10 @@ def sample_window_indices(
         msg = "canonical must be non-empty"
         raise ValueError(msg)
 
-    require_strictly_increasing("canonical", canonical)
-
     # A window with no reference timestamps produces no rows. `len(window)` is
     # `len(window.timestamps_ns)`, so this is the only emptiness check needed.
     if len(window) == 0:
+        require_strictly_increasing("canonical", canonical)
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
     active_grid = window.timestamps_ns
@@ -183,7 +145,7 @@ def sample_window_indices(
     indices = find_closest_indices(canonical, active_grid)
 
     if policy.max_delta_ns is not None:
-        deltas = np.abs(canonical[indices] - active_grid)
+        deltas = timestamp_distance_ns(canonical[indices], active_grid)
         if np.any(deltas > policy.max_delta_ns):
             worst_idx = int(deltas.argmax())
             max_delta = int(deltas[worst_idx])

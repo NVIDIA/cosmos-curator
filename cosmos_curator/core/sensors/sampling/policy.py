@@ -33,6 +33,23 @@ class NearestTimestampPolicy:
 
 
 @attrs.define(frozen=True, hash=False)
+class GpsInterpolationPolicy:
+    """GPS position interpolation policy.
+
+    Attributes:
+        max_gap_ns: maximum permitted duration between the lower and upper
+            source fixes. ``None`` disables only this maximum-gap check.
+
+    """
+
+    __hash__ = None  # type: ignore[assignment]
+    max_gap_ns: int | None = attrs.field(default=None, validator=attrs.validators.optional(attrs.validators.ge(0)))
+
+
+GpsSamplingPolicy = NearestTimestampPolicy | GpsInterpolationPolicy
+
+
+@attrs.define(frozen=True, hash=False)
 class NoSamplingPolicy:
     """Explicit no-operation policy for sensors whose current sampling is policy-independent."""
 
@@ -44,6 +61,14 @@ def require_nearest_timestamp_policy(policy: object, *, sensor_name: str) -> Nea
     if isinstance(policy, NearestTimestampPolicy):
         return policy
     msg = f"{sensor_name} requires NearestTimestampPolicy, got {type(policy).__name__}"
+    raise TypeError(msg)
+
+
+def require_gps_sampling_policy(policy: object, *, sensor_name: str) -> GpsSamplingPolicy:
+    """Return a supported GPS policy or raise a configuration error."""
+    if isinstance(policy, (NearestTimestampPolicy, GpsInterpolationPolicy)):
+        return policy
+    msg = f"{sensor_name} requires NearestTimestampPolicy or GpsInterpolationPolicy, got {type(policy).__name__}"
     raise TypeError(msg)
 
 

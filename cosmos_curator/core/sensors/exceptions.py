@@ -58,6 +58,11 @@ class AlignmentFailureReason(enum.StrEnum):
 
     EMPTY_BATCH = "empty_batch"
     TOLERANCE_EXCEEDED = "tolerance_exceeded"
+    GPS_NO_ELIGIBLE_FIX = "gps_no_eligible_fix"
+    GPS_MAX_DELTA_EXCEEDED = "gps_max_delta_exceeded"
+    GPS_MISSING_BRACKET = "gps_missing_bracket"
+    GPS_INVALID_SUPPORT_POSITION = "gps_invalid_support_position"
+    GPS_MAX_GAP_EXCEEDED = "gps_max_gap_exceeded"
 
 
 @attrs.define(slots=False, eq=False)
@@ -80,12 +85,16 @@ class AlignmentError(Exception):
             configured key, so it can be used to look that sensor up. ``None``
             only when raised below the sensor layer, as the sampler does.
         align_timestamps_ns: the reference timeline the window asked to be served.
-        sensor_timestamps_ns: the sensor's own timestamps that were selected to
-            serve it. ``TOLERANCE_EXCEEDED`` only.
-        delta_ns: how far the worst selection missed by. ``TOLERANCE_EXCEEDED``
-            only.
+        sensor_timestamps_ns: selected sensor-clock timestamps, when a failure
+            has a selected source row.
+        delta_ns: observed nearest-selection distance.
         max_delta_ns: the policy's configured tolerance, the limit ``delta_ns``
-            broke. ``TOLERANCE_EXCEEDED`` only.
+            broke.
+        known_source_timestamps_ns: source alignment timestamps relevant to the
+            failure: selected timestamps, interpolation brackets, or all known
+            source support when no narrower diagnostic exists.
+        gap_ns: observed source-bracket duration.
+        max_gap_ns: configured interpolation gap limit.
 
     These reuse the package's own names on purpose. ``align_timestamps_ns`` and
     ``sensor_timestamps_ns`` mean here exactly what they mean on a ``SensorData``
@@ -102,6 +111,9 @@ class AlignmentError(Exception):
     sensor_timestamps_ns: npt.NDArray[np.int64] | None = attrs.field(default=None, converter=_owned_copy)
     delta_ns: int | None = None
     max_delta_ns: int | None = None
+    known_source_timestamps_ns: npt.NDArray[np.int64] | None = attrs.field(default=None, converter=_owned_copy)
+    gap_ns: int | None = None
+    max_gap_ns: int | None = None
 
     def __str__(self) -> str:
         """Render as ``[sensor_id: ]reason: detail``."""

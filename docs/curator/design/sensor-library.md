@@ -400,9 +400,61 @@ bounds of that window, and whose `window.timestamps_ns` are the active reference
 Policies are explicit concrete objects passed at the sampling boundary:
 
 - **`NearestTimestampPolicy(max_delta_ns: int | None = None)`** — nearest timestamp selection for camera-like sensors. `0` requires exact matches; `None` disables only the maximum-delta check.
+- **`GpsInterpolationPolicy(max_gap_ns: int | None = None)`** — maximum allowed duration between GPS source fixes used to derive one position. `GpsSensor.sample()` applies it to its complete configured MCAP source.
 - **`NoSamplingPolicy()`** — explicit no-op policy for sensors whose current sampling behavior is policy-independent.
 
 Callers pass fully constructed policy objects. Sensors validate whether the provided concrete policy type is supported; they do not infer defaults from `None`, dictionaries, modality defaults, or overrides.
+
+### Pure GPS alignment
+
+`cosmos_curator.core.sensors.alignment.gps.align_gps()` aligns already-decoded
+`GpsData`; it does not read MCAP or define clip spans. `GpsSensor.sample()`
+decodes its configured MCAP once, then invokes this operation for each output
+window. Callers provide source rows whose
+`align_timestamps_ns` use the mapper-produced alignment clock, plus requested
+timestamps in that same clock and an explicit policy:
+
+```python
+from cosmos_curator.core.sensors.alignment.gps import align_gps
+from cosmos_curator.core.sensors.sampling.policy import GpsInterpolationPolicy, NearestTimestampPolicy
+
+nearest = align_gps(source_gps, requested_timestamps_ns, policy=NearestTimestampPolicy(max_delta_ns=500_000_000))
+interpolated = align_gps(source_gps, requested_timestamps_ns, policy=GpsInterpolationPolicy(max_gap_ns=2_000_000_000))
+```
+
+Nearest alignment selects the closest source fix, chooses the earlier fix for
+an exact midpoint, permits source-row reuse, and preserves source metadata and
+device timestamps. Interpolation requires an exact valid fix or valid lower and
+upper source brackets, never extrapolates, and interpolates positions in WGS-84
+Earth-centered, Earth-fixed (ECEF) coordinates. Derived interpolation rows use
+the requested timestamp in both timestamp arrays, clear source-only optional
+metadata, and record `source_bracket_timestamps_ns` provenance.
+
+The caller owns clip-boundary semantics. The planned post-split GPS MCAP format
+will contain all records in its half-open clip span plus, when available, one
+immediate source fix before the start and one at or after the end. The current
+splitter does not yet write GPS MCAPs or these halo fixes. Until it does,
+interior-only clip data can raise a structured `GPS_MISSING_BRACKET`
+`AlignmentError` near a boundary rather than extrapolating, reading another
+clip, or inventing a position.
+
+Both policies treat every source row as eligible, so nearest selection may also
+return a future halo rather than only using one as interpolation support. That
+is deliberate. Any fix beyond a halo is necessarily farther from an in-span
+request than the halo itself, so the two planned halo rows are exactly sufficient
+for clip-local nearest to return the same fix the unsplit session would, and
+splitting or re-splitting a session would not change alignment answers.
+Restricting nearest to the clip span would instead make the selected fix depend
+on where the cut landed. The cost is that nearest output
+`sensor_timestamps_ns` may lie outside the clip span, so consumers must not
+treat nearest provenance as span-bounded.
+
+Halo sufficiency assumes the two clocks agree closely. Splitting selects records
+by MCAP `log_time`, because a schema-agnostic raw copy cannot read mapped time,
+while alignment selects and brackets by mapper-produced `align_timestamp_ns`.
+Under a significant offset between them a halo chosen in `log_time` can fall on
+the wrong side of a request in alignment time, which surfaces as a
+`GPS_MISSING_BRACKET` failure rather than a wrong position.
 
 ### SamplingSpec
 
@@ -502,7 +554,7 @@ policies = {
     "cam0": NearestTimestampPolicy(max_delta_ns=5_000_000),
     "cam1": NearestTimestampPolicy(max_delta_ns=5_000_000),
     "imu0": NoSamplingPolicy(),
-    "gps0": NoSamplingPolicy(),
+    "gps0": NearestTimestampPolicy(max_delta_ns=500_000_000),
 }
 
 # Iterate over the group, yielding aligned frames
@@ -513,7 +565,7 @@ for frame in sensor_group.sample(spec, policies=policies):
     frame["cam0"]   # CameraData: frames (N, H, W, 3) uint8 RGB
     frame["cam1"]   # CameraData: same layout; H, W from stream metadata
     frame["imu0"]   # ImuData, SoA, point samples aligned to the reference grid
-    frame["gps0"]   # GpsData, SoA, WGS-84 fixes selected or interpolated
+    frame["gps0"]   # GpsData, SoA, WGS-84 rows aligned to the active timestamps
 ```
 
 ### Unit conventions
@@ -574,7 +626,7 @@ seekable stream or downloaded to a `Path` / `bytes` first.
 
 - **Containers**: Time indexed container files are the only supported container format, like MCAP, or MP4.
 - **SamplingGrid**: Half-open timeline (`start_ns`, `exclusive_end_ns`) and active `timestamps_ns` plus `stride_ns` / `duration_ns`; iterable in **window** order (`for window in grid`). Each **`window`** is a `SamplingWindow` with `start_ns`, `exclusive_end_ns`, and `timestamps_ns` `(N,)`. Drives batch shape **`N`** per yield. Held by a **`SamplingSpec`**; not passed alone to **`sample`** / **`align`**.
-- **Sampling policies**: Explicit concrete policy objects such as **`NearestTimestampPolicy(max_delta_ns=...)`** and **`NoSamplingPolicy()`**. They contain no timeline geometry and are passed separately at sampling boundaries.
+- **Sampling policies**: Explicit concrete policy objects such as **`NearestTimestampPolicy(max_delta_ns=...)`**, **`GpsInterpolationPolicy(max_gap_ns=...)`**, and **`NoSamplingPolicy()`**. They contain no timeline geometry and are passed separately at their sampling or alignment boundaries.
 - **SamplingSpec**: **Required** argument to **`sensor.sample(spec, policy=...)`**. Always contains **`grid: SamplingGrid`**.
 - **Binary Parsers**: Parse binary data, like vendor-specific lidar data, or h265 encoded video packets, into easily handled Pythonic data formats like CameraData, LidarData, ImuData, etc.
 - **Sensors**: One per data source (CameraSensor, ImuSensor, GpsSensor, LidarSensor, etc.). Expose `start_ns`, `end_ns`, and **`sample(spec, policy=...)`** — a generator over **`spec.grid`** **windows**. Each yield returns SoA with batch dimension **`N`**. Each sensor validates its concrete policy type before sampling. Each sensor type implements its own sampling strategy (nearest, interpolate, preintegrate, bucket).
@@ -591,7 +643,11 @@ seekable stream or downloaded to a `Path` / `bytes` first.
 - **GpsData**: The first generic GPS/GNSS payload is a SoA batch of
   WGS-84 fix rows with required latitude, longitude, altitude, and position
   validity plus optional covariance, velocity, fix type, satellite count,
-  accuracy, dilution of precision, host/UTC timestamps, and sequence fields.
+  accuracy, dilution of precision, host/UTC timestamps, sequence fields, and
+  interpolation bracket provenance. Pure nearest and interpolation utilities
+  live in `core/sensors/alignment/`; `GpsSensor.sample()` uses the GPS utility
+  after decoding its configured source once. Sensor splitting remains outside
+  those utilities.
   See `docs/curator/design/sensor-library-gps-data.md`.
 - **Cloud sources**: The sensor library does **not** accept URIs. Callers feed
   data from S3, Azure Blob, GCS, or any other remote store by opening their
@@ -626,6 +682,10 @@ seekable stream or downloaded to a `Path` / `bytes` first.
 cosmos_curator
 └── core
     └── sensors
+        ├── alignment
+        │    ├── __init__.py
+        │    ├── nearest.py        # Generic nearest-timestamp selection
+        │    └── gps.py            # GPS nearest and interpolation operations
         ├── containers
         │    ├── __init__.py
         │    ├── mp4.py            # Mp4Container
@@ -646,7 +706,7 @@ cosmos_curator
         ├── sampling
         │    ├── __init__.py
         │    ├── grid.py           # SamplingGrid (reference timeline + window iteration)
-        │    ├── policy.py         # NearestTimestampPolicy, NoSamplingPolicy
+        │    ├── policy.py         # NearestTimestampPolicy, GpsInterpolationPolicy, NoSamplingPolicy
         │    ├── spec.py           # SamplingSpec(grid) — required for sample / align
         │    └── sampler.py        # nearest_neighbor, time_spans
         └── data

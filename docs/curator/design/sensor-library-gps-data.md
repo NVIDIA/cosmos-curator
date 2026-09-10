@@ -159,6 +159,7 @@ class GpsData:
     host_timestamps_ns: npt.NDArray[np.int64] | None = None
     utc_timestamps_ns: npt.NDArray[np.int64] | None = None
     sequence_counter: npt.NDArray[np.uint64] | None = None
+    source_bracket_timestamps_ns: npt.NDArray[np.int64] | None = None
 ```
 
 ### Required Fields
@@ -180,7 +181,7 @@ class GpsData:
 | `velocity_enu_m_s` | `np.float64` | `(N, 3)` | m/s | Optional velocity in local ENU order. Parsers with NED velocity should convert N/E/D to E/N/U. |
 | `velocity_valid` | `np.bool_` | `(N, 3)` | unitless | Optional per-axis velocity validity mask. |
 | `fix_type` | `np.uint8` | `(N,)` | unitless | Optional normalized `GpsFixType` value. `GpsFixType` is PX4-inspired but not source-native: `0` no fix or unknown, `2` 2D fix, `3` 3D fix, `4` differential, `5` RTK float, `6` RTK fixed, `8` extrapolated. Parser adapters should map source-specific status values into this enum or leave the field `None`. |
-| `satellites_used` | `np.uint16` | `(N,)` | count | Optional number of satellites used by the fix. |
+| `satellites_used` | `np.uint32` | `(N,)` | count | Optional number of satellites used by the fix. |
 | `horizontal_accuracy_m` | `np.float64` | `(N,)` | m | Optional horizontal position accuracy estimate. |
 | `vertical_accuracy_m` | `np.float64` | `(N,)` | m | Optional vertical position accuracy estimate. |
 | `hdop` | `np.float64` | `(N,)` | unitless | Optional horizontal dilution of precision. |
@@ -189,6 +190,7 @@ class GpsData:
 | `host_timestamps_ns` | `np.int64` | `(N,)` | ns | Optional host/container receive timestamps, distinct from source measurement timestamps. |
 | `utc_timestamps_ns` | `np.int64` | `(N,)` | ns | Optional UTC timestamp reported by the receiver, converted to nanoseconds when available. |
 | `sequence_counter` | `np.uint64` | `(N,)` | unitless | Optional source sequence counter when available. |
+| `source_bracket_timestamps_ns` | `np.int64` | `(N, 2)` | ns | Optional provenance for derived interpolation rows: canonical lower and upper source times. The left time must be less than or equal to the right time, and the pair must contain the row's `align_timestamps_ns` value. Both columns hold the same time for an exact source match. Nearest and raw source rows set this to `None`. |
 
 ## Timestamp Semantics
 
@@ -200,6 +202,23 @@ compare rows across sensors.
 row. If a source exposes multiple timestamp concepts, parsers should map the
 timestamp used for alignment to `sensor_timestamps_ns` and document its source
 meaning.
+
+The pure GPS alignment utilities use `align_timestamps_ns` as the source and
+request timeline. Callers populate it with mapper-produced alignment timestamps,
+and provide requested timestamps in that same clock. Nearest output retains the
+selected source `sensor_timestamps_ns`; derived interpolation output uses the
+requested time in both timestamp arrays and records its support times in
+`source_bracket_timestamps_ns`. The planned post-split clip format will supply
+in-span fixes with one predecessor and one successor halo fix when available.
+The current splitter does not yet write GPS MCAPs or halos, so an interior-only
+clip can raise `GPS_MISSING_BRACKET` near a boundary; GPS interpolation never
+extrapolates across missing support.
+
+Once halos are produced, nearest selection may return one too, keeping a
+clip-local result identical to the unsplit session's. A nearest
+`sensor_timestamps_ns` value can therefore fall outside the clip span it was
+requested for, so it records true source provenance rather than a span-bounded
+value.
 
 `host_timestamps_ns` is optional receive-time metadata. For DriveWorks, it can
 map to host timestamp output modes when configured. It should not replace

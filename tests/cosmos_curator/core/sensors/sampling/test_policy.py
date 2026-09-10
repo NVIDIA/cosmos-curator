@@ -16,7 +16,7 @@
 
 import pytest
 
-from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy, NoSamplingPolicy
+from cosmos_curator.core.sensors.sampling.policy import GpsInterpolationPolicy, NearestTimestampPolicy, NoSamplingPolicy
 
 
 def test_nearest_timestamp_policy_instantiation() -> None:
@@ -33,6 +33,18 @@ def test_nearest_timestamp_policy_rejects_negative_max_delta() -> None:
     msg = r"'max_delta_ns' must be >= 0: -1"
     with pytest.raises(ValueError, match=msg):
         NearestTimestampPolicy(max_delta_ns=-1)
+
+
+def test_gps_interpolation_policy_instantiation() -> None:
+    """GpsInterpolationPolicy can omit or explicitly bound its support gap."""
+    assert GpsInterpolationPolicy().max_gap_ns is None
+    assert GpsInterpolationPolicy(max_gap_ns=5_000_000).max_gap_ns == 5_000_000
+
+
+def test_gps_interpolation_policy_rejects_negative_max_gap() -> None:
+    """Negative interpolation support gaps are rejected at construction time."""
+    with pytest.raises(ValueError, match=r"'max_gap_ns' must be >= 0: -1"):
+        GpsInterpolationPolicy(max_gap_ns=-1)
 
 
 def test_no_sampling_policy_instantiation() -> None:

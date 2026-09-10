@@ -33,6 +33,11 @@ def test_reason_values_are_the_machine_readable_vocabulary() -> None:
     assert [reason.value for reason in AlignmentFailureReason] == [
         "empty_batch",
         "tolerance_exceeded",
+        "gps_no_eligible_fix",
+        "gps_max_delta_exceeded",
+        "gps_missing_bracket",
+        "gps_invalid_support_position",
+        "gps_max_gap_exceeded",
     ]
 
 
@@ -56,6 +61,9 @@ def test_structured_fields_are_readable_without_payload_inspection() -> None:
         sensor_timestamps_ns=source,
         delta_ns=10,
         max_delta_ns=5,
+        known_source_timestamps_ns=np.array([90, 190], dtype=np.int64),
+        gap_ns=100,
+        max_gap_ns=50,
     )
 
     assert error.reason is AlignmentFailureReason.TOLERANCE_EXCEEDED
@@ -65,6 +73,9 @@ def test_structured_fields_are_readable_without_payload_inspection() -> None:
     np.testing.assert_array_equal(error.sensor_timestamps_ns, source)
     assert error.delta_ns == 10
     assert error.max_delta_ns == 5
+    np.testing.assert_array_equal(error.known_source_timestamps_ns, [90, 190])
+    assert error.gap_ns == 100
+    assert error.max_gap_ns == 50
 
 
 def test_optional_fields_default_to_none() -> None:
@@ -76,6 +87,9 @@ def test_optional_fields_default_to_none() -> None:
     assert error.sensor_timestamps_ns is None
     assert error.delta_ns is None
     assert error.max_delta_ns is None
+    assert error.known_source_timestamps_ns is None
+    assert error.gap_ns is None
+    assert error.max_gap_ns is None
 
 
 def test_str_reports_reason_detail_and_sensor_id() -> None:

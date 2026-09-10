@@ -50,6 +50,18 @@ def test_gps_data_accepts_required_fields() -> None:
     np.testing.assert_array_equal(gps_data.latitude_deg, np.array([37.4, 37.5], dtype=np.float64))
 
 
+def test_gps_data_accepts_source_bracket_timestamps() -> None:
+    """Derived GPS rows may record the inclusive pair of source support times."""
+    brackets = np.array([[100, 100], [100, 200]], dtype=np.int64)
+
+    gps_data = _make_gps_data(source_bracket_timestamps_ns=brackets)
+
+    assert gps_data.source_bracket_timestamps_ns is not brackets
+    assert gps_data.source_bracket_timestamps_ns is not None
+    assert gps_data.source_bracket_timestamps_ns.flags.writeable is False
+    np.testing.assert_array_equal(gps_data.source_bracket_timestamps_ns, brackets)
+
+
 def test_gps_data_accepts_all_optional_fields() -> None:
     """GpsData should accept the planned generic optional GPS/GNSS fields."""
     gps_data = _make_gps_data(
@@ -272,6 +284,14 @@ def test_gps_data_creates_readonly_views_without_mutating_inputs() -> None:
         ("altitude_m", np.array([10.0, np.nan], dtype=np.float64), "finite"),
         ("position_valid", np.ones((2,), dtype=np.bool_), r"shape \(N, 3\)"),
         ("position_valid", np.ones((2, 3), dtype=np.int8), "dtype bool"),
+        ("source_bracket_timestamps_ns", np.array([100, 200], dtype=np.int64), r"shape \(N, 2\)"),
+        ("source_bracket_timestamps_ns", np.array([[100, 200], [200, 300]], dtype=np.int32), "dtype int64"),
+        ("source_bracket_timestamps_ns", np.array([[200, 100], [200, 300]], dtype=np.int64), "left bracket"),
+        (
+            "source_bracket_timestamps_ns",
+            np.array([[101, 200], [200, 300]], dtype=np.int64),
+            "contain the matching align_timestamps_ns",
+        ),
     ],
 )
 def test_gps_data_rejects_invalid_required_fields(
@@ -343,6 +363,7 @@ def test_gps_data_rejects_invalid_optional_fields(
         ("host_timestamps_ns", np.array([95], dtype=np.int64)),
         ("utc_timestamps_ns", np.array([1_700_000_000_000_000_000], dtype=np.int64)),
         ("sequence_counter", np.array([7], dtype=np.uint64)),
+        ("source_bracket_timestamps_ns", np.array([[100, 100]], dtype=np.int64)),
     ],
 )
 def test_gps_data_rejects_optional_batch_length_mismatches(

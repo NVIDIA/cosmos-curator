@@ -25,10 +25,15 @@ from google.protobuf.message import Message
 from mcap.reader import McapReader
 from mcap.records import Channel, Schema
 
+from cosmos_curator.core.sensors.alignment.gps import align_gps
 from cosmos_curator.core.sensors.data.extrinsics import SensorExtrinsics
 from cosmos_curator.core.sensors.data.gps_data import GpsData
-from cosmos_curator.core.sensors.sampling.grid import SamplingWindow
-from cosmos_curator.core.sensors.sampling.policy import NoSamplingPolicy, require_no_sampling_policy
+from cosmos_curator.core.sensors.sampling.policy import (
+    GpsInterpolationPolicy,
+    GpsSamplingPolicy,
+    NearestTimestampPolicy,
+    require_gps_sampling_policy,
+)
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.mcap import (
@@ -247,12 +252,13 @@ def _empty_gps_data(
 
 
 class GpsSensor:
-    """MCAP-backed raw GPS sensor.
+    """MCAP-backed GPS sensor with explicit nearest or interpolation alignment.
 
     Reads mapped protobuf messages from an MCAP topic. ``schema_name`` selects
     the message declared by the MCAP's embedded descriptor, and
-    ``protobuf_mapping`` maps that message into ``GpsData`` fields. No
-    resampling, interpolation, or sensor fusion is performed.
+    ``protobuf_mapping`` maps that message into ``GpsData`` fields. ``sample``
+    aligns the complete configured source with an explicit GPS policy; it does
+    not perform sensor fusion.
     Mapping an optional scalar value without its matching validity field defaults
     that field's validity to true. Mapped optional scalar arrays remain present
     across every sampling window and preserve raw values; use their validity
@@ -311,7 +317,7 @@ class GpsSensor:
 
     def supports_sampling_policy(self, policy: object) -> bool:
         """Return whether this sensor can sample with *policy*."""
-        return isinstance(policy, NoSamplingPolicy)
+        return isinstance(policy, (NearestTimestampPolicy, GpsInterpolationPolicy))
 
     def _message_class_for_message(self, schema: Schema | None, channel: Channel) -> type[Message]:
         """Resolve the dynamic message class and validate each message channel."""
@@ -326,17 +332,18 @@ class GpsSensor:
             )
         return self._empty_gps_data
 
-    def _read_window_messages(
+    def _read_messages(
         self,
         reader: McapReader,
-        window: SamplingWindow,
+        start_ns: int,
+        exclusive_end_ns: int,
     ) -> GpsData:
-        """Read all GPS samples whose message time overlaps one sampling window."""
+        """Decode all GPS samples whose MCAP log times fall in a half-open range."""
         samples: list[DecodedGpsSample] = []
         for schema, channel, message in self._mcap.iter_messages(
             reader,
-            int(window.start_ns),
-            int(window.exclusive_end_ns),
+            start_ns,
+            exclusive_end_ns,
             log_time_order=True,
         ):
             resolved_cls = self._message_class_for_message(schema, channel)
@@ -352,16 +359,34 @@ class GpsSensor:
             return self._get_empty_gps_data()
         return _gps_data_from_samples(samples, self._mapped_optional_scalar_names)
 
-    def sample(self, spec: SamplingSpec, *, policy: NoSamplingPolicy) -> Generator[GpsData]:
-        """Yield raw GPS sample batches for each sampling window.
-
-        Each yielded batch contains the MCAP messages whose ``log_time`` falls
-        inside the current half-open sampling window. Unless explicitly mapped,
-        ``align_timestamps_ns`` copies the mapped sensor timestamp rather than
-        the sampling grid timestamps.
-        """
-        require_no_sampling_policy(policy, sensor_name=type(self).__name__)
+    def read_all(self) -> GpsData:
+        """Decode every message on the configured GPS topic into one source batch."""
         with self._mcap.open_reader() as reader:
             self._resolve_message_class(reader)
-            for window in spec.grid:
-                yield self._read_window_messages(reader, window)
+            return self._read_messages(reader, self.start_ns, self.end_ns + 1)
+
+    def sample(
+        self,
+        spec: SamplingSpec,
+        *,
+        policy: GpsSamplingPolicy,
+    ) -> Generator[GpsData]:
+        """Yield GPS rows aligned to each window's requested timestamps.
+
+        Each ``sample()`` invocation decodes the configured source once before
+        producing its first window. Every source fix in that MCAP is then
+        eligible for every requested timestamp; windows batch output rows only.
+        The planned post-split pipeline will make the MCAP a clip-local GPS
+        source with its half-open interior plus one predecessor and one
+        successor halo fix when available. The current splitter does not yet
+        write GPS MCAPs or halos, so interpolation of interior-only clip data
+        can raise ``GPS_MISSING_BRACKET`` near a boundary rather than
+        extrapolating.
+
+        Alignment decisions use mapper-produced ``align_timestamps_ns``. MCAP
+        ``log_time`` is used only to traverse the source records.
+        """
+        policy = require_gps_sampling_policy(policy, sensor_name=type(self).__name__)
+        source = self.read_all()
+        for window in spec.grid:
+            yield align_gps(source, window.timestamps_ns, policy=policy)

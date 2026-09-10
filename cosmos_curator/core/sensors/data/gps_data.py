@@ -44,6 +44,8 @@ else:
     AttrsAttribute = attrs.Attribute
 
 _VECTOR_COLUMNS = 3
+_BRACKET_NDIM = 2
+_BRACKET_COLUMNS = 2
 _VECTOR_BATCH_VALIDATOR = float64_batch((_VECTOR_COLUMNS,))
 _PER_AXIS_VALIDITY_VALIDATOR = bool_batch((_VECTOR_COLUMNS,))
 _OPTIONAL_COVARIANCE_VALIDATOR = attrs.validators.optional(symmetric_psd_covariance_batch(_VECTOR_COLUMNS))
@@ -105,6 +107,39 @@ class _HasGpsBatchFields(Protocol):
     host_timestamps_ns: npt.NDArray[np.int64] | None
     utc_timestamps_ns: npt.NDArray[np.int64] | None
     sequence_counter: npt.NDArray[np.uint64] | None
+    source_bracket_timestamps_ns: npt.NDArray[np.int64] | None
+
+
+def _optional_source_bracket_timestamps(
+    _instance: object,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.int64] | None,
+) -> None:
+    """Validate optional source-time interpolation bracket provenance."""
+    if value is not None:
+        if value.ndim != _BRACKET_NDIM or value.shape[1:] != (_BRACKET_COLUMNS,):
+            msg = f"{attribute.name} must have shape (N, {_BRACKET_COLUMNS}), got shape={value.shape}"
+            raise ValueError(msg)
+        if value.dtype != np.int64:
+            msg = f"{attribute.name} must have dtype int64, got {value.dtype}"
+            raise ValueError(msg)
+        if np.any(value[:, 0] > value[:, 1]):
+            msg = f"{attribute.name} left bracket timestamps must be less than or equal to right bracket timestamps"
+            raise ValueError(msg)
+
+
+def _source_brackets_contain_alignment_timestamps(
+    instance: _HasGpsBatchFields,
+    _attribute: object,
+    value: npt.NDArray[np.int64] | None,
+) -> None:
+    """Require interpolation provenance to surround each derived row's timestamp."""
+    if value is None:
+        return
+    outside_bracket = (instance.align_timestamps_ns < value[:, 0]) | (instance.align_timestamps_ns > value[:, 1])
+    if np.any(outside_bracket):
+        msg = "source_bracket_timestamps_ns must contain the matching align_timestamps_ns value"
+        raise ValueError(msg)
 
 
 def _optional_fix_type(
@@ -228,6 +263,7 @@ def _batch_lengths(
         "host_timestamps_ns",
         "utc_timestamps_ns",
         "sequence_counter",
+        "source_bracket_timestamps_ns",
     )
     for field_name in optional_fields:
         value = getattr(instance, field_name)
@@ -368,15 +404,21 @@ class GpsData:
         converter=as_optional_readonly_view,
         validator=optional_int64_array,
     )
-    # sequence_counter is final so cross-field validators run after attrs has
-    # set and structurally validated every required and optional GPS/GNSS array.
     sequence_counter: npt.NDArray[np.uint64] | None = attrs.field(
         default=None,
         converter=as_optional_readonly_view,
+        validator=optional_uint64_array,
+    )
+    # This field is final so cross-field validators run after attrs has set and
+    # structurally validated every required and optional GPS/GNSS array.
+    source_bracket_timestamps_ns: npt.NDArray[np.int64] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
         validator=attrs.validators.and_(
-            optional_uint64_array,
+            _optional_source_bracket_timestamps,
             _scalar_validity_pairs,
             _batch_lengths,
+            _source_brackets_contain_alignment_timestamps,
             _raw_value_constraints,
         ),
     )

@@ -126,10 +126,11 @@ def write_protobuf_mcap(
     schema_encoding: str = "protobuf",
     message_encoding: str = "protobuf",
     library: str = "cosmos_curator sensor test",
+    chunk_size: int = 1_048_576,
 ) -> None:
     """Write serialized protobuf samples to one synthetic MCAP channel."""
     with path.open("wb") as out_file:
-        writer = Writer(out_file, compression=CompressionType.ZSTD)
+        writer = Writer(out_file, compression=CompressionType.ZSTD, chunk_size=chunk_size)
         writer.start(library=library)
         schema_id = writer.register_schema(name=schema_name, encoding=schema_encoding, data=schema_data)
         channel_id = writer.register_channel(
