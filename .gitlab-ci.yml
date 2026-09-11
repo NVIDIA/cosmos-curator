@@ -1203,7 +1203,7 @@ semgrep-sast:
 # Run end-to-end tests on NVCF cluster
 nvcf-helm:
   stage: end-to-end
-  allow_failure: true
+  allow_failure: false
   needs:
     - job: resolve_version
       artifacts: true
@@ -1233,6 +1233,9 @@ nvcf-helm:
     - *setup_curator_cli
     - *configure_nvcf_cli
     - .gitlab/scripts/nvcf_helm_cleanup.sh
+  retry:
+    max: 2
+    when: always
   artifacts:
     when: always
     paths:
@@ -1246,7 +1249,7 @@ nvcf-helm:
 # Run validation tests against S3 artifacts from NVCF function
 nvcf-helm-validate:
   stage: end-to-end
-  allow_failure: true
+  allow_failure: false
   needs: [ "nvcf-helm" ]
   rules: *nvcf_helm_validate_rules
   image: ${CI_BUILDER_IMAGE}
