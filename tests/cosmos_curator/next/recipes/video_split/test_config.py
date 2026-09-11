@@ -9,6 +9,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from cosmos_curator.core.utils.storage.s3_validation import MAX_S3_KEY_LENGTH_BYTES
 from cosmos_curator.next.recipes.video_split.config import (
     FixedStrideConfig,
     TranscodeConfig,
@@ -98,6 +99,31 @@ def test_config_accepts_s3_compatible_bucket_names() -> None:
     config = resolve_config_data(_config({"uris": ["s3://example_bucket/a.mp4"]}))
 
     assert config.input.uris == ("s3://example_bucket/a.mp4",)
+
+
+def test_config_accepts_a_bucket_at_the_cross_backend_length_limit() -> None:
+    """Ceph RGW and SwiftStack bucket names may be as long as 255 characters."""
+    bucket = f"a{'_' * 253}z"
+
+    config = resolve_config_data(_config({"uris": [f"s3://{bucket}/a.mp4"]}))
+
+    assert config.input.uris == (f"s3://{bucket}/a.mp4",)
+
+
+def test_config_rejects_a_bucket_over_the_cross_backend_length_limit() -> None:
+    """Keep the dependency-light config validator aligned with S3Prefix's upper bound."""
+    bucket = f"a{'b' * 254}z"
+
+    with pytest.raises(ValidationError, match="Invalid S3 bucket name"):
+        resolve_config_data(_config({"uris": [f"s3://{bucket}/a.mp4"]}))
+
+
+def test_config_rejects_an_object_key_over_the_s3_length_limit() -> None:
+    """Keep the dependency-light config validator aligned with S3Prefix's key limit."""
+    key = f"{'a' * (MAX_S3_KEY_LENGTH_BYTES - 3)}.mp4"
+
+    with pytest.raises(ValidationError, match="Invalid S3 object key"):
+        resolve_config_data(_config({"uris": [f"s3://example-bucket/{key}"]}))
 
 
 def test_lance_table_may_use_a_driver_local_path(tmp_path: Path) -> None:

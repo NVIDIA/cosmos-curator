@@ -15,13 +15,10 @@
 
 """Dependency-light canonical URI helpers shared by config and runtime code."""
 
-import re
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-# Cosmos Curator supports S3-compatible stores whose bucket names may contain
-# underscores, matching the shared S3Prefix contract.
-_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
+from cosmos_curator.core.utils.storage.s3_validation import validate_s3_prefix
 
 
 def normalize_s3_uri(location: str, *, strip_trailing_slash: bool = False) -> str:
@@ -37,14 +34,12 @@ def normalize_s3_uri(location: str, *, strip_trailing_slash: bool = False) -> st
     if parsed.query or parsed.fragment:
         msg = f"S3 locations cannot contain a query or fragment: {location!r}"
         raise ValueError(msg)
-    if not _BUCKET_PATTERN.fullmatch(parsed.netloc):
-        msg = f"Invalid S3 bucket name: {parsed.netloc}"
-        raise ValueError(msg)
 
     # Keys are taken verbatim, matching AWS CLI s3:// semantics. Percent-decoding
     # here would corrupt keys that legitimately contain '%' and would collapse two
     # distinct objects onto one source identity.
     key = parsed.path.removeprefix("/")
+    validate_s3_prefix(parsed.netloc, key)
     normalized = f"s3://{parsed.netloc}/{key}"
     if strip_trailing_slash and key:
         normalized = normalized.rstrip("/")

@@ -23,7 +23,6 @@ import contextlib
 import io
 import os
 import pathlib
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -42,6 +41,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from cosmos_curator.core.utils.environment import S3_PROFILE_PATH
+from cosmos_curator.core.utils.storage import s3_validation
 from cosmos_curator.core.utils.storage.storage_client import (
     DOWNLOAD_CHUNK_SIZE_BYTES,
     UPLOAD_CHUNK_SIZE_BYTES,
@@ -53,12 +53,9 @@ from cosmos_curator.core.utils.storage.storage_client import (
     is_storage_path,
 )
 
-# S3 accepts a key whose UTF-8 encoding is at most 1024 bytes and imposes no charset
-# rule beyond that. The budget is in bytes, not characters.
-MAX_S3_KEY_LENGTH_BYTES = 1024
-# Legal in a key, rejected only in a human-authored config value: see the rationale in
-# ``validate_configured_s3_location``.
-_KEY_GLOB_CHARACTERS = ("*", "?")
+# Backward-compatible exports for callers that imported these from s3_client.
+MAX_S3_KEY_LENGTH_BYTES = s3_validation.MAX_S3_KEY_LENGTH_BYTES
+validate_configured_s3_location = s3_validation.validate_configured_s3_location
 
 
 @attrs.define
@@ -114,31 +111,7 @@ class S3Prefix(StoragePrefix):
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
 
-        # Validate bucket name: 3-63 chars, lowercase letters, numbers, dots, hyphens, start/end alphanumeric
-        # Add underscore since some S3-complaint storage allow underscores in bucket names
-        if not re.match(r"^[a-z0-9][a-z0-9_\-.]{1,61}[a-z0-9]$", bucket):
-            error_msg = f"Invalid S3 bucket name: {bucket}"
-            raise ValueError(error_msg)
-
-        # Length is S3's only real constraint on a key, so it is the only one checked.
-        # A character allowlist rejected keys that work in the store today -- Hive-style
-        # ``run=2026-08-01/`` partitions among them -- and adding one character at a time
-        # only moves the wall, since ``+``, ``:``, ``@`` and ``(`` are equally legal.
-        # S3 spends the budget on the UTF-8 encoding, so a key of multibyte characters
-        # runs out sooner than its character count suggests; measuring characters here
-        # would accept keys the SDK then rejects.
-        key_length_bytes = len(key.encode("utf-8"))
-        if key_length_bytes > MAX_S3_KEY_LENGTH_BYTES:
-            error_msg = f"Invalid S3 object key: exceeds {MAX_S3_KEY_LENGTH_BYTES} bytes ({key_length_bytes})"
-            raise ValueError(error_msg)
-
-        # Glob metacharacters are deliberately *not* rejected here. They are legal key
-        # characters and objects really are named ``a*foo``, so a type that addresses
-        # an object store has to represent them -- both listing paths below build an
-        # S3Prefix out of keys the store returned, and refusing one would abort the
-        # whole enumeration over a single object. The mistyped-wildcard case that does
-        # warrant rejection is a human-authored config value, which
-        # ``validate_configured_s3_location`` handles.
+        s3_validation.validate_s3_prefix(bucket, key)
 
     @property
     def bucket(self) -> str:
@@ -159,34 +132,6 @@ class S3Prefix(StoragePrefix):
 
         """
         return f"s3://{self.bucket}/{self.prefix}"
-
-
-def validate_configured_s3_location(location: str) -> None:
-    """Validate an S3 URI that a human wrote into a config file.
-
-    Deliberately stricter than :class:`S3Prefix`, and the extra strictness belongs
-    here rather than in the type because the two validate different populations.
-    ``S3Prefix`` is built from keys the store hands back, where ``*`` and ``?`` are
-    ordinary characters in an object that genuinely exists. A configured prefix
-    carrying one is a mistyped shell glob instead: nothing in the read path expands
-    a wildcard, so S3 accepts the request, matches zero objects, and the run
-    succeeds having processed nothing. That silent no-op is the failure this catches,
-    and catching it at ``cosmos-curator pipeline validate`` costs nothing.
-
-    Args:
-        location: The ``s3://`` URI to validate.
-
-    Raises:
-        ValueError: If the bucket or key is invalid, or the key contains ``*`` or
-            ``?``.
-
-    """
-    prefix = S3Prefix(location)
-    if any(char in prefix.prefix for char in _KEY_GLOB_CHARACTERS):
-        error_msg = (
-            f"Invalid S3 object key: {prefix.prefix} contains a glob metacharacter (* or ?), which is not expanded"
-        )
-        raise ValueError(error_msg)
 
 
 def make_s3_session(config: S3ClientConfig) -> boto3.Session:
