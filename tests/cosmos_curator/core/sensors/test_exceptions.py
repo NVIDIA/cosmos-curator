@@ -38,6 +38,8 @@ def test_reason_values_are_the_machine_readable_vocabulary() -> None:
         "gps_missing_bracket",
         "gps_invalid_support_position",
         "gps_max_gap_exceeded",
+        "ego_trajectory_no_eligible_pose",
+        "ego_trajectory_max_delta_exceeded",
     ]
 
 

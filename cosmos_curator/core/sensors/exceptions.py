@@ -63,6 +63,8 @@ class AlignmentFailureReason(enum.StrEnum):
     GPS_MISSING_BRACKET = "gps_missing_bracket"
     GPS_INVALID_SUPPORT_POSITION = "gps_invalid_support_position"
     GPS_MAX_GAP_EXCEEDED = "gps_max_gap_exceeded"
+    EGO_TRAJECTORY_NO_ELIGIBLE_POSE = "ego_trajectory_no_eligible_pose"
+    EGO_TRAJECTORY_MAX_DELTA_EXCEEDED = "ego_trajectory_max_delta_exceeded"
 
 
 @attrs.define(slots=False, eq=False)

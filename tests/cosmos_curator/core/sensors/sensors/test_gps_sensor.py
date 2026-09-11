@@ -26,6 +26,7 @@ from google.protobuf.descriptor import FileDescriptor
 from google.protobuf.message import Message
 
 from cosmos_curator.core.sensors.data.gps_data import GpsData
+from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sampling.policy import GpsInterpolationPolicy, NearestTimestampPolicy, NoSamplingPolicy
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.gps_sensor import DEFAULT_TOPIC, GpsSensor
@@ -365,6 +366,78 @@ def test_gps_sensor_rejects_no_sampling_policy(tmp_path: Path) -> None:
         next(sensor.sample(one_window_spec(100, 200), policy=NoSamplingPolicy()))  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="GpsSensor requires NearestTimestampPolicy or GpsInterpolationPolicy"):
         next(sensor.sample(one_window_spec(100, 200), policy=None))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_reason"),
+    [
+        (NearestTimestampPolicy(), AlignmentFailureReason.GPS_NO_ELIGIBLE_FIX),
+        (GpsInterpolationPolicy(), AlignmentFailureReason.GPS_MISSING_BRACKET),
+    ],
+)
+def test_gps_sensor_reports_an_empty_topic_as_a_structured_alignment_failure(
+    tmp_path: Path,
+    policy: NearestTimestampPolicy | GpsInterpolationPolicy,
+    expected_reason: AlignmentFailureReason,
+) -> None:
+    """An empty configured GPS topic is bad alignment data under either GPS policy."""
+    path = tmp_path / "empty_gps.mcap"
+    _write_reference_gps_mcap(path, [])
+    sensor = _reference_gps_sensor(path)
+
+    with pytest.raises(AlignmentError) as error_info:
+        next(SensorGroup({"gps": sensor}).sample(one_window_spec(100, 200), policies={"gps": policy}))
+
+    error = error_info.value
+    assert error.reason is expected_reason
+    assert error.sensor_id == "gps"
+    np.testing.assert_array_equal(error.align_timestamps_ns, [100])
+    np.testing.assert_array_equal(error.known_source_timestamps_ns, [])
+
+
+def test_gps_sensor_read_all_preserves_empty_mapped_batch_contract(tmp_path: Path) -> None:
+    """An empty configured topic decodes to a fully shaped mapped GPS batch."""
+    path = tmp_path / "empty_gps_read_all.mcap"
+    _write_reference_gps_mcap(path, [])
+
+    batch = _reference_gps_sensor(path).read_all()
+
+    for timestamp_name in ("align_timestamps_ns", "sensor_timestamps_ns", "host_timestamps_ns"):
+        timestamps = getattr(batch, timestamp_name)
+        assert timestamps is not None
+        assert timestamps.shape == (0,)
+        assert timestamps.dtype == np.int64
+    for coordinate_name in (
+        "latitude_deg",
+        "longitude_deg",
+        "altitude_m",
+        "horizontal_accuracy_m",
+        "vertical_accuracy_m",
+        "hdop",
+        "vdop",
+        "pdop",
+    ):
+        coordinate = getattr(batch, coordinate_name)
+        assert coordinate is not None
+        assert coordinate.shape == (0,)
+        assert coordinate.dtype == np.float64
+    assert batch.position_valid.shape == (0, 3)
+    assert batch.position_valid.dtype == np.bool_
+    assert batch.satellites_used is not None
+    assert batch.satellites_used.shape == (0,)
+    assert batch.satellites_used.dtype == np.uint32
+    for validity_name in (
+        "satellites_used_valid",
+        "horizontal_accuracy_m_valid",
+        "vertical_accuracy_m_valid",
+        "hdop_valid",
+        "vdop_valid",
+        "pdop_valid",
+    ):
+        validity = getattr(batch, validity_name)
+        assert validity is not None
+        assert validity.shape == (0,)
+        assert validity.dtype == np.bool_
 
 
 def test_gps_sensor_alignment_is_invariant_to_mcap_chunk_boundaries(tmp_path: Path) -> None:

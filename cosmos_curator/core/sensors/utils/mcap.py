@@ -40,6 +40,10 @@ PROTOBUF_ENCODING = "protobuf"
 NS_PER_USEC = 1_000
 
 
+class EmptyMcapTopicError(ValueError):
+    """Raised when an otherwise readable MCAP contains no messages for a topic."""
+
+
 def parse_protobuf_message(
     message_cls: type[ProtobufMessage],
     data: bytes,
@@ -127,7 +131,7 @@ def load_start_end_ns(reader: McapReader, topic: str) -> tuple[int, int]:
             _schema, _channel, first_msg = next(earliest)
         except StopIteration as e:
             msg = f"no MCAP messages on topic {topic!r}"
-            raise ValueError(msg) from e
+            raise EmptyMcapTopicError(msg) from e
 
         latest = reader.iter_messages(topics=topic, log_time_order=True, reverse=True)
         try:
@@ -145,7 +149,7 @@ def load_start_end_ns(reader: McapReader, topic: str) -> tuple[int, int]:
         end_ns = log_time_ns if end_ns is None else max(end_ns, log_time_ns)
     if start_ns is None or end_ns is None:
         msg = f"no MCAP messages on topic {topic!r}"
-        raise ValueError(msg)
+        raise EmptyMcapTopicError(msg)
     return start_ns, end_ns
 
 
@@ -173,7 +177,7 @@ def load_timeline(reader: McapReader, topic: str) -> npt.NDArray[np.int64]:
     ]
     if not times:
         msg = f"no MCAP messages on topic {topic!r}"
-        raise ValueError(msg)
+        raise EmptyMcapTopicError(msg)
     arr = np.array(times, dtype=np.int64)
     arr.flags.writeable = False
     return arr
@@ -241,7 +245,7 @@ class McapTopicAccessor:
         """Cache start and end timestamps from a non-empty topic timeline."""
         if len(timeline_ns) == 0:
             msg = f"no MCAP messages on topic {self.topic!r}"
-            raise ValueError(msg)
+            raise EmptyMcapTopicError(msg)
         self._start_ns = int(timeline_ns[0])
         self._end_ns = int(timeline_ns[-1])
 

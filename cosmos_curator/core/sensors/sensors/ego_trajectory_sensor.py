@@ -25,13 +25,15 @@ from google.protobuf.message import Message
 from mcap.reader import McapReader
 from mcap.records import Channel, Schema
 
+from cosmos_curator.core.sensors.alignment.ego_trajectory import align_ego_trajectory_nearest
 from cosmos_curator.core.sensors.data.egotrajectory_data import EgoTrajectory
 from cosmos_curator.core.sensors.data.extrinsics import SensorExtrinsics
-from cosmos_curator.core.sensors.sampling.grid import SamplingWindow
+from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy, require_nearest_timestamp_policy
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.group import STREAM_TIMESTAMPS_CAMERA_ONLY_MSG
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.mcap import (
+    EmptyMcapTopicError,
     McapProtobufMessageResolver,
     McapTopicAccessor,
     parse_protobuf_message,
@@ -115,22 +117,24 @@ def _empty_ego_trajectory(
 class EgoTrajectorySensor:
     """MCAP-backed ego-trajectory sensor.
 
-    Reads mapped protobuf messages from an MCAP topic. ``schema_name`` selects
-    the message declared by the MCAP's embedded descriptor, and
-    ``protobuf_mapping`` maps that message into ``EgoTrajectory`` fields.
-    Optional output arrays are present only when their corresponding values are
-    mapped: ``host_timestamp_ns`` or ``sequence_counter``. Empty and populated
-    windows preserve the same optional-array presence.
+    Requires ``NearestTimestampPolicy`` and decodes all mapped protobuf poses
+    in the configured clip once per :meth:`sample` invocation. It selects one
+    pose per requested timestamp from the clip's complete candidate set.
+    ``schema_name`` selects the message declared by the MCAP's embedded
+    descriptor, and ``protobuf_mapping`` maps that message into
+    ``EgoTrajectory`` fields. Optional output arrays are present only when
+    their corresponding values are mapped: ``host_timestamp_ns`` or
+    ``sequence_counter``. Empty and populated output windows preserve the same
+    optional-array presence.
 
     Poses are sensor-origin ``T_worldENU_from_sensorBody`` transforms.
     Configured rig extrinsics are retained for downstream pipeline composition;
-    the raw sensor output preserves the wire pose. ``frame`` is library metadata
+    selected output preserves the wire pose. ``frame`` is library metadata
     naming the clip-local ENU world (default ``world_enu``).
 
     Every populated batch requires strictly increasing alignment timestamps;
-    duplicate or decreasing values raise ``ValueError``. Raw reads leave
-    ``align_timestamps_ns`` equal to ``sensor_timestamps_ns`` when the mapping
-    omits ``align_timestamp_ns``.
+    duplicate or decreasing values raise ``ValueError``. Mapping omission leaves
+    source ``align_timestamps_ns`` equal to ``sensor_timestamps_ns``.
     """
 
     def __init__(  # noqa: PLR0913
@@ -241,29 +245,41 @@ class EgoTrajectorySensor:
             sequence=self._include_sequence,
         )
 
-    def _read_window_messages(
-        self,
-        reader: McapReader,
-        window: SamplingWindow,
-    ) -> EgoTrajectory:
-        """Read all ego-trajectory samples whose message time overlaps one sampling window."""
-        return self._read_messages(reader, int(window.start_ns), int(window.exclusive_end_ns))
-
     def read_all(self) -> EgoTrajectory:
         """Decode every message on the configured ego-trajectory topic into one batch."""
         with self._mcap.open_reader() as reader:
             self._resolve_message_class(reader)
-            return self._read_messages(reader, self.start_ns, self.end_ns + 1)
+            try:
+                return self._read_messages(reader, self.start_ns, self.end_ns + 1)
+            except EmptyMcapTopicError:
+                return self._get_empty_ego_trajectory()
 
-    def sample(self, spec: SamplingSpec) -> Generator[EgoTrajectory]:
-        """Yield ego-trajectory batches for each sampling window.
+    def supports_sampling_policy(self, policy: object) -> bool:
+        """Return whether this sensor can sample with *policy*."""
+        return isinstance(policy, NearestTimestampPolicy)
 
-        Each yielded batch contains the MCAP messages whose ``log_time`` falls
-        inside the current half-open sampling window. ``align_timestamps_ns``
-        copies the mapped sensor timestamp unless the mapping explicitly supplies
-        ``align_timestamp_ns`` from another clock.
+    def sample(
+        self,
+        spec: SamplingSpec,
+        *,
+        policy: NearestTimestampPolicy,
+    ) -> Generator[EgoTrajectory]:
+        """Yield one nearest source pose for every requested window timestamp.
+
+        Each ``sample()`` invocation decodes the configured clip source once
+        before producing its first window. Every source pose in that clip is
+        then eligible for every requested timestamp; windows batch output rows
+        only. The planned post-split pipeline will make a clip contain its
+        half-open interior plus, when available, immediate predecessor and
+        successor halo poses. They are eligible for nearest selection too, so a
+        selected source timestamp can lie outside the clip span. The current
+        splitter does not yet write ego-trajectory MCAPs or halos, so
+        interior-only data has no boundary-invariance guarantee. MCAP
+        ``log_time`` selects records while decoding the clip but does not
+        participate in nearest selection, tolerance checking, or output
+        timestamps. Those use mapper-produced ``align_timestamps_ns``.
         """
-        with self._mcap.open_reader() as reader:
-            self._resolve_message_class(reader)
-            for window in spec.grid:
-                yield self._read_window_messages(reader, window)
+        policy = require_nearest_timestamp_policy(policy, sensor_name=type(self).__name__)
+        source = self.read_all()
+        for window in spec.grid:
+            yield align_ego_trajectory_nearest(source, window.timestamps_ns, policy=policy)

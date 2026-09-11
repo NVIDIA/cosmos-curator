@@ -37,6 +37,7 @@ from cosmos_curator.core.sensors.sampling.policy import (
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.mcap import (
+    EmptyMcapTopicError,
     McapProtobufMessageResolver,
     McapTopicAccessor,
     parse_protobuf_message,
@@ -363,7 +364,10 @@ class GpsSensor:
         """Decode every message on the configured GPS topic into one source batch."""
         with self._mcap.open_reader() as reader:
             self._resolve_message_class(reader)
-            return self._read_messages(reader, self.start_ns, self.end_ns + 1)
+            try:
+                return self._read_messages(reader, self.start_ns, self.end_ns + 1)
+            except EmptyMcapTopicError:
+                return self._get_empty_gps_data()
 
     def sample(
         self,

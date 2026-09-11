@@ -399,7 +399,7 @@ bounds of that window, and whose `window.timestamps_ns` are the active reference
 
 Policies are explicit concrete objects passed at the sampling boundary:
 
-- **`NearestTimestampPolicy(max_delta_ns: int | None = None)`** — nearest timestamp selection for camera-like sensors. `0` requires exact matches; `None` disables only the maximum-delta check.
+- **`NearestTimestampPolicy(max_delta_ns: int | None = None)`** — shared nearest-timestamp selection for camera, GPS, and ego-trajectory sensors. `0` requires exact matches; `None` disables only the maximum-delta check.
 - **`GpsInterpolationPolicy(max_gap_ns: int | None = None)`** — maximum allowed duration between GPS source fixes used to derive one position. `GpsSensor.sample()` applies it to its complete configured MCAP source.
 - **`NoSamplingPolicy()`** — explicit no-op policy for sensors whose current sampling behavior is policy-independent.
 
@@ -455,6 +455,34 @@ while alignment selects and brackets by mapper-produced `align_timestamp_ns`.
 Under a significant offset between them a halo chosen in `log_time` can fall on
 the wrong side of a request in alignment time, which surfaces as a
 `GPS_MISSING_BRACKET` failure rather than a wrong position.
+
+### Pure ego-trajectory alignment
+
+`cosmos_curator.core.sensors.alignment.ego_trajectory.align_ego_trajectory_nearest()`
+aligns one already-decoded, per-clip `EgoTrajectory` onto requested timestamps
+with an explicit `NearestTimestampPolicy`. It uses the same generic nearest
+timestamp operation as GPS: every source pose in the clip is eligible, exact
+midpoint ties choose the earlier pose, and a source row may be reused.
+
+`EgoTrajectorySensor.sample(spec, policy=NearestTimestampPolicy(...))` decodes
+its configured clip once per invocation, then calls that operation for each
+window's requested timestamps. Its windows batch output rows; they do not
+filter the clip's candidate poses. The planned post-split ego-trajectory MCAP
+format will contain its half-open clip interior plus, when available, one
+immediate predecessor and one successor halo pose. The current splitter does
+not yet write ego-trajectory MCAPs or halos. Once it does, every source pose is
+eligible, including those halos; with mapper-produced alignment timestamps
+mapped into the session clock, the two rows are sufficient for clip-local
+nearest selection to equal the unsplit session result. A selected
+`sensor_timestamps_ns` value may consequently lie outside the clip span; it
+records source provenance rather than a span-bounded timestamp.
+
+The source and requested `align_timestamps_ns` use the mapper-produced
+alignment clock. MCAP `log_time` determines only which records splitting placed
+in the clip; it does not participate in selection, tolerance checking, or
+output timestamps. Each result row copies one source position, XYZW quaternion,
+validity value, and optional metadata unchanged. Pose interpolation is excluded
+until position and orientation can be given a rotation-aware contract.
 
 ### SamplingSpec
 

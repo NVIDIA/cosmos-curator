@@ -21,14 +21,21 @@ import pytest
 from foxglove_schemas_protobuf.PoseInFrame_pb2 import PoseInFrame
 from google.protobuf import descriptor_pb2
 from google.protobuf.descriptor import FileDescriptor
+from mcap.reader import make_reader
 
+from cosmos_curator.core.sensors.data.egotrajectory_data import EgoTrajectory
+from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
+from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy, NoSamplingPolicy
+from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.ego_trajectory_sensor import (
     DEFAULT_FRAME,
     DEFAULT_TOPIC,
     EgoTrajectorySensor,
 )
+from cosmos_curator.core.sensors.sensors.group import SensorGroup
 from tests.cosmos_curator.core.sensors.test_utils import (
     McapSample,
+    make_sampling_grid,
     one_window_spec,
     protobuf_descriptor_set_from_proto,
     protobuf_message_class,
@@ -123,7 +130,7 @@ def _reference_payload(
     return bytes(sample.SerializeToString())
 
 
-def _write_reference_mcap(path: Path, samples: list[McapSample]) -> None:
+def _write_reference_mcap(path: Path, samples: list[McapSample], *, chunk_size: int = 1_048_576) -> None:
     """Write an MCAP using the checked-in reference ego-trajectory schema."""
     write_protobuf_mcap(
         path,
@@ -132,6 +139,7 @@ def _write_reference_mcap(path: Path, samples: list[McapSample]) -> None:
         schema_name=_REFERENCE_SCHEMA_NAME,
         schema_data=_reference_descriptor_set().SerializeToString(),
         library="cosmos_curator reference egotrajectory sensor test",
+        chunk_size=chunk_size,
     )
 
 
@@ -148,6 +156,11 @@ def _reference_sensor(
         protobuf_mapping=protobuf_mapping,
         frame=frame,
     )
+
+
+def _nearest_sample(sensor: EgoTrajectorySensor, spec: SamplingSpec) -> EgoTrajectory:
+    """Advance one sensor-alignment window under the required nearest policy."""
+    return next(sensor.sample(spec, policy=NearestTimestampPolicy()))
 
 
 def _minimal_mapping(**overrides: object) -> dict[str, object]:
@@ -184,20 +197,15 @@ def test_ego_trajectory_sensor_reads_reference_schema_with_checked_in_mapping(tm
         ],
     )
 
-    batch = next(_reference_sensor(path).sample(one_window_spec(100, 300)))
+    batch = _nearest_sample(_reference_sensor(path), one_window_spec(100, 300))
 
-    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([100, 200], dtype=np.int64))
-    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([100, 200], dtype=np.int64))
-    np.testing.assert_array_equal(batch.host_timestamps_ns, np.array([150, 250], dtype=np.int64))
-    np.testing.assert_array_equal(batch.sequence_counter, np.array([10, 11], dtype=np.uint64))
-    np.testing.assert_array_equal(batch.pose_valid, np.array([True, True], dtype=np.bool_))
+    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([100], dtype=np.int64))
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([100], dtype=np.int64))
+    np.testing.assert_array_equal(batch.host_timestamps_ns, np.array([150], dtype=np.int64))
+    np.testing.assert_array_equal(batch.sequence_counter, np.array([10], dtype=np.uint64))
+    np.testing.assert_array_equal(batch.pose_valid, np.array([True], dtype=np.bool_))
     np.testing.assert_allclose(batch.positions_m[0], (1.0, 2.0, 3.0))
-    np.testing.assert_allclose(batch.positions_m[1], (4.0, 5.0, 6.0))
-    half_sqrt = float(np.sqrt(0.5))
-    np.testing.assert_allclose(
-        batch.orientations_xyzw,
-        np.array([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, half_sqrt, half_sqrt]]),
-    )
+    np.testing.assert_allclose(batch.orientations_xyzw, np.array([[0.0, 0.0, 0.0, 1.0]]))
     assert batch.frame == DEFAULT_FRAME
 
 
@@ -238,17 +246,14 @@ def test_ego_trajectory_sensor_reads_foxglove_pose_in_frame_with_checked_in_mapp
         schema_name=_FOXGLOVE_SCHEMA_NAME,
         protobuf_mapping=_FOXGLOVE_MAPPING_PATH,
     )
-    batch = next(sensor.sample(one_window_spec(100, 300)))
+    batch = _nearest_sample(sensor, one_window_spec(10_000, 30_000))
 
-    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([10_000, 20_000], dtype=np.int64))
-    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([10_000, 20_000], dtype=np.int64))
-    np.testing.assert_allclose(batch.positions_m, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([10_000], dtype=np.int64))
+    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([10_000], dtype=np.int64))
+    np.testing.assert_allclose(batch.positions_m, np.array([[1.0, 2.0, 3.0]]))
     half_sqrt = float(np.sqrt(0.5))
-    np.testing.assert_allclose(
-        batch.orientations_xyzw,
-        np.array([[0.0, 0.0, half_sqrt, half_sqrt], _IDENTITY_ORIENTATION_XYZW]),
-    )
-    np.testing.assert_array_equal(batch.pose_valid, np.array([True, True], dtype=np.bool_))
+    np.testing.assert_allclose(batch.orientations_xyzw, np.array([[0.0, 0.0, half_sqrt, half_sqrt]]))
+    np.testing.assert_array_equal(batch.pose_valid, np.array([True], dtype=np.bool_))
     assert batch.frame == DEFAULT_FRAME
 
 
@@ -279,7 +284,7 @@ def test_ego_trajectory_sensor_rejects_foxglove_pose_in_frame_without_pose(tmp_p
     )
 
     with pytest.raises(ValueError, match=r"fields\.position_m path 'pose\.position\.x' was not found"):
-        next(sensor.sample(one_window_spec(100, 200)))
+        _nearest_sample(sensor, one_window_spec(100, 200))
 
 
 def test_ego_trajectory_sensor_preserves_invalid_identity_poses(tmp_path: Path) -> None:
@@ -299,34 +304,71 @@ def test_ego_trajectory_sensor_preserves_invalid_identity_poses(tmp_path: Path) 
         ],
     )
 
-    batch = next(_reference_sensor(path).sample(one_window_spec(100, 300)))
+    batch = _nearest_sample(_reference_sensor(path), one_window_spec(200, 300))
 
-    assert batch.pose_valid.tolist() == [True, False]
-    np.testing.assert_array_equal(batch.positions_m[1], np.zeros(3, dtype=np.float64))
-    np.testing.assert_array_equal(batch.orientations_xyzw[1], np.array([0.0, 0.0, 0.0, 1.0]))
+    assert batch.pose_valid.tolist() == [False]
+    np.testing.assert_array_equal(batch.positions_m[0], np.zeros(3, dtype=np.float64))
+    np.testing.assert_array_equal(batch.orientations_xyzw[0], np.array([0.0, 0.0, 0.0, 1.0]))
 
 
-def test_ego_trajectory_reference_mapping_empty_window_preserves_optional_arrays(tmp_path: Path) -> None:
-    """Fully mapped reference optionals should remain present in empty windows."""
+def test_ego_trajectory_sensor_uses_the_complete_clip_as_its_candidate_set(tmp_path: Path) -> None:
+    """A request outside MCAP log-time coverage can use a pose from the clip."""
     path = tmp_path / "reference_empty_window.mcap"
     _write_reference_mcap(path, [McapSample(log_time_ns=100, data=_reference_payload(100))])
 
-    batch = next(_reference_sensor(path).sample(one_window_spec(200, 300)))
+    batch = _nearest_sample(_reference_sensor(path), one_window_spec(200, 300))
 
-    assert batch.align_timestamps_ns.shape == (0,)
-    assert batch.sensor_timestamps_ns.shape == (0,)
-    assert batch.positions_m.shape == (0, 3)
-    assert batch.orientations_xyzw.shape == (0, 4)
-    assert batch.pose_valid.shape == (0,)
+    np.testing.assert_array_equal(batch.align_timestamps_ns, [200])
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, [100])
+    assert batch.positions_m.shape == (1, 3)
+    assert batch.orientations_xyzw.shape == (1, 4)
+    assert batch.pose_valid.shape == (1,)
     assert batch.host_timestamps_ns is not None
-    assert batch.host_timestamps_ns.shape == (0,)
+    assert batch.host_timestamps_ns.shape == (1,)
     assert batch.sequence_counter is not None
-    assert batch.sequence_counter.shape == (0,)
+    assert batch.sequence_counter.shape == (1,)
     assert batch.frame == DEFAULT_FRAME
 
 
-def test_ego_trajectory_sensor_windows_by_log_time(tmp_path: Path) -> None:
-    """Sampling windows should include only messages whose log_time falls inside."""
+def test_ego_trajectory_sensor_selects_halo_poses_from_a_clip(tmp_path: Path) -> None:
+    """Predecessor and successor clip halos remain nearest-pose candidates."""
+    path = tmp_path / "clip_egotrajectory.mcap"
+    _write_reference_mcap(
+        path,
+        [
+            McapSample(
+                log_time_ns=90,
+                data=_reference_payload(90, sequence_counter=9, position_m=(9.0, 0.0, 0.0)),
+            ),
+            McapSample(
+                log_time_ns=140,
+                data=_reference_payload(140, sequence_counter=14, position_m=(14.0, 0.0, 0.0)),
+            ),
+            McapSample(
+                log_time_ns=200,
+                data=_reference_payload(200, sequence_counter=20, position_m=(20.0, 0.0, 0.0)),
+            ),
+        ],
+    )
+    spec = SamplingSpec(
+        grid=make_sampling_grid(
+            timestamps_ns=np.array([100, 125, 150, 175, 200], dtype=np.int64),
+            stride_ns=100,
+            duration_ns=100,
+        )
+    )
+
+    [batch] = list(_reference_sensor(path).sample(spec, policy=NearestTimestampPolicy()))
+
+    np.testing.assert_array_equal(batch.align_timestamps_ns, [100, 125, 150, 175])
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, [90, 140, 140, 200])
+    np.testing.assert_array_equal(batch.positions_m[:, 0], [9.0, 14.0, 14.0, 20.0])
+    assert batch.sequence_counter is not None
+    np.testing.assert_array_equal(batch.sequence_counter, [9, 14, 14, 20])
+
+
+def test_ego_trajectory_sensor_selects_from_the_clip_using_alignment_time(tmp_path: Path) -> None:
+    """Windows request rows; MCAP log time does not filter nearest candidates."""
     path = tmp_path / "windowed.mcap"
     _write_reference_mcap(
         path,
@@ -337,10 +379,147 @@ def test_ego_trajectory_sensor_windows_by_log_time(tmp_path: Path) -> None:
         ],
     )
 
-    batch = next(_reference_sensor(path).sample(one_window_spec(150, 250)))
+    batch = _nearest_sample(_reference_sensor(path), one_window_spec(150, 250))
 
-    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([200], dtype=np.int64))
-    np.testing.assert_array_equal(batch.sequence_counter, np.array([2], dtype=np.uint64))
+    np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([150], dtype=np.int64))
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, np.array([100], dtype=np.int64))
+    np.testing.assert_array_equal(batch.sequence_counter, np.array([1], dtype=np.uint64))
+
+
+def test_ego_trajectory_sensor_routes_nearest_policy_through_sensor_group(tmp_path: Path) -> None:
+    """SensorGroup receives one aligned ego pose for every requested row."""
+    path = tmp_path / "group_aligned.mcap"
+    _write_reference_mcap(
+        path,
+        [
+            McapSample(log_time_ns=100, data=_reference_payload(100, sequence_counter=1)),
+            McapSample(log_time_ns=200, data=_reference_payload(200, sequence_counter=2)),
+        ],
+    )
+    sensor = _reference_sensor(path)
+
+    assert sensor.supports_sampling_policy(NearestTimestampPolicy())
+    assert not sensor.supports_sampling_policy(NoSamplingPolicy())
+    frame = next(
+        SensorGroup({"ego": sensor}).sample(
+            one_window_spec(150, 250),
+            policies={"ego": NearestTimestampPolicy()},
+        )
+    )
+    trajectory = frame.sensor_data["ego"]
+
+    np.testing.assert_array_equal(trajectory.align_timestamps_ns, [150])
+    np.testing.assert_array_equal(trajectory.sensor_timestamps_ns, [100])
+
+    with pytest.raises(TypeError, match="EgoTrajectorySensor requires NearestTimestampPolicy"):
+        next(sensor.sample(one_window_spec(150, 250), policy=None))  # type: ignore[arg-type]
+
+
+def test_ego_trajectory_sensor_propagates_nearest_tolerance_errors_through_the_group(tmp_path: Path) -> None:
+    """SensorGroup attributes an ego nearest-tolerance failure to its configured sensor."""
+    path = tmp_path / "group_tolerance.mcap"
+    _write_reference_mcap(path, [McapSample(log_time_ns=100, data=_reference_payload(100))])
+    sensor = _reference_sensor(path)
+
+    with pytest.raises(AlignmentError) as error_info:
+        next(
+            SensorGroup({"ego": sensor}).sample(
+                one_window_spec(200, 300),
+                policies={"ego": NearestTimestampPolicy(max_delta_ns=50)},
+            )
+        )
+
+    error = error_info.value
+    assert error.reason is AlignmentFailureReason.EGO_TRAJECTORY_MAX_DELTA_EXCEEDED
+    assert error.sensor_id == "ego"
+    assert error.delta_ns == 100
+    assert error.max_delta_ns == 50
+    np.testing.assert_array_equal(error.align_timestamps_ns, [200])
+    np.testing.assert_array_equal(error.sensor_timestamps_ns, [100])
+    np.testing.assert_array_equal(error.known_source_timestamps_ns, [100])
+
+
+def test_ego_trajectory_sensor_reports_an_empty_topic_as_an_alignment_error(tmp_path: Path) -> None:
+    """A configured but empty ego topic is unsatisfiable data, not a sensor defect."""
+    path = tmp_path / "empty_egotrajectory.mcap"
+    _write_reference_mcap(path, [])
+    sensor = _reference_sensor(path)
+
+    with pytest.raises(AlignmentError) as error_info:
+        next(
+            SensorGroup({"ego": sensor}).sample(
+                one_window_spec(100, 200),
+                policies={"ego": NearestTimestampPolicy()},
+            )
+        )
+
+    error = error_info.value
+    assert error.reason is AlignmentFailureReason.EGO_TRAJECTORY_NO_ELIGIBLE_POSE
+    assert error.sensor_id == "ego"
+    assert error.max_delta_ns is None
+    np.testing.assert_array_equal(error.align_timestamps_ns, [100])
+    np.testing.assert_array_equal(error.known_source_timestamps_ns, [])
+
+
+def test_ego_trajectory_sensor_preserves_shapes_for_an_empty_raw_read_range(tmp_path: Path) -> None:
+    """An empty half-open MCAP range is a valid shape-preserving source batch."""
+    path = tmp_path / "empty_read_range.mcap"
+    _write_reference_mcap(path, [McapSample(log_time_ns=100, data=_reference_payload(100))])
+    sensor = _reference_sensor(path)
+
+    with sensor._mcap.open_reader() as reader:
+        sensor._resolve_message_class(reader)
+        batch = sensor._read_messages(reader, 200, 300)
+
+    assert batch.positions_m.shape == (0, 3)
+    assert batch.orientations_xyzw.shape == (0, 4)
+    assert batch.host_timestamps_ns is not None
+    assert batch.host_timestamps_ns.shape == (0,)
+    assert batch.sequence_counter is not None
+    assert batch.sequence_counter.shape == (0,)
+
+
+def test_ego_trajectory_sensor_reuses_one_decoded_source_across_multiple_windows(
+    tmp_path: Path,
+) -> None:
+    """Each output window aligns against the complete clip source."""
+    half_sqrt = float(np.sqrt(0.5))
+    path = tmp_path / "multiple_windows.mcap"
+    _write_reference_mcap(
+        path,
+        [
+            McapSample(log_time_ns=90, data=_reference_payload(90, sequence_counter=9, position_m=(9.0, 0.0, 0.0))),
+            McapSample(log_time_ns=140, data=_reference_payload(140, sequence_counter=14, position_m=(14.0, 0.0, 0.0))),
+            McapSample(
+                log_time_ns=220,
+                data=_reference_payload(
+                    220,
+                    sequence_counter=22,
+                    position_m=(22.0, 0.0, 0.0),
+                    orientation_xyzw=(0.0, 0.0, half_sqrt, half_sqrt),
+                ),
+            ),
+        ],
+    )
+    sensor = _reference_sensor(path)
+    spec = SamplingSpec(
+        grid=make_sampling_grid(
+            timestamps_ns=np.array([100, 150, 200, 250, 300], dtype=np.int64),
+            stride_ns=100,
+            duration_ns=100,
+        )
+    )
+    first, second = list(sensor.sample(spec, policy=NearestTimestampPolicy()))
+
+    np.testing.assert_array_equal(first.align_timestamps_ns, [100, 150])
+    np.testing.assert_array_equal(first.sensor_timestamps_ns, [90, 140])
+    np.testing.assert_array_equal(first.positions_m[:, 0], [9.0, 14.0])
+    np.testing.assert_array_equal(first.sequence_counter, [9, 14])
+    np.testing.assert_array_equal(second.align_timestamps_ns, [200, 250])
+    np.testing.assert_array_equal(second.sensor_timestamps_ns, [220, 220])
+    np.testing.assert_array_equal(second.positions_m[:, 0], [22.0, 22.0])
+    np.testing.assert_allclose(second.orientations_xyzw, [[0.0, 0.0, half_sqrt, half_sqrt]] * 2)
+    np.testing.assert_array_equal(second.sequence_counter, [22, 22])
 
 
 def test_ego_trajectory_sensor_rejects_missing_required_mapping_fields(tmp_path: Path) -> None:
@@ -397,6 +576,66 @@ def test_ego_trajectory_sensor_read_all(tmp_path: Path) -> None:
     assert len(batch.positions_m) == 2
 
 
+def test_ego_trajectory_alignment_is_invariant_to_internal_mcap_chunk_boundaries(tmp_path: Path) -> None:
+    """Equivalent clip records align identically regardless of how MCAP chunks them."""
+    samples = [
+        McapSample(log_time_ns=100, data=_reference_payload(1_100, sequence_counter=10, position_m=(1.0, 2.0, 3.0))),
+        McapSample(log_time_ns=200, data=_reference_payload(1_200, sequence_counter=20, position_m=(4.0, 5.0, 6.0))),
+        McapSample(log_time_ns=400, data=_reference_payload(1_400, sequence_counter=40, position_m=(7.0, 8.0, 9.0))),
+    ]
+    small_chunks_path = tmp_path / "small_chunks.mcap"
+    large_chunks_path = tmp_path / "large_chunks.mcap"
+    _write_reference_mcap(small_chunks_path, samples, chunk_size=1)
+    _write_reference_mcap(large_chunks_path, samples, chunk_size=1_048_576)
+
+    with small_chunks_path.open("rb") as stream:
+        small_chunks_summary = make_reader(stream).get_summary()
+    with large_chunks_path.open("rb") as stream:
+        large_chunks_summary = make_reader(stream).get_summary()
+    assert small_chunks_summary is not None
+    assert large_chunks_summary is not None
+    assert len(small_chunks_summary.chunk_indexes) > 1
+    assert len(large_chunks_summary.chunk_indexes) == 1
+
+    spec = one_window_spec(1_150, 1_250)
+    policy = NearestTimestampPolicy(max_delta_ns=100)
+    small_chunks = next(_reference_sensor(small_chunks_path).sample(spec, policy=policy))
+    large_chunks = next(_reference_sensor(large_chunks_path).sample(spec, policy=policy))
+
+    np.testing.assert_array_equal(small_chunks.align_timestamps_ns, large_chunks.align_timestamps_ns)
+    np.testing.assert_array_equal(small_chunks.sensor_timestamps_ns, large_chunks.sensor_timestamps_ns)
+    np.testing.assert_array_equal(small_chunks.positions_m, large_chunks.positions_m)
+    np.testing.assert_array_equal(small_chunks.orientations_xyzw, large_chunks.orientations_xyzw)
+    np.testing.assert_array_equal(small_chunks.pose_valid, large_chunks.pose_valid)
+    assert small_chunks.host_timestamps_ns is not None
+    assert large_chunks.host_timestamps_ns is not None
+    np.testing.assert_array_equal(small_chunks.host_timestamps_ns, large_chunks.host_timestamps_ns)
+    assert small_chunks.sequence_counter is not None
+    assert large_chunks.sequence_counter is not None
+    np.testing.assert_array_equal(small_chunks.sequence_counter, large_chunks.sequence_counter)
+
+
+def test_ego_trajectory_alignment_uses_log_time_order_across_physically_reordered_chunks(tmp_path: Path) -> None:
+    """Physical MCAP write order does not change mapped-time nearest selection."""
+    path = tmp_path / "physically_reordered.mcap"
+    _write_reference_mcap(
+        path,
+        [
+            McapSample(log_time_ns=400, data=_reference_payload(400, sequence_counter=4)),
+            McapSample(log_time_ns=100, data=_reference_payload(100, sequence_counter=1)),
+            McapSample(log_time_ns=200, data=_reference_payload(200, sequence_counter=2)),
+        ],
+        chunk_size=1,
+    )
+
+    batch = _nearest_sample(_reference_sensor(path), one_window_spec(150, 250))
+
+    np.testing.assert_array_equal(batch.align_timestamps_ns, [150])
+    np.testing.assert_array_equal(batch.sensor_timestamps_ns, [100])
+    assert batch.sequence_counter is not None
+    np.testing.assert_array_equal(batch.sequence_counter, [1])
+
+
 def test_ego_trajectory_sensor_rejects_duplicate_mapped_align_timestamps(tmp_path: Path) -> None:
     """Mapped ego-trajectory rows require strictly increasing alignment timestamps."""
     path = tmp_path / "duplicate_timestamps.mcap"
@@ -409,7 +648,7 @@ def test_ego_trajectory_sensor_rejects_duplicate_mapped_align_timestamps(tmp_pat
     )
 
     with pytest.raises(ValueError, match="strictly sorted in ascending order with no duplicates"):
-        next(_reference_sensor(path).sample(one_window_spec(100, 300)))
+        _nearest_sample(_reference_sensor(path), one_window_spec(100, 300))
 
 
 def test_ego_trajectory_sensor_read_all_rejects_recording_wide_duplicate_alignment(tmp_path: Path) -> None:
@@ -433,13 +672,14 @@ def test_ego_trajectory_sensor_custom_mapping_preserves_optional_absence_for_all
     _write_reference_mcap(path, [McapSample(log_time_ns=100, data=_reference_payload(100))])
     sensor = _reference_sensor(path, protobuf_mapping=_minimal_mapping())
 
-    populated = next(sensor.sample(one_window_spec(100, 200)))
-    empty = next(sensor.sample(one_window_spec(200, 300)))
-    for batch in (populated, empty):
+    first = _nearest_sample(sensor, one_window_spec(100, 200))
+    second = _nearest_sample(sensor, one_window_spec(200, 300))
+    for batch in (first, second):
         assert batch.host_timestamps_ns is None
         assert batch.sequence_counter is None
-    np.testing.assert_array_equal(populated.sensor_timestamps_ns, np.array([100], dtype=np.int64))
-    assert empty.align_timestamps_ns.shape == (0,)
+    np.testing.assert_array_equal(first.sensor_timestamps_ns, np.array([100], dtype=np.int64))
+    np.testing.assert_array_equal(second.align_timestamps_ns, np.array([200], dtype=np.int64))
+    np.testing.assert_array_equal(second.sensor_timestamps_ns, np.array([100], dtype=np.int64))
 
 
 def test_ego_trajectory_sensor_rejects_empty_frame(tmp_path: Path) -> None:
@@ -474,7 +714,7 @@ def test_ego_trajectory_sensor_rejects_wrong_position_length(tmp_path: Path) -> 
     )
 
     with pytest.raises(ValueError, match=r"fields\.position_m expected 3 values"):
-        next(_reference_sensor(path).sample(one_window_spec(100, 200)))
+        _nearest_sample(_reference_sensor(path), one_window_spec(100, 200))
 
 
 def test_ego_trajectory_sensor_rejects_wrong_orientation_length(tmp_path: Path) -> None:
@@ -491,4 +731,4 @@ def test_ego_trajectory_sensor_rejects_wrong_orientation_length(tmp_path: Path) 
     )
 
     with pytest.raises(ValueError, match=r"fields\.orientation_xyzw expected 4 values"):
-        next(_reference_sensor(path).sample(one_window_spec(100, 200)))
+        _nearest_sample(_reference_sensor(path), one_window_spec(100, 200))
