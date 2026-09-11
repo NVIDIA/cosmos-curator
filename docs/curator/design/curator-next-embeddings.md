@@ -491,6 +491,30 @@ manifest, and the rows are read inside the workers.
   (not the row set); `[:None]` is the identity slice, so an uncapped run pays
    nothing for the knob.
 
+Because the fragment is the work unit, the table's fragment geometry is this
+leg's parallelism ceiling, and the run logs it once before the first fill:
+`embedding source s3://…/clips.lance v41: 8,412,900 rows, 1,052 fragments
+(min=4,900 median=8,000 max=8,000 per fragment), 31 fields`. The
+fragment count bounds how many workers can run at all, and the largest fragment
+bounds how long the last one keeps the others waiting — so a table that is coarse
+or lopsided is visible before any GPU time is spent on it rather than inferred
+afterwards from a long tail. The line is summarised from manifest metadata by
+[`report_table_shape`](../../../cosmos_curator/next/utils/lance_utils.py) and
+reads no column data. Read after `ensure_embedding_columns`, so its version and
+field count describe the schema the fills actually scan.
+
+That same helper appends a note to the same record — never a second one, and
+never at a level above `INFO` — when at least half the fragments hold fewer rows
+than Lance's own small-file boundary of 1,024: the point past which per-fragment
+manifest entry, file open, footer read and scanner setup stop being amortized.
+The note states that boundary and the cost of moving either way from it, and
+stops there. It issues no instruction and names no operation, because whether the
+layout is actually wrong depends on how wide the reader is, which the storage
+helper cannot know — a layout it reports on can be the right one, and coarsening
+it costs read parallelism and lengthens the tail the last block runs alone. For
+the same reason the converse fault, too few fragments for the cluster's width,
+draws nothing from the helper at all.
+
 Pinning the version is **not** a concurrency mechanism — the table is assumed
 quiescent for the duration of a run (§7). It is there for two ordinary reasons:
 every worker must scan one schema and one row set, and Lance needs a base version
@@ -1863,9 +1887,12 @@ many workers, without moving vectors through the driver:
 | `ray.data.Dataset.write_lance` | An append sink, not a column update — and broken on the current Ray / pylance pin |
 
 The chosen path is the only one that is simultaneously column-local, atomic,
-partially fillable, and distributed. See
-[`lance-write-evolution`](../../../.cursor/rules/lance-write-evolution.mdc) for the
-write-primitive comparison in full.
+partially fillable, and distributed: a per-fragment
+`LanceFragment.update_columns` keyed on `clip_id`, committed once as a
+`LanceOperation.Update` naming only the touched fragments, as detailed under
+[Atomic column write](#atomic-column-write-no-staging-tree-no-tombstones). The
+table above is the write-primitive comparison in full; the upstream reference is
+[Lance data evolution](https://lance.org/guide/data_evolution/).
 
 ### The quiescent-source contract
 

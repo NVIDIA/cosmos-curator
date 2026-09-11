@@ -13,12 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared Ray Data runtime configuration for Curator Next recipes."""
+"""Shared Ray Data runtime configuration for Curator Next recipes.
+
+Every function here mutates the process-global ``ray.data.DataContext``, which is
+what makes this one module rather than several: progress output, stability knobs,
+eager actor autoscaling, and the job checkpoint are all fields on the same
+ambient object, and a caller needs to know that setting one of them affects every
+dataset the process later builds.
+
+``installed_checkpoint`` is the only one that is scoped rather than set-and-forget,
+because leaking a checkpoint config would silently checkpoint an unrelated later
+plan under the wrong id column.
+"""
 
 import os
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from typing import Any, Final
 
+import pyarrow.fs as pafs
 import ray
+from loguru import logger
+from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.core.utils import environment
 
@@ -43,6 +60,19 @@ _MAP_RETRY_PATTERNS: list[str] = [
     "IncompleteRead",
 ]
 _MAP_MAX_RETRIES = 3
+_CHECKPOINT_CONFIG_LOCK = threading.Lock()
+
+# What the startup snapshot reports per node and in total: the two resources Ray
+# knows natively plus the logical IO budget Curator adds. Every Curator stage
+# reservation is drawn from these three, so a stage that never gets scheduled is
+# explained by one of them.
+_SNAPSHOT_RESOURCES: Final[tuple[str, ...]] = ("CPU", "GPU", environment.CURATOR_IO_RESOURCE_NAME)
+
+# Above this many nodes only cluster totals are logged. The per-node breakdown
+# exists to expose a HETEROGENEOUS cluster, where a total divided by a node count
+# is a fiction; a job large enough to exceed this bound would emit a page of log
+# per run, which is how a diagnostic gets filtered out and stops being read.
+_SNAPSHOT_BREAKDOWN_MAX_NODES: Final = 16
 
 
 def configure_ray_data_progress(*, progress: bool) -> None:
@@ -120,12 +150,111 @@ def configure_ray_data_eager_actor_autoscaling() -> None:
     ctx.autoscaling_config.actor_pool_max_upscaling_delta = None
 
 
-def curator_io_slots_per_node() -> int:
-    """Return the configured logical IO capacity for a Curator Ray node."""
-    raw_value = os.environ.get(
-        environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR,
-        str(environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE),
+@contextmanager
+def installed_checkpoint(
+    *,
+    id_column: str,
+    checkpoint_path: str,
+    filesystem: pafs.FileSystem | None = None,
+) -> Iterator[None]:
+    """Install one Ray Data job checkpoint for the enclosed plan and always clear it.
+
+    Two properties of the id column decide whether a resume works at all, and both
+    are the CALLER's responsibility - this function only names the column::
+
+        Read --> ... --> terminal write
+          ^                    ^
+          |                    +-- the id column must SURVIVE into the written
+          |                        output; Ray marks a row complete by reading
+          |                        the column back off the sink
+          +-- the id column must be present on the FIRST operator; the checkpoint
+              filter reads it off the Read output, so a column added later in the
+              plan is invisible to the skip
+
+    A plan that drops the column anywhere between those two points records no
+    progress at all while appearing to work. Ray also plans job checkpointing only
+    for a logical DAG that ends in a write, so a ``materialize()`` terminal
+    disables the mechanism with nothing but a Python warning.
+
+    Args:
+        id_column: Column holding one completed row's checkpoint id. Values are
+            the caller's; only its own datasource knows the snapshot they are
+            drawn from.
+        checkpoint_path: Cluster-accessible directory - object storage or a
+            network-mounted path. A node-local path gives each worker a
+            checkpoint no other worker can read.
+        filesystem: Filesystem the checkpoint is read and written through. Pass
+            the same one the sink uses, or a run under a non-ambient credential
+            profile writes results it cannot read back.
+
+    Yields:
+        Nothing; the context is the installation.
+
+    Raises:
+        RuntimeError: If a configuration is already installed, or if the active
+            one is not the one installed here.
+
+    """
+    installed = CheckpointConfig(
+        id_column=id_column,
+        checkpoint_path=checkpoint_path,
+        # The most dangerous default in this design. Ray's default is True, and it
+        # deletes the checkpoint when the DATASET EXECUTION succeeds - which is the
+        # end of the inference phase, before anything has been published. Accepting
+        # the default would destroy the progress record inside exactly the window
+        # this configuration exists to protect.
+        delete_checkpoint_on_success=False,
+        override_filesystem=filesystem,
     )
+    with _CHECKPOINT_CONFIG_LOCK:
+        context = ray.data.DataContext.get_current()
+        # Process-global ambient state, so the guard and installation are one
+        # operation: otherwise two threads can both observe None and replace
+        # each other's checkpoint before either plan starts.
+        if context.checkpoint_config is not None:
+            msg = (
+                f"a Ray Data checkpoint configuration is already installed "
+                f"(id column {context.checkpoint_config.id_column!r}); refusing to replace it"
+            )
+            raise RuntimeError(msg)
+        context.checkpoint_config = installed
+        # ASSERTED rather than assumed: setting the config on a context the
+        # execution does not use is a silent no-op that costs a full re-run of a
+        # GPU phase to discover.
+        active = ray.data.DataContext.get_current().checkpoint_config
+        if (
+            active is None
+            or active.id_column != id_column
+            or active.checkpoint_path != checkpoint_path
+            or active.filesystem is not installed.filesystem
+        ):
+            context.checkpoint_config = None
+            msg = (
+                f"the active Ray Data checkpoint configuration is not the one just installed "
+                f"(expected id column {id_column!r} at {checkpoint_path!r}, found "
+                f"{active and active.id_column!r} at {active and active.checkpoint_path!r}; "
+                f"expected filesystem type {type(installed.filesystem).__name__!r}, found "
+                f"{active and type(active.filesystem).__name__!r}); "
+                f"refusing to run a phase that would record no progress"
+            )
+            raise RuntimeError(msg)
+    try:
+        logger.info(f"Installed Ray Data job checkpoint on {id_column!r} at {checkpoint_path}")
+        yield
+    finally:
+        with _CHECKPOINT_CONFIG_LOCK:
+            context.checkpoint_config = None
+
+
+def curator_io_slots_per_node() -> int:
+    """Return the configured logical IO capacity for a Curator Ray node.
+
+    Also reports the resolved value and its provenance at INFO: this is the one
+    place the environment override is read, so it is the only layer that can
+    still tell a configured budget from an inherited one.
+    """
+    override = os.environ.get(environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR)
+    raw_value = str(environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE) if override is None else override
     try:
         slots = int(raw_value)
     except ValueError as exc:
@@ -134,6 +263,24 @@ def curator_io_slots_per_node() -> int:
     if slots < 1:
         msg = f"{environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR} must be at least 1, got {slots}"
         raise ValueError(msg)
+    # Provenance, not just the value. A starved IO budget reads the same either
+    # way, but "16 was chosen" and "16 was inherited" imply opposite fixes, and
+    # nothing downstream can tell them apart once the number is a plain float on
+    # a node. Only what THIS process can see is claimed: sbatch.sh.j2 exports the
+    # variable on every Slurm job, from --ray-io-slots-per-node when it is passed
+    # and from the same built-in default when it is not, so "set" inside a Slurm
+    # job is not evidence that an operator picked the number.
+    if override is None:
+        provenance = f"the built-in default ({environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR} is unset)"
+    else:
+        provenance = (
+            f"{environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR}={override!r}, which a Slurm job exports "
+            f"whether or not --ray-io-slots-per-node was passed"
+        )
+    logger.info(
+        f"Curator node IO budget resolved to {slots} {environment.CURATOR_IO_RESOURCE_NAME} slot(s) "
+        f"per node from {provenance}."
+    )
     return slots
 
 
@@ -142,21 +289,76 @@ def curator_io_resources() -> dict[str, float]:
     return {environment.CURATOR_IO_RESOURCE_NAME: float(curator_io_slots_per_node())}
 
 
-def ensure_ray_initialized(*, local_resources: Mapping[str, float] | None = None) -> None:
+def _render_resources(resources: Mapping[str, float]) -> str:
+    """Render one node's or one cluster's resource counts in snapshot order."""
+    return ", ".join(f"{resources[name]:g} {name}" for name in _SNAPSHOT_RESOURCES)
+
+
+def _log_cluster_snapshot() -> None:
+    """Log the resources the connected Ray cluster advertises right now.
+
+    A SNAPSHOT, and the text says so. Slurm releases the driver as soon as the
+    FIRST worker registers (``slurm_ray_runtime._wait_for_first_worker``), so a
+    multi-node job routinely reads its own cluster here while later nodes are
+    still joining::
+
+        head up --> first worker joins --> DRIVER STARTS --> workers 2..N join
+                                              ^
+                                              +-- this reading
+
+    Waiting for a complete picture would trade a diagnostic for a startup stall
+    on every recipe, so the count is published with its uncertainty stated rather
+    than waited into being final.
+    """
+    nodes = ray.nodes()  # type: ignore[no-untyped-call]  # Missing in Ray stubs.
+    advertised = [
+        (
+            str(node.get("NodeManagerAddress") or node.get("NodeID", "unknown")),
+            {name: float(node.get("Resources", {}).get(name, 0.0)) for name in _SNAPSHOT_RESOURCES},
+        )
+        for node in nodes
+        if node.get("Alive", False)
+    ]
+    totals = {name: sum(resources[name] for _, resources in advertised) for name in _SNAPSHOT_RESOURCES}
+    lines = [
+        f"Ray cluster snapshot at driver start: {len(advertised)} live node(s) advertising "
+        f"{_render_resources(totals)} in total. Nodes still joining are not counted."
+    ]
+    if len(advertised) <= _SNAPSHOT_BREAKDOWN_MAX_NODES:
+        lines.extend(f"  node {address}: {_render_resources(resources)}" for address, resources in advertised)
+    logger.info("\n".join(lines))
+
+
+def ensure_ray_initialized(
+    *,
+    local_resources: Mapping[str, float] | None = None,
+    runtime_env_vars: Mapping[str, str] | None = None,
+) -> None:
     """Initialize Ray and verify resources required by the calling recipe.
 
     ``local_resources`` are supplied only when this process owns a new local
     Ray node. Slurm and externally managed clusters must advertise the same
     resources when their nodes start; Ray cannot add them after the fact.
+    ``runtime_env_vars`` configure every task and actor in a newly initialized
+    Ray job; they cannot change one that was already initialized. One INFO
+    snapshot of what the cluster advertises is logged on the way through, since
+    this is the one point every recipe passes and the verification below reads
+    the same figures.
     """
     if not ray.is_initialized():
         connects_to_existing_cluster = bool(os.environ.get("RAY_ADDRESS")) or (
             environment.SLURM_RAY_ENV_VAR_NAME in os.environ
         )
+        init_kwargs: dict[str, Any] = {"ignore_reinit_error": True}
+        if runtime_env_vars:
+            init_kwargs["runtime_env"] = {"env_vars": dict(runtime_env_vars)}
         if local_resources and not connects_to_existing_cluster:
-            ray.init(ignore_reinit_error=True, resources=dict(local_resources))
-        else:
-            ray.init(ignore_reinit_error=True)
+            init_kwargs["resources"] = dict(local_resources)
+        ray.init(**init_kwargs)
+
+    # Before the check below, so the refusal it can raise arrives with the
+    # reading that explains it rather than after an operator goes looking.
+    _log_cluster_snapshot()
 
     if local_resources:
         cluster_resources = ray.cluster_resources()  # type: ignore[no-untyped-call]

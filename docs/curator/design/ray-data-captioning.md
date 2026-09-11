@@ -163,7 +163,9 @@ Current shims:
 
 GPU Ray Data stages use `ray_data_gpu_runtime_env(...)`, which sets
 `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0` and restores Ray's `CUDA_VISIBLE_DEVICES` masking while the shared Xenna
-image still defaults the flag to `1`. The helper is shared with the TransNetV2 splitter.
+image still defaults the flag to `1`. The helper is shared with the TransNetV2 splitter. It also pins
+`VLLM_CACHE_ROOT` to node-local `/tmp/vllm` so engine workers do not share one `XDG_CACHE_HOME` compile-cache
+directory on a cluster filesystem. The cache may still be reused on the same node if `/tmp` persists between jobs.
 
 ## Metadata and Stats
 

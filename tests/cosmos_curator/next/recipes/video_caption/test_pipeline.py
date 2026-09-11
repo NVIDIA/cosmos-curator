@@ -66,6 +66,11 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
     monkeypatch.setattr(pipeline, "validate_model_directory", lambda *_args: events.append("model"))
     monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: events.append("workspace"))
     monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
+    monkeypatch.setattr(
+        pipeline,
+        "s3_compatibility_env_vars",
+        lambda *_args, **_kwargs: {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"},
+    )
 
     def initialize_ray(**kwargs: object) -> None:
         ray_init_calls.append(kwargs)
@@ -108,7 +113,56 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
     assert summary["skipped_complete_fragments"] == 1
     assert summary["clips_lance_version"] == 12
     assert summary["cleanup_complete"] is True
-    assert ray_init_calls == [{"local_resources": {"curator_io": 16.0}}]
+    assert ray_init_calls == [
+        {
+            "local_resources": {"curator_io": 16.0},
+            "runtime_env_vars": {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"},
+        }
+    ]
+
+
+def test_storage_compatibility_is_selected_from_every_worker_visible_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ray workers are started with the settings every location they open requires.
+
+    The media root, the clip table, and the staging root are each configurable on
+    their own, so a selection made from the staging root alone would leave a
+    worker reading media or scanning the table under the SDK default.
+    """
+    attempt = CaptionAttempt(version=9, pending_fragment_ids=(0,), complete_fragment_ids=())
+    config = _config(tmp_path)
+    workspace = _workspace(tmp_path)
+    compatibility_calls: list[tuple[tuple[str, ...], str]] = []
+    _common_mocks(monkeypatch, tmp_path, attempt)
+    monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
+
+    def classify_endpoints(*locations: str, storage_profile: str) -> dict[str, str]:
+        compatibility_calls.append((locations, storage_profile))
+        return {}
+
+    monkeypatch.setattr(pipeline, "s3_compatibility_env_vars", classify_endpoints)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **_kwargs: None)
+    monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        pipeline,
+        "publish_staged_results",
+        lambda *_args, **_kwargs: PublicationSummary(published_fragments=1, already_committed_fragments=0),
+    )
+    monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: None)
+
+    pipeline.run_config(config)
+
+    assert compatibility_calls == [
+        (
+            (config.input.media_root, config.input.clips_lance_uri, workspace.root_uri),
+            config.execution.storage_profile,
+        )
+    ]
 
 
 def test_complete_attempt_skips_model_and_ray_and_validates_existing_workspace(

@@ -508,6 +508,29 @@ def test_non_text_episode_task_description_raises(tmp_path: Path) -> None:
         _discovered(_make_config(shard.parent))
 
 
+@pytest.mark.parametrize(
+    "description_type",
+    [pa.string(), pa.large_string(), pa.string_view(), pa.dictionary(pa.int32(), pa.string())],
+    ids=["string", "large_string", "string_view", "dictionary"],
+)
+def test_every_arrow_text_encoding_is_an_accepted_task_description(
+    description_type: pa.DataType, tmp_path: Path
+) -> None:
+    """Every Arrow string encoding is a valid description, dictionary encoding included.
+
+    The description gate aborts the whole shard, so narrowing it to one encoding
+    would reject healthy datasets. A dictionary of text is the case a plain
+    ``is_string`` check misses while leaving the common shapes passing, and
+    exporters emit it for a column that repeats one description per episode.
+    """
+    shard = _write_shard(tmp_path / "dataset" / "shard_00")
+    _replace_episode_task_description(shard, pa.array([DEFAULT_TASK_DESCRIPTION], type=description_type))
+
+    items = _discovered(_make_config(shard.parent))
+
+    assert {item.task_description for item in items} == {DEFAULT_TASK_DESCRIPTION}
+
+
 def test_episode_task_descriptions_are_isolated_per_shard(tmp_path: Path) -> None:
     """Verify each shard resolves episode descriptions against its own metadata."""
     root = tmp_path / "dataset"

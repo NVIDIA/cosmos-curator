@@ -1,0 +1,23 @@
+schema_version: 1
+kind: robot-action-caption
+input:
+  # Replace with the clips.lance produced by robot-action-split.
+  clips_lance_uri: s3://your-bucket/output/lerobot-clips/lance/clips.lance
+  # A split table carries no curate_selection_reason column, which the default
+  # selected-only scope requires, so dropping this line here fails preflight.
+  # Drop it only against a post-Curate table, to caption just its selected rows.
+  selected_only: false
+model:
+  variant: qwen2.5_vl
+video:
+  # This complete mapping is semantic and digested. At its 64-frame ceiling,
+  # Qwen2.5-VL receives at most 24,576 visual tokens under current accounting.
+  fps: 3.0
+  min_frames: 4
+  max_frames: 64
+  min_pixels: 3136
+  max_pixels: 602112
+execution:
+  storage_profile: default
+  # Execution-only scheduler/encoder capacity; excluded from caption identity.
+  max_num_batched_tokens: 32768

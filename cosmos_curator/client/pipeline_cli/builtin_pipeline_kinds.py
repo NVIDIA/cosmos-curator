@@ -26,6 +26,7 @@ from cosmos_curator.next.recipes.curation.pipeline_kind import CURATE_KIND
 from cosmos_curator.next.recipes.data_integrity.pipeline_kind import DATA_INTEGRITY_KIND
 from cosmos_curator.next.recipes.embeddings.pipeline_kind import EMBEDDINGS_KIND
 from cosmos_curator.next.recipes.multimodal_split.pipeline_kind import MULTIMODAL_SPLIT_KIND
+from cosmos_curator.next.recipes.robot_action_caption.pipeline_kind import ROBOT_ACTION_CAPTION_KIND
 from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND
 from cosmos_curator.next.recipes.video_caption.pipeline_kind import VIDEO_CAPTION_KIND
 from cosmos_curator.next.recipes.video_split.pipeline_kind import VIDEO_SPLIT_KIND
@@ -42,6 +43,7 @@ BUILTIN_PIPELINE_KINDS = PipelineKindRegistry(
         VIDEO_CAPTION_KIND,
         VIDEO_SPLIT_KIND,
         ROBOT_ACTION_SPLIT_KIND,
+        ROBOT_ACTION_CAPTION_KIND,
         CURATE_KIND,
         EMBEDDINGS_KIND,
         # Deprecated alongside cosmos_curator.pipelines.ray_data; delete these

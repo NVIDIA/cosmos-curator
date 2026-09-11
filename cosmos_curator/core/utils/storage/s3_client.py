@@ -616,6 +616,52 @@ class S3Client(StorageClient):
 
         self.s3.delete_object(Bucket=dest.bucket, Key=dest.prefix)
 
+    def delete_prefix(self, uri: StoragePrefix) -> int:
+        """Delete every object under ``uri``, treating it as a directory.
+
+        S3-only, like :meth:`list_child_prefixes`: the operation has no meaning
+        for a store whose delete is not prefix-addressed.
+
+        Args:
+            uri: The S3 prefix to remove. Must name a key, not a bare bucket.
+
+        Returns:
+            The number of objects deleted, zero if the prefix held none.
+
+        Raises:
+            ValueError: If deletion is not allowed by the client configuration,
+                or if ``uri`` names the bucket root.
+            OSError: If the store refused any individual key. ``DeleteObjects``
+                reports those in a successful response rather than by raising.
+
+        """
+        assert isinstance(uri, S3Prefix)
+        if not self.can_delete:
+            error_msg = f"Deletion not allowed for prefix {uri.prefix} in bucket {uri.bucket}."
+            raise ValueError(error_msg)
+        # Anchored on the delimiter so a sibling whose name merely begins with
+        # this one is not swept in: "run-1/" must not match "run-10/".
+        directory = uri.prefix if uri.prefix.endswith("/") else f"{uri.prefix}/"
+        if not directory.strip("/"):
+            error_msg = f"Refusing to delete the whole bucket {uri.bucket}; delete_prefix needs a key."
+            raise ValueError(error_msg)
+        deleted = 0
+        paginator = self.s3.get_paginator("list_objects_v2")
+        # A page holds at most 1000 keys and one DeleteObjects accepts at most
+        # 1000, so a page maps to exactly one request without further chunking.
+        for page in paginator.paginate(Bucket=uri.bucket, Prefix=directory):
+            keys = [{"Key": obj["Key"]} for obj in page.get("Contents", ())]
+            if not keys:
+                continue
+            response = self.s3.delete_objects(Bucket=uri.bucket, Delete={"Objects": keys, "Quiet": True})
+            errors = response.get("Errors", ())
+            if errors:
+                reported = ", ".join(f"{error.get('Key')}: {error.get('Message')}" for error in errors)
+                error_msg = f"Failed to delete {len(errors)} of {len(keys)} objects under {uri.path}: {reported}"
+                raise OSError(error_msg)
+            deleted += len(keys)
+        return deleted
+
 
 class S3BackgroundUploader(BackgroundUploader):
     """Handles background uploads to S3."""

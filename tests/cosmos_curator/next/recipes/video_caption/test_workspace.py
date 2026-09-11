@@ -14,6 +14,7 @@ from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import (
     CaptionWorkspace,
+    arrow_filesystem,
     cleanup_workspace,
     ensure_workspace,
     filesystem_path,
@@ -149,6 +150,50 @@ def test_filesystem_path_unwraps_supported_uris() -> None:
     assert filesystem_path("s3://bucket/a/b") == "bucket/a/b"
     assert filesystem_path("file:///var/lib/caption/a") == "/var/lib/caption/a"
     assert filesystem_path("relative/a") == "relative/a"
+
+
+def test_filesystem_path_decodes_a_percent_escaped_file_uri(tmp_path: Path) -> None:
+    """``%20`` in a ``file://`` URI is an escaped space, not two characters of the name.
+
+    Asserted against a directory that really exists, because the workspace has to
+    open what comes back; a string comparison alone would not notice a staging
+    root nothing can reach.
+    """
+    spaced = tmp_path / "my staging root"
+    spaced.mkdir()
+    assert "%20" in spaced.as_uri()
+
+    assert Path(filesystem_path(spaced.as_uri())) == spaced
+
+
+def test_filesystem_path_refuses_an_unsupported_scheme() -> None:
+    """An unsupported URI must not pass through as the path of a local staging root.
+
+    Which layer answers this is not the recipe's decision: the shared Arrow
+    helper owns the URI contract for every caller that pairs a filesystem with a
+    path. Pinned here because what matters at this boundary is that the
+    workspace refuses the root rather than staging into a relative directory
+    named after the scheme.
+    """
+    with pytest.raises(ValueError, match="unsupported Arrow filesystem URI scheme 'gs'"):
+        filesystem_path("gs://bucket/staging")
+
+
+def test_filesystem_path_refuses_a_nonlocal_file_authority() -> None:
+    """A ``file://host`` root names another machine and cannot become a local path."""
+    with pytest.raises(ValueError, match="file URI authority must be empty or localhost"):
+        filesystem_path("file://server/staging")
+
+
+def test_arrow_filesystem_refuses_an_unsupported_scheme() -> None:
+    """Backend selection fails closed: an unsupported URI never selects local storage.
+
+    The counterpart to the path refusal above, and the one that matters more: a
+    silently local filesystem would report every remote object as absent, so the
+    run would stage a complete second copy instead of failing.
+    """
+    with pytest.raises(ValueError, match="unsupported Arrow filesystem URI scheme 'gs'"):
+        arrow_filesystem("gs://bucket/staging", storage_profile="default")
 
 
 def test_file_uri_workspace_round_trip(

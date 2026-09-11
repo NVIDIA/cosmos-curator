@@ -22,6 +22,13 @@ _RAY_DATA_GPU_ENV_VARS = {
     # CUDA_VISIBLE_DEVICES masking when this inverted flag is truthy, so "0"
     # restores Ray's normal per-actor GPU visibility for Ray Data stages.
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
+    # vLLM derives its cache root from XDG_CACHE_HOME, which the
+    # points at the user's cache on a shared cluster filesystem - so every
+    # engine worker on every node would read and write one compile-cache
+    # directory with no cross-node lock. Node-local storage gives each worker
+    # its own tree; the cache then does not outlive the node, which is
+    # accepted because the compile artifacts regenerate on demand.
+    "VLLM_CACHE_ROOT": "/tmp/vllm",  # noqa: S108
 }
 
 
@@ -53,7 +60,7 @@ class PixiRuntimeEnv(RuntimeEnv):
 
 
 def ray_data_gpu_runtime_env(env_name: str, env_vars: dict[str, str] | None = None) -> PixiRuntimeEnv:
-    """Create a Pixi runtime env for Ray Data GPU stages with Ray GPU masking enabled."""
+    """Create a Pixi runtime env for Ray Data GPU stages, with GPU masking and a node-local vLLM cache."""
     copied_env_vars = {} if env_vars is None else dict(env_vars)
     copied_env_vars.update(_RAY_DATA_GPU_ENV_VARS)
     return PixiRuntimeEnv(env_name, env_vars=copied_env_vars)

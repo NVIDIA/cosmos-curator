@@ -60,6 +60,7 @@ google-genai = ">=1.59.0"
 ngcsdk = "*"
 pillow = ">=12.2.0"
 pyasn1 = ">=0.6.3"
+pybase64 = ">=1.5.0"
 pylance = ">=0.39.0"
 pulp = "*"
 ray = { version = "==2.58.0", extras = ["default", "data"] }

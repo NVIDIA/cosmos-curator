@@ -34,11 +34,14 @@ against the installed Lance rather than trusting API names:
    group can be re-added and refilled by the ordinary write path - the two facts
    the ``--reset-group`` maintenance operation rests on.
 
-The physical-file evidence behind these claims (per-field data-file locator sets
-before and after a commit, the ``_rowaddr`` bit layout, and the measured failure
-modes of ``merge``, ``merge_columns``/``Merge`` and ``merge_insert``) is recorded
-in ``.cursor/docs/lance-write-and-data-evolution.md``. This file asserts only the
-behaviour the pipeline depends on, keyed the way the pipeline keys it.
+These assertions are deliberately narrower than the storage engine's behaviour:
+they cover only what the pipeline depends on, keyed the way the pipeline keys it.
+The rejected alternatives are not re-tested here because each fails structurally
+rather than intermittently - ``merge`` and ``merge_columns`` are add-only, a
+``Merge`` commit demands the complete fragment list rather than the touched
+subset, and ``merge_insert`` replaces whole rows, so it writes tombstones and
+reorders them. See ``docs/curator/design/curator-next-embeddings.md`` for that
+comparison and the design it justifies.
 """
 
 import lance

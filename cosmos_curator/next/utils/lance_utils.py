@@ -16,18 +16,31 @@
 """Shared Lance utilities for Curator Next recipes.
 
 Deliberately small: the things every Curator Next recipe needs from Lance before
-it can decide anything - "does this table exist yet, and how many rows does it
-hold" - plus one bounded column read and the one constant every sink that writes
-its own fragments must agree on. Absence is answerable either
-way: ``open_dataset`` returns ``None`` for a caller that treats a missing table as
-a valid state, and ``open_dataset_or_raise`` raises for one that cannot proceed
+it can decide anything - "does this table exist yet, how many rows does it hold,
+and how is it laid out" - plus one bounded column read and the one constant every
+sink that writes its own fragments must agree on. Absence is answerable either way:
+``open_dataset`` returns ``None`` for a caller that treats a missing table as a
+valid state, and ``open_dataset_or_raise`` raises for one that cannot proceed
 without it. Everything table-shaped (schemas, key columns, what a vector means)
-belongs to the owning recipe, not here.
+belongs to the owning recipe, not here; anything answerable from PyArrow alone
+belongs in ``arrow_utils``, so that a caller inspecting a Parquet schema need not
+import a Lance module to ask it.
 
 ``distinct_non_null_values`` is here rather than in one recipe because more than
 one recipe needs to prove a column carries a single value, and a second
 implementation of that read could answer differently. Which recipe asks, and what
 it concludes, stays with the caller.
+
+``report_table_shape`` is shared for the same reason and answers only the
+physical question - how many fragments, how the rows sit across them. A recipe
+whose unit of work is a fragment reads its own parallelism ceiling out of that;
+one that lets Ray choose its block count reads nothing of the sort, so the
+interpretation belongs at the call site and not here. Sharing it also writes one
+rendering once, so two recipes cannot describe one table's geometry in two
+shapes. It states the one fact this module *can* establish without knowing its
+consumer: whether the fragments are small by Lance's own storage predicate.
+Whether that is a problem, or whether they are too FEW, is a statement about the
+reader's width, so no helper here makes it and none recommends an operation.
 
 Write paths are NOT here on purpose. Each recipe owns its own commit semantics:
 ``video_split`` and ``robot_action_split`` append fragments, the embeddings recipe
@@ -35,10 +48,13 @@ updates column groups in place. A shared "write a Lance table" helper would have
 to encode one of those choices for all of them.
 """
 
+import statistics
 from typing import Literal
 
+import attrs
 import lance
 import pyarrow as pa
+from loguru import logger
 
 from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options
 
@@ -148,3 +164,173 @@ def count_rows(uri: str, *, storage_profile: str = "default") -> int:
     if dataset is None:
         return 0
     return int(dataset.count_rows())
+
+
+# Lance's own default for ``write_dataset(max_rows_per_group=...)``, measured 1024 at
+# both pylance 10.0.0 (the lock) and 11.0.0; the threshold tracks Lance's figure, not
+# this literal, so re-measure if that default ever moves.
+#
+# Do NOT read it as a physical unit and do NOT retune it to whatever the writer's
+# current unit is. The Lance file format dropped row groups at data storage version
+# 2.0 and stores pages instead, and varying this knob over 64 / 1024 / 8192 leaves
+# page count and per-page item counts unchanged at storage versions 2.0 / 2.1 / 2.2
+# across int, wide-mixed, string, fixed-size-list and list schemas.
+#
+# What anchors the threshold is that Lance reads this same default as its own
+# SMALL-FILE predicate: ``dataset.stats.dataset_stats()`` counts data files through
+# ``num_small_files(max_rows_per_group)``, which is strictly rows < 1024 - the same
+# boundary the comparison below draws. A fragment under it is one Lance's own tooling
+# calls small, so its per-fragment costs - manifest entry, file open, footer read,
+# scanner setup - are unamortized against a file the format itself considers too
+# thin. That is why the threshold is anchored to a per-fragment ROW COUNT and not to
+# a fragment COUNT: how many fragments is "too few" depends on the reader's
+# parallelism, which a storage utility cannot know.
+#
+# Deliberately NOT Lance's fragment target (max_rows_per_file / compact_files
+# target_rows_per_fragment, 1048576): this project's writers intentionally target
+# thousands of rows per fragment, so that bound would warn on nearly every table we
+# write, including the 8,000-row fragments whose problem is the opposite direction.
+# That rejection is also why the emitted note names no remedy operation: the
+# obvious one is compact_files, whose default target IS 1048576, so a bare call
+# would collapse a table this note fires on into a single fragment - the opposite
+# direction, and the one whose cost this layer cannot see.
+_LANCE_SMALL_FILE_ROW_THRESHOLD = 1024
+
+
+@attrs.define(frozen=True)
+class LanceTableShape:
+    """How a Lance table is physically laid out at one version.
+
+    Fragment geometry, not content. A caller that hands one fragment to one unit
+    of work reads ``num_fragments`` as its concurrency ceiling and
+    ``max_fragment_rows`` as the bound on its last unit's runtime; whether that
+    mapping holds is the caller's to know, so this type states the shape and
+    never what it implies.
+
+    ``num_rows`` is the sum of the per-fragment counts by construction, and every
+    count is net of deletions, so the total agrees with ``count_rows()``.
+
+    Attributes:
+        version: The dataset version these counts describe.
+        num_fragments: Fragment count.
+        num_rows: Total rows, net of deletions.
+        min_fragment_rows: Smallest per-fragment row count; 0 when there are no
+            fragments, as are the other two distribution fields.
+        median_fragment_rows: A per-fragment row count with as many fragments
+            below it as above; always a count some fragment actually has.
+        max_fragment_rows: Largest per-fragment row count.
+        num_fields: Schema field count.
+
+    """
+
+    version: int
+    num_fragments: int
+    num_rows: int
+    min_fragment_rows: int
+    median_fragment_rows: int
+    max_fragment_rows: int
+    num_fields: int
+
+    def as_message(self) -> str:
+        """Return the one operator-facing line describing this shape.
+
+        Owned here rather than composed per call site so two recipes cannot
+        describe one table's geometry in two different shapes.
+        """
+        # Terse because the small-fragment note is appended to this line, and the
+        # combined form has to stay readable in a terminal.
+        head = f"v{self.version}: {self.num_rows:,} rows, {self.num_fragments:,} fragments"
+        if not self.num_fragments:
+            # The three distribution fields are 0 for an empty table, which would
+            # otherwise render as a real reading of zero-row fragments.
+            return f"{head}, {self.num_fields} fields"
+        return (
+            f"{head} (min={self.min_fragment_rows:,} median={self.median_fragment_rows:,} "
+            f"max={self.max_fragment_rows:,} per fragment), {self.num_fields} fields"
+        )
+
+    @property
+    def small_fragment_note(self) -> str | None:
+        """Return where this table sits against Lance's small-file boundary, or ``None``.
+
+        Keyed on the median so one small remainder fragment - the ordinary tail of
+        any write - cannot trigger it; it takes at least half the fragments being
+        under Lance's own small-file threshold.
+
+        States the boundary and the cost in BOTH directions, and stops there. It
+        issues no imperative and names no operation, because which direction is
+        better for this table depends on the reader's width - the one thing this
+        layer cannot see. A remedy phrased as a call would be acted on with its
+        default target, and for a table small enough to trip this note that
+        default collapses it to a single fragment, which is the fault this note
+        cannot even detect. The reasoning behind the boundary lives at
+        ``_LANCE_SMALL_FILE_ROW_THRESHOLD`` and in ``docs/``, not in a line
+        emitted on every table open; the count and the median live in
+        ``as_message()``, which this is appended to.
+        """
+        if self.num_fragments <= 1 or self.median_fragment_rows >= _LANCE_SMALL_FILE_ROW_THRESHOLD:
+            return None
+        return (
+            f"median fragment under Lance's {_LANCE_SMALL_FILE_ROW_THRESHOLD:,}-row small-file boundary: "
+            "smaller fragments leave per-fragment open and footer costs unamortized, "
+            "larger ones cost a fragment-per-worker reader parallel units and lengthen its last-block tail"
+        )
+
+
+def report_table_shape(dataset: lance.LanceDataset, label: str) -> LanceTableShape:
+    """Summarise a Lance table's fragment geometry from manifest metadata, log it, and return it.
+
+    Reads no column data, so it is safe on the driver against remote object
+    storage at any table size: it costs the manifest the handle already holds,
+    and no request per fragment. Takes an open handle rather than a URI because
+    every caller has one, and re-opening would pin a version the caller is not
+    reading.
+
+    One record rather than a summary line plus a conditional second one, so the
+    distribution the note is drawn from always travels with it. Always INFO: the
+    only judgement available here is that the median fragment sits under Lance's
+    small-file boundary, which is a true statement about storage and not a fault,
+    since whether the layout is wrong depends on the reader's width. *label* and
+    every word of ``as_message()`` are identical with and without the note, so
+    one filter matches both forms.
+
+    Args:
+        dataset: Open handle to the table to summarise.
+        label: What this table is to the caller, e.g. ``"embedding source <uri>"``.
+            Doubles as the grep anchor, so it should be stable per call site.
+
+    Returns:
+        The reported geometry, so a caller can act on it rather than re-read it.
+
+    """
+    # physical_rows less num_deletions, rather than fragment.count_rows(), because
+    # a property pair cannot later acquire a filter argument - and count_rows WITH
+    # a filter is a scan. Both properties resolve from the manifest: measured by
+    # moving a table's data/ away while leaving _deletions/ in place, so a scan is
+    # the only thing the absence can break, and re-reading them.
+    rows_per_fragment = sorted(
+        int(fragment.metadata.physical_rows) - int(fragment.metadata.num_deletions)
+        for fragment in dataset.get_fragments()
+    )
+    shape = LanceTableShape(
+        version=int(dataset.version),
+        num_fragments=len(rows_per_fragment),
+        # Summed rather than read from count_rows() so the total cannot disagree
+        # with the distribution printed beside it.
+        num_rows=sum(rows_per_fragment),
+        # The three distribution fields stay 0 for a table with no fragments,
+        # which as_message() renders as no distribution rather than as a reading
+        # of zero-row fragments.
+        min_fragment_rows=rows_per_fragment[0] if rows_per_fragment else 0,
+        # median_low, not median: it returns an observed fragment size instead of
+        # the midpoint of two, so an even fragment count yields a count some
+        # fragment really has rather than a synthetic half-row figure.
+        median_fragment_rows=statistics.median_low(rows_per_fragment) if rows_per_fragment else 0,
+        max_fragment_rows=rows_per_fragment[-1] if rows_per_fragment else 0,
+        num_fields=len(dataset.schema),
+    )
+    message = f"{label} {shape.as_message()}"
+    if (note := shape.small_fragment_note) is not None:
+        message = f"{message} - {note}"
+    logger.info(message)
+    return shape

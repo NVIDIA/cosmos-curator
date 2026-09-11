@@ -181,7 +181,7 @@ authoritative; retries are not expected to reproduce identical text bit-for-bit.
 
 ### Current v1 contract
 
-The current contract follows the pinned
+The current contract follows the revision-pinned
 [Qwen3.8 model card](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/README.md):
 
 | Setting | Value |
@@ -191,7 +191,7 @@ The current contract follows the pinned
 | Thinking | Disabled through the model-shipped chat template. |
 | Sampling | Temperature `0.7`, top-p `0.8`, top-k `20`, min-p `0.0`, presence penalty `1.5`, repetition penalty `1.0`. |
 | Maximum output | 2,048 tokens. |
-| Video input | Complete MP4, sampled at 2 FPS; prepared frames are not sampled a second time. |
+| Video input | Complete MP4, sampled at 2 FPS and clamped to 4-768 frames; prepared frames are not sampled a second time. |
 | Audio | Ignored. |
 
 Supported variants resolve their model IDs and immutable revisions from
@@ -226,6 +226,9 @@ them against the current fragment instead of assuming that an old `(fragment_id,
 
 Phase A installs a job-level `CheckpointConfig` with `clip_id` as its identity column, `checkpoints/` as its durable
 path, and checkpoint deletion on success disabled. Ray places `CheckpointFilter` directly after the datasource read.
+When the workspace uses GCS through its S3/XML endpoint, driver and worker
+filesystem construction follow the endpoint-scoped compatibility policy in
+[Ray Data: S3-compatible object storage (GCS)](ray-data.md#s3-compatible-object-storage-gcs).
 
 For each compact output shard, Ray's file-sink protocol performs this durability handshake:
 

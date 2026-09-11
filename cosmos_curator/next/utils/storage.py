@@ -13,15 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared storage utilities for Curator Next recipes."""
+"""Stateless location and byte helpers for Curator Next recipes.
+
+Every helper here is single-shot: it names or normalizes a URI, or moves the
+complete bytes of one object, and lets a backend failure reach the caller
+unchanged. Reading a per-row media object under a size ceiling, with retries and
+a classified verdict on failure, is a stateful job that lives next door in
+:mod:`cosmos_curator.next.utils.media_reader`.
+
+Importing this module costs a cloud SDK (``botocore``, and ``azure.identity``
+transitively), which a client-only install does not have. Pure URI parsing
+therefore lives in :mod:`cosmos_curator.next.utils.local_uri` and is imported
+back below; a caller that only needs to resolve a path - a config model, a CLI
+render - must import that module directly rather than this one.
+"""
 
 import os
 import shutil
 import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
+import tenacity
 from botocore.exceptions import ClientError
 from loguru import logger
 
@@ -32,8 +45,26 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     is_remote_path,
     path_to_prefix,
 )
+from cosmos_curator.next.utils.local_uri import (
+    LOCAL_SCHEMES,
+    local_media_path,
+    local_path,
+    uri_scheme,
+)
 
 _PRECONDITION_FAILED = 412
+_CONDITIONAL_REQUEST_CONFLICT = 409
+
+# A conditional PUT that collides with another conditional PUT on the same key
+# answers 409, which S3 documents as retryable and which proves nothing about
+# whether the object exists. Retried here rather than propagated because
+# ``write_if_absent`` promises the loser of a race a verdict, and botocore does
+# not cover this code: its S3 retry policy is socket errors, 5xx, throttling,
+# ``RequestTimeout`` and ``BadDigest``. Bounded, and exhaustion re-raises the
+# botocore error rather than reporting a create that never happened.
+_S3_CONFLICT_MAX_ATTEMPTS = 5
+_S3_CONFLICT_RETRY_MULTIPLIER_S = 0.1
+_S3_CONFLICT_RETRY_MAX_WAIT_S = 2.0
 
 
 def artifact_uri(location: str) -> str:
@@ -41,7 +72,7 @@ def artifact_uri(location: str) -> str:
     if is_s3path(location):
         return S3Prefix(location).path
     if location.startswith("file://"):
-        return _file_uri_to_path(location).resolve().as_uri()
+        return local_path(location).resolve().as_uri()
     return Path(location).expanduser().resolve().as_uri()
 
 
@@ -214,10 +245,58 @@ def remove_object(uri: str, *, storage_profile: str = "default") -> None:
     logger.info(f"Removed local object {uri}.")
 
 
-def _write_local_if_absent(path: Path, data: bytes) -> None:
+def write_if_absent(uri: str, data: bytes, *, storage_profile: str = "default") -> bool:
+    """Create one object exactly once, reporting whether this call created it.
+
+    The create is atomic against a concurrent caller, which is what makes it
+    usable as the claim on a shared durable namespace: two workers racing to
+    initialize the same manifest cannot both believe they won, and the loser
+    reads the winner's bytes instead of overwriting them.
+
+    Args:
+        uri: Local path, ``file://`` URI, or ``s3://`` object URI.
+        data: Complete object contents.
+        storage_profile: Credential profile for the remote write.
+
+    Returns:
+        ``True`` when this call created the object, ``False`` when it already
+        existed and was left untouched.
+
+    Raises:
+        ValueError: If the URI scheme has no atomic create-if-absent primitive,
+            or if a local target already exists and is not a regular file, so
+            no create there could ever produce the object.
+        ClientError: If a remote conditional write keeps losing to a concurrent
+            one until the bounded retries are spent, leaving it unknown whether
+            the object exists.
+
+    """
+    if is_s3path(uri):
+        return _write_s3_if_absent(uri, data, storage_profile=storage_profile)
+    scheme = uri_scheme(uri)
+    if scheme in LOCAL_SCHEMES:
+        return _write_local_if_absent(local_media_path(uri), data)
+    msg = (
+        f"atomic create-if-absent is unavailable for scheme {scheme!r} ({uri}); "
+        f"supported schemes are local paths, file://, and s3://"
+    )
+    raise ValueError(msg)
+
+
+def _write_local_if_absent(path: Path, data: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        return
+    # A regular file is the only existing entry that answers "another caller
+    # created this object". A directory, a device, or a dangling symlink at the
+    # same name can never BECOME that object, so reporting it as an existing one
+    # hands the caller the losing-the-race verdict and sends it on to read bytes
+    # that are not there - surfacing as an errno from the read-back rather than
+    # as the name that is occupied. ``is_file`` follows symlinks, so a link to a
+    # real file is still an existing object.
+    if path.is_file():
+        return False
+    if path.exists() or path.is_symlink():
+        msg = f"cannot create {path} exactly once: the path exists and is not a regular file"
+        raise ValueError(msg)
 
     while True:
         temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -235,26 +314,60 @@ def _write_local_if_absent(path: Path, data: bytes) -> None:
         try:
             os.link(temporary_path, path)
         except FileExistsError:
-            return
+            # A concurrent caller won the race between the exists() check above
+            # and this link, so this call created nothing.
+            return False
         _fsync_directory(path.parent)
     finally:
         temporary_path.unlink(missing_ok=True)
+    return True
 
 
-def _write_s3_if_absent(location: str, data: bytes, *, storage_profile: str) -> None:
-    prefix = S3Prefix(location)
-    client = get_storage_client(location, profile_name=storage_profile)
-    if not isinstance(client, S3Client):
-        msg = f"Could not create an S3 client for {location}"
-        raise TypeError(msg)
+def _is_conditional_write_conflict(error: BaseException) -> bool:
+    """Return whether an S3 error reports a concurrent conditional write, not an existing object."""
+    if not isinstance(error, ClientError):
+        return False
+    status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = error.response.get("Error", {}).get("Code")
+    return status == _CONDITIONAL_REQUEST_CONFLICT or code == "ConditionalRequestConflict"
+
+
+def _put_s3_object_if_absent(client: S3Client, prefix: S3Prefix, data: bytes) -> bool:
+    """Issue one conditional PUT, reporting whether it created the object."""
     try:
         client.s3.put_object(Bucket=prefix.bucket, Key=prefix.prefix, Body=data, IfNoneMatch="*")
     except ClientError as exc:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         code = exc.response.get("Error", {}).get("Code")
-        if status == _PRECONDITION_FAILED or code in {"PreconditionFailed", "ConditionalRequestConflict"}:
-            return
+        # 412 is the only answer that means "already there": IfNoneMatch="*" was
+        # refused because the key is taken, so the object exists and this call
+        # left it untouched. A 409 is NOT that answer - it reports a conflicting
+        # conditional write in flight, whose outcome is still unknown, so
+        # reading it as "already there" would tell a caller an object exists
+        # that may never be written. It leaves here as the botocore error the
+        # retry above selects on.
+        if status == _PRECONDITION_FAILED or code == "PreconditionFailed":
+            return False
         raise
+    return True
+
+
+def _write_s3_if_absent(location: str, data: bytes, *, storage_profile: str) -> bool:
+    prefix = S3Prefix(location)
+    client = get_storage_client(location, profile_name=storage_profile)
+    if not isinstance(client, S3Client):
+        msg = f"Could not create an S3 client for {location}"
+        raise TypeError(msg)
+    retrying = tenacity.Retrying(
+        stop=tenacity.stop_after_attempt(_S3_CONFLICT_MAX_ATTEMPTS),
+        wait=tenacity.wait_exponential(
+            multiplier=_S3_CONFLICT_RETRY_MULTIPLIER_S,
+            max=_S3_CONFLICT_RETRY_MAX_WAIT_S,
+        ),
+        retry=tenacity.retry_if_exception(_is_conditional_write_conflict),
+        reraise=True,
+    )
+    return retrying(_put_s3_object_if_absent, client, prefix, data)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -263,18 +376,3 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-def local_path(location: str) -> Path:
-    """Return the filesystem path a non-S3 location names, whether URI or path."""
-    if location.startswith("file://"):
-        return _file_uri_to_path(location)
-    return Path(location)
-
-
-def _file_uri_to_path(uri: str) -> Path:
-    parsed = urlsplit(uri)
-    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"} or not parsed.path:
-        msg = f"Unsupported local file URI: {uri}"
-        raise ValueError(msg)
-    return Path(unquote(parsed.path))

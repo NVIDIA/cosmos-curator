@@ -13,21 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read/write/removal contract for ``next.utils.storage``.
+"""Storage-helper contracts for ``next.utils.storage``.
 
 Covers ``write_media`` (including the ``file://`` locations ``artifact_uri``
 hands out), ``remove_prefix`` (whole staging tree / prefix), ``remove_object``
-(a single durable artifact), and ``read_media_if_present``, on both the local
-and the remote branch. The removal and read helpers share the same
-degenerate paths every cleanup call relies on: an absent target is a no-op,
-and a non-absence failure propagates rather than being reported as a clean
-removal. The remote branch is exercised through a fake storage client so no
-network or credentials are needed.
+(a single durable artifact), ``read_media_if_present``, and ``write_if_absent``.
+The removal and read helpers share the degenerate paths every cleanup call
+relies on: an absent target is a no-op, and a non-absence failure propagates
+rather than being reported as success.
+
+The URI rules those entry points apply live in ``next.utils.local_uri`` and are
+covered in ``test_local_uri``; what remains here is that ``write_if_absent`` and
+``artifact_uri`` really do apply them, which no test of the parser alone shows.
+
+Remote branches use fake storage clients, so no network or credentials are
+needed. The capped, retrying media read layered on these helpers is covered
+separately in ``test_media_reader``.
 """
 
 import pathlib
 
 import pytest
+from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.azure_client import AzurePrefix
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
@@ -353,3 +360,248 @@ def test_read_media_if_present_remote_without_client_raises(monkeypatch: pytest.
 
     with pytest.raises(ValueError, match="no storage client"):
         storage.read_media_if_present("s3://bucket/run/report.json")
+
+
+class _FakeS3Api:
+    """Minimal ``client.s3`` stand-in for the conditional-create path.
+
+    Records the kwargs of every ``put_object`` so a test can assert the
+    conditional header that makes the create atomic, and refuses the write with
+    the real 412 shape when the object is already there.
+
+    Attributes:
+        calls: Keyword arguments of every ``put_object`` call, in order.
+
+    """
+
+    def __init__(self, *, existing: bool) -> None:
+        self._existing = existing
+        self.calls: list[dict[str, object]] = []
+
+    def put_object(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+        if self._existing:
+            raise ClientError(
+                {"Error": {"Code": "PreconditionFailed"}, "ResponseMetadata": {"HTTPStatusCode": 412}},
+                "PutObject",
+            )
+
+
+class _FakeS3Client:
+    """Storage client exposing only the raw ``s3`` handle the create path uses."""
+
+    def __init__(self, *, existing: bool = False) -> None:
+        self.s3 = _FakeS3Api(existing=existing)
+
+
+def test_write_if_absent_creates_an_absent_local_object(tmp_path: pathlib.Path) -> None:
+    """An absent object is written and the call reports that it created it."""
+    target = tmp_path / "nested" / "workspace.json"
+
+    assert storage.write_if_absent(str(target), b'{"schema": 1}') is True
+    assert target.read_bytes() == b'{"schema": 1}'
+
+
+def test_write_if_absent_leaves_an_existing_local_object_untouched(tmp_path: pathlib.Path) -> None:
+    """A second call creates nothing and does not overwrite the first call's bytes."""
+    target = tmp_path / "workspace.json"
+    storage.write_if_absent(str(target), b"first")
+
+    assert storage.write_if_absent(str(target), b"second") is False
+    assert target.read_bytes() == b"first"
+
+
+def test_write_if_absent_reports_losing_the_local_create_race(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A concurrent creator between the presence check and the link makes this call the loser.
+
+    The existence check cannot see a writer that lands microseconds later, so the
+    link is the real arbiter: only its ``FileExistsError`` distinguishes "I
+    created it" from "somebody else did", which is what a namespace claim needs.
+    """
+
+    def raise_file_exists(*_args: object, **_kwargs: object) -> None:
+        raise FileExistsError
+
+    monkeypatch.setattr(storage.os, "link", raise_file_exists)
+
+    assert storage.write_if_absent(str(tmp_path / "workspace.json"), b"mine") is False
+
+
+def test_write_if_absent_accepts_a_file_uri(tmp_path: pathlib.Path) -> None:
+    """A ``file://`` URI resolves to the same local object a bare path would."""
+    target = tmp_path / "workspace.json"
+
+    assert storage.write_if_absent(target.as_uri(), b"payload") is True
+    assert target.read_bytes() == b"payload"
+
+
+def test_write_if_absent_refuses_a_local_target_that_is_a_directory(tmp_path: pathlib.Path) -> None:
+    """A non-file entry at the target name is refused, not reported as an existing object.
+
+    ``False`` means "another caller created this object", and the caller acts on
+    it by reading those bytes back. A directory can never become the object, so
+    the honest answer names the occupied path instead of sending the caller into
+    a read that fails with an errno the name does not explain.
+    """
+    target = tmp_path / "workspace.json"
+    target.mkdir()
+
+    with pytest.raises(ValueError, match="exists and is not a regular file"):
+        storage.write_if_absent(str(target), b"payload")
+
+
+def test_write_if_absent_refuses_a_local_target_that_is_a_dangling_symlink(tmp_path: pathlib.Path) -> None:
+    """A link to nothing is refused too, because the create underneath it cannot land.
+
+    ``exists()`` follows the link and reports absence, so this is the one
+    occupied name a presence check alone misses; ``os.link`` would then fail and
+    the caller would be told somebody else won.
+    """
+    target = tmp_path / "workspace.json"
+    target.symlink_to(tmp_path / "missing")
+
+    with pytest.raises(ValueError, match="exists and is not a regular file"):
+        storage.write_if_absent(str(target), b"payload")
+
+
+def test_write_if_absent_accepts_a_symlink_to_an_existing_file_as_an_existing_object(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A link resolving to a regular file is an existing object, so the create reports False.
+
+    The positive control for the refusals above: the guard rejects names that
+    cannot hold the object, not every name that is not itself a plain file.
+    """
+    real = tmp_path / "real.json"
+    real.write_bytes(b"first")
+    target = tmp_path / "workspace.json"
+    target.symlink_to(real)
+
+    assert storage.write_if_absent(str(target), b"second") is False
+    assert real.read_bytes() == b"first"
+
+
+def test_write_if_absent_rejects_a_scheme_with_no_atomic_create() -> None:
+    """A scheme with no create-if-absent primitive fails loudly rather than racing."""
+    with pytest.raises(ValueError, match="atomic create-if-absent is unavailable for scheme 'az'"):
+        storage.write_if_absent("az://container/run/workspace.json", b"payload")
+
+
+def test_write_if_absent_creates_an_absent_s3_object_conditionally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The remote create is issued with the conditional header that makes it atomic.
+
+    Without ``IfNoneMatch`` the put would succeed unconditionally and silently
+    overwrite another run's manifest, so the header is the mechanism and not an
+    implementation detail.
+    """
+    client = _FakeS3Client()
+    monkeypatch.setattr(storage, "S3Client", _FakeS3Client)
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+
+    assert storage.write_if_absent("s3://bucket/run/workspace.json", b"payload") is True
+    assert client.s3.calls[0]["IfNoneMatch"] == "*"
+
+
+def test_write_if_absent_reports_an_existing_s3_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused precondition is the remote form of "it was already there"."""
+    client = _FakeS3Client(existing=True)
+    monkeypatch.setattr(storage, "S3Client", _FakeS3Client)
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+
+    assert storage.write_if_absent("s3://bucket/run/workspace.json", b"payload") is False
+
+
+def test_write_if_absent_rejects_a_one_slash_file_uri() -> None:
+    """Atomic local creation applies the same canonical file-URI contract as reads."""
+    with pytest.raises(ValueError, match="Unsupported local file URI"):
+        storage.write_if_absent("file:/abs/path.mp4", b"payload")
+
+
+def test_write_if_absent_rejects_a_file_uri_with_an_unencoded_delimiter() -> None:
+    """The create path applies the same delimiter contract as the read path.
+
+    The write direction is where truncation does the damage: a claim on
+    ``file:///runs#2`` that silently lands on ``/runs`` overwrites nothing but
+    claims the wrong namespace, and the caller is told it won.
+    """
+    with pytest.raises(ValueError, match="Unsupported local file URI"):
+        storage.write_if_absent("file:///data/runs#2/workspace.json", b"payload")
+
+
+def test_artifact_uri_rejects_a_file_uri_with_an_unencoded_delimiter() -> None:
+    """A truncated location must not be normalized into a durable manifest record.
+
+    ``artifact_uri`` output is written into rows and receipts, so accepting the
+    truncation here would persist a URI naming an object the run never touched.
+    """
+    with pytest.raises(ValueError, match="Unsupported local file URI"):
+        storage.artifact_uri("file:///data/runs#2/clip.mp4")
+
+
+class _ConflictingS3Api:
+    """``client.s3`` stand-in answering a fixed number of 409 conflicts first.
+
+    409 ``ConditionalRequestConflict`` is what S3 returns when another
+    conditional write is in flight against the same key. Unlike 412 it says
+    nothing about whether the object exists, so it is the code the create path
+    must retry rather than read as an answer.
+
+    Attributes:
+        calls: Keyword arguments of every ``put_object`` call, in order.
+
+    """
+
+    def __init__(self, *, conflicts: int) -> None:
+        self._remaining = conflicts
+        self.calls: list[dict[str, object]] = []
+
+    def put_object(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise ClientError(
+                {"Error": {"Code": "ConditionalRequestConflict"}, "ResponseMetadata": {"HTTPStatusCode": 409}},
+                "PutObject",
+            )
+
+
+class _ConflictingS3Client:
+    """Storage client exposing only the raw ``s3`` handle the create path uses."""
+
+    def __init__(self, *, conflicts: int) -> None:
+        self.s3 = _ConflictingS3Api(conflicts=conflicts)
+
+
+def test_write_if_absent_retries_a_concurrent_conditional_write_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 409 is a lost race against another writer, not proof the object is there.
+
+    Read as "already exists" it would report a create that never happened and
+    hand the caller an object to read that may never be written. Asserting the
+    call count as well as the verdict, because returning ``True`` on the first
+    attempt would satisfy the verdict alone.
+    """
+    client = _ConflictingS3Client(conflicts=2)
+    monkeypatch.setattr(storage, "S3Client", _ConflictingS3Client)
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+
+    assert storage.write_if_absent("s3://bucket/run/workspace.json", b"payload") is True
+    assert len(client.s3.calls) == 3
+
+
+def test_write_if_absent_raises_when_conflicts_outlast_the_bounded_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spending the retry budget raises rather than falling through to a verdict.
+
+    Whether the object exists is still unknown at exhaustion, so both booleans
+    are wrong: ``True`` claims a create that did not happen and ``False`` sends
+    the caller to read an object that may not be there.
+    """
+    monkeypatch.setattr(storage, "_S3_CONFLICT_MAX_ATTEMPTS", 2)
+    client = _ConflictingS3Client(conflicts=99)
+    monkeypatch.setattr(storage, "S3Client", _ConflictingS3Client)
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+
+    with pytest.raises(ClientError, match="ConditionalRequestConflict"):
+        storage.write_if_absent("s3://bucket/run/workspace.json", b"payload")
+    assert len(client.s3.calls) == 2

@@ -181,20 +181,24 @@ class ModalityWeights(BaseModel):
     # intended dominant curation term - and it carries a PRECONDITION: it assumes
     # subtask_name holds real language. On a corpus whose labels are still
     # identifiers ("subtask_6186") the text block contributes identifier
-    # collision distance and then dominates the metric. The Mecka corpus is no
-    # longer such a corpus - its labels were repaired and re-measured at AUC
-    # 0.853 - so the escape below is a contract for other corpora, not a
-    # workaround this one needs. subtask=0.0 is that escape and needs no code
+    # collision distance and then dominates the metric. The corpus this design was
+    # measured on is no longer such a corpus - its subtask labels score AUC 0.853
+    # against the task, i.e. real language - so the escape below is a contract for
+    # other corpora, not a workaround the measured one needs. Measurement and
+    # apparatus: docs/curator/design/curator-next-curation.md, "Why each modality
+    # is present". subtask=0.0 is that escape and needs no code
     # change: a zero-weight block contributes a zero sub-vector, keeps the fused
     # vector unit-norm, and drops out of the eligibility predicate, so the
     # modality leaves the metric AND stops being required of a row.
     subtask: float = Field(default=0.6, ge=0.0, le=1.0)
     image: float = Field(default=0.2, ge=0.0, le=1.0)
     # The action block carries NO task signal, and that is measured rather than
-    # assumed: on Mecka clips with repaired labels the task-separation
-    # ratio is 0.990 - different-task pairs sit no farther apart than same-task
-    # pairs - and same-task-closer AUC is 0.543, against 0.853 for text and
-    # 0.879 for image on the same rows. Gross dual-wrist kinematics do not
+    # assumed: the task-separation ratio is 0.990 - different-task pairs sit no
+    # farther apart than same-task pairs - and same-task-closer AUC is 0.543,
+    # against 0.853 for text and 0.879 for image on the same rows and the same
+    # grouping, so this is a property of the modality rather than of one corpus's
+    # labels. Measurement and apparatus: the design doc section cited above.
+    # Gross dual-wrist kinematics do not
     # distinguish woodworking from cleaning_shoes. So this weight buys
     # motion-redundancy separation and dedup locality: it is what stops "same
     # instruction, same scene, different execution" from being scored a
@@ -369,17 +373,19 @@ class CurateConfig(BaseModel):
 
     # Similarity above which two TASK labels become one fairness group, so wording
     # variants of one instruction do not each draw their own quota. Level 1 only:
-    # the task vocabulary is bounded by the annotation schema (2,738 measured), so
-    # a pairwise merge over the distinct labels is affordable there. Level 2 is not
-    # merged at all - see subtask_clusters.
+    # the distinct-task count is bounded by the annotation schema and does not move
+    # with the row count, so a pairwise merge over the distinct labels is affordable
+    # there whatever the corpus size. Level 2 is not merged at all - see
+    # subtask_clusters.
     merge_theta_task: float = Field(default=0.95, ge=0.0, le=1.0)
 
     # The level-2 fairness group count: how many subtask clusters one k-means over
     # embedding_text_subtask partitions the corpus into. A BOUND, and that is the
     # whole point of the field - the level-2 key it replaced was annotator prose
-    # running at ~0.816 distinct labels per row, so the group count G grew with N
-    # (~204M labels projected at 250M rows) and the mean group held ~1.2 clips. A
-    # quota clamps to its group's capacity, so at that cardinality no target below
+    # resolved per shard, whose distinct-label count grew in proportion to N, so
+    # the group count G grew with the corpus and the mean group held barely more
+    # than one clip. A quota clamps to its group's capacity, so at that
+    # cardinality no target below
     # the group count could fund any group twice and the allocation was decided
     # entirely by the tier's seeded residual order.
     #
@@ -401,20 +407,21 @@ class CurateConfig(BaseModel):
     #
     # 16 is chosen against the 250M-500M envelope, the same way
     # target_mean_cluster_rows is, and it fixes G at T * 16 - bounded by the task
-    # vocabulary rather than by the corpus. At 250M rows and 2,738 tasks that
-    # leaves ~5,700 clips per level-2 group, which is capacity a quota can
-    # actually divide, and the arithmetic ceiling sits in the thousands, so the
-    # semantic one is what holds 16 down. Raising the value at all is unsupported:
+    # vocabulary rather than by the corpus. At 250M rows that leaves every level-2
+    # group capacity a quota can actually divide, and the arithmetic ceiling sits
+    # in the thousands, so the semantic one is what holds 16 down. Raising the
+    # value at all is unsupported:
     # the ~40 marks where the argument definitively breaks, not a licence to reach
     # it, and nothing establishes a benefit above the default.
     #
-    # On a SMALL corpus 16 is thin: at 131,602 rows it leaves ~3 clips per group,
+    # On a SMALL corpus 16 is thin: it leaves each group only a handful of clips,
     # and a scarce target then leaves a large share of those groups with nothing,
     # so which of them are funded is decided by fairness_residual_seed. Whether the
     # arithmetic ceiling binds there is a property of the TARGET, not of the small
-    # corpus: at a target of 50,000 it is ~21 and the default is still legal, while
-    # at 10,000 it is ~4 and the default is not. The run warns once
-    # more than a fifth of the level-2 groups are unfunded, and reports the count
+    # corpus: it can sit above 16 on a small corpus at a generous target and below
+    # it on a larger corpus at a scarce one - worked cases are tabulated in the
+    # design doc cited below. The run warns once more
+    # than a fifth of the level-2 groups are unfunded, and reports the count
     # and share at every value below that - but the warning is a backstop, not a
     # substitute for the arithmetic, because a k modestly above the ceiling lands
     # in a band that is degenerate and still silent. This is the same

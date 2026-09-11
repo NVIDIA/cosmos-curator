@@ -36,10 +36,10 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import (
     CaptionWorkspace,
-    filesystem_path,
     record_phase_a_completion,
 )
 from cosmos_curator.next.recipes.video_split.storage import download_bytes
+from cosmos_curator.next.utils.arrow_utils import filesystem_path
 
 _ROW_ADDRESS_FRAGMENT_SHIFT = 32
 _ROW_ADDRESS_OFFSET_MASK = (1 << _ROW_ADDRESS_FRAGMENT_SHIFT) - 1

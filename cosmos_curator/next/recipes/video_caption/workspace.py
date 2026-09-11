@@ -8,14 +8,13 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pyarrow.fs as pafs
 from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
-from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options, get_storage_client
+from cosmos_curator.core.utils.storage.storage_utils import get_storage_client
 from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig
 from cosmos_curator.next.recipes.video_caption.contracts import (
     CHECKPOINT_ADAPTER_VERSION,
@@ -24,6 +23,7 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
     normalized_caption_contract,
 )
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
+from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
 
 _PRECONDITION_FAILED = 412
 _PHASE_A_COMPLETION_SCHEMA_VERSION = 1
@@ -175,37 +175,6 @@ def cleanup_workspace(workspace: CaptionWorkspace, *, storage_profile: str) -> N
     local_root = Path(filesystem_path(workspace.root_uri))
     if local_root.exists():
         shutil.rmtree(local_root)
-
-
-def arrow_filesystem(location: str, *, storage_profile: str) -> pafs.FileSystem:
-    """Build the Arrow filesystem used by Ray checkpoints and Parquet."""
-    if not location.lower().startswith("s3://"):
-        return pafs.LocalFileSystem()
-    options = get_lance_storage_options(location, profile_name=storage_profile) or {}
-    endpoint = options.get("aws_endpoint")
-    endpoint_override = endpoint
-    scheme = None
-    if endpoint and "://" in endpoint:
-        parsed = urlsplit(endpoint)
-        scheme = parsed.scheme
-        endpoint_override = parsed.netloc + parsed.path
-    return pafs.S3FileSystem(
-        access_key=options.get("aws_access_key_id"),
-        secret_key=options.get("aws_secret_access_key"),
-        session_token=options.get("aws_session_token"),
-        region=options.get("aws_region"),
-        scheme=scheme,
-        endpoint_override=endpoint_override,
-    )
-
-
-def filesystem_path(location: str) -> str:
-    """Remove the URI protocol for direct Arrow filesystem operations."""
-    if location.lower().startswith("s3://"):
-        return location[5:]
-    if location.lower().startswith("file://"):
-        return urlsplit(location).path
-    return location
 
 
 def _join(root: str, *parts: str) -> str:

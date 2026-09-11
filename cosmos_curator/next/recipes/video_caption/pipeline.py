@@ -43,6 +43,7 @@ from cosmos_curator.next.recipes.video_caption.workspace import (
     resolve_workspace,
     workspace_manifest_exists,
 )
+from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 
 
 def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
@@ -80,7 +81,19 @@ def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
             )
         else:
             validate_model_directory(spec)
-        ensure_ray_initialized(local_resources=curator_io_resources())
+        ensure_ray_initialized(
+            local_resources=curator_io_resources(),
+            # Every configured location, not just the staging root: each is set
+            # independently, so one can reach an endpoint the staging root does
+            # not. The media root stands in for the per-row clip URIs, which are
+            # read from the table and so are not enumerable here.
+            runtime_env_vars=s3_compatibility_env_vars(
+                config.input.media_root,
+                uri,
+                workspace.root_uri,
+                storage_profile=config.execution.storage_profile,
+            ),
+        )
         configure_ray_data_progress(progress=config.execution.progress)
         configure_ray_data_stability(disable_high_memory_detector=True)
         if not phase_a_complete:

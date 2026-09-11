@@ -400,6 +400,11 @@ There is no `false` and no `selected` boolean: "not selected" is
 `curate_selection_reason <> 'selected'`, "not curated" is `IS NULL`. Read the
 outcome with predicates against the table itself:
 
+The [`robot-action-caption` recipe](../design/curator-next-robot-action-caption.md)
+uses `curate_selection_reason = 'selected'` as its default input scope. Run
+Curate before captioning, or set `input.selected_only: false` explicitly when a
+standalone caption run should process every otherwise-pending row.
+
 ```python
 import lance
 
@@ -856,9 +861,19 @@ manifest cost is usually discussed, but nobody here has measured the manifest co
 this table: report manifest open and scan-planning latency at the current fragment
 count, and whether it grows enough to register against the scan it precedes.
 
-If it does register, **compaction is the remedy that costs no `C`** — it rewrites
-fragments after the fact, leaving the write-time geometry the sampler depends on
-untouched. Reach for the publish batch only if compaction is unavailable.
+If it does register, **compaction is the remedy that leaves the producer's field
+alone** — it rewrites fragments after the fact, so `clips_per_publish_batch` and the
+recovery unit it sizes stay where they are, and no cross-package request is needed.
+It does not leave `C` alone, though, and that is the trap: the sampler takes a
+fragment prefix of the table as **read**, so a compaction target divides
+`fit_sample_rows` exactly as the publish batch does. Lance's `compact_files` targets
+1,048,576 rows per fragment unless told otherwise, which on a 500M-row table yields
+about 477 fragments. Fragment count is what bounds read parallelism for every recipe
+whose unit of work is a fragment, and 477 still leaves that ample; what it does not
+leave ample is `C`, which falls from 500 to about 4 — a far heavier loss than the
+halving that doubling the publish batch would cost. Pick a target explicitly, from
+the width of the widest reader of this table and the `C` you are willing to keep.
+Reach for the publish batch only if compaction is unavailable.
 
 ## Comparing two runs
 

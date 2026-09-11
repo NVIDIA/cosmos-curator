@@ -146,6 +146,21 @@ New Ray Data pipelines are built one at a time, starting with simple examples an
 For pipelines that already have a Xenna implementation, the Ray Data version can be validated against it. Where Ray
 Data proves to be the better fit, it may replace the Xenna version; where Xenna works better, it stays.
 
+### S3-compatible object storage (GCS)
+
+An `s3://` location may resolve through a storage profile to Google Cloud
+Storage's S3/XML endpoint, `storage.googleapis.com`. PyArrow's embedded AWS
+client enables optional response-checksum validation that this endpoint does not
+implement compatibly. Curator therefore selects
+`AWS_RESPONSE_CHECKSUM_VALIDATION=when_required` for that exact endpoint before
+constructing the driver filesystem and propagates the same value through the Ray
+job runtime environment before workers reconstruct the filesystem.
+
+The policy is endpoint-scoped: AWS S3 and other compatible endpoints retain
+their SDK defaults. A recipe that needs this policy must initialize the Ray job
+through `ensure_ray_initialized` before submitting work; an already initialized
+job cannot have its runtime environment changed.
+
 ### Code sharing
 
 Model/inference code (tokenizers, GPU kernels, model weight loading) and common utilities (runtime environments,

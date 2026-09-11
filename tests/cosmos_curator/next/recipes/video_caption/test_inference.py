@@ -45,6 +45,7 @@ from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace, phase_a_completion_covers
 from cosmos_curator.next.recipes.video_split.lance_sink import append_clip_fragment, write_clip_fragment
 from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
+from tests.cosmos_curator.next.conftest import CURATOR_IO_RESOURCE, CURATOR_IO_SLOTS
 
 
 class _FakeCaptionProcessor:
@@ -699,7 +700,10 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
     workspace = _workspace(tmp_path)
 
     ray.shutdown()
-    ray.init(num_cpus=4, resources={"curator_io": 16}, include_dashboard=False)
+    # The shared cluster's own slot count, not a literal: ``curator_io_cluster``
+    # restarts any cluster whose count differs, so a copy here would silently
+    # trigger a mid-session restart the moment the fixture's constant moved.
+    ray.init(num_cpus=4, resources={CURATOR_IO_RESOURCE: CURATOR_IO_SLOTS}, include_dashboard=False)
     try:
         monkeypatch.setattr(
             inference,

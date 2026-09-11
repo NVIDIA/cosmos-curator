@@ -52,6 +52,7 @@ from cosmos_curator.next.recipes.robot_action_split.identities import (
     make_source_id,
     make_span_group_id,
 )
+from cosmos_curator.next.utils.arrow_utils import is_text_type
 
 _CHUNK_FILE_RE = re.compile(r"^chunk-(\d+)/file-(\d+)\.parquet$")
 _VIEW_PREFIX = "observation.images."
@@ -227,20 +228,6 @@ def _list_shard_dirs(
     return dirs
 
 
-def _holds_text(field_type: pa.DataType) -> bool:
-    """Return whether an Arrow type carries text usable as a label.
-
-    Every Arrow string encoding survives a parquet round trip as itself, so all
-    of them are accepted. ``binary`` is deliberately not: its values arrive as
-    ``bytes``, which stringify to ``"b'text'"`` rather than to the text.
-    """
-    if pa.types.is_dictionary(field_type):
-        return _holds_text(field_type.value_type)
-    return bool(
-        pa.types.is_string(field_type) or pa.types.is_large_string(field_type) or pa.types.is_string_view(field_type)
-    )
-
-
 def _read_label_map(
     source: str | io.BytesIO,
     key: str,
@@ -264,7 +251,7 @@ def _read_label_map(
     # DataFrame.index where a column scan cannot see it.
     table = pq.read_table(source)
     label = next(
-        (name for name in labels if name in table.column_names and _holds_text(table.schema.field(name).type)),
+        (name for name in labels if name in table.column_names and is_text_type(table.schema.field(name).type)),
         None,
     )
     # Reported separately: naming both halves when only one is missing sends the
@@ -510,7 +497,7 @@ def _validate_task_description_field(
     if "task_description" not in schema.names:
         return
     description_type = schema.field("task_description").type
-    if _holds_text(description_type):
+    if is_text_type(description_type):
         return
     source_name = source if isinstance(source, str) else f"{shard_name}/meta/episodes parquet"
     msg = (

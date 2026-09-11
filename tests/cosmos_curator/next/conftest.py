@@ -48,6 +48,19 @@ SYNTHETIC_MECKA_DATASET = "ds_under_test"
 NON_DEXTEROUS_SPEC = "libero"
 SYNTHETIC_NON_DEXTEROUS_DATASET = "ds_under_test_plain"
 
+# The custom resource production IO stages reserve, and the slot count the shared
+# cluster advertises. An IO-slot count, not compute: it leaves the CPU ceiling
+# below exactly as it is.
+CURATOR_IO_RESOURCE = "curator_io"
+CURATOR_IO_SLOTS = 16
+
+# The CPU ceiling the shared cluster publishes. Named rather than left as a
+# literal inside the starter because ``curator_io_cluster`` compares against it:
+# a starter and a guard holding separate copies would disagree the moment either
+# moved, and the guard's answer to that disagreement is to restart the cluster on
+# every test that asks for it.
+SHARED_CLUSTER_CPUS = 4
+
 
 @pytest.fixture
 def loguru_records() -> Iterator[list[dict[str, Any]]]:
@@ -89,30 +102,81 @@ def ray_local() -> Iterator[None]:
     run, so a test needing GPU resources must patch ``ray.cluster_resources``
     rather than re-initialise.
 
-    The two-CPU budget is a hard ceiling on any single task's request. Ray Data
-    does not reject a task that asks for more than the cluster holds - it
-    backpressures it under ``ResourceBudget`` forever, with no error and no
-    progress - so a test driving a Ray Data stage must pin the resource knobs it
-    passes rather than inherit a production default sized for a real cluster.
+    Ray Data does not reject a task that asks for more resource than the cluster
+    holds - it backpressures it under ``ResourceBudget`` forever, with no error
+    and no progress - and no cluster size removes that hazard. A test driving a
+    Ray Data stage must therefore pin the resource knobs it passes rather than
+    inherit a production default sized for a real cluster.
 
     ``curator_io`` is advertised because production IO stages request slots of it,
     and a cluster without it does not report the gap usefully: the guarded entry
     points raise a bare resource error while the unguarded ones hand Ray Data a
     task that can never be scheduled. Sixteen is an IO-slot count, not compute -
-    it leaves the two-CPU ceiling above exactly as it is.
+    it leaves the CPU budget above exactly as it is.
     """
-    ray.init(
-        num_cpus=4,
-        num_gpus=0,
-        resources={"curator_io": 16},
-        include_dashboard=False,
-        ignore_reinit_error=True,
-        log_to_driver=False,
-    )
+    _start_shared_cluster()
     try:
         yield
     finally:
         ray.shutdown()
+
+
+@pytest.fixture
+def curator_io_cluster(ray_local: None) -> None:
+    """Guarantee the shared cluster's shape for a test whose stages request ``curator_io``.
+
+    ``ray_local`` starts the cluster once and is then cached, so it cannot notice
+    that the cluster it started is gone. It does go: a production path elsewhere in
+    the tree shuts Ray down mid-session, and the next Ray Data execution silently
+    auto-initialises a whole-machine cluster advertising no custom resources. Every
+    later test then runs against a cluster nobody configured - harmless until a
+    stage asks for a slot of ``curator_io``, at which point the guarded entry points
+    fail with a resource error that names the resource and not the cause.
+
+    Ask for this fixture rather than ``ray_local`` when a stage under test reserves
+    ``curator_io``. It re-creates the documented shape when, and only when, the
+    ambient cluster is not it.
+
+    The check is on the advertised SLOT COUNT and is exact, not a floor, because
+    any other count is a cluster nobody configured. Presence alone would accept a
+    smaller count and then cap IO concurrency below what the test asked for, which
+    reads as a slow stage; a larger count lifts the ceiling a test observing IO
+    backpressure is relying on. Both failures are silent, so neither is accepted.
+
+    The CPU count is checked on the same terms, because an IO stage's actor count
+    is the lower of what the slots and the CPUs allow. A cluster carrying the
+    right slot count on a whole machine's CPUs therefore satisfies a slots-only
+    check while still moving that count, which moves the figure a test asserts
+    against without touching the resource the fixture is named for.
+    """
+    del ray_local
+    resources = ray.cluster_resources() if ray.is_initialized() else {}
+    advertised = resources.get(CURATOR_IO_RESOURCE, 0.0)
+    advertised_cpus = resources.get("CPU", 0.0)
+    if advertised == float(CURATOR_IO_SLOTS) and advertised_cpus == float(SHARED_CLUSTER_CPUS):
+        return
+    logger.warning(
+        f"The ambient Ray cluster advertises {advertised} {CURATOR_IO_RESOURCE} slots and "
+        f"{advertised_cpus} CPU, not the {CURATOR_IO_SLOTS} slots and {SHARED_CLUSTER_CPUS} CPU the "
+        f"shared cluster publishes; a previous module replaced it, so it is being restored."
+    )
+    ray.shutdown()
+    _start_shared_cluster()
+
+
+def _start_shared_cluster() -> None:
+    """Start the one cluster shape the Curator Next tests share."""
+    ray.init(
+        # Deliberate headroom so co-scheduled stages under test are not starved.
+        # Do not lower this to force a stage to pin its own CPU request: an
+        # over-asking task backpressures at any cluster size (see ray_local).
+        num_cpus=SHARED_CLUSTER_CPUS,
+        num_gpus=0,
+        resources={CURATOR_IO_RESOURCE: CURATOR_IO_SLOTS},
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        log_to_driver=False,
+    )
 
 
 @pytest.fixture

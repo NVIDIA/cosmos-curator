@@ -84,7 +84,7 @@ from cosmos_curator.next.recipes.embeddings.modalities import (
     build_image_fill,
     build_text_fill,
 )
-from cosmos_curator.next.utils.lance_utils import open_dataset_or_raise
+from cosmos_curator.next.utils.lance_utils import open_dataset_or_raise, report_table_shape
 
 # The modalities whose whole run is described by their spec, in execution order.
 # Action is absent by construction, not by omission: its fill cannot be built
@@ -164,6 +164,11 @@ def run_embedding_pipeline(config: EmbeddingPipelineConfig) -> EmbeddingRunResul
     dataset = _open_clips(config, storage_options=storage_options)
     added, schema_commit_version = ensure_embedding_columns(dataset, _enabled_groups(fills, config))
     logger.info(f"ensured embedding columns for {list(config.modalities)}: {added} field(s) added")
+    # Logged because ``fill`` hands one fragment to one actor, so this geometry is
+    # the ceiling on fill concurrency and its largest fragment is the one every
+    # other actor waits on. Read after the widening, so the reported version and
+    # field count name the schema the fills scan rather than the pre-widening one.
+    report_table_shape(dataset, f"embedding source {config.clips_lance_uri}")
 
     # Before the first fill, because a fill starts Ray Data and download_models
     # must fork from a Ray-free process.

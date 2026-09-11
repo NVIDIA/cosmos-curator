@@ -883,3 +883,85 @@ def test_module_imports_without_ray(repo_root: Path) -> None:
     )
 
     assert result.returncode == 0, f"s3_client is not importable without ray:\n{result.stderr}"
+
+
+class _FakeDeleteS3:
+    """List-then-bulk-delete stand-in recording every request it was handed."""
+
+    def __init__(self, pages: list[dict[str, Any]], errors: list[dict[str, str]] | None = None) -> None:
+        self.paginator = _FakePaginator(pages)
+        self._errors = errors or []
+        self.delete_calls: list[dict[str, Any]] = []
+
+    def get_paginator(self, name: str) -> _FakePaginator:
+        assert name == "list_objects_v2"
+        return self.paginator
+
+    def delete_objects(self, **kwargs: object) -> dict[str, Any]:
+        self.delete_calls.append(kwargs)
+        return {"Errors": self._errors} if self._errors else {}
+
+
+def _delete_client(
+    pages: list[dict[str, Any]],
+    errors: list[dict[str, str]] | None = None,
+    *,
+    can_delete: bool = True,
+) -> tuple[S3Client, _FakeDeleteS3]:
+    """Build a client whose only wired-up S3 calls are listing and bulk delete."""
+    fake = _FakeDeleteS3(pages, errors)
+    client = object.__new__(S3Client)
+    client.s3 = fake
+    client.can_delete = can_delete
+    return client, fake
+
+
+def test_delete_prefix_removes_each_listed_page_in_one_bulk_request() -> None:
+    """One DeleteObjects per listing page, which is what makes this cheaper than per-key deletes."""
+    client, fake = _delete_client([{"Contents": [{"Key": "ns/a"}, {"Key": "ns/b"}]}, {"Contents": [{"Key": "ns/c"}]}])
+
+    assert client.delete_prefix(S3Prefix("s3://bucket/ns")) == 3
+    assert [call["Delete"]["Objects"] for call in fake.delete_calls] == [
+        [{"Key": "ns/a"}, {"Key": "ns/b"}],
+        [{"Key": "ns/c"}],
+    ]
+
+
+def test_delete_prefix_anchors_the_listing_on_the_delimiter() -> None:
+    """Without the trailing slash the listing also matches a sibling named ``ns-2``."""
+    client, fake = _delete_client([{}])
+
+    client.delete_prefix(S3Prefix("s3://bucket/ns"))
+
+    assert fake.paginator.last_paginate_kwargs == {"Bucket": "bucket", "Prefix": "ns/"}
+
+
+def test_delete_prefix_refuses_a_bare_bucket() -> None:
+    """An empty key would anchor on ``/`` and sweep the whole bucket."""
+    client, fake = _delete_client([{"Contents": [{"Key": "anything"}]}])
+
+    with pytest.raises(ValueError, match="Refusing to delete the whole bucket"):
+        client.delete_prefix(S3Prefix("s3://bucket"))
+
+    assert fake.delete_calls == []
+
+
+def test_delete_prefix_raises_on_a_per_key_error_reported_in_a_successful_response() -> None:
+    """DeleteObjects reports refused keys in its body, so a bare 200 is not success."""
+    client, _ = _delete_client(
+        [{"Contents": [{"Key": "ns/a"}]}],
+        errors=[{"Key": "ns/a", "Message": "AccessDenied"}],
+    )
+
+    with pytest.raises(OSError, match="Failed to delete 1 of 1 objects under s3://bucket/ns"):
+        client.delete_prefix(S3Prefix("s3://bucket/ns"))
+
+
+def test_delete_prefix_refuses_a_client_not_configured_for_deletion() -> None:
+    """The capability gate every other destructive S3Client method carries."""
+    client, fake = _delete_client([{"Contents": [{"Key": "ns/a"}]}], can_delete=False)
+
+    with pytest.raises(ValueError, match="Deletion not allowed for prefix"):
+        client.delete_prefix(S3Prefix("s3://bucket/ns"))
+
+    assert fake.delete_calls == []

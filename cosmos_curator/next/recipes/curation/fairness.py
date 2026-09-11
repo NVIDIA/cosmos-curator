@@ -25,26 +25,29 @@ Distinct is not independent, and the difference matters when reading a report.
 The two keys share information by construction, because the fused vector weights
 subtask text at 0.6 and the level-2 cell is k-means over that same embedding:
 their measured normalized mutual information is 0.50, with 55% of the fairness key
-already fixed once the locality cluster is known. What follows from that is only
+already fixed once the locality cluster is known; the apparatus is in
+``docs/curator/design/curator-next-curation.md``, "What must stay separate".
+What follows from that is only
 that neither may be read as the other - they are NOT interchangeable. It has no
 operational consequence, because nothing here reads a cluster: ``FairnessQuota``
 is built from ``survivor_group_counts`` alone.
 
 The direction that would be a defect is the reverse one, and it is a measurement
-rather than a preference: the action block funds 0.2 of the fused metric and
-carries no task signal at all (task-separation ratio 0.990, same-task-closer AUC
-0.543 on 131,602 clips with repaired labels), so no function of the fused vector
-can stand in for a task identity.
+rather than a preference: the action block funds 0.2 of the fused metric and is
+measurably blind to which task is being performed - task-separation ratio 0.990,
+same-task-closer AUC 0.543, which is chance - so no function of the fused vector
+can stand in for a task identity. Measurement and apparatus:
+``docs/curator/design/curator-next-curation.md``, "Why each modality is present".
 
 The separation is between the two METRICS, not between strings and vectors. Both
 levels here are functions of the label's own text embedding - the one block that
 does carry label semantics, measured at AUC 0.853 - and neither ever reads the
 fused vector. Level 1 folds the task vocabulary pairwise, because the annotation
-schema bounds it (2,738 distinct tasks measured). Level 2 PARTITIONS the subtask
-text embedding into ``subtask_clusters`` cells, because its vocabulary is
-free-form annotator prose that grows with the corpus: at ~0.816 distinct labels
-per row a pairwise fold over it is both a quadratic driver kernel and a group
-count no quota can divide.
+schema bounds it: the distinct-task count is a property of that schema and does
+not move with the row count. Level 2 PARTITIONS the subtask text embedding into
+``subtask_clusters`` cells, because its vocabulary is free-form annotator prose
+resolved per shard, so its size grows with the corpus: a pairwise fold over it is
+both a quadratic driver kernel and a group count no quota can divide.
 
 Four steps, in this order, each a pure function here and wired by ``pipeline``::
 
@@ -309,16 +312,18 @@ _MERGE_COLLAPSE_WARN_FACTOR = 2
 # only a residue bounded by the level-1 remainder (see the module docstring). So
 # this line measures scarcity and is not weakened by the comparator, even though
 # reseeding can move it by tens of groups on a corpus of mixed cell occupancy.
-# A measured sweep is what moved it: at a target of 5%
-# of survivors 24.4% of groups received nothing, and at 3.8% it was 36.3% - both
-# silent at a halving factor, and neither is a regime an operator would want to
-# discover from the selected set.
+# A measured sweep is what moved the factor off a halving: at scarce targets a
+# quarter to over a third of the partition received nothing while a halving factor
+# stayed silent, and neither share is a regime an operator would want to discover
+# from the selected set. The swept numbers are in
+# docs/curator/design/curator-next-curation.md.
 #
-# It is a SMALL-CORPUS signal either way. At production scale (250M rows, ~2,738
-# tasks, 16 cells) G is bounded near 46,500 against a multi-million target, so
-# every group is funded, unfunded is zero, and this line is silent whatever the
-# factor. What it catches is a pilot run, or a k set far too high for the corpus
-# it was pointed at.
+# It is a SMALL-CORPUS signal either way. At the 250M-500M design envelope G is
+# bounded by the task vocabulary times the cell count, which the doc above works
+# out to orders of magnitude below a multi-million target, so every group is
+# funded, unfunded is zero, and this line is silent whatever the factor. What it
+# catches is a pilot run, or a k set far too high for the corpus it was pointed
+# at.
 #
 # This does NOT overlap _MERGE_COLLAPSE_WARN_FACTOR, which fires on too FEW
 # level-1 groups (a task merge that folded away most of its vocabulary). This

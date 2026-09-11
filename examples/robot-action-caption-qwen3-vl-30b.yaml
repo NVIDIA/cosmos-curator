@@ -1,0 +1,13 @@
+schema_version: 1
+kind: robot-action-caption
+input:
+  # Replace with the clips.lance produced by robot-action-split.
+  clips_lance_uri: s3://your-bucket/output/lerobot-clips/lance/clips.lance
+  # A split table carries no curate_selection_reason column, which the default
+  # selected-only scope requires, so dropping this line here fails preflight.
+  # Drop it only against a post-Curate table, to caption just its selected rows.
+  selected_only: false
+model:
+  variant: qwen3_vl_30b
+execution:
+  storage_profile: default

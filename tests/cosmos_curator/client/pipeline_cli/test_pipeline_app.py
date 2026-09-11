@@ -198,6 +198,7 @@ def test_pipeline_template_help_lists_caption_judge() -> None:
         "data-integrity",
         "embeddings",
         "multimodal-split",
+        "robot-action-caption",
         "robot-action-split",
         "video-caption",
         "video-split",
@@ -219,7 +220,7 @@ def test_pipeline_template_rejects_unknown_kind_as_json() -> None:
         "message": (
             "Unknown pipeline kind 'unknown'. Valid pipeline kinds: "
             "caption_judge, curate, data-integrity, embeddings, multimodal-split, "
-            "robot-action-split, video-caption, video-split, video_split"
+            "robot-action-caption, robot-action-split, video-caption, video-split, video_split"
         ),
     }
 

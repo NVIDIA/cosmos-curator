@@ -31,21 +31,26 @@ def test_ray_data_gpu_runtime_env_enables_ray_cuda_masking() -> None:
     env = ray_data_gpu_runtime_env("default")
 
     assert env.get("py_executable") == "pixi run --as-is -e default python"
-    assert env.get("env_vars") == {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0"}
+    assert env["env_vars"]["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_ray_data_gpu_runtime_env_pins_a_node_local_vllm_cache_root() -> None:
+    """Ray Data GPU runtime envs keep the vLLM cache off the shared cluster filesystem."""
+    env = ray_data_gpu_runtime_env("default")
+
+    assert env["env_vars"]["VLLM_CACHE_ROOT"] == "/tmp/vllm"  # noqa: S108
 
 
 def test_ray_data_gpu_runtime_env_merges_extra_env_vars() -> None:
     """GPU runtime env callers can pass additional actor environment variables."""
     env = ray_data_gpu_runtime_env("default", env_vars={"EXTRA": "1"})
 
-    assert env["env_vars"] == {
-        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
-        "EXTRA": "1",
-    }
+    assert env["env_vars"]["EXTRA"] == "1"
+    assert env["env_vars"]["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "0"
 
 
 def test_ray_data_gpu_runtime_env_preserves_cuda_masking_override() -> None:
     """GPU runtime env callers cannot accidentally disable Ray CUDA masking."""
     env = ray_data_gpu_runtime_env("default", env_vars={"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"})
 
-    assert env["env_vars"] == {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0"}
+    assert env["env_vars"]["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "0"
