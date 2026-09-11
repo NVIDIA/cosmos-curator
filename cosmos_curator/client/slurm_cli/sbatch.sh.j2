@@ -58,7 +58,17 @@ echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
 
 # ******************* These are read internally it seems ***********************************
 # ******** Master port, address and world size MUST be passed as variables for DDP to work
-head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+job_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+job_nodes_status=$?
+head_node=${job_nodes%%$'\n'*}
+if [ "${job_nodes_status}" -ne 0 ]; then
+  echo "Failed to resolve the Slurm head node (scontrol status ${job_nodes_status})." >&2
+  exit "${job_nodes_status}"
+fi
+if [ -z "${head_node}" ]; then
+  echo "Failed to resolve the Slurm head node: scontrol returned no nodes." >&2
+  exit 1
+fi
 
 export COSMOS_S3_PROFILE_PATH="/creds/s3_creds"
 export COSMOS_AZURE_PROFILE_PATH="/creds/azure_creds"
@@ -94,7 +104,12 @@ export {{ env_var }}="{{ value }}"
 if [ -f "{{source_environment_file}}" ]; then
   set -a
   source "{{source_environment_file}}"
+  source_environment_status=$?
   set +a
+  if [ "${source_environment_status}" -ne 0 ]; then
+    echo "Failed to source {{source_environment_file}} (status ${source_environment_status})." >&2
+    exit "${source_environment_status}"
+  fi
 fi
 {% endif %}
 
@@ -126,7 +141,9 @@ cleanup_on_exit() {
     rm -f "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json"
   fi
 }
-trap cleanup_on_exit EXIT SIGTERM SIGINT
+trap cleanup_on_exit EXIT
+trap 'exit 143' SIGTERM
+trap 'exit 130' SIGINT
 
 {% if prepare_node_local_mounts and node_local_mount_sources %}
 echo "Preparing node-local mount source paths..."
@@ -135,6 +152,11 @@ srun --mpi=none --nodes={{num_nodes}} --ntasks={{num_nodes}} --ntasks-per-node=1
 mkdir -p "{{node_local_mount_source}}"
 {% endfor %}
 '
+node_local_mount_status=$?
+if [ "${node_local_mount_status}" -ne 0 ]; then
+  echo "Failed to prepare node-local mount paths (srun status ${node_local_mount_status})." >&2
+  exit "${node_local_mount_status}"
+fi
 {% endif %}
 
 # Actual run command
@@ -149,5 +171,7 @@ srun \
   --container-mounts {{container_mounts}} \
   --container-env {{ container_env_keys | join(',') }} \
   bash -c {{container_command}} _ {{command}}
+srun_status=$?
 
-echo "$(date) - Srun called."
+echo "$(date) - Srun exited with status ${srun_status}."
+exit "${srun_status}"
