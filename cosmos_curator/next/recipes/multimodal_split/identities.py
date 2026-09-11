@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Clip identity for the ``multimodal-split`` recipe.
+"""Stable identities for the ``multimodal-split`` recipe.
 
 What a clip is addressed by, and therefore what a rerun overwrites rather than
 duplicates. Separate from the stage that writes it so that changing how a clip
 is produced cannot quietly change where it lands.
 """
 
+from typing import Any
+
 from cosmos_curator.next.media.spans import Span
+from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
+from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns
 from cosmos_curator.next.utils.identity import canonical_digest
 
 # Bump when the meaning of written media changes in a way the settings do not
@@ -30,6 +34,9 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # digest inputs changed, so a version left at 1 would name two different
 # identity schemes -- ids from either would be version 1 and indistinguishable.
 MEDIA_CONTRACT_VERSION = 2
+EPISODE_IDENTITY_VERSION = 1
+SPLIT_CONTRACT_DIGEST_VERSION = 1
+MATERIALIZATION_DIGEST_VERSION = 1
 
 
 def make_source_id(session_uri: str) -> str:
@@ -87,5 +94,77 @@ def make_clip_id(source_id: str, span: Span) -> str:
             "start_ns": span.start_ns,
             "end_ns": span.end_ns,
             "media_contract_version": MEDIA_CONTRACT_VERSION,
+        }
+    )
+
+
+def make_episode_id(source_id: str, span: Span) -> str:
+    """Identify one logical source interval independently of its rendering."""
+    return canonical_digest(
+        {
+            "kind": "multimodal-av-episode",
+            "episode_identity_version": EPISODE_IDENTITY_VERSION,
+            "source_id": source_id,
+            "start_ns": span.start_ns,
+            "exclusive_end_ns": span.end_ns,
+        }
+    )
+
+
+def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
+    """Bind the settings that define the camera-media transformation."""
+    return canonical_digest(
+        {
+            "kind": "multimodal-av-split-contract",
+            "split_contract_digest_version": SPLIT_CONTRACT_DIGEST_VERSION,
+            "media_contract_version": MEDIA_CONTRACT_VERSION,
+            "clip": {
+                "duration_ns": clip_duration_ns(config),
+                "sampling_fps": config.clip.sampling_fps,
+            },
+            "cameras": [
+                {"camera_key": key, "sensor_type": camera.sensor_type} for key, camera in sorted(config.cameras.items())
+            ],
+            "video": {
+                "max_delta_ns": config.video.max_delta_ns,
+                "encoder": {
+                    "video_encoder": config.video.encoder.video_encoder,
+                    "video_bitrate": config.video.encoder.video_bitrate,
+                    "gop_size": config.video.encoder.gop_size,
+                    "faststart": config.video.encoder.faststart,
+                },
+            },
+        }
+    )
+
+
+def make_materialization_digest(  # noqa: PLR0913 -- every input is a normative digest field
+    *,
+    episode_id: str,
+    split_clip_id: str,
+    split_contract_digest: str,
+    sampling_fps: int,
+    row_count: int,
+    camera_media: list[dict[str, Any]],
+) -> str:
+    """Bind an episode to the exact camera MP4 and timing-sidecar bytes."""
+    return canonical_digest(
+        {
+            "kind": "multimodal-av-episode-materialization",
+            "materialization_digest_version": MATERIALIZATION_DIGEST_VERSION,
+            "episode_id": episode_id,
+            "split_clip_id": split_clip_id,
+            "split_contract_digest": split_contract_digest,
+            "sampling_fps": sampling_fps,
+            "row_count": row_count,
+            "camera_artifacts": [
+                {
+                    "camera_key": str(camera["camera_key"]),
+                    "media_sha256": str(camera["media_sha256"]),
+                    "timeline_sha256": str(camera["timeline_sha256"]),
+                    "observations_sha256": str(camera["observations_sha256"]),
+                }
+                for camera in sorted(camera_media, key=lambda camera: str(camera["camera_key"]))
+            ],
         }
     )

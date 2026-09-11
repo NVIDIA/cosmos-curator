@@ -129,10 +129,10 @@ class MultimodalSplitClipConfig(BaseModel):
         """Check that a clip's duration is a whole number of sampled frames.
 
         A clip is a whole number of frames or it is not a valid clip, and 0.333 s
-        at 30 fps is 9.99 of them. Deliberately stricter than the design
-        document, whose ``row_count = floor(duration_ns * sampling_fps /
-        1_000_000_000)`` would truncate that tail -- refusing the config beats
-        silently dropping a partial frame at runtime.
+        at 30 fps is 9.99 of them. Refusing that config preserves the requested
+        duration instead of silently dropping a partial frame at runtime. The
+        delivered half-open grid remains authoritative for row count after the
+        duration is normalized to integer nanoseconds.
 
         Every arithmetic check here goes through ``Decimal`` rather than float.
         The two diverge on ordinary durations -- ``65.693362 * 1e9`` is
@@ -320,19 +320,26 @@ class MultimodalSplitSensorConfig(BaseModel):
 
 
 class MultimodalSplitOutputConfig(BaseModel):
-    """Where written media goes.
-
-    Only media today. The Lance table and error report URIs that ``video_split``
-    carries belong to the publication ticket, and adding them here before
-    anything writes them would describe a surface that does not exist.
-    """
+    """Output root for camera artifacts, diagnostics, and canonical episodes."""
 
     model_config = _MODEL_CONFIG
 
     path: str = Field(
         min_length=1,
-        description="Local directory or s3:// prefix that written clips are placed beneath.",
+        description="Local directory or s3:// prefix containing sessions/, errors/, and episodes.lance.",
     )
+
+    # Publication deliberately remains in schema v1: it is unconditional,
+    # derives episodes.lance from output.path, and adds no setting or opt-out.
+    @property
+    def episodes_lance_uri(self) -> str:
+        """Return the fixed canonical episode-table location beneath the output root."""
+        if "://" not in self.path:
+            return f"{self.path.rstrip('/')}/episodes.lance"
+        # Preserve URI root separators: stripping the whole ``file:///`` string
+        # would turn the filesystem root into the relative-looking ``file:``.
+        parsed = urlsplit(self.path)
+        return parsed._replace(path=f"{parsed.path.rstrip('/')}/episodes.lance").geturl()
 
     @field_validator("path")
     @classmethod

@@ -30,7 +30,8 @@ from typing import Any, NamedTuple, cast
 import pyarrow as pa
 import ray
 from loguru import logger
-from ray.data.aggregate import Count, Sum
+from ray.data.aggregate import Sum
+from ray.data.expressions import col
 
 from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_progress,
@@ -39,9 +40,26 @@ from cosmos_curator.next.core.ray_runtime import (
 )
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig, resolve_config
 from cosmos_curator.next.recipes.multimodal_split.discovery import discover_candidate_sessions
-from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
+from cosmos_curator.next.recipes.multimodal_split.identities import make_source_id
+from cosmos_curator.next.recipes.multimodal_split.lance_sink import (
+    append_episode_fragment,
+    open_episode_table,
+    open_or_create_episode_table,
+)
+from cosmos_curator.next.recipes.multimodal_split.plan import (
+    ALREADY_CANONICAL,
+    CAMERA_PLAN,
+    remaining_episode_ids_batch,
+    span_planner_batch,
+)
 from cosmos_curator.next.recipes.multimodal_split.preflight import check_readable, check_writable
-from cosmos_curator.next.recipes.multimodal_split.split import split_session
+from cosmos_curator.next.recipes.multimodal_split.publication import (
+    PublicationSummary,
+    assemble_episode_group,
+    stage_episode_batch,
+)
+from cosmos_curator.next.recipes.multimodal_split.recovery import ReconciliationMap, read_reconciliation
+from cosmos_curator.next.recipes.multimodal_split.split import split_camera_batch
 from cosmos_curator.next.recipes.multimodal_split.storage import list_error_reports, open_sensor_source
 
 
@@ -76,6 +94,15 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     check_readable(config.input.input_path_prefix, storage_profile=config.execution.storage_profile)
     check_writable(config.output.path, storage_profile=config.execution.storage_profile)
 
+    episode_dataset = open_or_create_episode_table(
+        uri=config.output.episodes_lance_uri,
+        storage_profile=config.execution.storage_profile,
+    )
+    source_ids = [make_source_id(str(location)) for location in sessions["session_uri"].to_pylist()]
+    # Read existing episode facts from one driver-pinned snapshot so planner
+    # workers do not open Lance.
+    reconciliation = read_reconciliation(episode_dataset, source_ids)
+
     ensure_ray_initialized()
     configure_ray_data_progress(progress=config.execution.progress)
     configure_ray_data_stability(disable_high_memory_detector=True)
@@ -84,11 +111,46 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     # those into that camera's clips. One lineage, and the driver is not part of
     # it: the rows are counted in the same pass that sums their bytes, so a run
     # of ten thousand sessions never assembles its clips in one process.
-    plans = plan_dataset(sessions, config)
-    clips = clip_dataset(plans, config)
-    totals = clips.aggregate(Count(), Sum("clip_bytes"))
-    clips_written = int(totals["count()"] or 0)
-    clip_bytes = int(totals["sum(clip_bytes)"] or 0)
+    # Planning writes manifests for absent work, so materialize it before the
+    # tagged stream is consumed twice for encoding and skip accounting.
+    plans = plan_dataset(sessions, config, reconciliation=reconciliation).materialize()
+    already_canonical_plans = plans.filter(expr=col("result_kind") == ALREADY_CANONICAL)
+    camera_plans = plans.filter(expr=col("result_kind") == CAMERA_PLAN)
+    already_canonical = already_canonical_plans.count()
+    # Camera rows repeat each planned episode ID. De-duplicate within each
+    # block first to discard the large repeated plan payload, then globally
+    # group the projected IDs so Ray block shaping cannot inflate the count.
+    remaining_episode_ids = camera_plans.map_batches(
+        cast("Any", remaining_episode_ids_batch),
+        batch_format="pyarrow",
+        batch_size=None,
+    )
+    episodes_remaining = _count_unique_episode_ids(remaining_episode_ids)
+    episodes_planned = already_canonical + episodes_remaining
+    if episodes_remaining:
+        outcomes = clip_dataset(plans, config)
+        # Cache assembled results so publication's later consumers cannot replay
+        # splitting's media writes.
+        assembled = assembly_dataset(outcomes).materialize()
+        publication = publish_assembled_episodes(assembled, config=config)
+    else:
+        publication = PublicationSummary(
+            episodes_newly_published=0,
+            episodes_dropped=0,
+            camera_clips_written=0,
+            clip_bytes=0,
+        )
+    validate_episode_accounting(
+        episodes_planned=episodes_planned,
+        episodes_already_canonical=already_canonical,
+        episodes_newly_published=publication.episodes_newly_published,
+        episodes_dropped=publication.episodes_dropped,
+    )
+    final_episode_dataset = open_episode_table(
+        uri=config.output.episodes_lance_uri,
+        storage_profile=config.execution.storage_profile,
+    )
+    final_lance_version = int(final_episode_dataset.version)
 
     failures = read_failures(config)
     # A sample, not the set. One warning per failure buries the shape of a bad
@@ -110,17 +172,23 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     elapsed_seconds = monotonic() - started_at
     summary: dict[str, Any] = {
         "sessions": sessions.num_rows,
-        "camera_clips_written": clips_written,
+        "camera_clips_written": publication.camera_clips_written,
+        "episodes_planned": episodes_planned,
+        "episodes_already_canonical": already_canonical,
+        "episodes_newly_published": publication.episodes_newly_published,
+        "episodes_dropped": publication.episodes_dropped,
         "failures": failures.total,
         "failures_by_category": errors_by_category,
-        "clip_bytes": clip_bytes,
+        "clip_bytes": publication.clip_bytes,
         "elapsed_seconds": elapsed_seconds,
         "output_path": config.output.path,
+        "episodes_lance_uri": config.output.episodes_lance_uri,
+        "episodes_lance_version": final_lance_version,
     }
     logger.info(
         "Wrote {} camera clip(s) ({}) from {} session(s) to {}",
-        clips_written,
-        _format_bytes(clip_bytes),
+        publication.camera_clips_written,
+        _format_bytes(publication.clip_bytes),
         sessions.num_rows,
         config.output.path,
     )
@@ -132,6 +200,15 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
             "Failures by category: {}",
             ", ".join(f"{category}={count}" for category, count in sorted(errors_by_category.items())),
         )
+    logger.info(
+        "Canonical episodes at {} v{}: planned={}, already_canonical={}, newly_published={}, dropped={}",
+        config.output.episodes_lance_uri,
+        final_lance_version,
+        episodes_planned,
+        already_canonical,
+        publication.episodes_newly_published,
+        publication.episodes_dropped,
+    )
     logger.info("Multimodal split finished: elapsed={}", _format_elapsed(elapsed_seconds))
     return summary
 
@@ -160,6 +237,32 @@ def _format_bytes(total: int) -> str:
     return f"{size:.1f} GiB"
 
 
+def validate_episode_accounting(
+    *,
+    episodes_planned: int,
+    episodes_already_canonical: int,
+    episodes_newly_published: int,
+    episodes_dropped: int,
+) -> None:
+    """Require every independently planned episode to reach one terminal state."""
+    accounted = episodes_already_canonical + episodes_newly_published + episodes_dropped
+    if episodes_planned != accounted:
+        msg = (
+            f"Episode accounting mismatch: planned={episodes_planned}, "
+            f"already_canonical={episodes_already_canonical}, "
+            f"newly_published={episodes_newly_published}, dropped={episodes_dropped}"
+        )
+        raise RuntimeError(msg)
+
+
+def _count_unique_episode_ids(episode_ids: ray.data.Dataset) -> int:
+    """Count episode IDs globally, independent of Ray block layout."""
+    # Exact by construction. Use distributed key grouping rather than
+    # CountDistinct's global unique-set accumulator because this value gates a
+    # hard post-publication accounting failure.
+    return int(episode_ids.groupby("split_clip_id").count().count())
+
+
 # Bytes per gibibyte, so the config's ``memory_gb`` maps to Ray's
 # ``memory=`` (bytes) without a magic ``1024**3`` at the call site. This matches
 # how the embeddings recipe converts its own per-worker reservation.
@@ -169,7 +272,12 @@ _BYTES_PER_GIB = 1024**3
 _FAILURE_EXAMPLES = 5
 
 
-def plan_dataset(session_table: pa.Table, config: ResolvedMultimodalSplitConfig) -> ray.data.Dataset:
+def plan_dataset(
+    session_table: pa.Table,
+    config: ResolvedMultimodalSplitConfig,
+    *,
+    reconciliation: ReconciliationMap | None = None,
+) -> ray.data.Dataset:
     """Fan sessions out to one planning task each, emitting a row per camera.
 
     Takes the table discovery built rather than a list of dicts: from_arrow keeps
@@ -177,9 +285,15 @@ def plan_dataset(session_table: pa.Table, config: ResolvedMultimodalSplitConfig)
     dict per session on the driver first.
     """
     sessions: ray.data.Dataset = ray.data.from_arrow(session_table, override_num_blocks=session_table.num_rows)
-    return sessions.flat_map(
-        cast("Any", span_planner),
-        fn_kwargs={"config": config, "storage_profile": config.execution.storage_profile},
+    return sessions.map_batches(
+        cast("Any", span_planner_batch),
+        batch_format="pyarrow",
+        batch_size=None,
+        fn_kwargs={
+            "config": config,
+            "storage_profile": config.execution.storage_profile,
+            "reconciliation": reconciliation or {},
+        },
         # Measured over S3: a planning task keeps 0.13 of a core busy, spending
         # 96% of its wall clock waiting on storage -- 0.29 on a local disk, which
         # is why SpanPlannerResources makes this a setting rather than a constant. Asking for a whole CPU overstates
@@ -190,11 +304,11 @@ def plan_dataset(session_table: pa.Table, config: ResolvedMultimodalSplitConfig)
 
 
 def clip_dataset(plans: ray.data.Dataset, config: ResolvedMultimodalSplitConfig) -> ray.data.Dataset:
-    """Turn each planned camera into its clips, one row at a time.
+    """Turn each planned camera into fixed-schema terminal outcomes.
 
     A camera, not a session: a task now holds one decode rather than a whole
     rig's twelve, which is a truer figure to declare. It is not more
-    parallelism, though: ``flat_map`` dispatches one task per block, and the
+    parallelism, though: ``map_batches`` dispatches one task per block, and the
     planner's per-camera rows stay inside their session's block, so a rig's
     cameras are split one after another in the same task. Concurrency is the
     session count either way.
@@ -203,11 +317,71 @@ def clip_dataset(plans: ray.data.Dataset, config: ResolvedMultimodalSplitConfig)
     run by that instead.
     """
     memory_gb = config.execution.split_session.memory_gb
-    return plans.flat_map(
-        cast("Any", split_session),
+    camera_plans = plans.filter(expr=col("result_kind") == CAMERA_PLAN)
+    return camera_plans.map_batches(
+        cast("Any", split_camera_batch),
+        batch_format="pyarrow",
+        batch_size=None,
         fn_kwargs={"config": config, "storage_profile": config.execution.storage_profile},
         memory=(None if memory_gb is None else int(memory_gb * _BYTES_PER_GIB)),
     )
+
+
+def assembly_dataset(outcomes: ray.data.Dataset) -> ray.data.Dataset:
+    """Group current-run camera outcomes into one terminal episode result."""
+    # Completeness belongs to the full planned camera set, so this episode-level
+    # shuffle is required; publishing camera outcomes directly could publish partial episodes.
+    return outcomes.groupby("split_clip_id").map_groups(
+        cast("Any", assemble_episode_group),
+        batch_format="pyarrow",
+        zero_copy_batch=True,
+    )
+
+
+# Reuse robot_action_split's private 8,000-row publish-batch default.
+# Tune independently when multimodal episode fragment measurements exist.
+_EPISODES_PER_PUBLICATION_BLOCK = 8_000
+_APPEND_ATTEMPTS = 3
+
+
+def publish_assembled_episodes(
+    assembled: ray.data.Dataset,
+    *,
+    config: ResolvedMultimodalSplitConfig,
+) -> PublicationSummary:
+    """Stage complete rows on workers, commit serially, and total terminal accounting."""
+    totals = assembled.aggregate(Sum("camera_clips_written"), Sum("camera_clip_bytes"))
+    camera_total = totals["sum(camera_clips_written)"]
+    camera_clips_written = int(camera_total or 0)
+    byte_total = totals["sum(camera_clip_bytes)"]
+    clip_bytes = int(byte_total or 0)
+    dropped = assembled.filter(expr=col("assembly_status") == "dropped").count()
+    complete = assembled.filter(expr=col("assembly_status") == "complete")
+    complete_count = complete.count()
+    if complete_count == 0:
+        return PublicationSummary(0, dropped, camera_clips_written, clip_bytes)
+
+    batches = complete.repartition(target_num_rows_per_block=_EPISODES_PER_PUBLICATION_BLOCK, strict=True)
+    staged = batches.map_batches(
+        cast("Any", stage_episode_batch),
+        batch_format="pyarrow",
+        batch_size=None,
+        fn_kwargs={
+            "uri": config.output.episodes_lance_uri,
+            "storage_profile": config.execution.storage_profile,
+        },
+    )
+    published = 0
+    for batch in staged.iter_batches(prefetch_batches=0, batch_size=None, batch_format="pyarrow"):
+        for result in cast("pa.Table", batch).to_pylist():
+            append_episode_fragment(
+                str(result["candidate_json"]),
+                uri=config.output.episodes_lance_uri,
+                storage_profile=config.execution.storage_profile,
+                attempts=_APPEND_ATTEMPTS,
+            )
+            published += int(result["episode_count"])
+    return PublicationSummary(published, dropped, camera_clips_written, clip_bytes)
 
 
 class FailureSummary(NamedTuple):

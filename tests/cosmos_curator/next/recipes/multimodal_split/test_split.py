@@ -455,6 +455,33 @@ def test_a_camera_is_opened_as_a_stream_rather_than_a_path(tmp_path: Path, make_
         assert source.seekable()
 
 
+def test_an_unreadable_camera_emits_one_failure_outcome_per_planned_span(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An early open failure cannot make every episode for that camera disappear from accounting."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    config = make_config(root, tmp_path / "media")
+    plan = span_planner(
+        {"source_session_id": "session-000", "session_uri": str(session)},
+        config=config,
+    )[0]
+    monkeypatch.setattr(
+        split_module,
+        "open_sensor_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("camera unavailable")),
+    )
+
+    outcomes = split_module.split_session(plan, config=config)
+
+    assert len(outcomes) == len(plan["spans"])
+    assert {outcome["status"] for outcome in outcomes} == {"failure"}
+    assert all(outcome["expected_row_count"] == 30 for outcome in outcomes)
+
+
 def test_splitting_builds_no_video_index(
     tmp_path: Path,
     make_session: Callable[..., Path],

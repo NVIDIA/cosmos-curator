@@ -272,7 +272,12 @@ def test_a_run_splits_the_sessions_it_discovers(
 
     assert output.json_payload["sessions"] == 2
     assert output.json_payload["camera_clips_written"] == 6
+    assert output.json_payload["episodes_planned"] == 6
+    assert output.json_payload["episodes_newly_published"] == 6
     assert output.json_payload["failures"] == 0
+    assert output.json_payload["episodes_lance_uri"] == str(tmp_path / "media" / "episodes.lance")
+    assert "published 6 new episode(s)" in output.message
+    assert "episodes.lance at Lance v" in output.message
     assert "6 camera clip(s)" in output.message
 
 

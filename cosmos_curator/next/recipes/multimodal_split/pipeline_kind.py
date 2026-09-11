@@ -16,8 +16,8 @@
 """Config-backed pipeline-kind surface for the ``multimodal-split`` recipe.
 
 A run discovers candidate sessions and splits each one into per-camera clips,
-one MP4 per configured camera. The non-camera modalities and Lance publication
-are separate work, and none of them changes this surface.
+one MP4 per configured camera, then publishes one canonical Lance row for each
+complete camera set. Non-camera modalities remain separate work.
 """
 
 from collections.abc import Sequence
@@ -99,8 +99,9 @@ def _prepare_run(
         return PipelineRunOutput(
             json_payload=summary,
             message=(
-                f"multimodal-split: wrote {summary['camera_clips_written']} camera clip(s) from "
-                f"{summary['sessions']} session(s) to {summary['output_path']}, with "
+                f"multimodal-split: published {summary['episodes_newly_published']} new episode(s) and wrote "
+                f"{summary['camera_clips_written']} camera clip(s) from {summary['sessions']} session(s) to "
+                f"{summary['episodes_lance_uri']} at Lance v{summary['episodes_lance_version']}, with "
                 f"{summary['failures']} failure(s)."
             ),
         )

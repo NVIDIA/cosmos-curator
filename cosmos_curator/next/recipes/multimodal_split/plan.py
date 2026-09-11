@@ -31,9 +31,11 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sampling.sampler import find_closest_indices
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.grids import (
@@ -42,7 +44,15 @@ from cosmos_curator.next.recipes.multimodal_split.grids import (
     sampling_grid_ns,
     timeline_end_ns,
 )
-from cosmos_curator.next.recipes.multimodal_split.identities import make_clip_id, make_source_id
+from cosmos_curator.next.recipes.multimodal_split.identities import (
+    MEDIA_CONTRACT_VERSION,
+    make_clip_id,
+    make_episode_id,
+    make_source_id,
+    make_split_contract_digest,
+)
+from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
+from cosmos_curator.next.recipes.multimodal_split.recovery import ReconciliationMap, reconcile_planned_episode
 from cosmos_curator.next.recipes.multimodal_split.reports import (
     failure,
     write_clip_manifest,
@@ -55,32 +65,65 @@ from cosmos_curator.next.recipes.multimodal_split.storage import (
 )
 
 SENSOR_TYPE_CAMERA = "camera"
+CAMERA_PLAN = "camera_plan"
+ALREADY_CANONICAL = "already_canonical"
 
-SPAN_PLAN_SCHEMA = pa.schema(
+_PLANNED_SPAN_STRUCT = pa.struct(
     [
+        pa.field("clip_id", pa.string(), nullable=False),
+        pa.field("episode_id", pa.string(), nullable=False),
+        pa.field("source_id", pa.string(), nullable=False),
         pa.field("source_session_id", pa.large_string(), nullable=False),
-        pa.field("sensor_key", pa.large_string(), nullable=False),
-        pa.field("sensor_uri", pa.large_string(), nullable=False),
-        # Every sensor is a camera today. Named anyway, because splitting a rig
-        # of cameras and an IMU is the same job on different media, and the
-        # stage that reads this row has to know which it was handed.
-        pa.field("sensor_type", pa.large_string(), nullable=False),
-        pa.field("timeline_ns", pa.large_list(pa.int64()), nullable=False),
+        pa.field("source_session_location", pa.large_string(), nullable=False),
+        pa.field("start_ns", pa.int64(), nullable=False),
+        pa.field("exclusive_end_ns", pa.int64(), nullable=False),
+        pa.field("sampling_fps", pa.int32(), nullable=False),
+        pa.field("expected_row_count", pa.int64(), nullable=False),
+        pa.field("timestamp_source", pa.string(), nullable=False),
+        pa.field("record_schema_version", pa.int32(), nullable=False),
+        pa.field("media_contract_version", pa.int32(), nullable=False),
+        pa.field("split_contract_digest", pa.string(), nullable=False),
         pa.field(
-            "spans",
-            pa.large_list(
-                pa.struct(
-                    [
-                        pa.field("clip_id", pa.large_string(), nullable=False),
-                        pa.field("start_ns", pa.int64(), nullable=False),
-                        pa.field("exclusive_end_ns", pa.int64(), nullable=False),
-                    ]
-                )
-            ),
+            "planned_camera_keys",
+            pa.large_list(pa.field("item", pa.string(), nullable=False)),
             nullable=False,
         ),
     ]
 )
+
+PLANNING_RESULT_SCHEMA = pa.schema(
+    [
+        pa.field("result_kind", pa.string(), nullable=False),
+        pa.field("source_session_id", pa.large_string(), nullable=False),
+        pa.field("sensor_key", pa.large_string()),
+        pa.field("sensor_uri", pa.large_string()),
+        # Every sensor is a camera today. Named anyway, because splitting a rig
+        # of cameras and an IMU is the same job on different media, and the
+        # stage that reads this row has to know which it was handed.
+        pa.field("sensor_type", pa.large_string()),
+        pa.field("timeline_ns", pa.large_list(pa.int64())),
+        pa.field(
+            "spans",
+            pa.large_list(pa.field("item", _PLANNED_SPAN_STRUCT, nullable=False)),
+        ),
+        pa.field("episode_id", pa.string()),
+    ]
+)
+# Compatibility name for callers that treated this as the planner's output schema.
+SPAN_PLAN_SCHEMA = PLANNING_RESULT_SCHEMA
+
+REMAINING_EPISODE_ID_SCHEMA = pa.schema([pa.field("split_clip_id", pa.string(), nullable=False)])
+
+
+def remaining_episode_ids_batch(plans: pa.Table) -> pa.Table:
+    """Project the unique episode IDs represented by a camera-plan block."""
+    spans = pc.list_flatten(plans["spans"])
+    clip_ids = pc.struct_field(spans, "clip_id").to_pylist()
+    episode_ids = sorted({str(clip_id) for clip_id in clip_ids})
+    return pa.Table.from_pydict(
+        {"split_clip_id": episode_ids},
+        schema=REMAINING_EPISODE_ID_SCHEMA,
+    )
 
 
 def span_planner(
@@ -88,6 +131,7 @@ def span_planner(
     *,
     config: ResolvedMultimodalSplitConfig,
     storage_profile: str = "default",
+    reconciliation: ReconciliationMap | None = None,
 ) -> list[dict[str, Any]]:
     """Plan one session into spans, and emit one row per camera that will serve them.
 
@@ -158,39 +202,101 @@ def span_planner(
     if not servable:
         return []
 
-    planned = [
-        {
+    camera_keys = sorted(cameras)
+    camera_sources = {key: sensor_uris[key] for key in camera_keys}
+    split_contract_digest = make_split_contract_digest(config)
+    planned: list[dict[str, Any]] = []
+    already_canonical: list[dict[str, Any]] = []
+    existing_by_episode_id = (reconciliation or {}).get(source_id, {})
+    for span in servable:
+        entry: dict[str, Any] = {
             "clip_id": make_clip_id(source_id, span),
+            "episode_id": make_episode_id(source_id, span),
+            "source_id": source_id,
+            "source_session_id": session_id,
+            "source_session_location": session_uri,
             "start_ns": span.start_ns,
             "exclusive_end_ns": span.end_ns,
+            "sampling_fps": config.clip.sampling_fps,
+            # The delivered half-open grid is authoritative. Publication
+            # regenerates it so a carried row count cannot diverge silently.
+            "expected_row_count": len(sampling_grid_ns(span, config)),
+            "timestamp_source": TimestampSource.CAPTURE.value,
+            "record_schema_version": RECORD_SCHEMA_VERSION,
+            "media_contract_version": MEDIA_CONTRACT_VERSION,
+            "split_contract_digest": split_contract_digest,
+            "planned_camera_keys": camera_keys,
         }
-        for span in servable
-    ]
+        if reconcile_planned_episode(
+            entry,
+            existing_by_episode_id=existing_by_episode_id,
+            camera_sources=camera_sources,
+        ):
+            already_canonical.append(
+                {
+                    "result_kind": ALREADY_CANONICAL,
+                    "source_session_id": session_id,
+                    "sensor_key": None,
+                    "sensor_uri": None,
+                    "sensor_type": None,
+                    "timeline_ns": None,
+                    "spans": None,
+                    "episode_id": entry["episode_id"],
+                }
+            )
+        else:
+            planned.append(entry)
     # Written here rather than after the media, because no single camera task
     # knows which other views a clip holds. Coverage is all-or-nothing, so the
     # planned set is the set -- unless an encode fails, which its camera reports.
-    for span, entry in zip(servable, planned, strict=True):
+    for entry in planned:
+        span = Span(start_ns=int(entry["start_ns"]), end_ns=int(entry["exclusive_end_ns"]))
         write_clip_manifest(
             session_id,
             str(entry["clip_id"]),
             span,
-            sorted(cameras),
+            camera_keys,
             output_path=config.output.path,
             sampling_fps=config.clip.sampling_fps,
             storage_profile=storage_profile,
         )
 
-    return [
+    camera_plans = [
         {
+            "result_kind": CAMERA_PLAN,
             "source_session_id": session_id,
             "sensor_key": key,
             "sensor_uri": sensor_uris[key],
             "sensor_type": SENSOR_TYPE_CAMERA,
             "timeline_ns": timelines[key].tolist(),
             "spans": planned,
+            "episode_id": None,
         }
         for key in cameras
+        if planned
     ]
+    return [*camera_plans, *already_canonical]
+
+
+def span_planner_batch(
+    sessions: pa.Table,
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str = "default",
+    reconciliation: ReconciliationMap | None = None,
+) -> pa.Table:
+    """Plan one Arrow block while preserving the fixed transient result schema."""
+    rows = [
+        result
+        for session in sessions.to_pylist()
+        for result in span_planner(
+            session,
+            config=config,
+            storage_profile=storage_profile,
+            reconciliation=reconciliation,
+        )
+    ]
+    return pa.Table.from_pylist(rows, schema=PLANNING_RESULT_SCHEMA)
 
 
 def plan_common_spans(

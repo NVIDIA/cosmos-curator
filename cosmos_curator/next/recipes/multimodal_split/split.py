@@ -21,6 +21,7 @@ a partially decodable session yields whole clips and named failures rather than
 short clips.
 """
 
+import hashlib
 import io
 import itertools
 import tempfile
@@ -30,6 +31,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import pyarrow as pa
 
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
@@ -60,6 +62,40 @@ from cosmos_curator.next.utils.storage import write_media
 # or how many rows it holds.
 FrameProvider = Callable[[Span, int, list[int]], Iterator[npt.NDArray[np.uint8]]]
 
+CAMERA_OUTCOME_SCHEMA = pa.schema(
+    [
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("record_schema_version", pa.int32(), nullable=False),
+        pa.field("media_contract_version", pa.int32(), nullable=False),
+        pa.field("episode_id", pa.string(), nullable=False),
+        pa.field("split_clip_id", pa.string(), nullable=False),
+        pa.field("source_id", pa.string(), nullable=False),
+        pa.field("source_session_id", pa.large_string(), nullable=False),
+        pa.field("source_session_location", pa.large_string(), nullable=False),
+        pa.field("start_ns", pa.int64(), nullable=False),
+        pa.field("exclusive_end_ns", pa.int64(), nullable=False),
+        pa.field("sampling_fps", pa.int32(), nullable=False),
+        pa.field("expected_row_count", pa.int64(), nullable=False),
+        pa.field("timestamp_source", pa.string(), nullable=False),
+        pa.field("split_contract_digest", pa.string(), nullable=False),
+        pa.field(
+            "planned_camera_keys",
+            pa.large_list(pa.field("item", pa.string(), nullable=False)),
+            nullable=False,
+        ),
+        pa.field("camera_key", pa.string(), nullable=False),
+        pa.field("sensor_type", pa.string(), nullable=False),
+        pa.field("source_media_location", pa.large_string(), nullable=False),
+        pa.field("media_location", pa.large_string()),
+        pa.field("media_size_bytes", pa.int64()),
+        pa.field("media_sha256", pa.string()),
+        pa.field("timeline_location", pa.large_string()),
+        pa.field("timeline_sha256", pa.string()),
+        pa.field("observations_location", pa.large_string()),
+        pa.field("observations_sha256", pa.string()),
+    ]
+)
+
 
 def split_session(
     item: dict[str, Any],
@@ -89,7 +125,7 @@ def split_session(
     )
     clip_ids = [str(entry["clip_id"]) for entry in item["spans"]]
 
-    rows: list[dict[str, Any]] = []
+    clips: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     try:
         # The stream is caller-owned and stays open for every span: the library
@@ -100,7 +136,6 @@ def split_session(
             clips, walk_failures = _stream_clips(
                 source, spans, clip_ids, timeline, session_id, sensor_key, sensor_type, config, storage_profile
             )
-            rows.extend(clips)
             failures.extend(walk_failures)
     except Exception as error:  # noqa: BLE001 -- one unreadable view is one failed sensor
         failures.append(failure(session_id, sensor_key, None, "open_sensor", error))
@@ -108,7 +143,77 @@ def split_session(
     write_sensor_errors(
         session_id, sensor_key, failures, output_path=config.output.path, storage_profile=storage_profile
     )
-    return rows
+    # Join successes back onto every planned span. errors/ is diagnostic history,
+    # so this terminal stream must also represent failures and all-failed episodes.
+    clips_by_id = {str(clip["clip_id"]): clip for clip in clips}
+    if len(clips_by_id) != len(clips):
+        msg = f"Camera {sensor_key!r} emitted duplicate successful clip IDs"
+        raise ValueError(msg)
+    return [_camera_outcome(item, entry, clips_by_id.get(str(entry["clip_id"]))) for entry in item["spans"]]
+
+
+def split_camera_batch(
+    plans: pa.Table,
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str = "default",
+) -> pa.Table:
+    """Split one Arrow block while preserving the fixed terminal outcome schema."""
+    rows = [
+        outcome
+        for plan in plans.to_pylist()
+        for outcome in split_session(plan, config=config, storage_profile=storage_profile)
+    ]
+    return pa.Table.from_pylist(rows, schema=CAMERA_OUTCOME_SCHEMA)
+
+
+def _camera_outcome(
+    plan: dict[str, Any],
+    span: dict[str, Any],
+    clip: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build one terminal outcome for every planned camera span."""
+    if clip is None:
+        success_fields: dict[str, Any] = {
+            "media_location": None,
+            "media_size_bytes": None,
+            "media_sha256": None,
+            "timeline_location": None,
+            "timeline_sha256": None,
+            "observations_location": None,
+            "observations_sha256": None,
+        }
+    else:
+        success_fields = {
+            "media_location": str(clip["clip_location"]),
+            "media_size_bytes": int(clip["clip_bytes"]),
+            "media_sha256": str(clip["media_sha256"]),
+            "timeline_location": str(clip["timeline_location"]),
+            "timeline_sha256": str(clip["timeline_sha256"]),
+            "observations_location": str(clip["observations_location"]),
+            "observations_sha256": str(clip["observations_sha256"]),
+        }
+    return {
+        "status": "success" if clip is not None else "failure",
+        "record_schema_version": int(span["record_schema_version"]),
+        "media_contract_version": int(span["media_contract_version"]),
+        "episode_id": str(span["episode_id"]),
+        "split_clip_id": str(span["clip_id"]),
+        "source_id": str(span["source_id"]),
+        "source_session_id": str(span["source_session_id"]),
+        "source_session_location": str(span["source_session_location"]),
+        "start_ns": int(span["start_ns"]),
+        "exclusive_end_ns": int(span["exclusive_end_ns"]),
+        "sampling_fps": int(span["sampling_fps"]),
+        "expected_row_count": int(span["expected_row_count"]),
+        "timestamp_source": str(span["timestamp_source"]),
+        "split_contract_digest": str(span["split_contract_digest"]),
+        "planned_camera_keys": [str(key) for key in span["planned_camera_keys"]],
+        "camera_key": str(plan["sensor_key"]),
+        "sensor_type": str(plan["sensor_type"]),
+        "source_media_location": str(plan["sensor_uri"]),
+        **success_fields,
+    }
 
 
 def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part of one clip's identity
@@ -154,10 +259,13 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
             # leave that state permanently, under a stable clip id. Written this
             # way the MP4 is the commit point: sidecars without media are
             # invisible, media without sidecars cannot happen.
-            _write_clip_timeline(destination, timeline_ns, storage_profile)
-            _write_clip_observations(destination, selected, storage_profile)
+            timeline_location, timeline_sha256 = _write_clip_timeline(destination, timeline_ns, storage_profile)
+            observations_location, observations_sha256 = _write_clip_observations(
+                destination, selected, storage_profile
+            )
             write_media(destination, video, storage_profile=storage_profile)
             clip_bytes = len(video)
+            media_sha256 = hashlib.sha256(video).hexdigest()
     except _StreamEndedError:
         # The tail was shorter than a whole clip. encode_frames_to_path has
         # already removed the partial file.
@@ -180,11 +288,16 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
         # Measured from the bytes that were written rather than derived from the
         # bitrate, so a run's reported total cannot drift from what is on disk.
         "clip_bytes": clip_bytes,
+        "media_sha256": media_sha256,
+        "timeline_location": timeline_location,
+        "timeline_sha256": timeline_sha256,
+        "observations_location": observations_location,
+        "observations_sha256": observations_sha256,
     }
     return clip, None
 
 
-def _write_clip_observations(destination: str, selected: list[int], storage_profile: str) -> None:
+def _write_clip_observations(destination: str, selected: list[int], storage_profile: str) -> tuple[str, str]:
     """Write, for each of the clip's frames, when the camera actually saw it.
 
     The timeline beside this says where the clip's frames sit: the grid it was
@@ -202,10 +315,13 @@ def _write_clip_observations(destination: str, selected: list[int], storage_prof
     require_nondecreasing("observations", observations)
     buffer = io.BytesIO()
     np.save(buffer, observations, allow_pickle=False)
-    write_media(observations_uri(destination), buffer.getvalue(), storage_profile=storage_profile)
+    location = observations_uri(destination)
+    payload = buffer.getvalue()
+    write_media(location, payload, storage_profile=storage_profile)
+    return location, hashlib.sha256(payload).hexdigest()
 
 
-def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], storage_profile: str) -> None:
+def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], storage_profile: str) -> tuple[str, str]:
     """Write the clip's own observation timeline beside its media.
 
     A clip is read the same way a session is, and an MP4 starts at zero however it
@@ -222,7 +338,10 @@ def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], s
     """
     buffer = io.BytesIO()
     write_timestamps_ns(timeline_ns.astype(np.int64), buffer)
-    write_media(timeline_uri(destination), buffer.getvalue(), storage_profile=storage_profile)
+    location = timeline_uri(destination)
+    payload = buffer.getvalue()
+    write_media(location, payload, storage_profile=storage_profile)
+    return location, hashlib.sha256(payload).hexdigest()
 
 
 def _stream_clips(  # noqa: PLR0913 -- one argument per part of a session's identity

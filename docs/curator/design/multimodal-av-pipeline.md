@@ -167,27 +167,30 @@ source_interval_end_ns = source_interval_ns[1]
 ```
 
 The design contract is that these normalized values are deterministic for a
-given configuration. Values that cannot be represented as integer nanoseconds,
-or as a positive integer FPS for the episode timeline, are rejected. All
-formulas in this document use these normalized integer values.
+given configuration. The delivered camera-only split converts positive seconds
+values with exact decimal arithmetic and truncates any fractional-nanosecond
+tail; the episode timeline requires a positive integer FPS. All formulas in this
+document use these normalized integer values.
 
 Rows are episode-relative and regular:
 
 ```text
 row i:
   frame_index = i
+  episode_time_ns[i] = delivered grid offset defined by the canonical publication contract
   timestamp = episode_time_ns[i] / 1e9
-  row_count = floor(duration_ns * output_fps / 1_000_000_000)
-  episode_time_ns[i] = floor(i * 1_000_000_000 / output_fps)
+  row_count = length of the delivered capture-clock grid
   target_source_time_ns[i] = source_interval_start_ns + episode_time_ns[i]
 ```
 
 `output_fps` is the normalized integer FPS for the episode timeline. Rows are
-emitted for `0 <= i < row_count`. This floor-based rule makes row count a
-deterministic function of integer clip duration and output FPS; any tail shorter
-than one output period is not represented as an extra row. The episode timestamp
-grid is explicitly half-open: `0 <= timestamp < duration_s`. There is no row at
-exactly `duration_s`.
+emitted for `0 <= i < row_count`. The delivered camera-only grid construction
+and rounding rule are defined by
+[Canonical Multimodal AV Episode Publication](multimodal-av-episode-publication.md#capture-clock-grid).
+The grid construction makes row count a deterministic function of integer clip
+duration and output FPS without independently re-deriving it from a second
+formula. The episode timestamp grid is explicitly half-open:
+`0 <= episode_time_ns[i] < duration_ns`. There is no row at the exclusive end.
 
 `target_source_time_ns` is the ideal grid point on the source timeline, not the
 timestamp of any selected sensor observation. Actual selected sensor timestamps
@@ -810,10 +813,9 @@ can:
 - produce inspectable Lance episode, row, media-reference, provenance, and
   curation records;
 - write one logical episode per aligned multiview clip;
-- compute row count as
-  `floor(duration_ns * output_fps / 1_000_000_000)` using normalized clip
-  geometry;
-- emit episode rows only for the half-open interval `0 <= timestamp < duration_s`;
+- compute row count as the length of the delivered capture-clock grid;
+- emit episode rows only for the half-open interval
+  `0 <= episode_time_ns[i] < duration_ns`;
 - preserve source timestamps and alignment provenance;
 - write modality calibration metadata and episode calibration references;
 - apply explicit camera, IMU, and GPS/GNSS policies;

@@ -102,10 +102,22 @@ def split_all(
     session's clips runs both stages -- which is also what keeps them honest
     about the row the planner actually hands over.
     """
-    return [
-        clip
+    outcomes = [
+        outcome
         for plan in span_planner(item, config=config, storage_profile=storage_profile)
-        for clip in split_session(plan, config=config, storage_profile=storage_profile)
+        if plan["result_kind"] == "camera_plan"
+        for outcome in split_session(plan, config=config, storage_profile=storage_profile)
+    ]
+    return [
+        {
+            **outcome,
+            "clip_id": outcome["split_clip_id"],
+            "sensor_key": outcome["camera_key"],
+            "clip_location": outcome["media_location"],
+            "clip_bytes": outcome["media_size_bytes"],
+        }
+        for outcome in outcomes
+        if outcome["status"] == "success"
     ]
 
 

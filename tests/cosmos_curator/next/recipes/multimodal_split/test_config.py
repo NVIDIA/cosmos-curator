@@ -404,10 +404,10 @@ def test_stride_and_minimum_duration_are_not_settings_here(field: str) -> None:
 def test_a_duration_that_is_not_a_whole_number_of_frames_is_rejected(duration_s: float, sampling_fps: int) -> None:
     """A clip is a whole number of output frames or it is not a valid clip.
 
-    0.333 s at 30 fps is 9.99 frames. This is deliberately stricter than the
-    design document, whose ``floor(duration_ns * output_fps / 1_000_000_000)``
-    would truncate the tail: refusing the config beats silently dropping a partial
-    frame during a run.
+    0.333 s at 30 fps is 9.99 frames. Refusing the config preserves the requested
+    duration instead of silently dropping a partial frame during a run; the
+    delivered grid determines row count only after validation and nanosecond
+    normalization.
     """
     with pytest.raises(ValidationError, match="frames, which is not a whole number"):
         MultimodalSplitClipConfig(duration_s=duration_s, sampling_fps=sampling_fps)
@@ -593,6 +593,23 @@ def test_the_output_path_is_canonicalized_like_the_input_prefix() -> None:
     output = MultimodalSplitOutputConfig(path="s3://example-bucket/media///")
 
     assert output.path == "s3://example-bucket/media"
+
+
+@pytest.mark.parametrize(
+    ("root", "expected"),
+    [
+        ("/", "/episodes.lance"),
+        ("/data/media", "/data/media/episodes.lance"),
+        ("file:///", "file:///episodes.lance"),
+        ("file:///data/media", "file:///data/media/episodes.lance"),
+        ("s3://bucket/media", "s3://bucket/media/episodes.lance"),
+    ],
+)
+def test_the_canonical_episode_table_has_one_derived_location(root: str, expected: str) -> None:
+    """Version-one configs gain publication without a new output setting."""
+    output = MultimodalSplitOutputConfig(path=root)
+
+    assert output.episodes_lance_uri == expected
 
 
 @pytest.mark.parametrize(

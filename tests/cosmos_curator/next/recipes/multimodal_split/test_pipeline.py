@@ -15,27 +15,61 @@
 
 """End-to-end tests for the ``multimodal-split`` run path."""
 
+import hashlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+import ray
 
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
+from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import pipeline
+from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import (
     MultimodalSplitExecutionConfig,
     ResolvedMultimodalSplitConfig,
 )
 from cosmos_curator.next.recipes.multimodal_split.pipeline import run_config
-from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri
+from cosmos_curator.next.recipes.multimodal_split.reports import (
+    failure,
+    plan_error_uri,
+    sensor_error_uri,
+    write_sensor_errors,
+)
 
 # The session-scoped cluster is the only one the Curator Next tree may start.
 # Without this the bare ``ray.init`` inside ``run_config`` claims the whole
 # machine and every later test in the run silently inherits that shape.
 pytestmark = pytest.mark.usefixtures("ray_local")
+
+
+def test_episode_accounting_rejects_a_missing_terminal_outcome() -> None:
+    """The independently planned count must equal the three terminal states."""
+    with pytest.raises(RuntimeError, match=r"planned=1.*already_canonical=0.*newly_published=0.*dropped=0"):
+        pipeline.validate_episode_accounting(
+            episodes_planned=1,
+            episodes_already_canonical=0,
+            episodes_newly_published=0,
+            episodes_dropped=0,
+        )
+
+
+def test_episode_id_count_is_global_across_ray_blocks() -> None:
+    """Real Ray blocks are the only way to prove the count is block-layout independent."""
+    episode_ids = ray.data.from_arrow(
+        [
+            pa.table({"split_clip_id": ["a", "b"]}),
+            pa.table({"split_clip_id": ["a", "b"]}),
+        ]
+    )
+
+    assert episode_ids.num_blocks() == 2
+    assert pipeline._count_unique_episode_ids(episode_ids) == 2
 
 
 def test_a_run_writes_one_clip_per_span_across_every_session(
@@ -53,8 +87,18 @@ def test_a_run_writes_one_clip_per_span_across_every_session(
 
     assert summary["sessions"] == 2
     assert summary["camera_clips_written"] == 6
+    assert summary["episodes_planned"] == 6
+    assert summary["episodes_already_canonical"] == 0
+    assert summary["episodes_newly_published"] == 6
+    assert summary["episodes_dropped"] == 0
     assert summary["failures"] == 0
     assert len(list(media.rglob("*.mp4"))) == 6
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    assert len(episodes) == 6
+    selected = episodes[0]["camera_media"][0]
+    payload = Path(selected["media_location"]).read_bytes()
+    assert len(payload) == selected["media_size_bytes"]
+    assert hashlib.sha256(payload).hexdigest() == selected["media_sha256"]
 
 
 def test_one_unusable_session_does_not_end_the_run(
@@ -74,6 +118,100 @@ def test_one_unusable_session_does_not_end_the_run(
     assert summary["camera_clips_written"] == 3
     assert summary["failures"] == 1
     assert len(list(media.rglob("*.mp4"))) == 3
+
+
+def test_a_fully_reconciled_rerun_is_a_zero_encode_noop(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Canonical rows remove their camera work before any stable artifact path is touched."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000")
+    config = make_config(root, tmp_path / "media")
+    first = run_config(config)
+
+    second = run_config(config)
+
+    assert second["episodes_planned"] == first["episodes_planned"] == 3
+    assert second["episodes_already_canonical"] == 3
+    assert second["episodes_newly_published"] == 0
+    assert second["episodes_dropped"] == 0
+    assert second["camera_clips_written"] == 0
+    assert second["episodes_lance_version"] == first["episodes_lance_version"]
+    assert lance.dataset(config.output.episodes_lance_uri).count_rows() == 3
+
+
+def test_a_post_planning_camera_failure_drops_only_the_incomplete_episodes(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful sibling artifacts survive while no partial episode row is published."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", uri_pattern="camera/front.mp4")
+    make_session(root, "session-000", uri_pattern="camera/left.mp4")
+    media = tmp_path / "media"
+    config = make_config(
+        root,
+        media,
+        cameras={"front": "camera/front.mp4", "left": "camera/left.mp4"},
+    )
+    real_split = split_module.split_session
+
+    def fail_left_camera(
+        item: dict[str, Any],
+        *,
+        config: ResolvedMultimodalSplitConfig,
+        storage_profile: str = "default",
+    ) -> list[dict[str, Any]]:
+        if item["sensor_key"] != "left":
+            return real_split(item, config=config, storage_profile=storage_profile)
+        failures = [
+            failure(
+                str(item["source_session_id"]),
+                "left",
+                Span(start_ns=int(span["start_ns"]), end_ns=int(span["exclusive_end_ns"])),
+                "sample_and_encode",
+                OSError("controlled post-planning camera failure"),
+                str(span["clip_id"]),
+            )
+            for span in item["spans"]
+        ]
+        write_sensor_errors(
+            str(item["source_session_id"]),
+            "left",
+            failures,
+            output_path=config.output.path,
+            storage_profile=storage_profile,
+        )
+        return [split_module._camera_outcome(item, span, None) for span in item["spans"]]
+
+    def fail_left_batch(
+        plans: pa.Table,
+        *,
+        config: ResolvedMultimodalSplitConfig,
+        storage_profile: str = "default",
+    ) -> pa.Table:
+        outcomes = [
+            outcome
+            for item in plans.to_pylist()
+            for outcome in fail_left_camera(item, config=config, storage_profile=storage_profile)
+        ]
+        return pa.Table.from_pylist(outcomes, schema=split_module.CAMERA_OUTCOME_SCHEMA)
+
+    monkeypatch.setattr(pipeline, "split_camera_batch", fail_left_batch)
+
+    summary = run_config(config)
+
+    assert summary["episodes_planned"] == 3
+    assert summary["episodes_newly_published"] == 0
+    assert summary["episodes_dropped"] == 3
+    assert summary["camera_clips_written"] == 3
+    assert lance.dataset(config.output.episodes_lance_uri).count_rows() == 0
+    assert len(list(media.rglob("front.mp4"))) == 3
+    assert Path(sensor_error_uri(str(media), "session-000", "left")).is_file()
 
 
 def test_a_run_that_finds_no_sessions_is_refused(
@@ -155,7 +293,7 @@ def test_failures_are_summarized_by_category_rather_than_one_line_each(
     assert summary["failures_by_category"] == {"FileNotFoundError": 2}
 
 
-def _flat_map_kwargs(
+def _split_stage_kwargs(
     monkeypatch: pytest.MonkeyPatch,
     config: ResolvedMultimodalSplitConfig,
 ) -> dict[str, object]:
@@ -163,7 +301,10 @@ def _flat_map_kwargs(
     seen: dict[str, object] = {}
 
     class _FakeDataset:
-        def flat_map(self, _fn: object, **kwargs: object) -> object:
+        def filter(self, **_kwargs: object) -> object:
+            return self
+
+        def map_batches(self, _fn: object, **kwargs: object) -> object:
             seen.update(kwargs)
             return self
 
@@ -181,7 +322,10 @@ def _stage_kwargs(
     calls: list[dict[str, object]] = []
 
     class _FakeDataset:
-        def flat_map(self, _fn: object, **kwargs: object) -> object:
+        def filter(self, **_kwargs: object) -> object:
+            return self
+
+        def map_batches(self, _fn: object, **kwargs: object) -> object:
             calls.append(dict(kwargs))
             return self
 
@@ -227,7 +371,7 @@ def test_a_declared_session_heap_is_what_ray_reserves(
     """
     config = make_config(tmp_path / "recordings", tmp_path / "media", memory_gb=1.5)
 
-    seen = _flat_map_kwargs(monkeypatch, config)
+    seen = _split_stage_kwargs(monkeypatch, config)
 
     assert seen["memory"] == int(1.5 * 1024**3)
 
@@ -240,7 +384,7 @@ def test_an_undeclared_session_heap_leaves_ray_to_its_own_default(
     """No measurement, no reservation: a guess of ours would be worth no more than Ray's."""
     config = make_config(tmp_path / "recordings", tmp_path / "media")
 
-    seen = _flat_map_kwargs(monkeypatch, config)
+    seen = _split_stage_kwargs(monkeypatch, config)
 
     assert seen["memory"] is None
 
