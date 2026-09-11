@@ -39,6 +39,8 @@ def test_stability_configuration_preserves_high_memory_detector_by_default(
     ray_runtime.configure_ray_data_stability()
 
     assert high_memory_detector_config.detection_time_interval_s == 30
+    assert "ProbeError" in context.retried_map_errors
+    assert context.max_map_retries == 3
 
 
 def test_stability_configuration_can_disable_expected_video_memory_warnings(

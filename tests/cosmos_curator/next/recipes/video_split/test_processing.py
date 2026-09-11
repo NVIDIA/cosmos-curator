@@ -11,7 +11,14 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
-from cosmos_curator.next.media.ffmpeg import ProbeError, TranscodeError, VideoMetadata
+from cosmos_curator.core.utils.misc import retry_utils
+from cosmos_curator.next.media.ffmpeg import (
+    InvalidMediaError,
+    ProbeError,
+    TranscodeError,
+    UnsupportedMediaError,
+    VideoMetadata,
+)
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.video_split import processing
 from cosmos_curator.next.recipes.video_split.config import ResolvedVideoSplitConfig, resolve_config_data
@@ -27,12 +34,14 @@ class _NullLogger:
 
 @pytest.fixture(autouse=True)
 def _worker_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the real FFmpeg binary and noisy worker logs outside unit tests."""
+    """Keep real FFmpeg, backoff waits, and noisy worker logs outside unit tests."""
     monkeypatch.setattr(processing, "assert_video_encoder_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(processing, "logger", _NullLogger())
+    monkeypatch.setattr(retry_utils, "logger", _NullLogger())
+    monkeypatch.setattr(retry_utils.time, "sleep", lambda _: None)
 
 
-def _config(*, ffmpeg_batch_size: int = 16) -> ResolvedVideoSplitConfig:
+def _config(*, ffmpeg_batch_size: int = 16, probe_attempts: int = 1) -> ResolvedVideoSplitConfig:
     return resolve_config_data(
         {
             "schema_version": 1,
@@ -42,7 +51,7 @@ def _config(*, ffmpeg_batch_size: int = 16) -> ResolvedVideoSplitConfig:
             "output": {"media_root": "s3://example-bucket/output"},
             "execution": {
                 "storage_attempts": 1,
-                "probe_attempts": 1,
+                "probe_attempts": probe_attempts,
                 "transcode_attempts": 1,
                 "ffmpeg_batch_size": ffmpeg_batch_size,
             },
@@ -211,7 +220,7 @@ def _raise(error: Exception) -> Callable[..., object]:
     ("failing", "error", "stage"),
     [
         ("download_bytes", OSError("connection reset"), "source-read"),
-        ("probe_video_path", ProbeError("unreadable header"), "source-probe"),
+        ("probe_video_path", InvalidMediaError("unreadable header"), "source-probe"),
     ],
 )
 def test_expected_source_failures_flow_as_error_records(
@@ -233,13 +242,98 @@ def test_expected_source_failures_flow_as_error_records(
     assert processing.upload_clip(records[0], config=_config()) == records[0]
 
 
-def test_unexpected_source_error_fails_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A bug must not turn every source into a data error and publish emptiness."""
+@pytest.mark.parametrize("error", [KeyError("width"), ProbeError("inconclusive probe")])
+def test_unexpected_source_error_fails_the_task(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Bugs and unresolved probes must not turn every source into terminal media errors."""
     _happy_media(monkeypatch)
-    monkeypatch.setattr(processing, "probe_video_path", _raise(KeyError("width")))
+    monkeypatch.setattr(processing, "probe_video_path", _raise(error))
 
-    with pytest.raises(KeyError):
+    with pytest.raises(type(error)):
         processing.download_and_plan_source({"source_uri": _SOURCE_URI}, config=_config())
+
+
+@pytest.mark.parametrize("ffmpeg_batch_size", [1, 16])
+def test_clip_probe_retries_without_retranscoding(monkeypatch: pytest.MonkeyPatch, ffmpeg_batch_size: int) -> None:
+    """A transient probe failure reuses the encoded clip and preserves its siblings."""
+    observed: dict[str, Any] = {}
+    _happy_media(monkeypatch, observed=observed)
+    config = _config(ffmpeg_batch_size=ffmpeg_batch_size, probe_attempts=3)
+    downloaded = processing.download_and_plan_source({"source_uri": _SOURCE_URI}, config=config)
+    probes: list[Path] = []
+
+    def flaky_probe(path: Path, **_kwargs: object) -> VideoMetadata:
+        probes.append(path)
+        assert path.read_bytes() == b"clip bytes"
+        if len(probes) < 3:
+            message = "inconclusive clip probe"
+            raise ProbeError(message)
+        return _metadata(10_000_000_000)
+
+    monkeypatch.setattr(processing, "probe_video_path", flaky_probe)
+    records = list(processing.transcode_source(downloaded, config=config))
+
+    assert [row["record_type"] for row in records] == ["clip", "clip", "clip"]
+    assert all(row["clip_bytes"] == b"clip bytes" for row in records)
+    assert len(observed["spans"]) == 3
+    assert probes == [observed["clip_paths"][0]] * 3 + observed["clip_paths"][1:]
+    assert all(not path.exists() for path in observed["clip_paths"])
+
+
+@pytest.mark.parametrize("ffmpeg_batch_size", [1, 16])
+def test_exhausted_clip_probe_fails_the_task(monkeypatch: pytest.MonkeyPatch, ffmpeg_batch_size: int) -> None:
+    """An inconclusive clip stays retryable after local attempts and releases temporary files."""
+    observed: dict[str, Any] = {}
+    _happy_media(monkeypatch, observed=observed)
+    config = _config(ffmpeg_batch_size=ffmpeg_batch_size, probe_attempts=2)
+    downloaded = processing.download_and_plan_source({"source_uri": _SOURCE_URI}, config=config)
+    probes: list[Path] = []
+
+    def failed_probe(path: Path, **_kwargs: object) -> VideoMetadata:
+        probes.append(path)
+        message = "inconclusive clip probe"
+        raise ProbeError(message)
+
+    monkeypatch.setattr(processing, "probe_video_path", failed_probe)
+    with pytest.raises(ProbeError, match="inconclusive clip probe"):
+        list(processing.transcode_source(downloaded, config=config))
+
+    assert probes == [observed["clip_paths"][0]] * 2
+    assert all(not path.exists() for path in observed["clip_paths"])
+
+
+@pytest.mark.parametrize("ffmpeg_batch_size", [1, 16])
+@pytest.mark.parametrize("error_type", [InvalidMediaError, UnsupportedMediaError])
+def test_invalid_clip_probe_keeps_successful_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+    ffmpeg_batch_size: int,
+    error_type: type[InvalidMediaError | UnsupportedMediaError],
+) -> None:
+    """Confirmed bad media emits one clip error without spending the probe retry budget."""
+    observed: dict[str, Any] = {}
+    _happy_media(monkeypatch, observed=observed)
+    config = _config(ffmpeg_batch_size=ffmpeg_batch_size, probe_attempts=3)
+    downloaded = processing.download_and_plan_source({"source_uri": _SOURCE_URI}, config=config)
+    failed_clip_id = downloaded["clip_work"][1]["clip_id"]
+    probes: list[Path] = []
+
+    def invalid_probe(path: Path, **_kwargs: object) -> VideoMetadata:
+        probes.append(path)
+        if path.stem == failed_clip_id:
+            message = "unusable clip"
+            raise error_type(message)
+        return _metadata(10_000_000_000)
+
+    monkeypatch.setattr(processing, "probe_video_path", invalid_probe)
+    records = list(processing.transcode_source(downloaded, config=config))
+
+    assert [row["record_type"] for row in records] == ["clip", "error", "clip"]
+    assert records[1]["clip_id"] == failed_clip_id
+    assert records[1]["error_stage"] == "clip-probe"
+    assert records[1]["error_message"] == "unusable clip"
+    assert records[1]["clip_bytes"] == b""
+    assert len(observed["spans"]) == 3
+    assert probes == observed["clip_paths"]
+    assert all(not path.exists() for path in observed["clip_paths"])
 
 
 def test_one_clip_failure_keeps_its_successful_siblings(monkeypatch: pytest.MonkeyPatch) -> None:

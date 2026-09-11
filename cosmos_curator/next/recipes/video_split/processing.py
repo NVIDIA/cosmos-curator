@@ -53,8 +53,7 @@ from cosmos_curator.next.recipes.video_split.storage import (
 )
 from cosmos_curator.next.recipes.video_split.uris import join_s3_uri
 
-# FFmpeg reports transient transport stalls and permanently unreadable media
-# through the same exit code, so both are retried before becoming data errors.
+# Inconclusive probe failures propagate after retries; they are not media outcomes.
 _RETRYABLE_MEDIA_ERRORS = (ProbeError, TranscodeError)
 
 _BACKOFF_FACTOR = 2.0
@@ -282,8 +281,14 @@ def _inspect_transcoded_clip(
     config: ResolvedVideoSplitConfig,
 ) -> _PreparedClip:
     """Probe an FFmpeg output and return metadata plus its worker-local path."""
+    execution = config.execution
     try:
-        clip_metadata = probe_video_path(clip_path, timeout_s=config.execution.probe_timeout_s)
+        clip_metadata = _retry(
+            lambda: probe_video_path(clip_path, timeout_s=execution.probe_timeout_s),
+            _RETRYABLE_MEDIA_ERRORS,
+            attempts=execution.probe_attempts,
+            name="clip-probe",
+        )
         clip_size_bytes = clip_path.stat().st_size
     except MediaError as exc:
         clip_path.unlink(missing_ok=True)

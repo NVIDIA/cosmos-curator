@@ -302,6 +302,7 @@ def test_a_clip_whose_container_carries_no_usable_timing_becomes_an_error_row(
 
 
 def test_a_probe_fault_exposes_only_the_stable_clip_id(
+    capfd: pytest.CaptureFixture[str],
     media_fetch: MediaFetch,
     monkeypatch: pytest.MonkeyPatch,
     scanned_batch: ScannedBatch,
@@ -318,7 +319,7 @@ def test_a_probe_fault_exposes_only_the_stable_clip_id(
     leaked = "moov atom not found\nforged-warning"
 
     def raise_probe_fault(_data: bytes) -> object:
-        raise ffmpeg.ProbeError(leaked)
+        raise ffmpeg.InvalidMediaError(leaked)
 
     monkeypatch.setattr(media, "probe_video_bytes", raise_probe_fault)
     warnings: list[str] = []
@@ -329,10 +330,33 @@ def test_a_probe_fault_exposes_only_the_stable_clip_id(
         logger.remove(handler_id)
 
     warning = "".join(warnings)
+    captured = capfd.readouterr()
     assert url is None
-    assert fault == "ProbeError: clip_id='c0'"
+    assert fault == "InvalidMediaError: clip_id='c0'"
+    assert fault in warning
     assert leaked not in warning
     assert "forged-warning" not in warning
+    assert leaked not in captured.out + captured.err
+
+
+def test_an_inconclusive_probe_failure_fails_the_attempt(
+    media_fetch: MediaFetch,
+    monkeypatch: pytest.MonkeyPatch,
+    scanned_batch: ScannedBatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A probe timeout must remain retryable instead of becoming a terminal error row."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not a video")
+
+    def raise_probe_fault(_data: bytes) -> object:
+        message = "FFprobe timed out"
+        raise ffmpeg.ProbeError(message)
+
+    monkeypatch.setattr(media, "probe_video_bytes", raise_probe_fault)
+
+    with pytest.raises(ffmpeg.ProbeError, match="FFprobe timed out"):
+        media_fetch()(scanned_batch(str(clip)))
 
 
 def test_a_null_clip_uri_becomes_a_terminal_error_row(

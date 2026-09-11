@@ -1,5 +1,8 @@
 # Curator Next: Video Split
 
+**Status:** Deprecated in favor of [`video-cut`](curator-next-video-cut.md) and the planned `video-transcode` recipe.
+Retain the existing implementation until both replacements are available; migration and removal follow separately.
+
 ## Summary
 
 `video-split` turns source videos into fixed-stride MP4 clips. Ray Data overlaps source downloads, CPU transcoding, and
@@ -146,13 +149,16 @@ array for a clean run. Error reporting does not delay or roll back canonical fra
 Expected source and media failures become data records:
 
 - `source-read`: a source could not be downloaded after retries
-- `source-probe`: FFprobe could not describe the source
+- `source-probe`: FFprobe identified invalid or unsupported media in the downloaded source
 - `transcode`: FFmpeg could not produce one planned clip
-- `clip-probe`: FFprobe could not validate one produced clip
+- `clip-probe`: FFprobe identified invalid or unsupported media in one produced clip
 
-Unexpected exceptions, missing worker tools, invalid internal records, exhausted clip-upload retries, Lance failures,
-and error-report upload failures fail the task or run. This prevents a broken environment or shared destination from
-being reported as a large collection of bad media.
+Source and clip probes use `execution.probe_attempts`. Clip-probe retries inspect the same encoded file without
+repeating the transcode.
+
+Unexpected exceptions, missing worker tools, inconclusive probes after retries, invalid internal records, exhausted
+clip-upload retries, Lance failures, and error-report upload failures fail the task or run. This prevents a broken
+environment or shared destination from being reported as a large collection of bad media.
 
 Successful clip uploads use deterministic destinations and tolerate Ray task replay by replacement. Media is durable
 before its metadata row becomes canonical. If a run fails after upload but before its fragment commits, the MP4 or an

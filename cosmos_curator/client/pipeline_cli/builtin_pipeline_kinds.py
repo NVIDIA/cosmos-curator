@@ -29,6 +29,7 @@ from cosmos_curator.next.recipes.multimodal_split.pipeline_kind import MULTIMODA
 from cosmos_curator.next.recipes.robot_action_caption.pipeline_kind import ROBOT_ACTION_CAPTION_KIND
 from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND
 from cosmos_curator.next.recipes.video_caption.pipeline_kind import VIDEO_CAPTION_KIND
+from cosmos_curator.next.recipes.video_cut.pipeline_kind import VIDEO_CUT_KIND
 from cosmos_curator.next.recipes.video_split.pipeline_kind import VIDEO_SPLIT_KIND
 
 # Registering a kind also changes two restatements of the sorted name list in the
@@ -41,6 +42,7 @@ BUILTIN_PIPELINE_KINDS = PipelineKindRegistry(
         DATA_INTEGRITY_KIND,
         MULTIMODAL_SPLIT_KIND,
         VIDEO_CAPTION_KIND,
+        VIDEO_CUT_KIND,
         VIDEO_SPLIT_KIND,
         ROBOT_ACTION_SPLIT_KIND,
         ROBOT_ACTION_CAPTION_KIND,

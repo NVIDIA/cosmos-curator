@@ -23,6 +23,7 @@ def test_registered_kind_names_are_derived_from_concrete_objects() -> None:
         "robot-action-caption",
         "robot-action-split",
         "video-caption",
+        "video-cut",
         "video-split",
         "video_split",
     )

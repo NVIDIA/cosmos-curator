@@ -29,6 +29,8 @@ from cosmos_curator.next.media.spans import Span, nanoseconds_to_ffmpeg_timestam
 
 _DECODER_THREADS = 1
 _FILTER_THREADS = 1
+# libavutil/error.h: AVERROR_INVALIDDATA = FFERRTAG('I', 'N', 'D', 'A').
+_AVERROR_INVALIDDATA = -1094995529
 
 
 class TranscodeSettings(Protocol):
@@ -81,16 +83,30 @@ class TranscodeError(MediaError):
     """Raised when FFmpeg cannot produce one planned clip."""
 
 
-class ProbeError(MediaError):
-    """Raised when FFprobe cannot inspect a source or transcoded clip."""
+class ProbeError(RuntimeError):
+    """FFprobe failed without establishing a permanent media problem.
+
+    Timeouts, process termination, IO failures, and unrecognized responses may
+    be retried. Exhausting retries must fail the task rather than turn this
+    exception into a terminal media outcome.
+    """
+
+
+class InvalidMediaError(MediaError):
+    """FFprobe explicitly reported invalid data in a complete local source.
+
+    Callers must finish staging immutable input before probing a local path.
+    The same diagnostic over HTTP remains a :class:`ProbeError`, since a
+    transport failure can make otherwise valid media appear truncated.
+    """
 
 
 class UnsupportedMediaError(MediaError):
     """Raised when media is readable but does not satisfy the v1 contract.
 
-    Separate from :class:`ProbeError` because FFprobe answered: the payload is
-    intact and says the media is unusable, so a retry can only produce the same
-    answer.
+    FFprobe returned metadata, but it cannot support the requested operation.
+    Remote callers should verify this against a complete local copy before
+    recording a terminal outcome.
     """
 
 
@@ -131,12 +147,13 @@ def probe_video_path(path: Path, *, timeout_s: int = 120) -> VideoMetadata:
 
 
 def probe_video_source(source: str | Path, *, timeout_s: int = 120) -> VideoMetadata:
-    """Probe a local path or authenticated range-capable HTTP media source."""
+    """Probe a complete local source or authenticated range-capable HTTP source."""
     source_text = str(source)
     command = [
         "ffprobe",
         "-v",
         "error",
+        "-show_error",
         "-show_format",
         "-show_streams",
         "-of",
@@ -153,18 +170,32 @@ def probe_video_source(source: str | Path, *, timeout_s: int = 120) -> VideoMeta
         msg = f"FFprobe timed out after {exc.timeout}s on <source>"
         raise ProbeError(msg) from exc
     except subprocess.CalledProcessError as exc:
-        diagnostic = _redacted_diagnostic(exc.stderr, source_text)
-        msg = diagnostic or f"FFprobe exited with status {exc.returncode}"
-        raise ProbeError(msg) from exc
+        raise _probe_failure(exc, source_text) from exc
     try:
         payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         msg = "FFprobe returned invalid JSON"
         raise ProbeError(msg) from exc
     if not isinstance(payload, dict):
         msg = "FFprobe returned a non-object payload"
-        raise UnsupportedMediaError(msg)
+        raise ProbeError(msg)
     return _metadata_from_ffprobe(payload)
+
+
+def _probe_failure(error: subprocess.CalledProcessError, source: str) -> ProbeError | InvalidMediaError:
+    """Recognize local invalid data from FFprobe's structured error, never stderr."""
+    diagnostic = _redacted_diagnostic(error.stderr, source)
+    # A killed process is inconclusive even if it emitted an error before dying.
+    if error.returncode > 0 and not _is_http_source(source):
+        try:
+            payload = json.loads(error.stdout or b"")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        else:
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(detail, dict) and detail.get("code") == _AVERROR_INVALIDDATA:
+                return InvalidMediaError(diagnostic or "FFprobe reported invalid media data")
+    return ProbeError(diagnostic or f"FFprobe exited with status {error.returncode}")
 
 
 def transcode_span(
@@ -313,7 +344,7 @@ def _metadata_from_ffprobe(payload: dict[str, Any]) -> VideoMetadata:
     streams = payload.get("streams")
     if not isinstance(streams, list):
         msg = "FFprobe payload does not contain a streams list"
-        raise UnsupportedMediaError(msg)
+        raise ProbeError(msg)
     video_stream = next(
         (stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "video"),
         None,

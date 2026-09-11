@@ -22,9 +22,9 @@ in ``cosmos_curator.next.utils.lance_fragment_recovery``.
 import lance
 import pyarrow as pa
 
-from cosmos_curator.next.recipes.video_split.contracts import LANCE_DATA_STORAGE_VERSION
 from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
 from cosmos_curator.next.utils import lance_fragment_recovery
+from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 
 _KIND = "video-split"
 _APPEND_OPERATION = "append-clips"

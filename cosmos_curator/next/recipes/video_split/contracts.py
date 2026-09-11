@@ -15,14 +15,11 @@
 
 """Version constants for durable ``video-split`` contracts."""
 
-from typing import Literal
-
 # Bump when fixed, non-configurable span-to-media behavior changes.
 MEDIA_CONTRACT_VERSION = 1
 
 CLIP_RECORD_SCHEMA_VERSION = 1
 ERROR_RECORD_SCHEMA_VERSION = 1
-LANCE_DATA_STORAGE_VERSION: Literal["2.2"] = "2.2"
 
 # Frame counts are unknown for some containers. Work records carry this sentinel
 # because Ray blocks need a non-null int column; the published schema uses null.

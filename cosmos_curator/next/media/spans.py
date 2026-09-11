@@ -13,7 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deterministic integer-timeline span contracts for Curator Next media."""
+"""Deterministic integer-timeline span contracts for Curator Next media.
+
+Video, robot action, and AV remain independent streams during incubation.
+Each recipe using these helpers owns its output and recovery compatibility.
+Changes to rounding, interval boundaries, or tail retention require reviewing
+affected callers and their respective contract versions. Video-cut's
+``behavior_version`` applies to its own cutting contract.
+"""
 
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
