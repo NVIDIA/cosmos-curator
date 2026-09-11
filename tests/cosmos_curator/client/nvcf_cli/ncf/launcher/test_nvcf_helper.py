@@ -16,7 +16,7 @@
 """Test the NVCF Helper Module."""
 
 import json
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -30,6 +30,8 @@ from cosmos_curator.client.nvcf_cli.ncf.common import NotFoundError, NVCFRespons
 from cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper import (
     NvcfHelper,
     _extract_nvcf_error_details,
+    _nvcf_log_dir,
+    _path_in_dir,
     _raise_runtime_err,
     _raise_timeout_err,
 )
@@ -1368,9 +1370,221 @@ def test_nvcf_helper_direct_invocation_prefers_body_tracking_fields_over_folded_
     assert result == {"reqid": "test-reqid", "status": "in-progress"}
 
 
-def test_nvcf_helper_direct_invocation_rejects_async_status_without_request_id(
-    monkeypatch: MonkeyPatch, tmp_path: Path
-) -> None:
+@pytest.mark.parametrize("filename", ["/etc/passwd.zip", "../escape.zip", "../../etc/passwd"])
+def test_path_in_dir_rejects_names_that_escape_the_directory(tmp_path: Path, filename: str) -> None:
+    """An absolute or traversing name must not write outside the download directory."""
+    with pytest.raises(RuntimeError, match="outside"):
+        _path_in_dir(tmp_path, filename)
+
+
+def test_path_in_dir_keeps_a_normal_request_id(tmp_path: Path) -> None:
+    """A normal NVCF request id resolves inside the download directory."""
+    assert _path_in_dir(tmp_path, "12345678-1234-1234-1234-123456789abc.zip") == (
+        tmp_path / "12345678-1234-1234-1234-123456789abc.zip"
+    )
+
+
+def test_nvcf_log_dir_is_private_and_honours_xdg_cache_home(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """The log directory lands under XDG_CACHE_HOME and is readable only by its owner."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    log_dir = _nvcf_log_dir()
+    assert log_dir == tmp_path / "cache" / "cosmos_curator" / "nvcf"
+    assert log_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_invoke_wait_keeps_logs_in_a_private_persistent_dir(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Collected logs outlive the call so an operator can read them, and skip shared /tmp."""
+    shared_tmp = tmp_path / "shared-tmp"
+    shared_tmp.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        "cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper.tempfile.gettempdir",
+        lambda: str(shared_tmp),
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+
+    def fake_invoke(**_kwargs: object) -> dict[str, object]:
+        return {"reqid": "visible-reqid", "logs": ["line-one"], "status": "fulfilled"}
+
+    nvcf_helper.nvcf_helper_invoke_function = fake_invoke  # type: ignore[method-assign]
+    nvcf_helper.nvcf_helper_invoke_wait_retry_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        wait=True,
+        retry_cnt=1,
+        retry_delay=0,
+    )
+    assert (_nvcf_log_dir() / "visible-reqid.log").read_text() == "line-one\n"
+    assert not (shared_tmp / "visible-reqid.log").exists()
+
+
+def test_invoke_wait_does_not_create_log_dir_when_there_are_no_logs(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Directory creation is skipped when the response has nothing to write."""
+
+    def fail_log_dir() -> Path:
+        error_msg = "_nvcf_log_dir must not run when logs is None"
+        raise AssertionError(error_msg)
+
+    monkeypatch.setattr(
+        "cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper._nvcf_log_dir",
+        fail_log_dir,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+
+    def fake_invoke(**_kwargs: object) -> dict[str, object]:
+        return {"reqid": "visible-reqid", "status": "fulfilled"}
+
+    nvcf_helper.nvcf_helper_invoke_function = fake_invoke  # type: ignore[method-assign]
+    nvcf_helper.nvcf_helper_invoke_wait_retry_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        wait=True,
+        retry_cnt=1,
+        retry_delay=0,
+    )
+
+
+def test_invoke_wait_survives_an_unwritable_log_dir(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """A cache that cannot be created must not abort a successful invoke."""
+
+    def fail_log_dir() -> Path:
+        error_msg = "HOME is unset"
+        raise RuntimeError(error_msg)
+
+    monkeypatch.setattr(
+        "cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper._nvcf_log_dir",
+        fail_log_dir,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+
+    def fake_invoke(**_kwargs: object) -> dict[str, object]:
+        return {"reqid": "visible-reqid", "logs": ["line-one"], "status": "fulfilled"}
+
+    nvcf_helper.nvcf_helper_invoke_function = fake_invoke  # type: ignore[method-assign]
+    nvcf_helper.nvcf_helper_invoke_wait_retry_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        wait=True,
+        retry_cnt=1,
+        retry_delay=0,
+    )
+
+
+def test_status_wait_survives_an_unwritable_log_dir(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """A cache that cannot be created must not abort a successful status poll."""
+
+    def fail_log_dir() -> Path:
+        error_msg = "Permission denied"
+        raise PermissionError(error_msg)
+
+    monkeypatch.setattr(
+        "cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper._nvcf_log_dir",
+        fail_log_dir,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+
+    def fake_status(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"reqid": "visible-reqid", "zip": BytesIO(b"pk"), "status": "fulfilled"}
+
+    nvcf_helper.nvcf_helper_get_request_status = fake_status  # type: ignore[method-assign]
+    nvcf_helper.nvcf_helper_get_request_status_with_wait(
+        reqid="visible-reqid",
+        ddir=str(tmp_path),
+        funcid="test-id",
+        wait=False,
+    )
+
+
+def test_status_wait_keeps_log_zip_in_a_private_persistent_dir(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """The status-poll log zip outlives the call and skips a predictable name under /tmp."""
+    shared_tmp = tmp_path / "shared-tmp"
+    shared_tmp.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        "cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper.tempfile.gettempdir",
+        lambda: str(shared_tmp),
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+
+    def fake_status(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"reqid": "visible-reqid", "zip": BytesIO(b"pk"), "status": "fulfilled"}
+
+    nvcf_helper.nvcf_helper_get_request_status = fake_status  # type: ignore[method-assign]
+    nvcf_helper.nvcf_helper_get_request_status_with_wait(
+        reqid="visible-reqid",
+        ddir=str(tmp_path),
+        funcid="test-id",
+        wait=False,
+    )
+    assert (_nvcf_log_dir() / "visible-reqid-log.zip").read_bytes() == b"pk"
+    assert not (shared_tmp / "visible-reqid-log.zip").exists()
+
+
+def test_nvcf_helper_invoke_rejects_traversal_reqid_before_download(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Do not write invoke output using a response reqid that escapes --out-dir."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {
+            "status": 200,
+            "headers": {"location": "https://example.invalid/out.zip"},
+            "reqid": "../escape",
+            "body-status": "fulfilled",
+        }
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    with pytest.raises(RuntimeError, match="outside"):
+        nvcf_helper.nvcf_helper_invoke_function(
+            funcid="test-id",
+            ddir=str(tmp_path),
+            version="test-version",
+            data_file=None,
+            prompt_file=None,
+            s3_config=None,
+        )
+    mock_nvcf_client.download.assert_not_called()
+
+
+def test_nvcf_helper_invoke_writes_zip_inside_out_dir(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """A normal NVCF reqid downloads into --out-dir, not a parent path."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {
+            "status": 200,
+            "headers": {"location": "https://example.invalid/out.zip"},
+            "reqid": "abc-123",
+            "body-status": "fulfilled",
+        }
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        s3_config=None,
+    )
+
+    assert result["reqid"] == "abc-123"
+    dest = mock_nvcf_client.download.call_args.kwargs["dest"]
+    assert Path(dest) == (tmp_path / "abc-123.zip").resolve()
+    assert Path(dest).is_relative_to(tmp_path.resolve())
+
+
+def test_nvcf_helper_invoke_direct_async_without_reqid_raises(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     """Test direct async invocation cannot poll a non-terminal response without a reqid."""
     mock_nvcf_client = MagicMock()
     mock_nvcf_client.post.return_value = NVCFResponse({"status": 200, "headers": {}, "body-status": "in-progress"})

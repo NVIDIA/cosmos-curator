@@ -47,6 +47,7 @@ from cosmos_curator.core.utils.storage.storage_client import (
     StoragePrefix,
     StorageStat,
     is_storage_path,
+    join_under,
 )
 
 
@@ -490,6 +491,7 @@ class AzureClient(StorageClient):
         print(f"Syncing {azure_prefix} to {local_dir}")  # noqa: T201
         local_dir_path = Path(local_dir)
         local_dir_path.mkdir(parents=True, exist_ok=True)
+        dest_root = local_dir_path.resolve()
 
         assert isinstance(azure_prefix, AzurePrefix)
         # List all objects in the Azure prefix
@@ -503,9 +505,11 @@ class AzureClient(StorageClient):
             ncols=70,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
         ) as pbar:
+            planned: list[tuple[dict[str, Any], pathlib.Path]] = []
             for obj in azure_objects:
                 relative_path = obj["Name"][len(azure_prefix.blob) :].lstrip("/")
-                local_file_path = local_dir_path / relative_path
+                planned.append((obj, join_under(dest_root, relative_path)))
+            for obj, local_file_path in planned:
                 local_file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Check if local file exists and has the same size and last modified time
@@ -530,7 +534,7 @@ class AzureClient(StorageClient):
 
         if delete:
             # Remove local files that don't exist in Azure
-            local_files = list(local_dir_path.rglob("*"))
+            local_files = list(dest_root.rglob("*"))
             with tqdm(
                 total=len(local_files),
                 desc="Cleaning",
@@ -540,7 +544,7 @@ class AzureClient(StorageClient):
             ) as pbar:
                 for local_file in local_files:
                     if local_file.is_file():
-                        relative_path = local_file.relative_to(local_dir_path)
+                        relative_path = local_file.relative_to(dest_root)
                         azure_blob_name = f"{azure_prefix.blob}{relative_path}".rstrip("/")
                         if not any(obj["Name"] == azure_blob_name for obj in azure_objects):
                             local_file.unlink()

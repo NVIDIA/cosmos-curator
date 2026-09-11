@@ -16,6 +16,7 @@
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
@@ -290,3 +291,109 @@ def test_listing_does_not_abort_on_a_blob_whose_name_has_consecutive_hyphens() -
         "az://test-container/root/cam--01/a.mp4",
         "az://test-container/root/b.mp4",
     ]
+
+
+class _FakeSyncDownload:
+    def __init__(self, payload: bytes = b"ok") -> None:
+        self._payload = payload
+        self.requested: list[tuple[str, str]] = []
+
+    def get_blob_client(self, container: str, blob: str) -> "_FakeSyncDownload":
+        self.requested.append((container, blob))
+        return self
+
+    def download_blob(self) -> "_FakeSyncDownload":
+        return self
+
+    def readall(self) -> bytes:
+        return self._payload
+
+
+def _azure_sync_client(objects: list[dict[str, object]]) -> tuple[AzureClient, _FakeSyncDownload]:
+    """Build a client whose sync path lists ``objects`` and records blob downloads."""
+    service = _FakeSyncDownload()
+    client = object.__new__(AzureClient)
+    client.service_client = service
+    client.list_recursive = lambda *_a, **_k: objects  # type: ignore[method-assign]
+    return client, service
+
+
+def test_sync_remote_to_local_writes_nested_blobs_under_dest(tmp_path: Path) -> None:
+    """A nested blob name stays inside the cache directory."""
+    dest = tmp_path / "cache"
+    client, service = _azure_sync_client(
+        [
+            {
+                "Name": "root/nested/model.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+    )
+
+    client.sync_remote_to_local(AzurePrefix(_PREFIX), dest)
+
+    expected = dest / "nested" / "model.bin"
+    assert expected.read_bytes() == b"ok"
+    assert service.requested == [("test-container", "root/nested/model.bin")]
+
+
+def test_sync_remote_to_local_rejects_a_blob_that_escapes_dest(tmp_path: Path) -> None:
+    """Blob names with ``..`` must not write beside the destination."""
+    dest = tmp_path / "cache"
+    client, service = _azure_sync_client(
+        [
+            {
+                "Name": "root/../escape.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="outside"):
+        client.sync_remote_to_local(AzurePrefix(_PREFIX), dest)
+
+    assert service.requested == []
+    assert not (tmp_path / "escape.bin").exists()
+
+
+def test_sync_remote_to_local_rejects_escaping_blobs_before_any_download(tmp_path: Path) -> None:
+    """A later traversal blob must not leave earlier objects on disk."""
+    dest = tmp_path / "cache"
+    client, service = _azure_sync_client(
+        [
+            {
+                "Name": "root/good.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            },
+            {
+                "Name": "root/../escape.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError, match="outside"):
+        client.sync_remote_to_local(AzurePrefix(_PREFIX), dest)
+
+    assert service.requested == []
+    assert not (dest / "good.bin").exists()
+    assert not (tmp_path / "escape.bin").exists()
+
+
+def test_sync_remote_to_local_delete_walks_the_resolved_dest(tmp_path: Path) -> None:
+    """Stale files are removed from the real directory even when dest is a symlink."""
+    real = tmp_path / "real"
+    real.mkdir()
+    dest = tmp_path / "cache"
+    dest.symlink_to(real)
+    (real / "stale.bin").write_bytes(b"old")
+    client, service = _azure_sync_client([])
+
+    client.sync_remote_to_local(AzurePrefix(_PREFIX), dest, delete=True)
+
+    assert service.requested == []
+    assert not (real / "stale.bin").exists()

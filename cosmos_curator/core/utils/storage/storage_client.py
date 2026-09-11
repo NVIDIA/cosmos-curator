@@ -36,6 +36,34 @@ DOWNLOAD_CHUNK_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 UPLOAD_CHUNK_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 
 
+def join_under(root: pathlib.Path, relative: str) -> pathlib.Path:
+    """Join ``relative`` onto ``root`` and require the result stay inside ``root``.
+
+    Used by S3 and Azure ``sync_remote_to_local`` so a key containing ``..`` or an
+    absolute path cannot write outside the destination directory.
+
+    Object-store keys have no symlink file type, unlike zip members. An already
+    planted dest symlink is followed by ``resolve()`` and rejected when the
+    target escapes ``root``.
+
+    Args:
+        root: Already-resolved destination directory.
+        relative: Object-key remainder after the storage prefix is stripped.
+
+    Returns:
+        The resolved path under ``root``.
+
+    Raises:
+        ValueError: If the resolved path escapes ``root``.
+
+    """
+    dest = (root / relative).resolve()
+    if not dest.is_relative_to(root):
+        error_msg = f"Refusing to write path outside {root}: {relative}"
+        raise ValueError(error_msg)
+    return dest
+
+
 @attrs.define
 class BaseClientConfig:
     """Base configuration class for storage clients.

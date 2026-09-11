@@ -26,6 +26,7 @@ import json
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import time
 
 import attrs
@@ -392,7 +393,9 @@ def _download_model_weights_from_cloud_storage_to_workspace(
         )
         value_error(err_msg)
 
-    destination.mkdir(exist_ok=True, parents=True)
+    destination.parent.mkdir(exist_ok=True, parents=True)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=".weights-", dir=destination.parent))
+    storage_dir: str | None = None
     try:
         storage_dir = _get_cloud_storage_dir_for_weights_name(weights_name, model_weights_prefix)
         logger.info(f"Syncing {weights_name=} from {storage_dir=} to {destination=} ...")
@@ -402,13 +405,20 @@ def _download_model_weights_from_cloud_storage_to_workspace(
             value_error(f"Failed to create storage client for {storage_prefix=}")
         client.sync_remote_to_local(  # type: ignore[union-attr]
             storage_prefix,
-            destination,
-            delete=True,
+            staging,
             chunk_size_bytes=storage_client.DOWNLOAD_CHUNK_SIZE_BYTES,
         )
+        try:
+            staging.replace(destination)
+        except OSError:
+            # On a shared cache another node may have finished this same weights name
+            # first; renaming onto its populated directory fails. Its tree is complete,
+            # so keep it and drop ours.
+            if not destination.exists():
+                raise
+            shutil.rmtree(staging, ignore_errors=True)
         logger.info(f"Done syncing {weights_name=} from {storage_dir=} to {destination=} ...")
     except Exception as e:
-        # Incase we are unable to connect to s3, we delete the destination folder and raise the error
         logger.error(
             "Error syncing weights_name=%s from storage_dir=%s to destination=%s: %s",
             weights_name,
@@ -416,7 +426,7 @@ def _download_model_weights_from_cloud_storage_to_workspace(
             destination,
             e,
         )
-        destination.rmdir()
+        shutil.rmtree(staging, ignore_errors=True)
         raise
 
     return destination

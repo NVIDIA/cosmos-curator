@@ -162,7 +162,7 @@ def test_download_model_weights_from_cloud_storage_syncs(
     monkeypatch.setattr(environment, "CONTAINER_PATHS_MODEL_WEIGHT_CACHE_DIR", cache_dir)
     monkeypatch.setattr(storage_utils, "path_to_prefix", _identity)
 
-    calls: list[tuple[str, pathlib.Path, bool, int]] = []
+    calls: list[tuple[str, pathlib.Path, int]] = []
 
     class DummyClient:
         def sync_remote_to_local(
@@ -170,10 +170,9 @@ def test_download_model_weights_from_cloud_storage_syncs(
             storage_prefix: str,
             destination: pathlib.Path,
             *,
-            delete: bool,
             chunk_size_bytes: int,
         ) -> None:
-            calls.append((storage_prefix, destination, delete, chunk_size_bytes))
+            calls.append((storage_prefix, destination, chunk_size_bytes))
 
     dummy_client = DummyClient()
     prefix = "s3://bucket/models/"
@@ -188,14 +187,13 @@ def test_download_model_weights_from_cloud_storage_syncs(
     destination = model_utils._download_model_weights_from_cloud_storage_to_workspace(weights, prefix)
     assert destination == cache_dir / weights
     assert destination.exists()
-    assert calls == [
-        (
-            f"{prefix}{weights}/",
-            destination,
-            True,
-            storage_client.DOWNLOAD_CHUNK_SIZE_BYTES,
-        )
-    ]
+    assert len(calls) == 1
+    storage_prefix, staging, chunk_size = calls[0]
+    assert storage_prefix == f"{prefix}{weights}/"
+    assert staging.parent == destination.parent
+    assert staging != destination
+    assert not staging.exists()
+    assert chunk_size == storage_client.DOWNLOAD_CHUNK_SIZE_BYTES
 
 
 def test_download_model_weights_from_cloud_storage_errors_without_client(
@@ -234,6 +232,67 @@ def test_download_model_weights_from_cloud_storage_skips_existing(
 
     returned = model_utils._download_model_weights_from_cloud_storage_to_workspace("already", "s3://bucket/")
     assert returned == destination
+
+
+def test_download_model_weights_from_cloud_storage_does_not_leave_partial_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failed sync must not leave a directory that the next run would skip as complete."""
+    cache_dir = tmp_path / "cache_partial"
+    monkeypatch.setattr(environment, "CONTAINER_PATHS_MODEL_WEIGHT_CACHE_DIR", cache_dir)
+    monkeypatch.setattr(storage_utils, "path_to_prefix", _identity)
+
+    class DummyClient:
+        def sync_remote_to_local(
+            self,
+            _storage_prefix: str,
+            destination: pathlib.Path,
+            *,
+            chunk_size_bytes: int,
+        ) -> None:
+            del chunk_size_bytes
+            (destination / "partial.bin").write_bytes(b"truncated")
+            error_msg = "network drop"
+            raise OSError(error_msg)
+
+    monkeypatch.setattr(storage_utils, "get_storage_client", lambda _path: DummyClient())
+
+    with pytest.raises(OSError, match="network drop"):
+        model_utils._download_model_weights_from_cloud_storage_to_workspace("gpt2", "s3://bucket/")
+
+    assert not (cache_dir / "gpt2").exists()
+    assert list(cache_dir.iterdir()) == []
+
+
+def test_download_model_weights_from_cloud_storage_yields_to_a_concurrent_writer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A peer that populated the destination first wins; our staging copy is discarded."""
+    cache_dir = tmp_path / "cache_race"
+    monkeypatch.setattr(environment, "CONTAINER_PATHS_MODEL_WEIGHT_CACHE_DIR", cache_dir)
+    monkeypatch.setattr(storage_utils, "path_to_prefix", _identity)
+    destination = cache_dir / "gpt2"
+
+    class DummyClient:
+        def sync_remote_to_local(
+            self,
+            _storage_prefix: str,
+            staging: pathlib.Path,
+            *,
+            chunk_size_bytes: int,
+        ) -> None:
+            del chunk_size_bytes
+            (staging / "ours.bin").write_bytes(b"ours")
+            # Stand in for another process finishing the same weights name mid-sync.
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "theirs.bin").write_bytes(b"theirs")
+
+    monkeypatch.setattr(storage_utils, "get_storage_client", lambda _path: DummyClient())
+
+    returned = model_utils._download_model_weights_from_cloud_storage_to_workspace("gpt2", "s3://bucket/")
+    assert returned == destination
+    assert (destination / "theirs.bin").read_bytes() == b"theirs"
+    assert [entry.name for entry in cache_dir.iterdir()] == ["gpt2"]
 
 
 def test_download_model_weights_from_cloud_storage_batch(monkeypatch: pytest.MonkeyPatch) -> None:

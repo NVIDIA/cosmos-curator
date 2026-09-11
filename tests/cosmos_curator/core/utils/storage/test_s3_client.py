@@ -28,7 +28,7 @@ from botocore.exceptions import ClientError
 from cosmos_curator.core.utils.storage import s3_client
 from cosmos_curator.core.utils.storage.azure_client import AzurePrefix
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3ClientConfig, S3Prefix
-from cosmos_curator.core.utils.storage.storage_client import StorageStat
+from cosmos_curator.core.utils.storage.storage_client import StorageStat, join_under
 
 
 class _FakePaginator:
@@ -732,6 +732,113 @@ def test_response_without_content_length_falls_back_to_the_managed_transfer(
     assert data == payload
     assert fake.download_fileobj_calls == [("bucket", "root/a.mp4")]
     assert fake.bodies[0].read_count == 0
+
+
+def _sync_client(objects: list[dict[str, Any]]) -> tuple[S3Client, list[tuple[str, str, str]]]:
+    """Build a client whose sync path lists ``objects`` and records ``download_file``."""
+    downloads: list[tuple[str, str, str]] = []
+
+    class _FakeSyncS3:
+        def download_file(self, bucket: str, key: str, filename: str, **_kwargs: object) -> None:
+            downloads.append((bucket, key, filename))
+            path = Path(filename)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"ok")
+
+    client = object.__new__(S3Client)
+    client.s3 = _FakeSyncS3()
+    client.list_recursive = lambda *_a, **_k: objects  # type: ignore[method-assign]
+    return client, downloads
+
+
+def test_sync_remote_to_local_writes_nested_keys_under_dest(tmp_path: Path) -> None:
+    """A nested weights key stays inside the cache directory."""
+    dest = tmp_path / "cache"
+    client, downloads = _sync_client(
+        [
+            {
+                "Key": "weights/nested/model.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+    )
+
+    client.sync_remote_to_local(S3Prefix("s3://bucket/weights"), dest)
+
+    expected = dest / "nested" / "model.bin"
+    assert expected.read_bytes() == b"ok"
+    assert downloads == [("bucket", "weights/nested/model.bin", str(expected.resolve()))]
+
+
+def test_sync_remote_to_local_rejects_a_key_that_escapes_dest(tmp_path: Path) -> None:
+    """Object keys with ``..`` must not write beside the destination."""
+    dest = tmp_path / "cache"
+    client, downloads = _sync_client(
+        [
+            {
+                "Key": "weights/../escape.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="outside"):
+        client.sync_remote_to_local(S3Prefix("s3://bucket/weights"), dest)
+
+    assert downloads == []
+    assert not (tmp_path / "escape.bin").exists()
+
+
+def test_sync_remote_to_local_rejects_escaping_keys_before_any_download(tmp_path: Path) -> None:
+    """A later traversal key must not leave earlier objects on disk."""
+    dest = tmp_path / "cache"
+    client, downloads = _sync_client(
+        [
+            {
+                "Key": "weights/good.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            },
+            {
+                "Key": "weights/../escape.bin",
+                "Size": 2,
+                "LastModified": datetime(2026, 1, 1, tzinfo=UTC),
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError, match="outside"):
+        client.sync_remote_to_local(S3Prefix("s3://bucket/weights"), dest)
+
+    assert downloads == []
+    assert not (dest / "good.bin").exists()
+    assert not (tmp_path / "escape.bin").exists()
+
+
+def test_sync_remote_to_local_delete_walks_the_resolved_dest(tmp_path: Path) -> None:
+    """Stale files are removed from the real directory even when dest is a symlink."""
+    real = tmp_path / "real"
+    real.mkdir()
+    dest = tmp_path / "cache"
+    dest.symlink_to(real)
+    (real / "stale.bin").write_bytes(b"old")
+    client, downloads = _sync_client([])
+
+    client.sync_remote_to_local(S3Prefix("s3://bucket/weights"), dest, delete=True)
+
+    assert downloads == []
+    assert not (real / "stale.bin").exists()
+
+
+def test_join_under_rejects_a_dest_symlink_that_escapes_root(tmp_path: Path) -> None:
+    """A planted leaf symlink that points outside dest is the zip analog we can have."""
+    dest = tmp_path / "cache"
+    dest.mkdir()
+    (dest / "model.bin").symlink_to(tmp_path / "outside.bin")
+    with pytest.raises(ValueError, match="outside"):
+        join_under(dest.resolve(), "model.bin")
 
 
 # Blocks ``ray`` at the import system level, then does what the client CLI does: import the

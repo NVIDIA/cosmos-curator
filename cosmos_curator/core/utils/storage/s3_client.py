@@ -51,6 +51,7 @@ from cosmos_curator.core.utils.storage.storage_client import (
     StoragePrefix,
     StorageStat,
     is_storage_path,
+    join_under,
 )
 
 # Backward-compatible exports for callers that imported these from s3_client.
@@ -523,6 +524,7 @@ class S3Client(StorageClient):
         print(f"Syncing {s3_prefix} to {local_dir}")  # noqa: T201
         local_dir_path = Path(local_dir)
         local_dir_path.mkdir(parents=True, exist_ok=True)
+        dest_root = local_dir_path.resolve()
 
         assert isinstance(s3_prefix, S3Prefix)
         # List all objects in the S3 prefix
@@ -536,9 +538,11 @@ class S3Client(StorageClient):
             ncols=70,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
         ) as pbar:
+            planned: list[tuple[dict[str, Any], pathlib.Path]] = []
             for obj in s3_objects:
                 relative_path = obj["Key"][len(s3_prefix.prefix) :].lstrip("/")
-                local_file_path = local_dir_path / relative_path
+                planned.append((obj, join_under(dest_root, relative_path)))
+            for obj, local_file_path in planned:
                 local_file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Check if local file exists and has the same size and last modified time
@@ -565,7 +569,7 @@ class S3Client(StorageClient):
 
         if delete:
             # Remove local files that don't exist in S3
-            local_files = list(local_dir_path.rglob("*"))
+            local_files = list(dest_root.rglob("*"))
             with tqdm(
                 total=len(local_files),
                 desc="Cleaning",
@@ -575,7 +579,7 @@ class S3Client(StorageClient):
             ) as pbar:
                 for local_file in local_files:
                     if local_file.is_file():
-                        relative_path = local_file.relative_to(local_dir_path)
+                        relative_path = local_file.relative_to(dest_root)
                         s3_key = f"{s3_prefix.prefix}{relative_path}".rstrip("/")
                         if not any(obj["Key"] == s3_key for obj in s3_objects):
                             local_file.unlink()

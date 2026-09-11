@@ -34,6 +34,7 @@ import concurrent.futures
 import contextlib
 import copy
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -66,6 +67,51 @@ def _raise_runtime_err(msg: str | dict[str, Any]) -> NoReturn:
     if isinstance(msg, str):
         raise RuntimeError(msg)  # noqa: TRY004
     raise RuntimeError(json.dumps(msg))
+
+
+def _nvcf_log_dir() -> Path:
+    """Return the per-user directory that invoke logs and log zips are written to.
+
+    These artifacts exist to be read after a failed invocation, so they must outlive
+    the command that wrote them. Writing them to the shared system temp directory
+    instead would put them at a name the response chose, in a directory any local
+    account can create entries in, so a co-tenant could pre-plant a symlink there and
+    redirect the write.
+
+    Returns:
+        A private directory owned by the current user, created if absent.
+
+    """
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    root = Path(cache_home) if cache_home else Path.home() / ".cache"
+    log_dir = root / "cosmos_curator" / "nvcf"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.chmod(0o700)
+    return log_dir
+
+
+def _path_in_dir(directory: str | Path, filename: str) -> Path:
+    """Join ``filename`` under ``directory`` and require the result stay inside it.
+
+    ``filename`` is built from a request id the NVCF response chose, so it can
+    contain path separators or be absolute.
+
+    Args:
+        directory: Intended parent directory.
+        filename: Name to place under ``directory``.
+
+    Returns:
+        The resolved destination path.
+
+    Raises:
+        RuntimeError: If the resolved path escapes ``directory``.
+
+    """
+    root = Path(directory).resolve()
+    dest = (root / filename).resolve()
+    if not dest.is_relative_to(root):
+        _raise_runtime_err(f"Refusing to write path outside {root}: {filename}")
+    return dest
 
 
 def _raise_timeout_err(msg: str | dict[str, Any]) -> None:
@@ -855,8 +901,9 @@ class NvcfHelper(NvcfBase):
 
             if reqid is not None:
                 if logs is not None:
-                    fname = f"{tempfile.gettempdir()}/{reqid}.log"
+                    fname = f"{reqid}.log"
                     try:
+                        fname = str(_path_in_dir(_nvcf_log_dir(), fname))
                         with Path(fname).open("a") as fd:
                             fd.writelines(f"{line}\n" for line in logs)
                         msg = f"Wrote the collected logs to {fname}"
@@ -864,6 +911,7 @@ class NvcfHelper(NvcfBase):
                     except (
                         TypeError,
                         OSError,
+                        RuntimeError,
                         FileNotFoundError,
                         PermissionError,
                         AttributeError,
@@ -1042,7 +1090,7 @@ class NvcfHelper(NvcfBase):
         location = headers.get("location")
         if location:
             self.logger.info("Output is ready, attempting to download")
-            path = Path(ddir) / f"{reqid}.zip"
+            path = _path_in_dir(ddir, f"{reqid}.zip")
             self.nvcf_api_hdl.download(url=location, dest=str(path))
             dl_msg = f"Downloaded result {path}"
             self.logger.info(dl_msg)
@@ -1165,15 +1213,16 @@ class NvcfHelper(NvcfBase):
                 rqid = resp.get("reqid")
                 fzip = resp.get("zip")
                 if rqid is not None and fzip is not None:
-                    fname = f"{tempfile.gettempdir()}/{rqid}-log.zip"
+                    fname = f"{rqid}-log.zip"
                     try:
+                        fname = str(_path_in_dir(_nvcf_log_dir(), fname))
                         with Path(fname).open("wb") as fd:
                             fd.write(fzip.getvalue())
                         if first_log:
                             log_msg = f"Writing logs to {fname}"
                             self.logger.info(log_msg)
                             first_log = False
-                    except RuntimeError:
+                    except (OSError, RuntimeError):
                         err_msg = f"Failed to write the logs to {fname}: "
                         self.logger.exception(err_msg)
 
