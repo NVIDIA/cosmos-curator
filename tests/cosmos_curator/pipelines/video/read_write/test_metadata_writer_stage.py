@@ -282,6 +282,69 @@ def _assert_embeddings_written(output_dir: Path, clip: Clip, video_uuid: uuid.UU
     npt.assert_allclose(np.array(embedding_df.iloc[0]["embedding"]), np.array([0.1, 0.2], dtype=np.float32))
 
 
+def test_clip_writer_local_output_uris_stay_under_output_roots(tmp_path: Path) -> None:
+    """Storage-derived relative paths cannot escape local ClipWriter directories."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    stage = _create_stage(output_dir, input_dir)
+    escaping_input = f"{input_dir}/../../outside/video.mp4"
+
+    with pytest.raises(ValueError, match="Refusing to write path outside"):
+        stage._get_video_uri(escaping_input)
+    with pytest.raises(ValueError, match="Refusing to write path outside"):
+        stage._get_clip_chunk_uri(escaping_input, 0)
+    with pytest.raises(ValueError, match="Refusing to write path outside"):
+        stage._get_video_error_uri(escaping_input, 0)
+    with pytest.raises(ValueError, match="Refusing to write path outside"):
+        stage._get_clip_uri(
+            uuid.uuid4(),
+            stage.get_output_path_clips(str(output_dir)),
+            "mp4",
+            "../../../../outside/video",
+        )
+
+
+def test_clip_writer_local_output_uris_preserve_nested_paths(tmp_path: Path) -> None:
+    """Valid nested input paths retain their output layout."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    stage = _create_stage(output_dir, input_dir)
+    input_video = input_dir / "camera" / "video.mp4"
+    clip_uuid = uuid.uuid4()
+
+    assert stage._get_video_uri(str(input_video)) == (output_dir / "processed_videos/camera/video.mp4.json").resolve()
+    assert (
+        stage._get_clip_uri(
+            clip_uuid,
+            stage.get_output_path_clips(str(output_dir)),
+            "mp4",
+            "camera/video",
+        )
+        == (output_dir / f"clips/{clip_uuid}/camera/video.mp4").resolve()
+    )
+
+
+def test_clip_writer_preserves_relative_output_uris(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Containment validation must not make persisted relative locations absolute."""
+    monkeypatch.chdir(tmp_path)
+    input_dir = Path("input")
+    output_dir = Path("output")
+    input_dir.mkdir()
+    stage = _create_stage(output_dir, input_dir)
+    clip_uuid = uuid.uuid4()
+
+    clip_uri = stage._get_clip_uri(
+        clip_uuid,
+        stage.get_output_path_clips(str(output_dir)),
+        "mp4",
+    )
+
+    assert clip_uri == output_dir / "clips" / f"{clip_uuid}.mp4"
+    assert not clip_uri.is_absolute()
+
+
 @pytest.mark.parametrize(
     ("embedding_algorithm", "expected_stem"),
     [

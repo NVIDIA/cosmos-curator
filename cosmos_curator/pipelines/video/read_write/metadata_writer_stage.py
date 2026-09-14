@@ -36,6 +36,7 @@ from cosmos_curator.core.interfaces.stage_interface import CuratorStage, Curator
 from cosmos_curator.core.utils.data.ref_resolver import batch_resolve
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.core.utils.storage import storage_client, storage_utils
+from cosmos_curator.core.utils.storage.storage_client import join_under
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_files_relative,
     get_full_path,
@@ -669,25 +670,40 @@ class ClipWriterStage(CuratorStage):
             output_clip_file = f"{video_span_uuid}/{relative_path}{suffix}.{file_type}"
         else:
             output_clip_file = f"{video_span_uuid}{suffix}.{file_type}"
-        return get_full_path(path_prefix, output_clip_file)
+        return self._get_output_uri(path_prefix, output_clip_file)
+
+    @staticmethod
+    def _get_output_uri(
+        path_prefix: str,
+        relative_path: str,
+    ) -> storage_client.StoragePrefix | pathlib.Path:
+        root = get_full_path(path_prefix)
+        if isinstance(root, pathlib.Path):
+            candidate = root / relative_path
+            join_under(root.resolve(), relative_path)
+            return candidate
+        return get_full_path(root, relative_path)
+
+    def _get_input_relative_path(self, input_video_path: str) -> str:
+        if not input_video_path.startswith(self._input_path):
+            error_msg = f"Input video path is outside {self._input_path}: {input_video_path}"
+            raise ValueError(error_msg)
+        return input_video_path[len(self._input_path) :]
 
     def _get_video_uri(self, input_video_path: str) -> storage_client.StoragePrefix | pathlib.Path:
-        assert input_video_path.startswith(self._input_path)
-        video_metadata_path = input_video_path[len(self._input_path) :] + ".json"
+        video_metadata_path = self._get_input_relative_path(input_video_path) + ".json"
         output_path_videos = self.get_output_path_processed_videos(self._output_path)
-        return get_full_path(output_path_videos, video_metadata_path)
+        return self._get_output_uri(output_path_videos, video_metadata_path)
 
     def _get_clip_chunk_uri(self, input_video_path: str, idx: int) -> storage_client.StoragePrefix | pathlib.Path:
-        assert input_video_path.startswith(self._input_path)
-        clip_chunk_path = input_video_path[len(self._input_path) :] + f"_{idx}.json"
+        clip_chunk_path = self._get_input_relative_path(input_video_path) + f"_{idx}.json"
         output_path_videos = self.get_output_path_processed_clip_chunks(self._output_path)
-        return get_full_path(output_path_videos, clip_chunk_path)
+        return self._get_output_uri(output_path_videos, clip_chunk_path)
 
     def _get_video_error_uri(self, input_video_path: str, idx: int) -> storage_client.StoragePrefix | pathlib.Path:
-        assert input_video_path.startswith(self._input_path)
-        error_chunk_path = input_video_path[len(self._input_path) :] + f"_{idx}.json"
+        error_chunk_path = self._get_input_relative_path(input_video_path) + f"_{idx}.json"
         output_path_videos = self.get_output_path_video_errors(self._output_path)
-        return get_full_path(output_path_videos, error_chunk_path)
+        return self._get_output_uri(output_path_videos, error_chunk_path)
 
     def _write_clip_window_webp(self, clip: Clip) -> ClipStats:
         clip_stats = ClipStats()
