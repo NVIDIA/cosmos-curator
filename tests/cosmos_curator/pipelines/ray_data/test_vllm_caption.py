@@ -497,6 +497,7 @@ def test_caption_window_rows_passes_video_debug_render_context(
     assert rows[0]["prompt"] == "rendered"
 
 
+@pytest.mark.integration
 def test_caption_window_rows_runs_window_generation_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Skipped rows flow through the same processor branch, avoiding duplicate window prep."""
     calls_path = tmp_path / "window_calls.txt"
@@ -590,6 +591,7 @@ def test_caption_window_rows_runs_window_generation_once(monkeypatch: pytest.Mon
     assert sorted(window["caption_skip"] for window in rows[0]["caption_windows"]) == [False, True]
 
 
+@pytest.mark.integration
 def test_write_captioned_metadata_and_summary(tmp_path: Path) -> None:
     """Captioned clip rows write per-clip metadata and summary totals without a shuffle."""
     rows = [

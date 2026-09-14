@@ -96,6 +96,8 @@ from tests.cosmos_curator.next.recipes.robot_action_caption.caption_harness impo
     InferenceLedger,
 )
 
+pytestmark = pytest.mark.integration
+
 # Rows one fetch block carries. Small enough that a fixture-scale corpus still
 # spans several staged files, which is what makes partial durable progress
 # reachable at all.

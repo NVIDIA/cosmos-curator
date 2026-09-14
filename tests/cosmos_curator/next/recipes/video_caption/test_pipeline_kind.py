@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
 from cosmos_curator.next.recipes.video_caption import pipeline
 from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig
 from cosmos_curator.next.recipes.video_caption.pipeline_kind import VIDEO_CAPTION_KIND
@@ -31,6 +30,10 @@ def _write_config(path: Path) -> None:
 
 def test_kind_is_registered_and_exposes_config_surfaces(tmp_path: Path) -> None:
     """The generic CLI discovers all strict video-caption config operations."""
+    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
+        BUILTIN_PIPELINE_KINDS,
+    )
+
     config_path = tmp_path / "caption.yaml"
     _write_config(config_path)
 

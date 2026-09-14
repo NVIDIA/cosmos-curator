@@ -21,7 +21,7 @@ from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig
 from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 @pytest.mark.parametrize("faststart", [True, False])
 def test_remote_probe_reads_less_than_whole_mp4(
     config: ResolvedVideoCutConfig,

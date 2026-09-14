@@ -559,6 +559,7 @@ def test_a_projection_without_the_join_key_is_refused(make_clips_table: ClipsTab
         fill_embedding_group(lance.dataset(uri), fill, storage_options=None)
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_surviving_fragments_commit_when_one_fragment_fails(
     make_clips_table: ClipsTableFactory,
@@ -584,6 +585,7 @@ def test_surviving_fragments_commit_when_one_fragment_fails(
     assert vectors["c1"] is not None
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_skipped_fragments_rows_stay_pending_and_an_ordinary_rerun_fills_them(
     make_clips_table: ClipsTableFactory,
@@ -607,6 +609,7 @@ def test_a_skipped_fragments_rows_stay_pending_and_an_ordinary_rerun_fills_them(
     assert all(vector is not None for vector in _image_vectors_by_clip(uri).values())
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_topping_up_one_pending_row_leaves_its_filled_siblings_byte_identical(
     make_clips_table: ClipsTableFactory,
@@ -648,6 +651,7 @@ def test_topping_up_one_pending_row_leaves_its_filled_siblings_byte_identical(
     assert {clip: after_second[clip] for clip in preserved} == {clip: after_first[clip] for clip in preserved}
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_contract_violation_reaches_the_caller_as_a_value_error_and_commits_nothing(
     make_clips_table: ClipsTableFactory,
@@ -672,6 +676,7 @@ def test_a_contract_violation_reaches_the_caller_as_a_value_error_and_commits_no
     assert int(lance.dataset(uri).version) == version
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_partly_skipped_run_reports_the_skip_count_to_its_caller(
     make_clips_table: ClipsTableFactory,
@@ -700,6 +705,7 @@ def test_a_partly_skipped_run_reports_the_skip_count_to_its_caller(
     assert any("see the per-fragment warnings" in message for message in warnings)
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_run_whose_every_fragment_failed_raises_instead_of_reporting_success(
     make_clips_table: ClipsTableFactory,
@@ -729,6 +735,7 @@ def test_a_run_whose_every_fragment_failed_raises_instead_of_reporting_success(
     assert int(lance.dataset(uri).version) == version  # nothing was committed
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_rerun_over_a_fully_embedded_table_succeeds_and_commits_nothing(
     tmp_path: pathlib.Path,
@@ -753,6 +760,7 @@ def test_a_rerun_over_a_fully_embedded_table_succeeds_and_commits_nothing(
     assert int(lance.dataset(uri).version) == version
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_max_fragments_bounds_the_run_to_the_first_fragments(
     make_clips_table: ClipsTableFactory,

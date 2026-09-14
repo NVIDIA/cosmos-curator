@@ -22,11 +22,10 @@ the code under test, so nothing about them is stubbed.
 
 import json
 import pathlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any
 
 import pytest
-import ray
 import yaml
 
 from cosmos_curator.core.sensors.data_integrity.instruments import (
@@ -57,13 +56,6 @@ def _nothing_readable(store_root: pathlib.Path) -> bool:
     return not (
         store.read_streams(str(store_root)) or store.read_sessions(str(store_root)) or store.read_runs(str(store_root))
     )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _ray_cluster() -> Iterator[None]:
-    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False, ignore_reinit_error=True)
-    yield
-    ray.shutdown()
 
 
 @pytest.fixture
@@ -106,6 +98,8 @@ def summary(dataset: pathlib.Path, tmp_path: pathlib.Path) -> dict[str, object]:
     return pipeline.run_config(resolve_config_data(_config_data(dataset, tmp_path / "di-store")))
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_the_run_summarizes_what_it_covered(summary: dict[str, object]) -> None:
     """Two surviving sessions, four streams counted from the workers, one unreadable."""
     assert summary["sessions"] == NUM_SESSIONS
@@ -117,6 +111,8 @@ def test_the_run_summarizes_what_it_covered(summary: dict[str, object]) -> None:
     assert summary["empty_sessions"] == 0
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_the_whole_invocation_commits_exactly_once(summary: dict[str, object], tmp_path: pathlib.Path) -> None:
     """Many sessions, one run id, one commit -- the rule this recipe inherits."""
     runs = store.read_runs(str(tmp_path / "di-store"))
@@ -127,6 +123,8 @@ def test_the_whole_invocation_commits_exactly_once(summary: dict[str, object], t
     assert runs[0]["num_streams"] == NUM_STREAMS
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_every_stream_is_stored_once_under_this_run(summary: dict[str, object], tmp_path: pathlib.Path) -> None:
     """Reading without ``include_incomplete`` proves the rows are believed, not just present."""
     streams = store.read_streams(str(tmp_path / "di-store"))
@@ -135,6 +133,8 @@ def test_every_stream_is_stored_once_under_this_run(summary: dict[str, object], 
     assert {row["run_id"] for row in streams} == {summary["run_id"]}
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_nested_session_is_measured_once_under_the_session_enclosing_it(
     summary: dict[str, object],
     dataset: pathlib.Path,
@@ -155,6 +155,8 @@ def test_a_nested_session_is_measured_once_under_the_session_enclosing_it(
     assert str(dataset / "b" / "nested") not in {row["session_path"] for row in rows}
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_each_stream_keeps_the_session_it_was_found_under(
     summary: dict[str, object],
     dataset: pathlib.Path,
@@ -169,6 +171,8 @@ def test_each_stream_keeps_the_session_it_was_found_under(
     assert by_source[str(dataset / "b" / "rear.mp4")] == str(dataset / "b")
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_an_unreadable_stream_is_recorded_and_never_judged(
     summary: dict[str, object],
     dataset: pathlib.Path,
@@ -185,6 +189,8 @@ def test_an_unreadable_stream_is_recorded_and_never_judged(
     assert broken not in {row["source"] for row in store.read_evaluations(root)}
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_every_measured_stream_contributes_a_row_per_metric(summary: dict[str, object], tmp_path: pathlib.Path) -> None:
     """Five metrics, three measured streams, and one verdict for each pair."""
     del summary
@@ -195,6 +201,8 @@ def test_every_measured_stream_contributes_a_row_per_metric(summary: dict[str, o
     assert len(store.read_evaluations(root)) == NUM_MEASURED * NUM_METRICS
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_every_measured_session_is_stored_once(
     summary: dict[str, object], dataset: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
@@ -210,6 +218,8 @@ def test_every_measured_session_is_stored_once(
     assert all(row["error"] is None for row in sessions.values())
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_every_session_contributes_a_row_per_session_metric(summary: dict[str, object], tmp_path: pathlib.Path) -> None:
     """The pipeline measures the session as well as its streams, and stores both."""
     del summary
@@ -220,6 +230,8 @@ def test_every_session_contributes_a_row_per_session_metric(summary: dict[str, o
     assert len(store.read_session_evaluations(root)) == NUM_SESSIONS * len(SESSION_INSTRUMENTS)
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_failing_session_metric_reaches_the_store(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
@@ -261,6 +273,8 @@ def test_a_failing_session_metric_reaches_the_store(
     assert summary["failed_metrics"] == 0
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_the_manifest_describes_the_run_rather_than_a_session(
     summary: dict[str, object], tmp_path: pathlib.Path
 ) -> None:
@@ -273,6 +287,8 @@ def test_the_manifest_describes_the_run_rather_than_a_session(
     assert manifest["num_streams"] == NUM_STREAMS
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_run_with_findings_still_exits_zero(dataset: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """The runtime's contract, not ``di-session``'s: findings are results, not failures."""
     config_path = tmp_path / "config.yaml"
@@ -281,6 +297,8 @@ def test_a_run_with_findings_still_exits_zero(dataset: pathlib.Path, tmp_path: p
     assert pipeline.main([str(config_path)]) == 0
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_config_override_reaches_the_run(dataset: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """``--set`` is resolved like any other input before the cluster starts."""
     config_path = tmp_path / "config.json"
@@ -291,6 +309,8 @@ def test_a_config_override_reaches_the_run(dataset: pathlib.Path, tmp_path: path
     assert len(store.read_streams(str(tmp_path / "di-store"))) == NUM_SESSIONS
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_the_run_widens_rays_no_progress_window_to_the_configured_one(
     dataset: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -312,6 +332,8 @@ def test_the_run_widens_rays_no_progress_window_to_the_configured_one(
     assert captured["no_progress_timeout_s"] == 2 * 60 * 60
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_an_operator_can_widen_the_no_progress_window_further(
     dataset: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -328,6 +350,8 @@ def test_an_operator_can_widen_the_no_progress_window_further(
     assert captured["no_progress_timeout_s"] == -1
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_stale_session_path_costs_the_run_its_exit_status_but_not_its_rows(
     dataset: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
@@ -360,6 +384,8 @@ def test_a_stale_session_path_costs_the_run_its_exit_status_but_not_its_rows(
     assert store.session_rollup(str(store_root))["status"] == "ERROR"
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_an_unreachable_stream_costs_the_run_its_exit_status_but_adds_no_row(
     dataset: pathlib.Path,
     tmp_path: pathlib.Path,
@@ -393,6 +419,8 @@ def test_an_unreachable_stream_costs_the_run_its_exit_status_but_adds_no_row(
     assert store.session_rollup(str(store_root))["status"] == "ERROR"
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_run_that_could_list_nothing_at_all_commits_nothing(tmp_path: pathlib.Path) -> None:
     """With no measurement to preserve there is nothing to commit, so this fails the old way."""
     store_root = tmp_path / "di-store"
@@ -415,6 +443,8 @@ def test_a_run_that_could_list_nothing_at_all_commits_nothing(tmp_path: pathlib.
     assert len(store.read_sessions(str(store_root), include_incomplete=True)) == 2
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_run_that_measured_nothing_names_every_reason_it_did_not(tmp_path: pathlib.Path) -> None:
     """One unlistable session and one empty one call for different fixes, so both are named.
 
@@ -480,6 +510,8 @@ def test_every_way_to_measure_nothing_reads_as_itself(
         assert named is (clause in expected), f"{clause!r} {'named' if named else 'missing'} in {message!r}"
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_session_that_holds_no_streams_is_reported_without_failing_the_run(
     dataset: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
@@ -498,6 +530,8 @@ def test_a_session_that_holds_no_streams_is_reported_without_failing_the_run(
     assert summary["streams"] == NUM_STREAMS
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_sessions_holding_no_streams_fail_without_committing(tmp_path: pathlib.Path) -> None:
     """A run that measured nothing is a config mistake, not a passing run.
 
@@ -525,6 +559,8 @@ def test_sessions_holding_no_streams_fail_without_committing(tmp_path: pathlib.P
     assert _nothing_readable(store_root)
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_an_unwritable_store_root_fails_the_run(dataset: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """An operational failure propagates, so the runtime can exit nonzero on it."""
     blocker = tmp_path / "not-a-directory"

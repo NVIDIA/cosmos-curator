@@ -313,7 +313,7 @@ stages:
     - *e2e_web_entry
     - when: never
 
-  # Shared rule entries for gpu_tests and its dependent combine_coverage.
+  # Shared rule entries for runtime tests and their combined coverage.
   gpu_post_merge_push_entry: &gpu_post_merge_push_entry
     if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
   gpu_e2e_trigger_entry: &gpu_e2e_trigger_entry
@@ -335,15 +335,26 @@ stages:
     - *gpu_mr_default_entry
     - when: never
 
-  # combine_coverage: mirrors gpu_tests_rules, but on a labeled MR it stays
-  # on_success (not manual) and non-blocking. Because it `needs: gpu_tests`,
-  # GitLab keeps it skipped until gpu_tests runs, then runs it automatically.
+  # CPU integration tests have an independent opt-out from the Slurm GPU job.
+  integration_tests_rules: &integration_tests_rules
+    - *skip_single_purpose_web_rule
+    - *gpu_post_merge_push_entry
+    - *gpu_e2e_trigger_entry
+    - *e2e_merge_train_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)optional-integration-tests($|,)/'
+      when: manual
+      allow_failure: true
+    - *gpu_mr_default_entry
+    - when: never
+
+  # Coverage waits for all suites; either label makes it non-blocking when
+  # the corresponding runtime job is optional and manual.
   combine_coverage_rules: &combine_coverage_rules
     - *skip_single_purpose_web_rule
     - *gpu_post_merge_push_entry
     - *gpu_e2e_trigger_entry
     - *e2e_merge_train_entry
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)optional-gpu-tests($|,)/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)optional-(integration|gpu)-tests($|,)/'
       when: on_success
       allow_failure: true
     - *gpu_mr_default_entry
@@ -633,7 +644,7 @@ resolve_version:
 # as artifacts so every downstream consumer can pick the arch they need:
 #   - mypy / unit_tests        -> install over PyPI-resolved cosmos-xenna
 #   - .build_curator_arch      -> bake into pixi envs at image build time
-#   - k8s_gpu_tests / gpu_tests -> install over pixi-installed cosmos-xenna at
+#   - GPU / integration tests -> install over pixi-installed cosmos-xenna at
 #                                  test runtime (slim images install pixi envs
 #                                  from pixi.lock, which still pins the PyPI
 #                                  release)
@@ -809,7 +820,7 @@ client_wheel_smoke:
     # --use-local-xenna-build. The slim build skips this on purpose because
     # slim images install pixi envs at runtime from the lockfile, which still
     # pins the PyPI-released cosmos-xenna; the slim consumers (k8s_gpu_tests,
-    # gpu_tests, slurm_end_to_end, nvcf_split_benchmark) instead install the
+    # gpu_tests, integration_tests, slurm_end_to_end, nvcf_split_benchmark) instead install the
     # wheel into their pixi envs at test time via
     # .gitlab/scripts/install_local_xenna_into_pixi.sh.
     - |
@@ -999,6 +1010,57 @@ build_deploy_curator_distributable:
     reports:
       dotenv: build.env
 
+# Run CPU Ray and runtime integration tests in a dedicated Kubernetes pod.
+integration_tests:
+  stage: end-to-end
+  rules: *integration_tests_rules
+  needs:
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator_slim
+    - job: build_xenna_wheels
+      optional: true
+      artifacts: true
+  tags:
+    # The CPU runner permits the larger Ray resource requests below.
+    - k8s-cpu
+  image: ${CURATOR_SLIM_FULL_IMAGE}
+  timeout: 30 minutes
+  variables:
+    CUDA_VISIBLE_DEVICES: ""
+    KUBERNETES_POLL_TIMEOUT: 1800
+    KUBERNETES_CPU_REQUEST: "8"
+    KUBERNETES_CPU_LIMIT: "8"
+    KUBERNETES_MEMORY_REQUEST: "32Gi"
+    KUBERNETES_MEMORY_LIMIT: "32Gi"
+  before_script:
+    - export PIXI_CACHE_DIR=/cache/pixi
+    - export CONDA_OVERRIDE_CUDA=13.0.3
+    - cd /opt/cosmos-curator
+    - pixi install --frozen -e default
+    - WHEEL_DIR="${CI_PROJECT_DIR}/cosmos-xenna/target/wheels"
+      bash "${CI_PROJECT_DIR}/.gitlab/scripts/install_local_xenna_into_pixi.sh" default
+  script:
+    - export COVERAGE_FILE="${CI_PROJECT_DIR}/.coverage.integration_tests"
+    # Run serially so workers do not each start a separate Ray cluster.
+    - >-
+      pixi run --as-is -e default integration-test
+      --junitxml="${CI_PROJECT_DIR}/integration-report.xml"
+      --cov=cosmos_curator
+      --cov-report=term
+      --cov-report=xml:"${CI_PROJECT_DIR}/integration-coverage.xml"
+      --cov-report=html:"${CI_PROJECT_DIR}/integration-htmlcov"
+  artifacts:
+    when: always
+    reports:
+      junit: integration-report.xml
+    paths:
+      - integration-report.xml
+      - integration-coverage.xml
+      - integration-htmlcov/
+      - .coverage.integration_tests
+    expire_in: 1 week
+
 # Run GPU tests on SLURM cluster
 gpu_tests:
   stage: end-to-end
@@ -1149,9 +1211,10 @@ slurm_distributable_media_smoke:
       - slurm_distributable_smoke_remote_files/
       - slurm_distributable_smoke_*.submit.log
 
-# Combine coverage from unit tests and GPU tests
-# This job runs after both unit_tests and gpu_tests complete, combining coverage data from:
+# Combine coverage from the unit, CPU integration, and GPU suites.
+# This job runs after all three suites complete, combining coverage data from:
 # - unit_tests: .coverage.unit_tests
+# - integration_tests: .coverage.integration_tests
 # - gpu_tests: .coverage.gpu_*
 # This provides a complete picture of test coverage across all test suites and environments.
 # The coverage badge and MR coverage stats will use data from this job.
@@ -1159,18 +1222,18 @@ combine_coverage:
   variables:
     GIT_SUBMODULE_STRATEGY: none
   stage: end-to-end
-  needs: ["unit_tests", "gpu_tests"]
+  needs: ["unit_tests", "integration_tests", "gpu_tests"]
   rules: *combine_coverage_rules
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner  # Override to Docker executor
   script:
     - *setup_ci_builder_env
-    # Combine coverage data from both jobs
-    - echo "Combining coverage from unit_tests and gpu_tests..."
+    # Combine coverage data from all three jobs.
+    - echo "Combining coverage from unit_tests, integration_tests, and gpu_tests..."
     - echo "Available coverage files:"
     - ls -la .coverage.* || true
-    - coverage combine .coverage.unit_tests .coverage.gpu_*
+    - coverage combine .coverage.unit_tests .coverage.integration_tests .coverage.gpu_*
     # Generate final combined reports
     - coverage report
     - coverage xml

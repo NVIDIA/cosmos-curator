@@ -18,6 +18,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import ray
 
 from cosmos_curator.pipelines.ray_data.video_split._summary_writer import (
@@ -35,6 +36,7 @@ def test_relative_path_strips_prefix() -> None:
     assert _relative_path("s3://other/a.mp4", "s3://bucket/raw") == "s3://other/a.mp4"
 
 
+@pytest.mark.integration
 def test_write_summary_aggregates_across_videos(tmp_path: Path) -> None:
     """End-to-end: build a clip-row dataset, aggregate on the driver, write summary.json."""
     input_video_path = "s3://bucket/raw"

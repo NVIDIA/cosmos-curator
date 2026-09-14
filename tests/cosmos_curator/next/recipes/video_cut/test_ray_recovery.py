@@ -139,7 +139,7 @@ def _attempt(
     )
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 @pytest.mark.parametrize("probe_failures", [1, 4])
 def test_probe_retries_never_checkpoint_an_inconclusive_failure(
     config: ResolvedVideoCutConfig, tmp_path: Path, probe_failures: int
@@ -169,7 +169,7 @@ def test_probe_retries_never_checkpoint_an_inconclusive_failure(
     assert probes == [config.input.uris[0]] * (probe_failures + 1)
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 def test_fresh_driver_recovers_source_checkpoints_and_uncommitted_fragments(
     config: ResolvedVideoCutConfig, tmp_path: Path
 ) -> None:
@@ -230,7 +230,7 @@ def test_fresh_driver_recovers_source_checkpoints_and_uncommitted_fragments(
     assert len(set(actual["span_id"].to_pylist())) == len(actual) == 9
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 def test_native_pending_write_is_replayed_within_frozen_snapshot(
     config: ResolvedVideoCutConfig, tmp_path: Path
 ) -> None:
@@ -254,7 +254,7 @@ def test_native_pending_write_is_replayed_within_frozen_snapshot(
     assert sorted((tmp_path / "probes.txt").read_text().splitlines()) == list(config.input.uris)
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 @pytest.mark.parametrize("sources_per_checkpoint", [1, 2])
 def test_full_sized_fragments_pack_source_plans(
     config: ResolvedVideoCutConfig, tmp_path: Path, sources_per_checkpoint: int
@@ -277,7 +277,7 @@ def test_full_sized_fragments_pack_source_plans(
     assert len(set(spans["source_id"].to_pylist())) == 2
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 def test_empty_and_error_only_sources_publish_and_resume(config: ResolvedVideoCutConfig, tmp_path: Path) -> None:
     """An entirely empty expansion still publishes counts and skips all work on replay."""
     raw = config.model_dump(mode="json")

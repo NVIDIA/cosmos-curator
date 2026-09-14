@@ -3082,6 +3082,7 @@ class TestDedupScoreReport:
         assert "eps=0.1*->" not in line
         assert "* the configured dedup_eps" in line
 
+    @pytest.mark.integration
     @pytest.mark.usefixtures("ray_local")
     def test_the_configured_threshold_reaches_the_reported_ladder(self, loguru_records: list[dict[str, Any]]) -> None:
         """The run's own ``dedup_eps`` must survive the hop from the config to the line.

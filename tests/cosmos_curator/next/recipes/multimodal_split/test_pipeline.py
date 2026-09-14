@@ -42,11 +42,6 @@ from cosmos_curator.next.recipes.multimodal_split.reports import (
     write_sensor_errors,
 )
 
-# The session-scoped cluster is the only one the Curator Next tree may start.
-# Without this the bare ``ray.init`` inside ``run_config`` claims the whole
-# machine and every later test in the run silently inherits that shape.
-pytestmark = pytest.mark.usefixtures("ray_local")
-
 
 def test_episode_accounting_rejects_a_missing_terminal_outcome() -> None:
     """The independently planned count must equal the three terminal states."""
@@ -59,6 +54,8 @@ def test_episode_accounting_rejects_a_missing_terminal_outcome() -> None:
         )
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_episode_id_count_is_global_across_ray_blocks() -> None:
     """Real Ray blocks are the only way to prove the count is block-layout independent."""
     episode_ids = ray.data.from_arrow(
@@ -72,6 +69,8 @@ def test_episode_id_count_is_global_across_ray_blocks() -> None:
     assert pipeline._count_unique_episode_ids(episode_ids) == 2
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_run_writes_one_clip_per_span_across_every_session(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -101,6 +100,8 @@ def test_a_run_writes_one_clip_per_span_across_every_session(
     assert hashlib.sha256(payload).hexdigest() == selected["media_sha256"]
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_one_unusable_session_does_not_end_the_run(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -120,6 +121,8 @@ def test_one_unusable_session_does_not_end_the_run(
     assert len(list(media.rglob("*.mp4"))) == 3
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_fully_reconciled_rerun_is_a_zero_encode_noop(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -142,6 +145,8 @@ def test_a_fully_reconciled_rerun_is_a_zero_encode_noop(
     assert lance.dataset(config.output.episodes_lance_uri).count_rows() == 3
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_post_planning_camera_failure_drops_only_the_incomplete_episodes(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -226,6 +231,8 @@ def test_a_run_that_finds_no_sessions_is_refused(
         run_config(make_config(root, tmp_path / "media"))
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_execution_settings_reach_the_runtime_rather_than_being_accepted_and_ignored(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -255,6 +262,8 @@ def test_the_progress_bar_is_off_unless_asked_for() -> None:
     assert MultimodalSplitExecutionConfig().storage_profile == "default"
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_run_reports_elapsed_time_and_bytes_written(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -276,6 +285,8 @@ def test_a_run_reports_elapsed_time_and_bytes_written(
     assert summary["elapsed_seconds"] > 0
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_failures_are_summarized_by_category_rather_than_one_line_each(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -389,6 +400,8 @@ def test_an_undeclared_session_heap_leaves_ray_to_its_own_default(
     assert seen["memory"] is None
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_flood_of_failures_is_counted_without_being_collected(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -417,6 +430,8 @@ def test_a_flood_of_failures_is_counted_without_being_collected(
     assert len(failures.examples) == 5
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_damaged_plan_report_is_named_rather_than_counted_as_a_clean_session(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -469,6 +484,8 @@ def test_an_unreadable_report_is_logged_where_an_absent_one_is_not(
     assert "JSONDecodeError" in warning["message"]
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
 def test_a_split_failure_reaches_the_summary(
     tmp_path: Path,
     make_session: Callable[..., Path],

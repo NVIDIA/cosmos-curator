@@ -24,7 +24,6 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
 from cosmos_curator.next.recipes.multimodal_split import pipeline_kind
 from cosmos_curator.next.recipes.multimodal_split.config import (
     ResolvedMultimodalSplitConfig,
@@ -54,6 +53,10 @@ def _write_config(root: Path, prefix: str, *, clip: dict[str, object] | None = N
 
 def test_the_kind_is_registered_under_its_hyphenated_name() -> None:
     """The CLI resolves configs by their ``kind`` discriminator."""
+    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
+        BUILTIN_PIPELINE_KINDS,
+    )
+
     assert BUILTIN_PIPELINE_KINDS.get("multimodal-split") is MULTIMODAL_SPLIT_KIND
     assert "multimodal-split" in BUILTIN_PIPELINE_KINDS.names()
 
@@ -257,6 +260,7 @@ def test_the_schema_documents_the_input_section() -> None:
     assert set(schema["required"]) == {"schema_version", "kind", "input", "sensors", "output"}
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_run_splits_the_sessions_it_discovers(
     tmp_path: Path,
@@ -281,6 +285,7 @@ def test_a_run_splits_the_sessions_it_discovers(
     assert "6 camera clip(s)" in output.message
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_run_applies_overrides_before_discovering(
     tmp_path: Path,

@@ -7,7 +7,7 @@
 # architecture into each named pixi environment, replacing the cosmos-xenna
 # that pixi installed from the lockfile. This is the runtime equivalent of
 # the image-build path's `--use-local-xenna-build` flag, used by slim-image
-# consumers (k8s_gpu_tests, gpu_tests) that materialise pixi envs at runtime
+# consumers (k8s_gpu_tests, gpu_tests, integration_tests) that materialise pixi envs at runtime
 # from pixi.lock (which still pins the PyPI-released cosmos-xenna).
 #
 # This is a no-op when no matching wheel artifact is present, so it is safe

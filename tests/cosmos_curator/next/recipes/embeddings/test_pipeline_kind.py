@@ -15,7 +15,7 @@
 
 """Tests for the ``embeddings`` pipeline-kind surface: the CLI contract and its dispatch.
 
-Three layers, all runnable in the default CPU job:
+Three layers:
 
 - Surface tests against the eight callbacks (template, validate, render, schema),
   which need no table and no Ray.
@@ -25,6 +25,8 @@ Three layers, all runnable in the default CPU job:
   schema-widening commit and the skip path) and one ``ray_local`` fill through a
   stub embedder, which is the only place a config file drives real vectors into
   the table.
+
+The Ray fill runs in the integration suite; the remaining tests run in the CPU job.
 """
 
 import json
@@ -38,7 +40,6 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.next.embeddings.action.pca import PcaArtifact
 from cosmos_curator.next.embeddings.action.wrist_motion import DESCRIPTOR_DIM
@@ -158,6 +159,10 @@ def _stub_image_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
 
 def test_the_kind_is_registered_under_its_single_word_name() -> None:
     """The CLI resolves configs by their ``kind`` discriminator."""
+    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
+        BUILTIN_PIPELINE_KINDS,
+    )
+
     assert BUILTIN_PIPELINE_KINDS.get("embeddings") is EMBEDDINGS_KIND
     assert "embeddings" in BUILTIN_PIPELINE_KINDS.names()
 
@@ -549,6 +554,7 @@ def test_a_config_driven_run_widens_the_table_it_names(
     assert output.json_payload["ending_version"] == lance.dataset(clips_uri).version
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_config_driven_run_fills_the_enabled_modality(
     tmp_path: pathlib.Path,

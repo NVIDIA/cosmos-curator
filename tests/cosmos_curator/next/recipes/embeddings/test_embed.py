@@ -336,6 +336,7 @@ def test_a_run_whose_rows_all_failed_is_tolerated_when_the_group_already_holds_e
     check_action_outcome(all_failed, lance.dataset(clips_uri))
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_pca_candidate_extraction_dispatches_through_a_real_actor_pool(
     monkeypatch: pytest.MonkeyPatch,

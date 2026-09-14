@@ -11,8 +11,6 @@ import yaml
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
-from cosmos_curator.client.cli import cosmos_curator
-from cosmos_curator.client.pipeline_cli import pipeline_runtime
 from cosmos_curator.next.recipes.video_cut import pipeline
 from cosmos_curator.next.recipes.video_cut.config import (
     InputConfig,
@@ -79,6 +77,8 @@ def test_media_root_derives_outputs_and_preserves_overrides(tmp_path: Path) -> N
 
 def test_root_config_renders_without_discovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """CLI validation/rendering needs no S3 access and resolves defaults after overrides."""
+    from cosmos_curator.client.cli import cosmos_curator  # noqa: PLC0415 - deployment CLI dependencies are dev-only
+
     monkeypatch.setattr(pipeline, "resolve_input_uris", lambda *_args, **_kwargs: pytest.fail("unexpected discovery"))
     raw = {
         "schema_version": 1,
@@ -133,6 +133,9 @@ def test_cli_template_render_schema_and_dispatch(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Generic CLI and runtime select the new recipe, preserving lazy registration."""
+    from cosmos_curator.client.cli import cosmos_curator  # noqa: PLC0415 - deployment CLI dependencies are dev-only
+    from cosmos_curator.client.pipeline_cli import pipeline_runtime  # noqa: PLC0415 - client is dev-only
+
     runner = CliRunner()
     template = runner.invoke(cosmos_curator, ["pipeline", "template", "video-cut"])
     assert template.exit_code == 0, template.output

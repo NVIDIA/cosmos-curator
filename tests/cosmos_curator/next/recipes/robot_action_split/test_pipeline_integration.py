@@ -528,6 +528,7 @@ def test_lance_write_produces_multiple_fragments(dataset: Path, output_path: Pat
     assert len(ds.get_fragments()) == len(success)
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_full_pipeline_run(dataset: Path, output_path: Path) -> None:
     """Full pipeline over the default Ray Data path: run() reports correct counts.

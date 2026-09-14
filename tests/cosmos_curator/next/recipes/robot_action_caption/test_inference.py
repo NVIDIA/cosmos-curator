@@ -405,6 +405,7 @@ def phase_plan(
     )
 
 
+@pytest.mark.integration
 def test_the_phase_checkpoints_the_scanned_ids_in_its_own_workspace(phase_plan: PhasePlan) -> None:
     """Progress is recorded under the scan's own id column, inside this run's namespace.
 
@@ -418,6 +419,7 @@ def test_the_phase_checkpoints_the_scanned_ids_in_its_own_workspace(phase_plan: 
     assert phase_plan.checkpoint.checkpoint_path == phase_plan.workspace.checkpoints_uri
 
 
+@pytest.mark.integration
 def test_the_phase_splits_scan_rows_before_media_fetch(phase_plan: PhasePlan) -> None:
     """Use the scan batch size as a non-strict execution-block target."""
     assert phase_plan.repartition_kwargs == {
@@ -426,6 +428,7 @@ def test_the_phase_splits_scan_rows_before_media_fetch(phase_plan: PhasePlan) ->
     }
 
 
+@pytest.mark.integration
 def test_the_checkpoint_and_the_sink_share_one_filesystem(phase_plan: PhasePlan) -> None:
     """One credential set reaches both, so the checkpoint can read what the sink wrote.
 
@@ -438,11 +441,13 @@ def test_the_checkpoint_and_the_sink_share_one_filesystem(phase_plan: PhasePlan)
     assert phase_plan.checkpoint.filesystem is phase_plan.write_kwargs["filesystem"]
 
 
+@pytest.mark.integration
 def test_the_terminal_sink_routes_every_execution_block_by_fragment(phase_plan: PhasePlan) -> None:
     """Partition staged rows by their retained fragment identity."""
     assert phase_plan.write_kwargs["partition_cols"] == [FRAGMENT_ID_COLUMN]
 
 
+@pytest.mark.integration
 def test_the_media_stage_reserves_one_io_token_per_fetch_thread(phase_plan: PhasePlan) -> None:
     """An actor reserves exactly the concurrency it runs.
 
@@ -618,6 +623,7 @@ def _repartitioned_scan_blocks(
     return source, output_blocks
 
 
+@pytest.mark.integration
 def test_repartition_preserves_checkpoint_id_multiset_and_row_count(curator_io_cluster: None) -> None:
     """Every checkpoint identity crosses the execution-block boundary exactly once."""
     del curator_io_cluster
@@ -632,6 +638,7 @@ def test_repartition_preserves_checkpoint_id_multiset_and_row_count(curator_io_c
     assert Counter(output[CHECKPOINT_ID_COLUMN].to_pylist()) == Counter(source[CHECKPOINT_ID_COLUMN].to_pylist())
 
 
+@pytest.mark.integration
 def test_repartition_preserves_clip_to_fragment_routing(curator_io_cluster: None) -> None:
     """Each clip keeps the fragment identifier publication later groups by."""
     del curator_io_cluster
@@ -647,6 +654,7 @@ def test_repartition_preserves_clip_to_fragment_routing(curator_io_cluster: None
     assert actual == expected
 
 
+@pytest.mark.integration
 def test_non_strict_repartition_keeps_each_output_block_fragment_local(phase_plan: PhasePlan) -> None:
     """Do not coalesce adjacent fragment blocks while splitting large ones."""
     assert phase_plan.repartition_kwargs is not None
@@ -659,6 +667,7 @@ def test_non_strict_repartition_keeps_each_output_block_fragment_local(phase_pla
     assert [set(block[FRAGMENT_ID_COLUMN].to_pylist()) for block in output_blocks] == [{0}, {1}]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "fragment_rows",
     [
@@ -907,6 +916,7 @@ def test_the_media_guard_names_the_actor_count_as_what_the_budgets_can_place(
     assert "place 4 media actor(s) at once" in reported
 
 
+@pytest.mark.integration
 def test_the_media_pool_is_capped_at_the_actors_the_budgets_can_place(phase_plan: PhasePlan) -> None:
     """An actor the pool cannot place still counts in the pool's own occupancy.
 
@@ -923,6 +933,7 @@ def test_the_media_pool_is_capped_at_the_actors_the_budgets_can_place(phase_plan
     assert (compute.min_size, compute.max_size) == (1, 2)
 
 
+@pytest.mark.integration
 def test_the_media_batch_matches_the_fetch_width(phase_plan: PhasePlan) -> None:
     """A batch holds exactly one clip per thread.
 
@@ -935,16 +946,19 @@ def test_the_media_batch_matches_the_fetch_width(phase_plan: PhasePlan) -> None:
     assert phase_plan.media_kwargs["fn_constructor_kwargs"]["fetch_workers"] == _CONFIGURED_FETCH_WORKERS
 
 
+@pytest.mark.integration
 def test_the_configured_media_cpu_cost_is_reserved_per_fetch(phase_plan: PhasePlan) -> None:
     """Multiply the configured per-read CPU cost by the actor's fetch width."""
     assert phase_plan.media_kwargs["num_cpus"] == 1.5
 
 
+@pytest.mark.integration
 def test_the_configured_lance_batch_size_reaches_the_pinned_scan(phase_plan: PhasePlan) -> None:
     """Pass the configured scan batch size to each fragment reader."""
     assert phase_plan.scan_batch_size == 13
 
 
+@pytest.mark.integration
 def test_the_configured_parquet_row_target_reaches_both_sink_hints(phase_plan: PhasePlan) -> None:
     """Use one configured staged-file target for both Ray sink hints."""
     assert (
@@ -953,11 +967,13 @@ def test_the_configured_parquet_row_target_reaches_both_sink_hints(phase_plan: P
     ) == (17, 17)
 
 
+@pytest.mark.integration
 def test_the_configured_inference_batch_size_reaches_the_processor(phase_plan: PhasePlan) -> None:
     """Pass the configured non-default row count to the vLLM processor."""
     assert phase_plan.processor.batch_size == 7
 
 
+@pytest.mark.integration
 def test_the_configured_max_concurrent_batches_reaches_the_processor(phase_plan: PhasePlan) -> None:
     """Pass the configured non-default in-flight depth to each replica."""
     assert phase_plan.processor.max_concurrent_batches == 3
@@ -1010,6 +1026,7 @@ def test_the_replica_floor_divides_the_free_gpus_by_the_replica_width() -> None:
     assert resolved.concurrency[0] == 1
 
 
+@pytest.mark.integration
 def test_the_media_stage_carries_both_restart_bounds(phase_plan: PhasePlan) -> None:
     """Spending the restarts while task retries stay unbounded stalls the stage silently.
 
@@ -1022,6 +1039,7 @@ def test_the_media_stage_carries_both_restart_bounds(phase_plan: PhasePlan) -> N
     assert passed == dict(ACTOR_RESTART_BOUNDS)
 
 
+@pytest.mark.integration
 def test_the_media_stage_is_built_with_the_configured_byte_cap(phase_plan: PhasePlan) -> None:
     """The cap the digest was computed from is the cap the actor enforces.
 
@@ -1033,6 +1051,7 @@ def test_the_media_stage_is_built_with_the_configured_byte_cap(phase_plan: Phase
     assert phase_plan.media_kwargs["fn_constructor_kwargs"]["max_clip_bytes"] == _CONFIGURED_CAP_BYTES
 
 
+@pytest.mark.integration
 def test_the_media_stage_is_built_with_the_configured_attempt_budget(phase_plan: PhasePlan) -> None:
     """The operator's retry budget reaches the actor that spends it.
 
@@ -1129,6 +1148,7 @@ def test_complete_runtime_video_controls_reach_the_engine_unchanged() -> None:
     assert engine_kwargs["mm_processor_kwargs"] == VIDEO.mm_processor_kwargs()
 
 
+@pytest.mark.integration
 def test_the_phase_binds_the_configured_pixel_cap_into_the_engine_pair(phase_plan: PhasePlan) -> None:
     """The cap the digest stamps is the cap the engine is built with.
 
@@ -1196,6 +1216,7 @@ def test_the_allocator_setting_is_not_taken_from_the_shared_gpu_environment() ->
     assert "PYTORCH_CUDA_ALLOC_CONF" not in shared["env_vars"]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("phase_plan", [None], indirect=True)
 def test_the_phase_omits_an_unconfigured_scheduler_budget(phase_plan: PhasePlan) -> None:
     """Preserve vLLM's scheduler default through the top-level phase caller."""
@@ -1203,6 +1224,7 @@ def test_the_phase_omits_an_unconfigured_scheduler_budget(phase_plan: PhasePlan)
     assert "max_num_batched_tokens" not in phase_plan.processor.engine_kwargs
 
 
+@pytest.mark.integration
 def test_the_phase_forwards_the_configured_scheduler_budget(phase_plan: PhasePlan) -> None:
     """Pass an execution-only scheduler budget from resolved config to vLLM."""
     assert phase_plan.processor.engine_kwargs["max_num_batched_tokens"] == _CONFIGURED_SCHEDULER_BUDGET
@@ -1239,6 +1261,7 @@ def test_the_processor_config_asks_for_the_media_preparation_stage() -> None:
     )
 
 
+@pytest.mark.integration
 def test_the_bound_request_hooks_execute_the_configured_generation(phase_plan: PhasePlan) -> None:
     """Execute one resolved generation object through both bound hooks."""
     request = phase_plan.preprocess(_fetched_row())
@@ -1274,6 +1297,7 @@ def test_the_bound_request_hooks_execute_the_configured_generation(phase_plan: P
     assert phase_plan.canonicalize_generations[0] is phase_plan.config.generation
 
 
+@pytest.mark.integration
 def test_the_phase_binds_generation_and_video_into_the_processor(phase_plan: PhasePlan) -> None:
     """Execute context and frame values from the resolved top-level config."""
     video = phase_plan.config.video

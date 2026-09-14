@@ -103,7 +103,7 @@ def test_readable_media_without_video_is_unsupported(monkeypatch: pytest.MonkeyP
         ffmpeg.probe_video_source(_LOCAL)
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 def test_real_probe_classifies_corruption_and_missing_path_differently(tmp_path: Path) -> None:
     """Real FFprobe distinguishes two failures that both exit with status one."""
     corrupt = tmp_path / "corrupt.mp4"

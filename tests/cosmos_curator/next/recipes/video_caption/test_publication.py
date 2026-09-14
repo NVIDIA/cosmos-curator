@@ -262,7 +262,7 @@ def test_distributed_publication_plan_hash_groups_pending_fragments(
     assert map_kwargs["memory"] == 8 * 1024**3
 
 
-@pytest.mark.env("default")
+@pytest.mark.integration
 def test_distributed_publication_executes_on_ray(
     tmp_path: Path,
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],

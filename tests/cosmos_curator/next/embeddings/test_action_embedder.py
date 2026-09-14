@@ -746,6 +746,7 @@ def test_read_config_rejects_a_read_width_below_one() -> None:
         DualWristMotionReadConfig(read_concurrency=0)
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_action_extractor_is_independent_across_ray_blocks(
     extractor: DualWristMotionDescriptorExtractor,
