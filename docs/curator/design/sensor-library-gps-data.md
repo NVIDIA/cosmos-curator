@@ -149,12 +149,18 @@ class GpsData:
     velocity_valid: npt.NDArray[np.bool_] | None = None
 
     fix_type: npt.NDArray[np.uint8] | None = None
-    satellites_used: npt.NDArray[np.uint16] | None = None
+    satellites_used: npt.NDArray[np.uint32] | None = None
+    satellites_used_valid: npt.NDArray[np.bool_] | None = None
     horizontal_accuracy_m: npt.NDArray[np.float64] | None = None
+    horizontal_accuracy_m_valid: npt.NDArray[np.bool_] | None = None
     vertical_accuracy_m: npt.NDArray[np.float64] | None = None
+    vertical_accuracy_m_valid: npt.NDArray[np.bool_] | None = None
     hdop: npt.NDArray[np.float64] | None = None
+    hdop_valid: npt.NDArray[np.bool_] | None = None
     vdop: npt.NDArray[np.float64] | None = None
+    vdop_valid: npt.NDArray[np.bool_] | None = None
     pdop: npt.NDArray[np.float64] | None = None
+    pdop_valid: npt.NDArray[np.bool_] | None = None
 
     host_timestamps_ns: npt.NDArray[np.int64] | None = None
     utc_timestamps_ns: npt.NDArray[np.int64] | None = None
@@ -181,12 +187,12 @@ class GpsData:
 | `velocity_enu_m_s` | `np.float64` | `(N, 3)` | m/s | Optional velocity in local ENU order. Parsers with NED velocity should convert N/E/D to E/N/U. |
 | `velocity_valid` | `np.bool_` | `(N, 3)` | unitless | Optional per-axis velocity validity mask. |
 | `fix_type` | `np.uint8` | `(N,)` | unitless | Optional normalized `GpsFixType` value. `GpsFixType` is PX4-inspired but not source-native: `0` no fix or unknown, `2` 2D fix, `3` 3D fix, `4` differential, `5` RTK float, `6` RTK fixed, `8` extrapolated. Parser adapters should map source-specific status values into this enum or leave the field `None`. |
-| `satellites_used` | `np.uint32` | `(N,)` | count | Optional number of satellites used by the fix. |
-| `horizontal_accuracy_m` | `np.float64` | `(N,)` | m | Optional horizontal position accuracy estimate. |
-| `vertical_accuracy_m` | `np.float64` | `(N,)` | m | Optional vertical position accuracy estimate. |
-| `hdop` | `np.float64` | `(N,)` | unitless | Optional horizontal dilution of precision. |
-| `vdop` | `np.float64` | `(N,)` | unitless | Optional vertical dilution of precision. |
-| `pdop` | `np.float64` | `(N,)` | unitless | Optional position dilution of precision. |
+| `satellites_used` / `satellites_used_valid` | `np.uint32` / `np.bool_` | `(N,)` | count / unitless | Optional number of satellites used by the fix plus per-row validity. Provide both arrays or neither. |
+| `horizontal_accuracy_m` / `horizontal_accuracy_m_valid` | `np.float64` / `np.bool_` | `(N,)` | m / unitless | Optional horizontal position accuracy estimate plus per-row validity. Provide both arrays or neither. |
+| `vertical_accuracy_m` / `vertical_accuracy_m_valid` | `np.float64` / `np.bool_` | `(N,)` | m / unitless | Optional vertical position accuracy estimate plus per-row validity. Provide both arrays or neither. |
+| `hdop` / `hdop_valid` | `np.float64` / `np.bool_` | `(N,)` | unitless | Optional horizontal dilution of precision plus per-row validity. Provide both arrays or neither. |
+| `vdop` / `vdop_valid` | `np.float64` / `np.bool_` | `(N,)` | unitless | Optional vertical dilution of precision plus per-row validity. Provide both arrays or neither. |
+| `pdop` / `pdop_valid` | `np.float64` / `np.bool_` | `(N,)` | unitless | Optional position dilution of precision plus per-row validity. Provide both arrays or neither. |
 | `host_timestamps_ns` | `np.int64` | `(N,)` | ns | Optional host/container receive timestamps, distinct from source measurement timestamps. |
 | `utc_timestamps_ns` | `np.int64` | `(N,)` | ns | Optional UTC timestamp reported by the receiver, converted to nanoseconds when available. |
 | `sequence_counter` | `np.uint64` | `(N,)` | unitless | Optional source sequence counter when available. |
@@ -252,6 +258,12 @@ sentinels for generic validity. Required numeric arrays should contain finite
 values. Downstream code should use `position_valid`, `velocity_valid`, and
 `fix_type` when deciding whether a row or axis is usable.
 
+`satellites_used`, `horizontal_accuracy_m`, `vertical_accuracy_m`, `hdop`,
+`vdop`, and `pdop` each pair with a `*_valid` mask: a parser must provide both
+the value array and its validity array, or omit both. Values keep their raw
+measurement when the matching validity entry is false; only entries marked
+valid are required to satisfy the field's finite/nonnegative constraints.
+
 Keep these source-specific values out of the required `GpsData` core unless a
 consumer needs compatible cross-source semantics:
 
@@ -283,12 +295,12 @@ table. Non-timestamp fields use these constraints:
 | `velocity_enu_m_s` | Optional `np.float64`, shape `(N, 3)`, finite values; no generic min/max. |
 | `velocity_valid` | Optional `np.bool_`, shape `(N, 3)`. |
 | `fix_type` | Optional `np.uint8`, shape `(N,)`; values must be in `GpsFixType`. |
-| `satellites_used` | Optional `np.uint16`, shape `(N,)`; no generic upper bound beyond dtype. |
-| `horizontal_accuracy_m` | Optional `np.float64`, shape `(N,)`, finite nonnegative values. |
-| `vertical_accuracy_m` | Optional `np.float64`, shape `(N,)`, finite nonnegative values. |
-| `hdop` | Optional `np.float64`, shape `(N,)`, finite nonnegative values. |
-| `vdop` | Optional `np.float64`, shape `(N,)`, finite nonnegative values. |
-| `pdop` | Optional `np.float64`, shape `(N,)`, finite nonnegative values. |
+| `satellites_used` / `satellites_used_valid` | Optional paired `np.uint32` and `np.bool_` arrays, shape `(N,)`; provide both or neither; no generic upper bound beyond dtype. |
+| `horizontal_accuracy_m` / `horizontal_accuracy_m_valid` | Optional paired `np.float64` and `np.bool_` arrays, shape `(N,)`; provide both or neither; finite nonnegative values where validity is true. |
+| `vertical_accuracy_m` / `vertical_accuracy_m_valid` | Optional paired `np.float64` and `np.bool_` arrays, shape `(N,)`; provide both or neither; finite nonnegative values where validity is true. |
+| `hdop` / `hdop_valid` | Optional paired `np.float64` and `np.bool_` arrays, shape `(N,)`; provide both or neither; finite nonnegative values where validity is true. |
+| `vdop` / `vdop_valid` | Optional paired `np.float64` and `np.bool_` arrays, shape `(N,)`; provide both or neither; finite nonnegative values where validity is true. |
+| `pdop` / `pdop_valid` | Optional paired `np.float64` and `np.bool_` arrays, shape `(N,)`; provide both or neither; finite nonnegative values where validity is true. |
 | `host_timestamps_ns` | Optional `np.int64`, shape `(N,)`. |
 | `utc_timestamps_ns` | Optional `np.int64`, shape `(N,)`; unavailable source sentinels should be normalized at parser boundaries. |
 | `sequence_counter` | Optional `np.uint64`, shape `(N,)`; no generic monotonicity rule because wrap, gaps, and reset behavior are source-specific. |
