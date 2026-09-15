@@ -164,6 +164,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
     clip_id: str,
     span: Span,
     cameras: list[str],
+    sensors: list[str],
     *,
     output_path: str,
     sampling_fps: int,
@@ -175,6 +176,11 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
     directory says which session was cut, or which part of it. Written as an
     artifact rather than left to the row stream so that a consumer given a path
     does not also need the table that produced it.
+
+    ``planned_sensors`` lists what else the clip was meant to hold -- a
+    trajectory, and eventually the rest -- separately from the cameras, because
+    the two are read differently: a camera's entry names an MP4 on the episode's
+    grid, and a sensor's names a file at its own rate.
 
     ``planned_cameras`` is named for what it is. The manifest is written during
     planning, before any camera has encoded, because no single camera task knows
@@ -191,6 +197,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
         "exclusive_end_ns": span.end_ns,
         "sampling_fps": sampling_fps,
         "planned_cameras": sorted(cameras),
+        "planned_sensors": sorted(sensors),
     }
     destination = f"{clip_dir_uri(output_path, session_id, clip_id)}/{_MANIFEST_NAME}"
     write_media(destination, json.dumps(manifest, indent=2).encode(), storage_profile=storage_profile)

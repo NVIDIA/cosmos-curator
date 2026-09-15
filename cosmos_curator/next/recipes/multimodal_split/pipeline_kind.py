@@ -15,9 +15,10 @@
 
 """Config-backed pipeline-kind surface for the ``multimodal-split`` recipe.
 
-A run discovers candidate sessions and splits each one into per-camera clips,
-one MP4 per configured camera, then publishes one canonical Lance row for each
-complete camera set. Non-camera modalities remain separate work.
+A run discovers candidate sessions and splits each one into clips: one MP4 per
+configured camera, resampled onto the clip's grid, and one MCAP per configured
+non-camera sensor, copied at the rate it was recorded. It then publishes one
+canonical Lance row per clip that every configured sensor could serve.
 """
 
 from collections.abc import Sequence
@@ -38,14 +39,17 @@ def _template_payload() -> dict[str, Any]:
 
     return {
         "kind": "multimodal-split",
-        "description": "Split AV recording sessions beneath a storage prefix into per-camera clips.",
+        "description": "Split AV recording sessions beneath a storage prefix into per-sensor clips.",
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-split"},
             {"path": "input.input_path_prefix", "example": "s3://example-bucket/recordings"},
             {
                 "path": "sensors",
-                "example": {"front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"}},
+                "example": {
+                    "front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"},
+                    "ego": {"sensor_type": "egotrajectory", "uri_pattern": "*/egotrajectory.mcap"},
+                },
             },
             {"path": "output.path", "example": "s3://example-bucket/media"},
         ],
@@ -100,7 +104,8 @@ def _prepare_run(
             json_payload=summary,
             message=(
                 f"multimodal-split: published {summary['episodes_newly_published']} new episode(s) and wrote "
-                f"{summary['camera_clips_written']} camera clip(s) from {summary['sessions']} session(s) to "
+                f"{summary['camera_clips_written']} camera clip(s) and "
+                f"{summary['sensor_clips_written']} sensor clip(s) from {summary['sessions']} session(s) to "
                 f"{summary['episodes_lance_uri']} at Lance v{summary['episodes_lance_version']}, with "
                 f"{summary['failures']} failure(s)."
             ),

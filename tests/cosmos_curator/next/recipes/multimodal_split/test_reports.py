@@ -80,6 +80,7 @@ def test_write_clip_manifest_records_where_and_how_fast_a_clip_was_cut(tmp_path:
         "clip-abc",
         span,
         ["front", "left"],
+        ["ego"],
         output_path=str(tmp_path),
         sampling_fps=30,
         storage_profile="default",
@@ -90,3 +91,7 @@ def test_write_clip_manifest_records_where_and_how_fast_a_clip_was_cut(tmp_path:
     assert written["parent_id"] == "session-000"
     assert written["sampling_fps"] == 30
     assert written["planned_cameras"] == ["front", "left"]
+    # Listed apart from the cameras, because the two are read differently: a
+    # camera's entry names an MP4 on the episode's grid, a sensor's a file at
+    # its own rate.
+    assert written["planned_sensors"] == ["ego"]

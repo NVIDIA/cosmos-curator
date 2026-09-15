@@ -37,7 +37,7 @@ from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFail
 from cosmos_curator.core.sensors.sampling.sampler import find_closest_indices
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.media.spans import Span
-from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
+from cosmos_curator.next.recipes.multimodal_split.config import SENSOR_TYPE_CAMERA, ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.grids import (
     clip_duration_ns,
     plan_clip_spans,
@@ -60,12 +60,13 @@ from cosmos_curator.next.recipes.multimodal_split.reports import (
 )
 from cosmos_curator.next.recipes.multimodal_split.storage import (
     list_session_paths,
+    load_mcap_bounds,
     load_timeline_ns,
     resolve_sensor_pattern,
 )
 
-SENSOR_TYPE_CAMERA = "camera"
 CAMERA_PLAN = "camera_plan"
+MCAP_PLAN = "mcap_plan"
 ALREADY_CANONICAL = "already_canonical"
 
 _PLANNED_SPAN_STRUCT = pa.struct(
@@ -85,6 +86,11 @@ _PLANNED_SPAN_STRUCT = pa.struct(
         pa.field("split_contract_digest", pa.string(), nullable=False),
         pa.field(
             "planned_camera_keys",
+            pa.large_list(pa.field("item", pa.string(), nullable=False)),
+            nullable=False,
+        ),
+        pa.field(
+            "planned_sensor_keys",
             pa.large_list(pa.field("item", pa.string(), nullable=False)),
             nullable=False,
         ),
@@ -126,6 +132,116 @@ def remaining_episode_ids_batch(plans: pa.Table) -> pa.Table:
     )
 
 
+def open_cameras(
+    session_id: str,
+    session_uri: str,
+    session_paths: list[str],
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str,
+) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], list[dict[str, Any]]]:
+    """Resolve and read every camera in *session_uri*, and say which ones failed.
+
+    Failures are per sensor, so one names the camera that failed. Attributing all
+    of them to the first configured one describes the wrong camera to whoever
+    reads the report.
+
+    A camera configured ``required: false`` that the session does not carry is
+    left out rather than reported. Its absence is not a fault, and the episode's
+    resolved key list is what records it -- there is no separate absence to write.
+    Every camera optional and every camera missing is still a session that
+    produced nothing, though, and producing nothing with an empty error file is
+    the one outcome that file exists to prevent, so that case does become a
+    failure.
+
+    Absence means the session's listing does not hold the artifact, which is the
+    only statement of absence a storage backend makes uniformly. Deciding it from
+    the exception instead would let a timeout read as an absence, and a dropped
+    sensor changes the window every clip is planned from -- so two runs of one
+    immutable session could plan different episode sets, and the second would
+    then fail reconciliation against the first.
+    """
+    sensor_uris: dict[str, str] = {}
+    timelines: dict[str, npt.NDArray[np.int64]] = {}
+    failures: list[dict[str, Any]] = []
+    for key, camera in config.cameras.items():
+        # Resolving and reading are separate because only the first can say the
+        # camera is not in this session. A camera that resolved and then failed
+        # to read is a fault whatever ``required`` says: a recording with video
+        # and no timestamps is a broken camera, not an absent one.
+        try:
+            uri = resolve_sensor_pattern(
+                session_uri, camera.uri_pattern, storage_profile=storage_profile, session_paths=session_paths
+            )
+        except FileNotFoundError as error:
+            if camera.required:
+                failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        except Exception as error:  # noqa: BLE001 -- an ambiguous pattern is one failed sensor
+            failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        try:
+            timelines[key] = load_timeline_ns(
+                uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+            )
+        except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
+            failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        sensor_uris[key] = uri
+
+    if not sensor_uris and not failures:
+        no_camera = ValueError("no configured camera could be opened")
+        failures.append(failure(session_id, None, None, "open_sensor", no_camera))
+    return sensor_uris, timelines, failures
+
+
+def open_mcap_sensors(
+    session_id: str,
+    session_uri: str,
+    session_paths: list[str],
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str,
+) -> tuple[dict[str, str], dict[str, tuple[int, int]], list[dict[str, Any]]]:
+    """Resolve every MCAP sensor in *session_uri* and read only its bounds.
+
+    Bounds, not the messages. An MCAP carries an index, so the first and last
+    time on a topic cost two seeks whatever the recording's length -- and the
+    messages themselves are the splitter's business, which reads them once in a
+    forward pass rather than shipping a three-hour topic through a plan row.
+
+    ``required`` decides a miss here exactly as it does for a camera, and on the
+    same evidence: the artifact is absent from the session's listing.
+    """
+    sensor_uris: dict[str, str] = {}
+    bounds: dict[str, tuple[int, int]] = {}
+    failures: list[dict[str, Any]] = []
+    for key, sensor in config.mcap_sensors.items():
+        try:
+            uri = resolve_sensor_pattern(
+                session_uri, sensor.uri_pattern, storage_profile=storage_profile, session_paths=session_paths
+            )
+        except FileNotFoundError as error:
+            if sensor.required:
+                failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        except Exception as error:  # noqa: BLE001 -- an ambiguous pattern is one failed sensor
+            failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        try:
+            bounds[key] = load_mcap_bounds(
+                uri,
+                sensor.topic,
+                storage_profile=storage_profile,
+                read_buffer_bytes=config.execution.read_buffer_bytes,
+            )
+        except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
+            failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        sensor_uris[key] = uri
+    return sensor_uris, bounds, failures
+
+
 def span_planner(
     item: dict[str, Any],
     *,
@@ -142,7 +258,6 @@ def span_planner(
     """
     session_id = str(item["source_session_id"])
     session_uri = str(item["session_uri"])
-    cameras = config.cameras
 
     # One listing for the whole rig. Resolving twelve wildcard patterns one at a
     # time lists the same session twelve times, which the previous comment here
@@ -158,33 +273,23 @@ def span_planner(
         )
         return []
 
-    # Per sensor, so a failure names the sensor that failed. Attributing all of
-    # them to the first configured one describes the wrong camera to whoever
-    # reads the report.
-    sensor_uris: dict[str, str] = {}
-    timelines: dict[str, npt.NDArray[np.int64]] = {}
-    failures: list[dict[str, Any]] = []
-    for key, camera in cameras.items():
-        try:
-            uri = resolve_sensor_pattern(
-                session_uri, camera.uri_pattern, storage_profile=storage_profile, session_paths=session_paths
-            )
-            timelines[key] = load_timeline_ns(
-                uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
-            )
-        except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
-            failures.append(failure(session_id, key, None, "open_sensor", error))
-            continue
-        sensor_uris[key] = uri
+    sensor_uris, timelines, failures = open_cameras(
+        session_id, session_uri, session_paths, config=config, storage_profile=storage_profile
+    )
+    mcap_uris, mcap_bounds, mcap_failures = open_mcap_sensors(
+        session_id, session_uri, session_paths, config=config, storage_profile=storage_profile
+    )
+    failures.extend(mcap_failures)
 
-    # All or nothing: a clip is one moment across every view, so a rig missing a
-    # sensor produces no clips rather than clips missing a view.
+    # All or nothing across the sensors declared required: a clip is one moment
+    # across everything the rig promised, so a session missing one produces no
+    # clips rather than clips missing a modality.
     if failures:
         write_plan_errors(session_id, failures, output_path=config.output.path, storage_profile=storage_profile)
         return []
 
     try:
-        spans = plan_common_spans(timelines, config)
+        spans = plan_common_spans(timelines, config, bounds=mcap_bounds)
     except Exception as error:  # noqa: BLE001 -- a rig whose views never overlap is one failed session
         write_plan_errors(
             session_id,
@@ -202,8 +307,13 @@ def span_planner(
     if not servable:
         return []
 
-    camera_keys = sorted(cameras)
+    # The cameras that resolved, not the cameras configured. An optional one that
+    # did not open is absent from the clip, and naming it here would promise a
+    # view no manifest or episode can deliver.
+    camera_keys = sorted(sensor_uris)
+    mcap_keys = sorted(mcap_uris)
     camera_sources = {key: sensor_uris[key] for key in camera_keys}
+    sensor_sources = {key: mcap_uris[key] for key in mcap_keys}
     split_contract_digest = make_split_contract_digest(config)
     planned: list[dict[str, Any]] = []
     already_canonical: list[dict[str, Any]] = []
@@ -226,11 +336,16 @@ def span_planner(
             "media_contract_version": MEDIA_CONTRACT_VERSION,
             "split_contract_digest": split_contract_digest,
             "planned_camera_keys": camera_keys,
+            # The non-camera sensors this clip is expected to carry, so assembly
+            # can tell a trajectory that was never asked for from one that was
+            # asked for and never written.
+            "planned_sensor_keys": mcap_keys,
         }
         if reconcile_planned_episode(
             entry,
             existing_by_episode_id=existing_by_episode_id,
             camera_sources=camera_sources,
+            sensor_sources=sensor_sources,
         ):
             already_canonical.append(
                 {
@@ -256,6 +371,7 @@ def span_planner(
             str(entry["clip_id"]),
             span,
             camera_keys,
+            mcap_keys,
             output_path=config.output.path,
             sampling_fps=config.clip.sampling_fps,
             storage_profile=storage_profile,
@@ -272,10 +388,27 @@ def span_planner(
             "spans": planned,
             "episode_id": None,
         }
-        for key in cameras
+        for key in camera_keys
         if planned
     ]
-    return [*camera_plans, *already_canonical]
+    # No timeline: the splitter reads the topic itself, in one forward pass over
+    # the same spans. Copying the messages here to carry them would move the
+    # whole recording through a plan row to save nothing.
+    mcap_plans = [
+        {
+            "result_kind": MCAP_PLAN,
+            "source_session_id": session_id,
+            "sensor_key": key,
+            "sensor_uri": uri,
+            "sensor_type": config.sensors[key].sensor_type,
+            "timeline_ns": None,
+            "spans": planned,
+            "episode_id": None,
+        }
+        for key, uri in sorted(mcap_uris.items())
+        if planned
+    ]
+    return [*camera_plans, *mcap_plans, *already_canonical]
 
 
 def span_planner_batch(
@@ -300,17 +433,33 @@ def span_planner_batch(
 
 
 def plan_common_spans(
-    timelines: dict[str, npt.NDArray[np.int64]], config: ResolvedMultimodalSplitConfig
+    timelines: dict[str, npt.NDArray[np.int64]],
+    config: ResolvedMultimodalSplitConfig,
+    *,
+    bounds: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[Span, ...]:
-    """Tile the window every camera was capturing into clip spans.
+    """Tile the window every sensor was recording into clip spans.
 
-    The latest start and the earliest end, not one camera's own bounds. Cameras
+    The latest start and the earliest end, not one sensor's own bounds. Cameras
     on a rig begin within a few frames of each other, so planning from one of
     them puts the first references before another view existed.
+
+    An MCAP sensor narrows the same window from its bounds rather than a
+    timeline, and for the same reason: a clip running past the last pose is a
+    clip whose trajectory stops partway through. It contributes only the window,
+    never coverage -- nothing is resampled onto the grid, so there is no
+    tolerance for it to miss.
     """
+    starts = [int(timeline[0]) for timeline in timelines.values()]
+    ends = [timeline_end_ns(timeline) for timeline in timelines.values()]
+    for first_ns, last_ns in (bounds or {}).values():
+        starts.append(first_ns)
+        # Exclusive, like a timeline's end: the last message is an instant, and a
+        # span ending on it would be asking for one that has not arrived.
+        ends.append(last_ns + 1)
     return plan_clip_spans(
-        start_ns=max(int(timeline[0]) for timeline in timelines.values()),
-        end_ns=min(timeline_end_ns(timeline) for timeline in timelines.values()),
+        start_ns=max(starts),
+        end_ns=min(ends),
         duration_ns=clip_duration_ns(config),
     )
 

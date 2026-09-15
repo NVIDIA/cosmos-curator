@@ -22,6 +22,7 @@ from typing import Any
 import av
 import numpy as np
 import pytest
+from mcap.writer import Writer as McapWriter
 
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
@@ -90,6 +91,75 @@ def make_session() -> Callable[..., Path]:
     return build
 
 
+EGO_TOPIC = "/egotrajectory"
+
+
+@pytest.fixture
+def make_ego_mcap() -> Callable[..., Path]:
+    """Return a builder for a session's egotrajectory MCAP.
+
+    Written with the upstream MCAP writer rather than the recipe's own, because
+    this stands in for what a recorder produced: the recipe reads these files and
+    does not write them, and the options that matter here -- chunking, a second
+    topic -- are properties of the recorder, not of the cut.
+
+    The payloads are opaque bytes rather than encoded poses. Nothing in this
+    recipe decodes them: planning reads the topic's first and last ``log_time``
+    from the index, and the cut copies records through unexamined. A fixture that
+    encoded real poses would assert the recipe understands a schema it is
+    deliberately built not to.
+    """
+
+    def build(
+        session: Path,
+        *,
+        first_ns: int = DEVICE_ORIGIN_NS,
+        # One past the camera's last frame, which is how a recorder behaves: the
+        # trajectory is still logging when the camera stops. At exactly 300 the
+        # trajectory would end 10ms early and cost the session its third clip,
+        # which is the narrowing rule working, not a fixture quirk -- the test
+        # that wants it asks for it.
+        count: int = 301,
+        rate_hz: int = 100,
+        uri_pattern: str = "ego/egotrajectory.mcap",
+        topic: str = EGO_TOPIC,
+        gap: tuple[int, int] | None = None,
+        chunked: bool = True,
+        extra_topic: str | None = None,
+    ) -> Path:
+        period_ns = _NS_PER_SECOND // rate_hz
+        # A dropout, as a half-open window of indices. A recorder that loses the
+        # trajectory for a while still writes an MCAP whose bounds span the whole
+        # session, which is why planning cannot see the hole.
+        skipped = range(*gap) if gap is not None else range(0)
+        path = session / uri_pattern
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as handle:
+            writer = McapWriter(handle, chunk_size=10_000, use_chunking=chunked)
+            writer.start(library="test recorder")
+            schema_id = writer.register_schema(name="test.Pose", encoding="test-schema", data=b"schema-bytes")
+            channels = {
+                name: writer.register_channel(schema_id=schema_id, topic=name, message_encoding="test-bytes")
+                for name in ([topic] if extra_topic is None else [topic, extra_topic])
+            }
+            for index in range(count):
+                if index in skipped:
+                    continue
+                log_time = first_ns + index * period_ns
+                for name, channel_id in channels.items():
+                    writer.add_message(
+                        channel_id=channel_id,
+                        log_time=log_time,
+                        data=f"{name}-{index}".encode(),
+                        publish_time=log_time,
+                        sequence=index,
+                    )
+            writer.finish()
+        return path
+
+    return build
+
+
 def split_all(
     item: dict[str, Any],
     *,
@@ -112,7 +182,7 @@ def split_all(
         {
             **outcome,
             "clip_id": outcome["split_clip_id"],
-            "sensor_key": outcome["camera_key"],
+            "sensor_key": outcome["sensor_key"],
             "clip_location": outcome["media_location"],
             "clip_bytes": outcome["media_size_bytes"],
         }
@@ -135,6 +205,10 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         uri_pattern: str = "camera/front.mp4",
         camera_key: str = "front",
         cameras: dict[str, str] | None = None,
+        optional_cameras: frozenset[str] = frozenset(),
+        mcap_sensors: dict[str, str] | None = None,
+        optional_sensors: frozenset[str] = frozenset(),
+        topic: str | None = None,
         video_bitrate: str = "400K",
         gop_size: int = 5,
         progress: bool = False,
@@ -150,7 +224,23 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                 "kind": "multimodal-split",
                 "input": {"input_path_prefix": str(input_root)},
                 "sensors": {
-                    key: {"sensor_type": "camera", "uri_pattern": pattern} for key, pattern in camera_map.items()
+                    **{
+                        key: {
+                            "sensor_type": "camera",
+                            "uri_pattern": pattern,
+                            "required": key not in optional_cameras,
+                        }
+                        for key, pattern in camera_map.items()
+                    },
+                    **{
+                        key: {
+                            "sensor_type": "egotrajectory",
+                            "uri_pattern": pattern,
+                            "required": key not in optional_sensors,
+                            "topic": topic,
+                        }
+                        for key, pattern in (mcap_sensors or {}).items()
+                    },
                 },
                 "output": {"path": str(media_root)},
                 "clip": {"duration_s": duration_s, "sampling_fps": output_fps},

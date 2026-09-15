@@ -49,6 +49,7 @@ from cosmos_curator.next.recipes.multimodal_split.lance_sink import (
 from cosmos_curator.next.recipes.multimodal_split.plan import (
     ALREADY_CANONICAL,
     CAMERA_PLAN,
+    MCAP_PLAN,
     remaining_episode_ids_batch,
     span_planner_batch,
 )
@@ -59,7 +60,7 @@ from cosmos_curator.next.recipes.multimodal_split.publication import (
     stage_episode_batch,
 )
 from cosmos_curator.next.recipes.multimodal_split.recovery import ReconciliationMap, read_reconciliation
-from cosmos_curator.next.recipes.multimodal_split.split import split_camera_batch
+from cosmos_curator.next.recipes.multimodal_split.split import split_camera_batch, split_mcap_batch
 from cosmos_curator.next.recipes.multimodal_split.storage import list_error_reports, open_sensor_source
 
 
@@ -173,6 +174,8 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "sessions": sessions.num_rows,
         "camera_clips_written": publication.camera_clips_written,
+        "sensor_clips_written": publication.sensor_clips_written,
+        "sensor_clip_bytes": publication.sensor_clip_bytes,
         "episodes_planned": episodes_planned,
         "episodes_already_canonical": already_canonical,
         "episodes_newly_published": publication.episodes_newly_published,
@@ -317,18 +320,32 @@ def clip_dataset(plans: ray.data.Dataset, config: ResolvedMultimodalSplitConfig)
     run by that instead.
     """
     memory_gb = config.execution.split_session.memory_gb
-    camera_plans = plans.filter(expr=col("result_kind") == CAMERA_PLAN)
-    return camera_plans.map_batches(
+    fn_kwargs = {"config": config, "storage_profile": config.execution.storage_profile}
+    camera_clips = plans.filter(expr=col("result_kind") == CAMERA_PLAN).map_batches(
         cast("Any", split_camera_batch),
         batch_format="pyarrow",
         batch_size=None,
-        fn_kwargs={"config": config, "storage_profile": config.execution.storage_profile},
+        fn_kwargs=fn_kwargs,
         memory=(None if memory_gb is None else int(memory_gb * _BYTES_PER_GIB)),
     )
+    # Two stages rather than one branching on sensor type, because their costs
+    # have nothing in common: a camera decodes and re-encodes video, while an
+    # MCAP is copied. Scheduling both under the camera's memory reservation would
+    # price the cheap one at the expensive one's rate.
+    mcap_clips = plans.filter(expr=col("result_kind") == MCAP_PLAN).map_batches(
+        cast("Any", split_mcap_batch),
+        batch_format="pyarrow",
+        batch_size=None,
+        fn_kwargs=fn_kwargs,
+    )
+    # One terminal stream, because an episode is assembled from every artifact in
+    # it at once: grouping by clip has to see a clip's video and its trajectory
+    # in the same group or completeness cannot be decided.
+    return camera_clips.union(mcap_clips)
 
 
 def assembly_dataset(outcomes: ray.data.Dataset) -> ray.data.Dataset:
-    """Group current-run camera outcomes into one terminal episode result."""
+    """Group current-run sensor outcomes into one terminal episode result."""
     # Completeness belongs to the full planned camera set, so this episode-level
     # shuffle is required; publishing camera outcomes directly could publish partial episodes.
     return outcomes.groupby("split_clip_id").map_groups(
@@ -350,16 +367,21 @@ def publish_assembled_episodes(
     config: ResolvedMultimodalSplitConfig,
 ) -> PublicationSummary:
     """Stage complete rows on workers, commit serially, and total terminal accounting."""
-    totals = assembled.aggregate(Sum("camera_clips_written"), Sum("camera_clip_bytes"))
-    camera_total = totals["sum(camera_clips_written)"]
-    camera_clips_written = int(camera_total or 0)
-    byte_total = totals["sum(camera_clip_bytes)"]
-    clip_bytes = int(byte_total or 0)
+    totals = assembled.aggregate(
+        Sum("camera_clips_written"),
+        Sum("camera_clip_bytes"),
+        Sum("sensor_clips_written"),
+        Sum("sensor_clip_bytes"),
+    )
+    camera_clips_written = int(totals["sum(camera_clips_written)"] or 0)
+    clip_bytes = int(totals["sum(camera_clip_bytes)"] or 0)
+    sensor_clips_written = int(totals["sum(sensor_clips_written)"] or 0)
+    sensor_clip_bytes = int(totals["sum(sensor_clip_bytes)"] or 0)
     dropped = assembled.filter(expr=col("assembly_status") == "dropped").count()
     complete = assembled.filter(expr=col("assembly_status") == "complete")
     complete_count = complete.count()
     if complete_count == 0:
-        return PublicationSummary(0, dropped, camera_clips_written, clip_bytes)
+        return PublicationSummary(0, dropped, camera_clips_written, clip_bytes, sensor_clips_written, sensor_clip_bytes)
 
     batches = complete.repartition(target_num_rows_per_block=_EPISODES_PER_PUBLICATION_BLOCK, strict=True)
     staged = batches.map_batches(
@@ -381,7 +403,9 @@ def publish_assembled_episodes(
                 attempts=_APPEND_ATTEMPTS,
             )
             published += int(result["episode_count"])
-    return PublicationSummary(published, dropped, camera_clips_written, clip_bytes)
+    return PublicationSummary(
+        published, dropped, camera_clips_written, clip_bytes, sensor_clips_written, sensor_clip_bytes
+    )
 
 
 class FailureSummary(NamedTuple):

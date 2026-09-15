@@ -191,7 +191,7 @@ def test_a_post_planning_camera_failure_drops_only_the_incomplete_episodes(
             output_path=config.output.path,
             storage_profile=storage_profile,
         )
-        return [split_module._camera_outcome(item, span, None) for span in item["spans"]]
+        return [split_module._sensor_outcome(item, span, None) for span in item["spans"]]
 
     def fail_left_batch(
         plans: pa.Table,
@@ -204,7 +204,7 @@ def test_a_post_planning_camera_failure_drops_only_the_incomplete_episodes(
             for item in plans.to_pylist()
             for outcome in fail_left_camera(item, config=config, storage_profile=storage_profile)
         ]
-        return pa.Table.from_pylist(outcomes, schema=split_module.CAMERA_OUTCOME_SCHEMA)
+        return pa.Table.from_pylist(outcomes, schema=split_module.SENSOR_OUTCOME_SCHEMA)
 
     monkeypatch.setattr(pipeline, "split_camera_batch", fail_left_batch)
 
@@ -308,15 +308,21 @@ def _split_stage_kwargs(
     monkeypatch: pytest.MonkeyPatch,
     config: ResolvedMultimodalSplitConfig,
 ) -> dict[str, object]:
-    """Return the keyword arguments the recipe hands Ray Data for the session fan-out."""
+    """Return the keyword arguments the recipe hands Ray Data, keyed by stage function."""
     seen: dict[str, object] = {}
 
     class _FakeDataset:
         def filter(self, **_kwargs: object) -> object:
             return self
 
-        def map_batches(self, _fn: object, **kwargs: object) -> object:
-            seen.update(kwargs)
+        def map_batches(self, fn: object, **kwargs: object) -> object:
+            # Keyed by the stage, not merged. Merging let a reservation moved from
+            # one stage to the other pass unnoticed, which is the single thing
+            # these tests exist to catch.
+            seen[getattr(fn, "__name__", str(fn))] = dict(kwargs)
+            return self
+
+        def union(self, *_others: object) -> object:
             return self
 
     monkeypatch.setattr(pipeline.ray.data, "from_arrow", lambda *_a, **_k: _FakeDataset())
@@ -338,6 +344,9 @@ def _stage_kwargs(
 
         def map_batches(self, _fn: object, **kwargs: object) -> object:
             calls.append(dict(kwargs))
+            return self
+
+        def union(self, *_others: object) -> object:
             return self
 
     monkeypatch.setattr(pipeline.ray.data, "from_arrow", lambda *_a, **_k: _FakeDataset())
@@ -362,7 +371,7 @@ def test_the_planner_is_scheduled_on_the_cpu_the_config_states(
     """
     config = make_config(tmp_path / "recordings", tmp_path / "media", planner_num_cpus=num_cpus)
 
-    planner, _splitter = _stage_kwargs(monkeypatch, config)
+    planner, *_splitters = _stage_kwargs(monkeypatch, config)
 
     assert planner["num_cpus"] == num_cpus
 
@@ -384,7 +393,11 @@ def test_a_declared_session_heap_is_what_ray_reserves(
 
     seen = _split_stage_kwargs(monkeypatch, config)
 
-    assert seen["memory"] == int(1.5 * 1024**3)
+    # The camera stage specifically. The two split stages are scheduled apart so
+    # the copied sensor is not priced at the decoder's rate, which only holds if
+    # the reservation lands on the stage the setting names.
+    assert seen["split_camera_batch"]["memory"] == int(1.5 * 1024**3)
+    assert "memory" not in seen["split_mcap_batch"]
 
 
 def test_an_undeclared_session_heap_leaves_ray_to_its_own_default(
@@ -397,7 +410,7 @@ def test_an_undeclared_session_heap_leaves_ray_to_its_own_default(
 
     seen = _split_stage_kwargs(monkeypatch, config)
 
-    assert seen["memory"] is None
+    assert seen["split_camera_batch"]["memory"] is None
 
 
 @pytest.mark.integration
@@ -553,3 +566,79 @@ def test_unreachable_storage_stops_the_run_before_ray_starts(
         run_config(make_config(root, tmp_path / "media"))
 
     assert not started["ray"], "storage was checked after Ray had already started"
+
+
+def test_a_run_publishes_one_episode_carrying_both_its_video_and_its_trajectory(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A clip is one moment across every modality, and the catalogue says so in one row.
+
+    The whole point of the join: a consumer reads an episode and finds both the
+    MP4 and the MCAP under one clip id, rather than having to pair two datasets
+    on a span it has to reconstruct.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    media = tmp_path / "media"
+
+    summary = run_config(make_config(root, media, mcap_sensors={"ego": "ego/egotrajectory.mcap"}))
+
+    assert summary["episodes_newly_published"] == 3
+    assert summary["episodes_dropped"] == 0
+    assert summary["failures"] == 0
+    # Counted apart from the cameras: a trajectory rides along with a clip
+    # rather than being a clip of its own, so folding it into the camera total
+    # would report six clips for a run that produced three.
+    assert summary["camera_clips_written"] == 3
+    assert summary["sensor_clips_written"] == 3
+    # Each total is the bytes of its own kind of artifact, kept apart so a run
+    # can say what its video cost separately from what its trajectories did.
+    mcaps = sorted(media.rglob("*.mcap"))
+    assert len(mcaps) == 3
+    assert summary["sensor_clip_bytes"] == sum(path.stat().st_size for path in mcaps)
+    assert summary["clip_bytes"] == sum(path.stat().st_size for path in media.rglob("*.mp4"))
+
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    assert len(episodes) == 3
+    for episode in episodes:
+        assert [camera["camera_key"] for camera in episode["camera_media"]] == ["front"]
+        assert [sensor["sensor_key"] for sensor in episode["sensor_media"]] == ["ego"]
+        trajectory = episode["sensor_media"][0]
+        assert trajectory["sensor_type"] == "egotrajectory"
+        payload = Path(trajectory["media_location"]).read_bytes()
+        assert len(payload) == trajectory["media_size_bytes"]
+        assert hashlib.sha256(payload).hexdigest() == trajectory["media_sha256"]
+        # Beside the video it belongs to, under the one clip id.
+        assert Path(trajectory["media_location"]).parent == Path(episode["camera_media"][0]["media_location"]).parent
+
+
+def test_a_trajectory_that_fails_to_cut_drops_the_episode_rather_than_publishing_a_partial_one(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A planned trajectory that produced no clip costs the episode its video too.
+
+    Symmetric with a camera that failed to encode. An episode published without
+    it would claim a clip is complete while quietly holding less than the run
+    was asked for, and nothing downstream could tell the difference.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    # A gap across the middle clip, which is the one span that cannot be cut.
+    make_ego_mcap(session, gap=(100, 200))
+    media = tmp_path / "media"
+
+    summary = run_config(make_config(root, media, mcap_sensors={"ego": "ego/egotrajectory.mcap"}))
+
+    assert summary["episodes_planned"] == 3
+    assert summary["episodes_newly_published"] == 2
+    assert summary["episodes_dropped"] == 1
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    assert len(episodes) == 2
+    assert all(len(episode["sensor_media"]) == 1 for episode in episodes)

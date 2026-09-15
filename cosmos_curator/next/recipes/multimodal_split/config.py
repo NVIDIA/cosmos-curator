@@ -49,7 +49,18 @@ MultimodalSplitVideoEncoder = Literal["libopenh264"]
 
 # Widened as each kind lands. A config naming a kind the recipe cannot process
 # yet is refused at load, rather than discovering it after a listing pass.
-MultimodalSplitSensorType = Literal["camera"]
+MultimodalSplitSensorType = Literal["camera", "egotrajectory"]
+
+#: Kinds cut by copying MCAP records rather than by sampling onto the clip grid.
+#:
+#: An egotrajectory is recorded at 100 Hz and consumed at that rate -- lidar
+#: motion compensation wants a pose at each point's own instant, not at a video
+#: frame's. Resampling onto the clip grid would throw away two thirds of it
+#: before any consumer saw it, so the clip carries what the sensor recorded and
+#: ``core.sensors.alignment.ego_trajectory`` derives poses from that when a
+#: consumer wants them on a grid.
+SENSOR_TYPE_CAMERA = "camera"
+MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory"})
 
 
 class MultimodalSplitInputConfig(BaseModel):
@@ -287,12 +298,34 @@ class MultimodalSplitSensorConfig(BaseModel):
     model_config = _MODEL_CONFIG
 
     sensor_type: MultimodalSplitSensorType = Field(
-        description="What kind of sensor this is. Only 'camera' is processed today.",
+        description="What kind of sensor this is, which decides how it is cut.",
     )
     uri_pattern: str = Field(
         min_length=1,
         description="Path to the artifact relative to a session URI, such as */camera_front.mp4.",
     )
+    topic: str | None = Field(
+        default=None,
+        min_length=1,
+        description="MCAP topic to cut. Defaults to the file's only topic, and is required when it has several.",
+    )
+    required: bool = Field(
+        default=True,
+        description="Whether a session missing this sensor is refused, or produces episodes without it.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_topic_applies(self) -> Self:
+        """Reject a topic on a sensor that has none, rather than ignoring it.
+
+        Only an MCAP carries topics. Accepting the field on a camera and reading
+        it nowhere lets a config say something the run does not do, and the
+        config is the only place an operator can see what was asked for.
+        """
+        if self.topic is not None and self.sensor_type not in MCAP_SENSOR_TYPES:
+            msg = f"sensor_type {self.sensor_type!r} carries no topics, so topic cannot be set"
+            raise ValueError(msg)
+        return self
 
     @field_validator("uri_pattern")
     @classmethod
@@ -456,6 +489,26 @@ class ResolvedMultimodalSplitConfig(BaseModel):
         min_length=1,
         description="Sensor key to artifact. Every entry is written for every clip.",
     )
+
+    @model_validator(mode="after")
+    def _validate_a_camera_is_configured(self) -> Self:
+        """Refuse a rig with no camera, which cannot produce an episode.
+
+        ``min_length`` on ``sensors`` carried this while a camera was the only
+        kind of sensor there was. It no longer does: a config naming only a
+        trajectory satisfies it, then fails per session in planning, so a run
+        exits successfully having written nothing but error reports.
+
+        The cameras define the episode's timeline -- its span, its grid, and its
+        row count all come from them -- so a clip without one is not a clip with
+        a modality missing, it is nothing to hang the other modalities on.
+        """
+        if not self.cameras:
+            kinds = ", ".join(sorted({sensor.sensor_type for sensor in self.sensors.values()})) or "none"
+            msg = f"sensors must include at least one camera, which defines the episode timeline; got {kinds}"
+            raise ValueError(msg)
+        return self
+
     output: MultimodalSplitOutputConfig
     clip: MultimodalSplitClipConfig = Field(default_factory=MultimodalSplitClipConfig)
     video: MultimodalSplitVideoConfig = Field(default_factory=MultimodalSplitVideoConfig)
@@ -470,7 +523,12 @@ class ResolvedMultimodalSplitConfig(BaseModel):
         what each sensor says it is, rather than being a shape an operator has to
         express by choosing which block to write a sensor in.
         """
-        return {key: sensor for key, sensor in self.sensors.items() if sensor.sensor_type == "camera"}
+        return {key: sensor for key, sensor in self.sensors.items() if sensor.sensor_type == SENSOR_TYPE_CAMERA}
+
+    @property
+    def mcap_sensors(self) -> dict[str, MultimodalSplitSensorConfig]:
+        """Return the sensors copied into a clip rather than sampled onto its grid."""
+        return {key: sensor for key, sensor in self.sensors.items() if sensor.sensor_type in MCAP_SENSOR_TYPES}
 
     @field_validator("sensors")
     @classmethod
@@ -495,12 +553,13 @@ _TEMPLATE_BASE: dict[str, Any] = {
     "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"}},
     "output": {"path": "s3://example-bucket/media"},
 }
-# Settings that default to null are dumped away by ``exclude_none``, so the two
-# that an operator would otherwise never discover are named here instead.
+# Settings that default to null are dumped away by ``exclude_none``, so the ones
+# an operator would otherwise never discover are named here instead.
 _TEMPLATE_PREAMBLE = """\
 # Every setting with a non-null default is shown; unchanged settings may be removed.
-# Two optional settings default to null and are omitted: input.session_id_list_path reads session
-# IDs from a file instead of listing the prefix, and input.limit caps how many sessions are kept.
+# Three optional settings default to null and are omitted: input.session_id_list_path reads session
+# IDs from a file instead of listing the prefix, input.limit caps how many sessions are kept, and
+# sensors.<key>.topic names which topic to cut from an MCAP carrying more than one.
 """
 
 

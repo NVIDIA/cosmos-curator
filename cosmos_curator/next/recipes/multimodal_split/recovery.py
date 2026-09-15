@@ -32,6 +32,7 @@ _RECONCILIATION_COLUMNS = (
     "timestamp_source",
     "split_contract_digest",
     "camera_media",
+    "sensor_media",
 )
 
 type ReconciliationMap = dict[str, dict[str, dict[str, Any]]]
@@ -61,8 +62,15 @@ def reconcile_planned_episode(
     *,
     existing_by_episode_id: dict[str, dict[str, Any]],
     camera_sources: dict[str, str],
+    sensor_sources: dict[str, str] | None = None,
 ) -> bool:
-    """Return whether an exact episode is canonical, failing incompatible matches."""
+    """Return whether an exact episode is canonical, failing incompatible matches.
+
+    Every artifact in the clip, not just its video. A wildcard pattern resolves
+    against the session's listing, so the same key and topic can name a different
+    file between runs -- and an episode reconciled on its cameras alone would keep
+    the trajectory cut from the old one under a canonical identity.
+    """
     existing = existing_by_episode_id.get(str(expected["episode_id"]))
     if existing is None:
         return False
@@ -73,9 +81,16 @@ def reconcile_planned_episode(
         int(expected["sampling_fps"]),
         str(expected["timestamp_source"]),
         tuple(sorted(camera_sources.items())),
+        tuple(sorted((sensor_sources or {}).items())),
     )
     existing_sources = tuple(
         sorted((str(camera["camera_key"]), str(camera["source_media_location"])) for camera in existing["camera_media"])
+    )
+    existing_sensor_sources = tuple(
+        sorted(
+            (str(sensor["sensor_key"]), str(sensor["source_media_location"]))
+            for sensor in existing.get("sensor_media") or []
+        )
     )
     existing_contract = (
         int(existing["record_schema_version"]),
@@ -84,11 +99,12 @@ def reconcile_planned_episode(
         int(existing["sampling_fps"]),
         str(existing["timestamp_source"]),
         existing_sources,
+        existing_sensor_sources,
     )
     if existing_contract != expected_contract:
         msg = (
             f"Canonical episode {expected['episode_id']} conflicts with the current multimodal-split contract or "
-            "resolved camera sources"
+            "resolved sensor sources"
         )
         raise ValueError(msg)
     return True

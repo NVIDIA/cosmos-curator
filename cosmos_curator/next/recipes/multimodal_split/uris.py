@@ -44,14 +44,17 @@ def resolve_sensor_uri(session_uri: str, uri_pattern: str) -> str:
     return f"{session_uri.rstrip('/')}/{uri_pattern}"
 
 
-def clip_media_uri(clip_dir: str, sensor_key: str) -> str:
+def clip_media_uri(clip_dir: str, sensor_key: str, suffix: str = ".mp4") -> str:
     """Return one sensor's media inside a clip's directory.
 
     The clip id is the moment and the file name is the view, so this is where
     the two meet. A reader holding both can construct the path rather than
     listing the directory to find out what a view is called.
+
+    The suffix is the container, which differs by sensor: a camera's clip is an
+    MP4 and a trajectory's is an MCAP, and both sit under the same clip id.
     """
-    return f"{clip_dir}/{sensor_key}.mp4"
+    return f"{clip_dir}/{sensor_key}{suffix}"
 
 
 def observations_uri(clip_media_location: str) -> str:

@@ -19,12 +19,26 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.next.recipes.multimodal_split.publication import assemble_episode_group, stage_episode_batch
-from cosmos_curator.next.recipes.multimodal_split.split import CAMERA_OUTCOME_SCHEMA
+from cosmos_curator.next.recipes.multimodal_split.split import SENSOR_OUTCOME_SCHEMA
 
 
-def _outcome(camera_key: str, *, status: str = "success") -> dict[str, object]:
+def _outcome(
+    camera_key: str,
+    *,
+    status: str = "success",
+    sensor_type: str = "camera",
+    planned_sensor_keys: list[str] | None = None,
+) -> dict[str, object]:
     marker = "1" if camera_key == "front" else "2"
     success = status == "success"
+    is_camera = sensor_type == "camera"
+    # A sensor clip is an MCAP. Fabricating .mp4 paths for one would let these
+    # tests pass against an outcome shape the splitter never emits.
+    suffix = ".mp4" if is_camera else ".mcap"
+
+    def sidecar(value: str) -> str | None:
+        return value if success and is_camera else None
+
     return {
         "status": status,
         "record_schema_version": 1,
@@ -41,21 +55,24 @@ def _outcome(camera_key: str, *, status: str = "success") -> dict[str, object]:
         "timestamp_source": "capture",
         "split_contract_digest": "contract",
         "planned_camera_keys": ["front", "left"],
-        "camera_key": camera_key,
-        "sensor_type": "camera",
-        "source_media_location": f"/input/session/{camera_key}.mp4",
-        "media_location": f"/output/{camera_key}.mp4" if success else None,
+        "planned_sensor_keys": planned_sensor_keys or [],
+        "sensor_key": camera_key,
+        "sensor_type": sensor_type,
+        "source_media_location": f"/input/session/{camera_key}{suffix}",
+        "media_location": f"/output/{camera_key}{suffix}" if success else None,
         "media_size_bytes": 100 if success else None,
         "media_sha256": marker * 64 if success else None,
-        "timeline_location": f"/output/{camera_key}.mp4.timestamps.npy" if success else None,
-        "timeline_sha256": "a" * 64 if success else None,
-        "observations_location": f"/output/{camera_key}.mp4.observations.npy" if success else None,
-        "observations_sha256": "b" * 64 if success else None,
+        # A cut sensor has no grid to record and no per-row selection to account
+        # for, so its sidecar descriptors are null where a camera's are set.
+        "timeline_location": sidecar(f"/output/{camera_key}.mp4.timestamps.npy"),
+        "timeline_sha256": sidecar("a" * 64),
+        "observations_location": sidecar(f"/output/{camera_key}.mp4.observations.npy"),
+        "observations_sha256": sidecar("b" * 64),
     }
 
 
 def _assemble(rows: list[dict[str, object]]) -> dict[str, object]:
-    table = pa.Table.from_pylist(rows, schema=CAMERA_OUTCOME_SCHEMA)
+    table = pa.Table.from_pylist(rows, schema=SENSOR_OUTCOME_SCHEMA)
     return assemble_episode_group(table).to_pylist()[0]
 
 
@@ -93,7 +110,7 @@ def test_malformed_camera_groups_fail_instead_of_being_reconciled(defect: str) -
     if defect == "duplicate":
         rows[1] = _outcome("front")
     elif defect == "unexpected":
-        rows[1]["camera_key"] = "rear"
+        rows[1]["sensor_key"] = "rear"
     else:
         rows[1]["source_session_location"] = "/different/session"
 
@@ -128,3 +145,80 @@ def test_staging_rejects_mixed_assembly_states_before_writing() -> None:
 
     with pytest.raises(ValueError, match=r"assembly states.*complete.*dropped"):
         stage_episode_batch(batch, uri="/unused", storage_profile="default")
+
+
+def _sensor_rows(*, planned: list[str], received: list[str]) -> list[dict[str, object]]:
+    """Return one camera outcome plus a sensor outcome per received key."""
+    rows: list[dict[str, object]] = [_outcome(key, planned_sensor_keys=planned) for key in ("front", "left")]
+    rows += [_outcome(key, sensor_type="egotrajectory", planned_sensor_keys=planned) for key in received]
+    return rows
+
+
+def test_a_sensor_outcome_joins_the_episode_it_belongs_to() -> None:
+    """A trajectory and the video of the same moment assemble into one row."""
+    result = _assemble(_sensor_rows(planned=["ego"], received=["ego"]))
+
+    assert result["assembly_status"] == "complete"
+    assert [camera["camera_key"] for camera in result["camera_media"]] == ["front", "left"]
+    assert [sensor["sensor_key"] for sensor in result["sensor_media"]] == ["ego"]
+    assert result["sensor_media"][0]["sensor_type"] == "egotrajectory"
+    assert result["camera_clips_written"] == 2
+    assert result["sensor_clips_written"] == 1
+
+
+def test_a_planned_sensor_that_never_arrived_drops_the_episode() -> None:
+    """A trajectory the clip was meant to hold and does not costs it its video too."""
+    result = _assemble(_sensor_rows(planned=["ego"], received=[]))
+
+    assert result["assembly_status"] == "dropped"
+    assert result["sensor_media"] is None
+    # The cameras it did write are still accounted for, so a dropped episode
+    # does not hide the work it cost.
+    assert result["camera_clips_written"] == 2
+    assert result["sensor_clips_written"] == 0
+
+
+def test_a_failed_sensor_outcome_drops_the_episode() -> None:
+    """A trajectory that was cut and failed is not a clip published without it."""
+    rows = _sensor_rows(planned=["ego"], received=["ego"])
+    rows[-1] = _outcome("ego", status="failure", sensor_type="egotrajectory", planned_sensor_keys=["ego"])
+
+    result = _assemble(rows)
+
+    assert result["assembly_status"] == "dropped"
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "unexpected"])
+def test_malformed_sensor_groups_fail_instead_of_being_reconciled(defect: str) -> None:
+    """A sensor set that is not the planned one is a broken stream, not an outcome.
+
+    Short is ordinary and drops the episode. A key nobody planned, or one
+    delivered twice, means the outcome stream itself is wrong, and publishing
+    from it would put an artifact on an episode that never asked for it.
+    """
+    received = ["ego", "ego"] if defect == "duplicate" else ["rear"]
+
+    with pytest.raises(ValueError, match=defect):
+        _assemble(_sensor_rows(planned=["ego"], received=received))
+
+
+def test_a_non_canonical_planned_sensor_set_is_refused() -> None:
+    """An unsorted planned set could make a short episode look complete."""
+    with pytest.raises(ValueError, match="non-canonical planned sensor set"):
+        _assemble(_sensor_rows(planned=["imu", "ego"], received=["ego", "imu"]))
+
+
+def test_a_dropped_episode_reports_the_sensor_bytes_it_did_write() -> None:
+    """A trajectory written for an episode whose camera failed is still counted."""
+    rows = [
+        _outcome("front", status="failure", planned_sensor_keys=["ego"]),
+        _outcome("left", planned_sensor_keys=["ego"]),
+        _outcome("ego", sensor_type="egotrajectory", planned_sensor_keys=["ego"]),
+    ]
+
+    result = _assemble(rows)
+
+    assert result["assembly_status"] == "dropped"
+    assert result["camera_clips_written"] == 1
+    assert result["sensor_clips_written"] == 1
+    assert result["sensor_clip_bytes"] == 100

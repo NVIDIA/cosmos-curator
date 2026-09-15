@@ -547,10 +547,22 @@ def test_exactly_one_camera_is_accepted() -> None:
     assert list(config.cameras) == ["front"]
 
 
-def test_no_cameras_is_rejected() -> None:
-    """A run with no camera produces no video, which is never what the caller meant."""
+def test_no_sensors_at_all_is_rejected() -> None:
+    """An empty sensor map names nothing to cut."""
     with pytest.raises(ValidationError, match="at least 1 item"):
         _resolved(sensors={})
+
+
+def test_sensors_without_a_camera_are_rejected() -> None:
+    """A rig of non-camera sensors cannot produce an episode, and says so at load.
+
+    The cameras define the episode's span, grid and row count, so there is
+    nothing to hang a trajectory on without one. Before this was checked, such a
+    config validated and then failed once per session in planning, so a run
+    exited successfully having written only error reports.
+    """
+    with pytest.raises(ValidationError, match="at least one camera"):
+        _resolved(sensors={"ego": {"sensor_type": "egotrajectory", "uri_pattern": "ego.mcap"}})
 
 
 def test_a_sensor_must_say_what_kind_it_is() -> None:
@@ -669,3 +681,37 @@ def test_a_wildcard_inside_a_segment_is_rejected(pattern: str) -> None:
     """
     with pytest.raises(ValidationError, match="whole path segment"):
         MultimodalSplitSensorConfig(sensor_type="camera", uri_pattern=pattern)
+
+
+def test_a_sensor_is_required_unless_it_says_otherwise() -> None:
+    """The default is what every config written before the flag existed meant."""
+    config = _resolved(
+        sensors={
+            "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+            "ego": {"sensor_type": "egotrajectory", "uri_pattern": "ego.mcap", "required": False},
+        }
+    )
+
+    assert config.sensors["front"].required is True
+    assert config.sensors["ego"].required is False
+    assert list(config.cameras) == ["front"]
+    assert list(config.mcap_sensors) == ["ego"]
+
+
+def test_a_topic_on_a_camera_is_refused_rather_than_ignored() -> None:
+    """Only an MCAP carries topics, and a config must not say what the run will not do."""
+    with pytest.raises(ValidationError, match="carries no topics"):
+        _resolved(sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4", "topic": "/front"}})
+
+
+def test_a_topic_on_an_mcap_sensor_is_accepted() -> None:
+    """The one field that makes a multi-topic recording usable."""
+    config = _resolved(
+        sensors={
+            "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+            "ego": {"sensor_type": "egotrajectory", "uri_pattern": "ego.mcap", "topic": "/ego"},
+        }
+    )
+
+    assert config.sensors["ego"].topic == "/ego"
+    assert config.sensors["front"].topic is None

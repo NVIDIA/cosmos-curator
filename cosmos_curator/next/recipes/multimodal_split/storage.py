@@ -38,6 +38,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     get_storage_client,
     is_remote_path,
 )
+from cosmos_curator.next.recipes.multimodal_split.mcap_streams import read_bounds
 from cosmos_curator.next.recipes.multimodal_split.reports import errors_prefix
 from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed, timeline_uri
 
@@ -110,6 +111,18 @@ def load_timeline_ns(
         return read_timestamps_ns(cast("BinaryIO", stream))
 
 
+def load_mcap_bounds(
+    sensor_uri: str, topic: str | None, *, storage_profile: str = "default", read_buffer_bytes: int | None = None
+) -> tuple[int, int]:
+    """Return the first and last message times on an MCAP sensor's topic.
+
+    All planning needs from an MCAP, and two indexed seeks rather than the whole
+    topic: a three-hour recording costs about what a twenty-second one does.
+    """
+    with open_sensor_source(sensor_uri, storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes) as stream:
+        return read_bounds(stream, topic)
+
+
 def resolve_sensor_pattern(
     session_uri: str,
     uri_pattern: str,
@@ -119,11 +132,9 @@ def resolve_sensor_pattern(
 ) -> str:
     """Resolve one camera's pattern against a session, wildcards and all.
 
-    A pattern naming its path exactly is joined without asking storage anything.
-    One with a wildcard segment is matched against the session's contents, which
-    matched against the session's contents -- a rig spreads twelve cameras over
-    five recorders, and which recorder holds which is the rig's business rather
-    than the config's.
+    Both an exact pattern and a wildcard one are matched against the session's
+    contents -- a rig spreads twelve cameras over five recorders, and which
+    recorder holds which is the rig's business rather than the config's.
 
     Pass ``session_paths`` to resolve a whole rig against one listing. Without
     it every camera lists the session again, which is twelve recursive listings
@@ -132,6 +143,11 @@ def resolve_sensor_pattern(
     Exactly one match, or neither answer is safe: none means the camera is not in
     this session, and several mean the pattern describes the rig rather than a
     camera in it. Picking one would silently drop a view from every clip.
+
+    A pattern naming its path exactly is checked against the listing too, so that
+    a sensor the session does not carry raises ``FileNotFoundError`` here rather
+    than surfacing later as whatever the storage backend raises on a missing
+    object. That distinction is what ``required: false`` turns on.
 
     Args:
         session_uri: The session to resolve within.
@@ -148,11 +164,20 @@ def resolve_sensor_pattern(
         ValueError: If more than one thing does.
 
     """
-    if "*" not in uri_pattern:
-        return resolve_sensor_uri(session_uri, uri_pattern)
     listing = (
         session_paths if session_paths is not None else list_session_paths(session_uri, storage_profile=storage_profile)
     )
+    if "*" not in uri_pattern:
+        # Checked against the listing rather than joined unchecked. The listing is
+        # already in hand, so this costs nothing, and it is the only way absence
+        # is reported as absence: opening a missing key raises whatever the
+        # backend raises, and smart_open surfaces a missing S3 object as a plain
+        # OSError rather than FileNotFoundError. A caller deciding whether a
+        # sensor is optional cannot tell that apart from a timeout.
+        if uri_pattern not in listing:
+            msg = f"no artifact in {session_uri} matches {uri_pattern!r}"
+            raise FileNotFoundError(msg)
+        return resolve_sensor_uri(session_uri, uri_pattern)
     matches = sorted(match_session_paths(listing, uri_pattern))
     if not matches:
         msg = f"no artifact in {session_uri} matches {uri_pattern!r}"

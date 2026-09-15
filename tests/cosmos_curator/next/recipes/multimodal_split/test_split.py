@@ -15,6 +15,7 @@
 
 """Tests for the ``multimodal-split`` split stage."""
 
+import hashlib
 import io
 import itertools
 import json
@@ -24,7 +25,9 @@ from typing import Any
 
 import av
 import numpy as np
+import pyarrow as pa
 import pytest
+from mcap.reader import make_reader as mcap_make_reader
 
 from cosmos_curator.core.sensors.sensors import camera_sensor
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
@@ -32,8 +35,13 @@ from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, wri
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans
-from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
+from cosmos_curator.next.recipes.multimodal_split.plan import MCAP_PLAN, PLANNING_RESULT_SCHEMA, span_planner
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri, sensor_error_uri
+from cosmos_curator.next.recipes.multimodal_split.split import (
+    SENSOR_OUTCOME_SCHEMA,
+    split_mcap_batch,
+    split_mcap_session,
+)
 
 from .conftest import DEVICE_ORIGIN_NS, split_all
 
@@ -1199,3 +1207,314 @@ def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
     assert [clip["clip_id"] for clip in written] == [reference[2]["clip_id"]]
     assert _observations(written[0]) == _observations(reference[2])
     assert len(_errors(config)) == 2
+
+
+def _ego_clips(
+    session: Path,
+    config: ResolvedMultimodalSplitConfig,
+) -> list[dict[str, object]]:
+    """Plan one session and cut its MCAP sensor, as the pipeline does."""
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    ego_plan = next(row for row in plans if row["result_kind"] == MCAP_PLAN)
+    return split_mcap_session(ego_plan, config=config)
+
+
+def test_an_mcap_clip_is_written_per_span_and_catalogued(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Every planned span becomes one MCAP beside the clip's video, with its digest."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success"] * 3
+    assert all(outcome["sensor_type"] == "egotrajectory" for outcome in outcomes)
+    for outcome in outcomes:
+        media = Path(str(outcome["media_location"]))
+        assert media.name == "ego.mcap"
+        assert media.parent.name == outcome["split_clip_id"]
+        written = media.read_bytes()
+        assert outcome["media_size_bytes"] == len(written)
+        assert outcome["media_sha256"] == hashlib.sha256(written).hexdigest()
+        with media.open("rb") as stream:
+            decoded = list(mcap_make_reader(stream).iter_messages())
+        assert decoded
+    # Copied rather than resampled, so there is no grid and no per-row account of
+    # which sample served which row -- the two artifacts a camera clip carries.
+    assert all(outcome["timeline_location"] is None for outcome in outcomes)
+    assert all(outcome["observations_location"] is None for outcome in outcomes)
+
+
+def test_an_interior_mcap_clip_carries_a_pose_at_or_before_its_start(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A clip can answer for its own first instant, which a strict half-open cut cannot.
+
+    Aligning grid row zero asks for a pose at exactly ``start``, and nearest
+    selection needs a sample at or before it. The session's first clip has none
+    to carry -- nothing precedes the recording -- so it is the interior clips
+    that show the bracket doing its job.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    answerable = []
+    carried = []
+    for outcome in outcomes:
+        with Path(str(outcome["media_location"])).open("rb") as stream:
+            times = [message.log_time for _s, _c, message in mcap_make_reader(stream).iter_messages()]
+        start_ns = int(outcome["start_ns"])
+        answerable.append(sum(1 for log_time in times if log_time <= start_ns))
+        carried.append(sum(1 for log_time in times if log_time < start_ns))
+    # The first clip answers for its own first instant from its own messages,
+    # because this trajectory begins exactly where the cameras do. The later two
+    # only manage it because the cut carried one message in from before the span.
+    assert carried == [0, 1, 1]
+    assert answerable == [1, 2, 2]
+
+
+def test_an_mcap_clip_holds_exactly_its_span_plus_the_bracket(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The cut is half-open on the bounds the cameras were cut on, plus one message.
+
+    A second of a 100 Hz trajectory is 100 messages. The session's first clip has
+    exactly those; the later ones carry the bracket as well, which is the message
+    the clip before it ended on.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    counts = []
+    for outcome in outcomes:
+        with Path(str(outcome["media_location"])).open("rb") as stream:
+            counts.append(len(list(mcap_make_reader(stream).iter_messages())))
+    assert counts == [100, 101, 101]
+
+
+def test_an_unreadable_mcap_fails_every_span_without_ending_the_session(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A trajectory that cannot be opened reports one failure per planned span.
+
+    Per span, not one for the sensor: the outcome stream is terminal, and a span
+    absent from it is indistinguishable from a worker that died holding it.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    ego = make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    ego_plan = next(row for row in plans if row["result_kind"] == MCAP_PLAN)
+    ego.write_bytes(b"not an mcap")
+
+    outcomes = split_mcap_session(ego_plan, config=config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["failure"] * 3
+    assert all(outcome["media_location"] is None for outcome in outcomes)
+
+
+def test_a_clip_spanning_a_trajectory_gap_is_refused_with_its_reason(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A clip holding no poses of its own fails, and the report says why.
+
+    Planning cannot see a dropout -- it reads the topic's first and last time and
+    nothing between -- so this span is a legitimate plan output. The clip carries
+    only the pose borrowed from before it, which cannot motion-compensate
+    anything, so it is refused rather than published looking whole.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session, gap=(100, 200))
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success", "failure", "success"]
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "ego")).read_bytes())
+    assert len(report["failures"]) == 1
+    assert report["failures"][0]["stage"] == "cut_mcap"
+    assert "no messages between" in report["failures"][0]["message"]
+
+
+def test_the_bracket_is_the_nearest_earlier_pose_on_an_unchunked_recording(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A recorder that wrote no chunk indexes still yields the pose just before the span.
+
+    The MCAP reader silently drops ``reverse`` when it cannot seek, so a reverse
+    lookup there returns the session's *earliest* message. On a three-hour
+    recording that is a pose hours stale, presented as the sample immediately
+    before the clip -- and nothing downstream could tell.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session, chunked=False)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    brackets = []
+    for outcome in outcomes:
+        with Path(str(outcome["media_location"])).open("rb") as stream:
+            times = sorted(message.log_time for _s, _c, message in mcap_make_reader(stream).iter_messages())
+        earlier = [log_time for log_time in times if log_time < int(outcome["start_ns"])]
+        brackets.append(earlier[-1] - int(outcome["start_ns"]) if earlier else None)
+    # 10ms before each span, one sample of a 100Hz trajectory -- not the session
+    # origin, which is where the unguarded reverse lookup lands.
+    assert brackets == [None, -10_000_000, -10_000_000]
+
+
+def test_a_multi_topic_mcap_must_name_the_topic_to_cut(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Cutting one of several topics without being told which would drop the rest."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session, extra_topic="/other")
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+
+    # Refused while planning, which reads the topic's bounds -- the ambiguity is
+    # caught before any clip directory exists rather than once per span.
+    assert results == []
+    report = json.loads(Path(plan_error_uri(config.output.path, "session-000")).read_bytes())
+    assert report["failures"][0]["sensor_key"] == "ego"
+    assert "must be named in config" in report["failures"][0]["message"]
+
+
+def test_a_named_topic_is_cut_from_a_multi_topic_mcap(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Naming the topic cuts that one and leaves its neighbour out of the clip."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session, extra_topic="/other")
+    config = make_config(
+        root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"}, topic="/egotrajectory"
+    )
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success"] * 3
+    with Path(str(outcomes[0]["media_location"])).open("rb") as stream:
+        topics = {channel.topic for _s, channel, _m in mcap_make_reader(stream).iter_messages()}
+    assert topics == {"/egotrajectory"}
+
+
+def test_a_cut_clip_carries_the_bytes_and_schema_it_arrived_with(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Every field of every message survives the cut, and so does the schema.
+
+    This is the whole contract: records are copied, never decoded, so a clip
+    opens with the code that already reads the session. Checking only timestamps
+    and counts would pass just as happily against a cutter that rewrote every
+    payload, which is exactly what makes a clip silently useless -- a consumer
+    reading it gets well-timed garbage.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    ego = make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+
+    with ego.open("rb") as stream:
+        source = {
+            message.log_time: (
+                schema.name,
+                schema.encoding,
+                schema.data,
+                channel.message_encoding,
+                message.data,
+                message.publish_time,
+                message.sequence,
+            )
+            for schema, channel, message in mcap_make_reader(stream).iter_messages()
+        }
+    outcomes = _ego_clips(session, config)
+
+    seen = 0
+    for outcome in outcomes:
+        with Path(str(outcome["media_location"])).open("rb") as stream:
+            for schema, channel, message in mcap_make_reader(stream).iter_messages():
+                assert (
+                    schema.name,
+                    schema.encoding,
+                    schema.data,
+                    channel.message_encoding,
+                    message.data,
+                    message.publish_time,
+                    message.sequence,
+                ) == source[message.log_time]
+                seen += 1
+    assert seen == 302  # 300 of their own across three clips, plus two brackets
+
+
+def test_an_mcap_block_round_trips_through_the_terminal_schema(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The batch stage casts sensor rows to the same schema camera rows use.
+
+    Which is where the null sidecar descriptors are actually exercised: a schema
+    that still demanded them would pass every direct-call test and fail only once
+    Ray asked for a block.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    config = make_config(root, tmp_path / "media", mcap_sensors={"ego": "ego/egotrajectory.mcap"})
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    block = pa.Table.from_pylist(
+        [row for row in plans if row["result_kind"] == MCAP_PLAN], schema=PLANNING_RESULT_SCHEMA
+    )
+
+    outcomes = split_mcap_batch(block, config=config)
+
+    assert outcomes.schema == SENSOR_OUTCOME_SCHEMA
+    rows = outcomes.to_pylist()
+    assert [row["status"] for row in rows] == ["success"] * 3
+    assert all(row["timeline_location"] is None for row in rows)
+    assert all(row["sensor_type"] == "egotrajectory" for row in rows)

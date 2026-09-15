@@ -43,6 +43,24 @@ CAMERA_MEDIA_STRUCT = pa.struct(
     ]
 )
 
+# A sensor whose clip is one file and nothing else. A camera's clip carries two
+# sidecars because it was resampled onto the episode's grid and the record of
+# which frame served which row is otherwise unrecoverable; a trajectory is copied
+# at its own rate, so there is no grid to record and no selection to account for.
+# Kept separate from ``CAMERA_MEDIA_STRUCT`` rather than widening it with fields
+# that would be null for every row: a reader asking "what is in this clip" gets
+# two lists whose shapes mean what they say.
+SENSOR_MEDIA_STRUCT = pa.struct(
+    [
+        pa.field("sensor_key", pa.string(), nullable=False),
+        pa.field("sensor_type", pa.string(), nullable=False),
+        pa.field("source_media_location", pa.large_string(), nullable=False),
+        pa.field("media_location", pa.large_string(), nullable=False),
+        pa.field("media_size_bytes", pa.int64(), nullable=False),
+        pa.field("media_sha256", pa.string(), nullable=False),
+    ]
+)
+
 EPISODE_SCHEMA = pa.schema(
     [
         pa.field("record_schema_version", pa.int32(), nullable=False),
@@ -62,6 +80,14 @@ EPISODE_SCHEMA = pa.schema(
         pa.field(
             "camera_media",
             pa.large_list(pa.field("item", CAMERA_MEDIA_STRUCT, nullable=False)),
+            nullable=False,
+        ),
+        # Empty when the config asked for no such sensor, which is a different
+        # statement from a camera list being empty -- an episode with no views is
+        # not an episode, while an episode with no trajectory is an ordinary one.
+        pa.field(
+            "sensor_media",
+            pa.large_list(pa.field("item", SENSOR_MEDIA_STRUCT, nullable=False)),
             nullable=False,
         ),
     ]
@@ -87,7 +113,11 @@ class EpisodeFacts:
     media_contract_version: int = MEDIA_CONTRACT_VERSION
 
 
-def build_episode_record(facts: EpisodeFacts, camera_media: list[dict[str, Any]]) -> dict[str, Any]:
+def build_episode_record(
+    facts: EpisodeFacts,
+    camera_media: list[dict[str, Any]],
+    sensor_media: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Build one canonical row, enforcing the capture-grid and camera contracts."""
     if facts.timestamp_source is not TimestampSource.CAPTURE:
         msg = f"Canonical multimodal episodes require capture timestamps, got {facts.timestamp_source.value!r}"
@@ -109,6 +139,11 @@ def build_episode_record(facts: EpisodeFacts, camera_media: list[dict[str, Any]]
     if not camera_keys or len(set(camera_keys)) != len(camera_keys):
         msg = "Canonical episode camera keys must be nonempty and unique"
         raise ValueError(msg)
+    ordered_sensors = sorted(sensor_media or [], key=lambda sensor: str(sensor["sensor_key"]))
+    sensor_keys = [str(sensor["sensor_key"]) for sensor in ordered_sensors]
+    if len(set(sensor_keys)) != len(sensor_keys):
+        msg = "Canonical episode sensor keys must be unique"
+        raise ValueError(msg)
     materialization_digest = make_materialization_digest(
         episode_id=facts.episode_id,
         split_clip_id=facts.split_clip_id,
@@ -116,6 +151,7 @@ def build_episode_record(facts: EpisodeFacts, camera_media: list[dict[str, Any]]
         sampling_fps=facts.sampling_fps,
         row_count=facts.row_count,
         camera_media=ordered,
+        sensor_media=ordered_sensors,
     )
     return {
         "record_schema_version": facts.record_schema_version,
@@ -133,6 +169,7 @@ def build_episode_record(facts: EpisodeFacts, camera_media: list[dict[str, Any]]
         "split_contract_digest": facts.split_contract_digest,
         "materialization_digest": materialization_digest,
         "camera_media": ordered,
+        "sensor_media": ordered_sensors,
     }
 
 

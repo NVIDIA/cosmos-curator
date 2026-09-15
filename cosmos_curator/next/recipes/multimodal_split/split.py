@@ -45,6 +45,7 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
 )
 from cosmos_curator.next.recipes.multimodal_split.cpu_video_encode import encode_frames_to_path
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, sampling_grid_ns, sampling_spec
+from cosmos_curator.next.recipes.multimodal_split.mcap_streams import McapSpanWriter, SpanCut
 from cosmos_curator.next.recipes.multimodal_split.reports import failure, write_sensor_errors
 from cosmos_curator.next.recipes.multimodal_split.storage import (
     open_sensor_source,
@@ -62,7 +63,7 @@ from cosmos_curator.next.utils.storage import write_media
 # or how many rows it holds.
 FrameProvider = Callable[[Span, int, list[int]], Iterator[npt.NDArray[np.uint8]]]
 
-CAMERA_OUTCOME_SCHEMA = pa.schema(
+SENSOR_OUTCOME_SCHEMA = pa.schema(
     [
         pa.field("status", pa.string(), nullable=False),
         pa.field("record_schema_version", pa.int32(), nullable=False),
@@ -83,7 +84,12 @@ CAMERA_OUTCOME_SCHEMA = pa.schema(
             pa.large_list(pa.field("item", pa.string(), nullable=False)),
             nullable=False,
         ),
-        pa.field("camera_key", pa.string(), nullable=False),
+        pa.field(
+            "planned_sensor_keys",
+            pa.large_list(pa.field("item", pa.string(), nullable=False)),
+            nullable=False,
+        ),
+        pa.field("sensor_key", pa.string(), nullable=False),
         pa.field("sensor_type", pa.string(), nullable=False),
         pa.field("source_media_location", pa.large_string(), nullable=False),
         pa.field("media_location", pa.large_string()),
@@ -95,6 +101,9 @@ CAMERA_OUTCOME_SCHEMA = pa.schema(
         pa.field("observations_sha256", pa.string()),
     ]
 )
+
+
+_MCAP_SUFFIX = ".mcap"
 
 
 def split_session(
@@ -149,7 +158,7 @@ def split_session(
     if len(clips_by_id) != len(clips):
         msg = f"Camera {sensor_key!r} emitted duplicate successful clip IDs"
         raise ValueError(msg)
-    return [_camera_outcome(item, entry, clips_by_id.get(str(entry["clip_id"]))) for entry in item["spans"]]
+    return [_sensor_outcome(item, entry, clips_by_id.get(str(entry["clip_id"]))) for entry in item["spans"]]
 
 
 def split_camera_batch(
@@ -164,15 +173,145 @@ def split_camera_batch(
         for plan in plans.to_pylist()
         for outcome in split_session(plan, config=config, storage_profile=storage_profile)
     ]
-    return pa.Table.from_pylist(rows, schema=CAMERA_OUTCOME_SCHEMA)
+    return pa.Table.from_pylist(rows, schema=SENSOR_OUTCOME_SCHEMA)
 
 
-def _camera_outcome(
+def split_mcap_session(
+    item: dict[str, Any],
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str = "default",
+) -> list[dict[str, Any]]:
+    """Cut every planned span of one MCAP sensor into a clip's own MCAP.
+
+    Copied, not resampled. A camera's clip is decoded and rebuilt onto the
+    episode's grid; a trajectory's is the session's messages at the rate they
+    were recorded, on the bounds the cameras were cut on. Nothing here decodes a
+    payload, so the clip carries the schema it arrived with and opens with
+    whatever code already reads the session.
+
+    Each cut carries the message immediately before its span. Aligning a clip's
+    first grid row asks for a sample at exactly that instant, and both nearest
+    selection and linear interpolation need one sample on the earlier side --
+    which a strict half-open cut does not leave. Measured across a real session,
+    every clip but the session's first had nothing at or before its leading grid
+    point without it.
+
+    Whole rather than windowed, unlike a camera. These files are small next to
+    video, and a remote read per span would re-fetch the chunks that adjacent
+    spans share.
+    """
+    session_id = str(item["source_session_id"])
+    sensor_key = str(item["sensor_key"])
+    sensor_uri = str(item["sensor_uri"])
+    entries = list(item["spans"])
+    spans = [Span(start_ns=int(entry["start_ns"]), end_ns=int(entry["exclusive_end_ns"])) for entry in entries]
+    clip_ids = [str(entry["clip_id"]) for entry in entries]
+    if len(set(clip_ids)) != len(clip_ids):
+        # Parity with the camera path, which raises on the same collision. Two
+        # spans sharing a clip id would write one file and then describe it with
+        # two rows carrying different bounds.
+        msg = f"Sensor {sensor_key!r} was planned with duplicate clip IDs"
+        raise ValueError(msg)
+
+    clips: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+    try:
+        with open_sensor_source(
+            sensor_uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+        ) as source:
+            writer = McapSpanWriter(source.read(), config.sensors[sensor_key].topic)
+        for clip_id, cut in zip(clip_ids, writer.iter_spans(spans), strict=True):
+            clip, clip_failure = _write_mcap_clip(writer, cut, clip_id, session_id, sensor_key, config, storage_profile)
+            if clip is not None:
+                clips[clip_id] = clip
+            if clip_failure is not None:
+                failures.append(clip_failure)
+    except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
+        failures.append(failure(session_id, sensor_key, None, "open_sensor", error))
+
+    write_sensor_errors(
+        session_id, sensor_key, failures, output_path=config.output.path, storage_profile=storage_profile
+    )
+    return [_sensor_outcome(item, entry, clips.get(str(entry["clip_id"]))) for entry in entries]
+
+
+def _write_mcap_clip(  # noqa: PLR0913 -- every argument names a different part of one clip's identity
+    writer: McapSpanWriter,
+    cut: SpanCut,
+    clip_id: str,
+    session_id: str,
+    sensor_key: str,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Write one span's messages, or describe why they could not be written."""
+    destination = clip_media_uri(clip_dir_uri(config.output.path, session_id, clip_id), sensor_key, _MCAP_SUFFIX)
+    try:
+        with tempfile.TemporaryDirectory() as staging:
+            local = Path(staging) / f"{clip_id}{_MCAP_SUFFIX}"
+            _total, own = writer.write_cut(cut, local)
+            if own == 0:
+                # The recording has a gap covering this whole clip. Planning
+                # cannot see one -- it reads the topic's first and last time and
+                # nothing in between -- so this is a legitimate span, not a file
+                # whose index disagrees with itself.
+                #
+                # Refused rather than written, because a clip holding no poses of
+                # its own cannot motion-compensate anything, which is what the
+                # trajectory is carried for. It takes the clip's video with it,
+                # the same way a missing camera does.
+                msg = (
+                    f"the recording has no messages between {cut.span.start_ns} and {cut.span.end_ns}, "
+                    f"so this clip holds none of its own"
+                )
+                raise ValueError(msg)  # noqa: TRY301 -- reported as this clip's failure, like any other
+            payload = local.read_bytes()
+            write_media(destination, payload, storage_profile=storage_profile)
+    except Exception as error:  # noqa: BLE001 -- one clip's failure never ends the session
+        return None, failure(session_id, sensor_key, cut.span, "cut_mcap", error, clip_id)
+
+    clip = {
+        "clip_id": clip_id,
+        "clip_location": destination,
+        "clip_bytes": len(payload),
+        "media_sha256": hashlib.sha256(payload).hexdigest(),
+        # A trajectory is not resampled, so there is no grid it was put onto and
+        # no per-row record of which sample served which row.
+        "timeline_location": None,
+        "timeline_sha256": None,
+        "observations_location": None,
+        "observations_sha256": None,
+    }
+    return clip, None
+
+
+def split_mcap_batch(
+    plans: pa.Table,
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str = "default",
+) -> pa.Table:
+    """Cut one Arrow block of MCAP plans while preserving the terminal outcome schema."""
+    rows = [
+        outcome
+        for plan in plans.to_pylist()
+        for outcome in split_mcap_session(plan, config=config, storage_profile=storage_profile)
+    ]
+    return pa.Table.from_pylist(rows, schema=SENSOR_OUTCOME_SCHEMA)
+
+
+def _optional_str(value: object) -> str | None:
+    """Return *value* as a string, or None where a sensor has no such artifact."""
+    return None if value is None else str(value)
+
+
+def _sensor_outcome(
     plan: dict[str, Any],
     span: dict[str, Any],
     clip: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build one terminal outcome for every planned camera span."""
+    """Build one terminal outcome for every planned span of one sensor."""
     if clip is None:
         success_fields: dict[str, Any] = {
             "media_location": None,
@@ -184,14 +323,17 @@ def _camera_outcome(
             "observations_sha256": None,
         }
     else:
+        # The sidecars are a camera's. A trajectory is copied rather than
+        # resampled, so it has no grid to record and no per-row account of which
+        # sample served which row, and those fields stay null for it.
         success_fields = {
             "media_location": str(clip["clip_location"]),
             "media_size_bytes": int(clip["clip_bytes"]),
             "media_sha256": str(clip["media_sha256"]),
-            "timeline_location": str(clip["timeline_location"]),
-            "timeline_sha256": str(clip["timeline_sha256"]),
-            "observations_location": str(clip["observations_location"]),
-            "observations_sha256": str(clip["observations_sha256"]),
+            "timeline_location": _optional_str(clip["timeline_location"]),
+            "timeline_sha256": _optional_str(clip["timeline_sha256"]),
+            "observations_location": _optional_str(clip["observations_location"]),
+            "observations_sha256": _optional_str(clip["observations_sha256"]),
         }
     return {
         "status": "success" if clip is not None else "failure",
@@ -209,7 +351,8 @@ def _camera_outcome(
         "timestamp_source": str(span["timestamp_source"]),
         "split_contract_digest": str(span["split_contract_digest"]),
         "planned_camera_keys": [str(key) for key in span["planned_camera_keys"]],
-        "camera_key": str(plan["sensor_key"]),
+        "planned_sensor_keys": [str(key) for key in span["planned_sensor_keys"]],
+        "sensor_key": str(plan["sensor_key"]),
         "sensor_type": str(plan["sensor_type"]),
         "source_media_location": str(plan["sensor_uri"]),
         **success_fields,

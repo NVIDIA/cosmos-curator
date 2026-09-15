@@ -22,10 +22,11 @@ The output root has one fixed layout:
     <camera_key>.mp4
     <camera_key>.mp4.timestamps.npy
     <camera_key>.mp4.observations.npy
+    <sensor_key>.mcap
   errors/
 ```
 
-`episodes.lance` is the canonical episode authority. Once referenced by a row, the camera artifacts are immutable by
+`episodes.lance` is the canonical episode authority. Once referenced by a row, the clip's artifacts are immutable by
 contract. The per-clip `clip.json` and sparse files under `errors/` remain path-local diagnostics; they are not
 publication inputs or current canonical state. Camera outcomes carried within one invocation are transient assembly
 inputs and are not another durable table.
@@ -54,6 +55,7 @@ The ordered producer-owned Arrow schema is:
 | `split_contract_digest` | `string not null` | Result-defining split configuration identity |
 | `materialization_digest` | `string not null` | Exact sorted camera-artifact-set identity |
 | `camera_media` | `large_list<struct<...>> not null` | Complete camera descriptors, sorted by `camera_key` |
+| `sensor_media` | `large_list<struct<...>> not null` | Complete non-camera descriptors, sorted by `sensor_key`; empty when none is configured |
 
 Every list item and every child of the `camera_media` struct is non-nullable:
 
@@ -68,6 +70,19 @@ Every list item and every child of the `camera_media` struct is non-nullable:
 | `timeline_sha256` | `string not null` | SHA-256 of grid-sidecar bytes |
 | `observations_location` | `large_string not null` | Selected-source-observation sidecar |
 | `observations_sha256` | `string not null` | SHA-256 of observation-sidecar bytes |
+
+Every list item and every child of the `sensor_media` struct is likewise non-nullable. It carries no grid or
+observation sidecars: a copied sensor is not resampled onto the episode's grid, so there is no grid to record and no
+per-row account of which sample served which row.
+
+| Child | Arrow type | Meaning |
+|---|---|---|
+| `sensor_key` | `string not null` | Stable configured sensor key |
+| `sensor_type` | `string not null` | Configured sensor kind, such as `egotrajectory` |
+| `source_media_location` | `large_string not null` | Resolved session artifact the clip was cut from |
+| `media_location` | `large_string not null` | Materialized clip MCAP |
+| `media_size_bytes` | `int64 not null` | Exact MCAP byte count |
+| `media_sha256` | `string not null` | SHA-256 of MCAP bytes |
 
 Camera storage order is lexicographic serialization, not a model-input order. A schema-level resolver requires an
 explicit `camera_key` and returns exactly one descriptor, rejecting missing or duplicate keys. A visual consumer uses:
@@ -112,7 +127,7 @@ across rendering choices.
 ```text
 {
   "kind": "multimodal-av-split-contract",
-  "split_contract_digest_version": 1,
+  "split_contract_digest_version": 2,
   "media_contract_version": <media contract version>,
   "clip": {
     "duration_ns": <resolved integer duration>,
@@ -121,6 +136,10 @@ across rendering choices.
   "cameras": [
     {"camera_key": <key>, "sensor_type": <type>},
     ... sorted by camera_key
+  ],
+  "mcap_sensors": [
+    {"sensor_key": <key>, "sensor_type": <type>, "topic": <topic or null>},
+    ... sorted by sensor_key
   ],
   "video": {
     "max_delta_ns": <resolved tolerance>,
@@ -143,7 +162,7 @@ resolved `source_media_location` remains explicit in the row and in pre-write co
 ```text
 {
   "kind": "multimodal-av-episode-materialization",
-  "materialization_digest_version": 1,
+  "materialization_digest_version": 2,
   "episode_id": <episode_id>,
   "split_clip_id": <split_clip_id>,
   "split_contract_digest": <split contract digest>,
@@ -212,13 +231,14 @@ Reconciliation assumes source media and capture-timestamp sidecars are immutable
 either in place can reuse an existing canonical episode because reconciliation does not rehash source inputs. Corrected
 inputs must use a new session location, and therefore a new source identity.
 
-Each non-reconciled camera emits exactly one current-run outcome per planned span. Both successes and failures carry the
-complete shared episode facts and expected row count. Successes additionally carry all artifact descriptors. Durable
+Each non-reconciled sensor emits exactly one current-run outcome per planned span. Both successes and failures carry the
+complete shared episode facts and expected row count. Successes additionally carry all artifact descriptors that apply
+to that sensor kind; a copied sensor has no grid or selection sidecars, so those descriptors are null for it. Durable
 error JSON supplies detailed failure category and message but does not veto a later successful current-run outcome.
 
 Assembly groups small outcomes by `split_clip_id`, compares the complete shared facts once, and requires exactly one
-outcome for every planned camera. Duplicate, unexpected, or conflicting input is an internal contract error. A missing
-or failed camera drops the episode without publishing a partial row. Successful sibling artifacts remain available for
+outcome for every planned camera and every planned non-camera sensor. Duplicate, unexpected, or conflicting input is an
+internal contract error. A missing or failed sensor of either kind drops the episode without publishing a partial row. Successful sibling artifacts remain available for
 diagnosis or retry. The splitter refuses an encode whose written row count differs from the planned grid before it emits
 a successful outcome.
 
@@ -243,10 +263,17 @@ Base-schema validation requires the producer-owned fields in exact order, type, 
 additional nullable top-level fields. Later base appends omit those fields, preserving existing enrichment values and
 presenting null for newly appended rows.
 
+This section governs *downstream* consumers -- work that runs after base publication and enriches an already-published
+episode. It does not govern the split producer, which owns every column it writes.
+
 Compact singular results may use producer-owned nullable episode fields. Dense, repeated, or independently versioned
 data belongs in typed tables or immutable sidecars keyed by `episode_id`. A visual result records the applicable
-`materialization_digest` in its own contract. Non-camera modalities do not become entries in `camera_media`; the
-episode identity and capture-clock interval/grid are their join seam.
+`materialization_digest` in its own contract. A downstream non-camera modality does not become an entry in
+`camera_media` or `sensor_media`; the episode identity and capture-clock interval/grid are its join seam.
+
+A modality the splitter itself cuts is not downstream work. It is base data the producer owns, catalogued in
+`sensor_media` alongside `camera_media` and committed in the same fragment, so one clip is one row rather than a join
+a reader has to reconstruct.
 
 Concrete field names, result metadata, completion semantics, and concurrent enrichment publication belong to the
 consumer that introduces them. Base publication does not reserve placeholder columns or define a universal result

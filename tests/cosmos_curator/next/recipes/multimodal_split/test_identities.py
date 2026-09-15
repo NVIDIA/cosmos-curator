@@ -158,7 +158,7 @@ def test_episode_and_materialization_digest_fixtures(
     assert split_clip_id == "06c13fc958dbf9468c99710c63777749752f320583620710c8c68e1299a2d855"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "6fbb071ddbeffc8e94f52a8d70553737584a3fcb12e56f4f779f4fa81c8aef74"
+    assert split_digest == "06fc1d634468823f792d6315a66edb68087215d267cb934b3bab50edad90cadc"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "a7aa78bcaebdb2bcc0d594c5882b3d3ad3065e6b31fe6dcf3f28c9443ec92ad3"
+        == "094cd94da4adb0a2aa7331806d2a9613544badf3fcc6e8a4fb5f77eccaf3d7ec"
     )
 
 
@@ -183,3 +183,62 @@ def test_split_contract_includes_rendering_but_excludes_execution(
 
     assert make_split_contract_digest(defining) != make_split_contract_digest(baseline)
     assert make_split_contract_digest(execution) == make_split_contract_digest(baseline)
+
+
+def _sensor(key: str, marker: str) -> dict[str, object]:
+    return {"sensor_key": key, "sensor_type": "egotrajectory", "media_sha256": marker * 64}
+
+
+def test_a_trajectory_changes_the_materialization_digest() -> None:
+    """An episode carrying a trajectory cannot digest like one that never had it.
+
+    The digest binds an episode to the exact bytes of every artifact in its clip.
+    Leaving non-camera artifacts out would let a clip whose trajectory changed --
+    or appeared -- pass as already materialized.
+    """
+    camera_media = [
+        {
+            "camera_key": "front",
+            "media_sha256": "1" * 64,
+            "timeline_sha256": "2" * 64,
+            "observations_sha256": "3" * 64,
+        }
+    ]
+    common = {
+        "episode_id": "episode",
+        "split_clip_id": "clip",
+        "split_contract_digest": "contract",
+        "sampling_fps": 30,
+        "row_count": 30,
+        "camera_media": camera_media,
+    }
+
+    without = make_materialization_digest(**common)
+    with_ego = make_materialization_digest(**common, sensor_media=[_sensor("ego", "4")])
+    other_bytes = make_materialization_digest(**common, sensor_media=[_sensor("ego", "5")])
+    other_key = make_materialization_digest(**common, sensor_media=[_sensor("imu", "4")])
+
+    assert len({without, with_ego, other_bytes, other_key}) == 4
+
+
+def test_the_split_contract_digest_binds_every_mcap_sensor_and_its_topic(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Adding a trajectory, or cutting a different topic, is a different contract.
+
+    Both change what a clip holds while leaving its geometry -- and so its
+    episode id -- untouched, which is precisely the case a digest exists to
+    catch. Without them a reconciling rerun would call the old clip canonical.
+    """
+    cameras = {"front": "front.mp4"}
+    camera_only = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras)
+    with_ego = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras, mcap_sensors={"ego": "ego.mcap"})
+    other_topic = make_config(
+        tmp_path / "in", tmp_path / "out", cameras=cameras, mcap_sensors={"ego": "ego.mcap"}, topic="/other"
+    )
+    other_key = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras, mcap_sensors={"imu": "ego.mcap"})
+
+    digests = {make_split_contract_digest(config) for config in (camera_only, with_ego, other_topic, other_key)}
+
+    assert len(digests) == 4

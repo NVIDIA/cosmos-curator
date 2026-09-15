@@ -29,6 +29,7 @@ from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns,
 from cosmos_curator.next.recipes.multimodal_split.records import (
     CAMERA_MEDIA_STRUCT,
     EPISODE_SCHEMA,
+    SENSOR_MEDIA_STRUCT,
     EpisodeFacts,
     build_episode_record,
     episode_table,
@@ -84,6 +85,7 @@ def test_episode_schema_is_exact_and_nested_items_are_non_nullable() -> None:
         "split_contract_digest",
         "materialization_digest",
         "camera_media",
+        "sensor_media",
     ]
 
     assert EPISODE_SCHEMA.names == expected_names
@@ -93,6 +95,11 @@ def test_episode_schema_is_exact_and_nested_items_are_non_nullable() -> None:
     assert not camera_list.value_field.nullable
     assert camera_list.value_type == CAMERA_MEDIA_STRUCT
     assert all(not field.nullable for field in CAMERA_MEDIA_STRUCT)
+    sensor_list = EPISODE_SCHEMA.field("sensor_media").type
+    assert pa.types.is_large_list(sensor_list)
+    assert not sensor_list.value_field.nullable
+    assert sensor_list.value_type == SENSOR_MEDIA_STRUCT
+    assert all(not field.nullable for field in SENSOR_MEDIA_STRUCT)
 
 
 def test_record_builder_sorts_cameras_and_camera_resolution_is_exact() -> None:
@@ -154,3 +161,41 @@ def test_delivered_grid_rounds_each_float64_offset(
     grid = sampling_grid_ns(Span(start_ns=0, end_ns=1_000_000_000), config)
 
     assert int(grid[2]) == 66_666_667
+
+
+def _sensor_media(key: str, marker: str) -> dict[str, object]:
+    return {
+        "sensor_key": key,
+        "sensor_type": "egotrajectory",
+        "source_media_location": f"/input/session/{key}.mcap",
+        "media_location": f"/output/{key}.mcap",
+        "media_size_bytes": 10,
+        "media_sha256": marker * 64,
+    }
+
+
+def test_sensor_media_is_stored_in_a_canonical_order() -> None:
+    """Two runs that assembled the same clip must produce the same row.
+
+    Outcome order is whatever the grouping handed over, and a row whose list
+    order follows that is a row whose bytes depend on scheduling -- so the same
+    clip could be published twice under two different serializations.
+    """
+    facts = _facts()
+
+    record = build_episode_record(
+        facts,
+        [_camera("front", "1")],
+        [_sensor_media("imu", "4"), _sensor_media("ego", "5")],
+    )
+
+    assert [sensor["sensor_key"] for sensor in record["sensor_media"]] == ["ego", "imu"]
+    assert episode_table([record]).schema == EPISODE_SCHEMA
+
+
+def test_a_duplicate_sensor_key_is_refused() -> None:
+    """One clip cannot hold the same sensor twice, whatever produced the outcomes."""
+    facts = _facts()
+
+    with pytest.raises(ValueError, match="sensor keys must be unique"):
+        build_episode_record(facts, [_camera("front", "1")], [_sensor_media("ego", "4"), _sensor_media("ego", "5")])

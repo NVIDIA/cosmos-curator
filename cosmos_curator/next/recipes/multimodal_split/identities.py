@@ -35,8 +35,19 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # identity schemes -- ids from either would be version 1 and indistinguishable.
 MEDIA_CONTRACT_VERSION = 2
 EPISODE_IDENTITY_VERSION = 1
-SPLIT_CONTRACT_DIGEST_VERSION = 1
-MATERIALIZATION_DIGEST_VERSION = 1
+# 2: MCAP sensors joined the contract. A clip published under version 1 was cut
+# from cameras alone, so it cannot be said to satisfy a config that also asks for
+# a trajectory.
+#
+# Reconciliation refuses such a clip rather than re-planning it: an episode whose
+# identity matches but whose contract does not is a conflict, and
+# ``reconcile_planned_episode`` raises. So adding a sensor to a config that has
+# already published needs a new output path, not a rerun into the old one.
+SPLIT_CONTRACT_DIGEST_VERSION = 2
+# 2: non-camera sensor artifacts joined the digest. An episode published under
+# version 1 was its cameras and nothing else, so it cannot be compared byte for
+# byte against one that also carries a trajectory.
+MATERIALIZATION_DIGEST_VERSION = 2
 
 
 def make_source_id(session_uri: str) -> str:
@@ -125,6 +136,15 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
             "cameras": [
                 {"camera_key": key, "sensor_type": camera.sensor_type} for key, camera in sorted(config.cameras.items())
             ],
+            # Every sensor that puts an artifact in a clip, so adding one makes
+            # published clips stale rather than leaving them reconciling as
+            # canonical against a contract they no longer satisfy. ``topic``
+            # belongs here for the same reason: the same clip cut from a
+            # different topic is different bytes under an unchanged identity.
+            "mcap_sensors": [
+                {"sensor_key": key, "sensor_type": sensor.sensor_type, "topic": sensor.topic}
+                for key, sensor in sorted(config.mcap_sensors.items())
+            ],
             "video": {
                 "max_delta_ns": config.video.max_delta_ns,
                 "encoder": {
@@ -146,8 +166,9 @@ def make_materialization_digest(  # noqa: PLR0913 -- every input is a normative 
     sampling_fps: int,
     row_count: int,
     camera_media: list[dict[str, Any]],
+    sensor_media: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Bind an episode to the exact camera MP4 and timing-sidecar bytes."""
+    """Bind an episode to the exact bytes of every artifact in its clip."""
     return canonical_digest(
         {
             "kind": "multimodal-av-episode-materialization",
@@ -165,6 +186,16 @@ def make_materialization_digest(  # noqa: PLR0913 -- every input is a normative 
                     "observations_sha256": str(camera["observations_sha256"]),
                 }
                 for camera in sorted(camera_media, key=lambda camera: str(camera["camera_key"]))
+            ],
+            # Present even when empty, so an episode that carries a trajectory
+            # and one that was never asked for it cannot digest alike.
+            "sensor_artifacts": [
+                {
+                    "sensor_key": str(sensor["sensor_key"]),
+                    "sensor_type": str(sensor["sensor_type"]),
+                    "media_sha256": str(sensor["media_sha256"]),
+                }
+                for sensor in sorted(sensor_media or [], key=lambda sensor: str(sensor["sensor_key"]))
             ],
         }
     )
