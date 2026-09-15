@@ -474,7 +474,8 @@ The v1 design does not:
 
 | Module | Responsibility |
 | --- | --- |
-| `pipeline.py` | Attempt orchestration, phase boundaries, Ray setup, verification, and cleanup. |
+| `pipeline.py` | Clip binding construction, attempt orchestration, phase boundaries, Ray setup, verification, and cleanup. |
+| `bindings.py` | Private recipe-owned row, result, and publication bindings for the shared two-phase engine. |
 | `config.py` | Strict config validation and derived storage locations. |
 | `contracts.py` | Model resolution, field schemas, normalized contract digest, and terminal-value rules. |
 | `lance_state.py` | Field registration, input validation, attempt capture, and physical-fragment identity. |

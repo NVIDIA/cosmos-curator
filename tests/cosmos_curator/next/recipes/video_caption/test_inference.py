@@ -7,7 +7,7 @@ import base64
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import lance
 import pyarrow as pa
@@ -22,6 +22,7 @@ from lance.fragment import LanceFragment
 from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.next.recipes.video_caption import inference
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
@@ -129,6 +130,7 @@ def test_caption_lance_read_task_reopens_with_storage_options_without_pickling_f
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     clip_row_factory: Callable[..., dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Ray tasks carry credentials and fragment IDs, never storage-blind fragment handles."""
     uri, dataset = clip_dataset_factory(rows=[clip_row_factory(0)])
@@ -144,6 +146,8 @@ def test_caption_lance_read_task_reopens_with_storage_options_without_pickling_f
         attempt,
         storage_options=storage_options,
         batch_size=17,
+        source_columns=caption_bindings.input.source_columns,
+        source_schema=caption_bindings.input.source_schema,
     )
     read_task = datasource.get_read_tasks(parallelism=1)[0]
 
@@ -201,7 +205,10 @@ def test_caption_lance_read_task_reopens_with_storage_options_without_pickling_f
     assert output[0].equals(table)
 
 
-def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(tmp_path: Path) -> None:
+def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(
+    tmp_path: Path,
+    caption_bindings: CaptionRunBindings,
+) -> None:
     """Media bytes are length-checked and embedded in an MP4 data URL."""
     payload = b"\x00\x00\x00\x18ftypmp42"
     clip = tmp_path / "clip.mp4"
@@ -219,7 +226,12 @@ def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(tmp_path: Path) ->
         schema=MAPPED_INPUT_SCHEMA,
     )
 
-    fetched = fetch_media_batch(source, storage_profile="default", attempts=2).to_pylist()[0]
+    fetched = fetch_media_batch(
+        source,
+        input_bindings=caption_bindings.input,
+        storage_profile="default",
+        attempts=2,
+    ).to_pylist()[0]
 
     assert fetched["video_data_url"] == f"data:video/mp4;base64,{base64.b64encode(payload).decode('ascii')}"
     assert fetched["download_error_type"] is None
@@ -239,6 +251,7 @@ def test_item_media_failures_become_rows(
     uri: str,
     size: int,
     message: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Deterministic missing, malformed, and unsupported media become item errors."""
     if uri == "existing":
@@ -250,14 +263,22 @@ def test_item_media_failures_become_rows(
         schema=MAPPED_INPUT_SCHEMA,
     )
 
-    fetched = fetch_media_batch(source, storage_profile="default", attempts=1).to_pylist()[0]
+    fetched = fetch_media_batch(
+        source,
+        input_bindings=caption_bindings.input,
+        storage_profile="default",
+        attempts=1,
+    ).to_pylist()[0]
 
     assert fetched["video_data_url"] is None
     assert fetched["download_error_type"] == "ItemMediaError"
     assert message in fetched["download_error_message"]
 
 
-def test_shared_media_failure_stops_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shared_media_failure_stops_the_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    caption_bindings: CaptionRunBindings,
+) -> None:
     """Repeated shared filesystem failures fail Phase A instead of becoming rows."""
     source = pa.Table.from_pylist(
         [{"fragment_id": 0, "row_offset": 0, "clip_id": "clip", "clip_uri": "/clip", "clip_size_bytes": 1}],
@@ -276,7 +297,12 @@ def test_shared_media_failure_stops_the_batch(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(inference.time, "sleep", lambda _: None)
 
     with pytest.raises(SharedMediaError, match="after 3 attempt"):
-        fetch_media_batch(source, storage_profile="default", attempts=3)
+        fetch_media_batch(
+            source,
+            input_bindings=caption_bindings.input,
+            storage_profile="default",
+            attempts=3,
+        )
     assert attempts == 3
 
 
@@ -365,7 +391,7 @@ def test_download_error_bypasses_llm() -> None:
 
 def test_download_error_preserves_identity_through_terminal_adapter(
     caption_spec: CaptionModelSpec,
-    caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Download failure normalization retains physical identity in the terminal row."""
     source = {
@@ -379,8 +405,7 @@ def test_download_error_preserves_identity_through_terminal_adapter(
     preprocessed = source | caption_llm_preprocess(source)
     terminal = canonicalize_llm_batch(
         pa.Table.from_pylist([preprocessed]),
-        spec=caption_spec,
-        digest=caption_digest,
+        bindings=caption_bindings,
     ).to_pylist()[0]
 
     assert (terminal["fragment_id"], terminal["row_offset"], terminal["clip_id"]) == (2, 3, "clip")
@@ -427,15 +452,16 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     monkeypatch.setattr(ray_data_llm, "build_processor", build_processor)
 
     processor = inference._build_llm_processor(
-        config,
-        caption_spec,
+        config.execution,
+        caption_spec.runtime_model_dir,
+        ("clip_id",),
         initial_inference_workers=3,
         inference_worker_ceiling=4,
     )
 
     assert isinstance(processor, inference._ExactVLLMBatchProcessor)
     assert captured["preprocess"] is caption_llm_preprocess
-    assert captured["postprocess"] is caption_llm_postprocess
+    assert cast("Any", captured["postprocess"]).func is caption_llm_postprocess
     processor_config = captured["config"]
     assert isinstance(processor_config, ray_data_llm.vLLMEngineProcessorConfig)
     assert processor_config.batch_size == 32
@@ -448,11 +474,13 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     assert multimodal_config.enabled is True
     assert multimodal_config.concurrency == (3, 4)
     assert multimodal_config.memory == 24 * 1024**3
-    assert multimodal_config.model_config_kwargs == {"media_io_kwargs": {"video": {"num_frames": -1}}}
+    expected_media_io_kwargs = {"media_io_kwargs": {"video": {"num_frames": -1, "fps": 2}}}
+    assert multimodal_config.model_config_kwargs == expected_media_io_kwargs
     chat_template_config = processor_config.chat_template_stage
     assert isinstance(chat_template_config, ray_data_llm.ChatTemplateStageConfig)
     assert chat_template_config.concurrency == (3, 4)
     assert chat_template_config.memory == 16 * 1024**3
+    assert processor_config.engine_kwargs["media_io_kwargs"] == expected_media_io_kwargs["media_io_kwargs"]
 
 
 def test_exact_vllm_batch_processor_inserts_strict_repartition() -> None:
@@ -550,7 +578,7 @@ def test_inference_worker_ceiling_is_work_bounded(
         }
     )
 
-    assert inference._resolve_inference_worker_ceiling(config, num_input_rows) == expected
+    assert inference._resolve_inference_worker_ceiling(config.execution, num_input_rows) == expected
 
 
 @pytest.mark.parametrize(
@@ -585,7 +613,8 @@ def test_postprocess_keeps_only_small_identity_and_token_values() -> None:
             "num_input_tokens": 4,
             "num_generated_tokens": 5,
             "video_data_url": "large",
-        }
+        },
+        staged_binding_columns=("clip_id",),
     )
 
     assert output == {
@@ -600,7 +629,7 @@ def test_postprocess_keeps_only_small_identity_and_token_values() -> None:
 
 def test_canonicalization_emits_success_truncated_and_error_rows(
     caption_spec: CaptionModelSpec,
-    caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Ray LLM shapes normalize into all three canonical terminal states."""
     raw = pa.Table.from_pylist(
@@ -635,7 +664,7 @@ def test_canonicalization_emits_success_truncated_and_error_rows(
         ]
     )
 
-    terminal = canonicalize_llm_batch(raw, spec=caption_spec, digest=caption_digest)
+    terminal = canonicalize_llm_batch(raw, bindings=caption_bindings)
     rows = terminal.to_pylist()
 
     assert terminal.schema.equals(result_schema(caption_spec), check_metadata=True)
@@ -669,6 +698,7 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
     clip_row_factory: Callable[..., dict[str, object]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Committed clip IDs skip media and inference after a post-attempt split append."""
@@ -682,8 +712,8 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
         row["clip_size_bytes"] = len(payload)
         rows.append(row)
     uri, _ = clip_dataset_factory(rows=rows, rows_per_fragment=1)
-    dataset = ensure_caption_fields(uri, storage_options=None, spec=caption_spec, attempts=3)
-    attempt = capture_attempt(dataset, spec=caption_spec, digest=caption_digest)
+    dataset = ensure_caption_fields(uri, storage_options=None, bindings=caption_bindings, attempts=3)
+    attempt = capture_attempt(dataset, bindings=caption_bindings)
     config = resolve_config_data(
         {
             "schema_version": 1,
@@ -713,9 +743,9 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
         run_inference_phase(
             dataset,
             attempt,
-            config,
-            caption_spec,
-            caption_digest,
+            config.execution,
+            caption_bindings,
+            caption_spec.runtime_model_dir,
             workspace,
             storage_options=None,
         )
@@ -739,7 +769,7 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
         assert candidate is not None
         append_clip_fragment(candidate, uri=uri, storage_profile="default", attempts=3)
         latest = lance.dataset(uri)
-        superset_attempt = capture_attempt(latest, spec=caption_spec, digest=caption_digest)
+        superset_attempt = capture_attempt(latest, bindings=caption_bindings)
         assert phase_a_completion_covers(workspace, superset_attempt, caption_digest) is False
         monkeypatch.setattr(
             inference,
@@ -750,9 +780,9 @@ def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
         run_inference_phase(
             latest,
             superset_attempt,
-            config,
-            caption_spec,
-            caption_digest,
+            config.execution,
+            caption_bindings,
+            caption_spec.runtime_model_dir,
             workspace,
             storage_options=None,
         )

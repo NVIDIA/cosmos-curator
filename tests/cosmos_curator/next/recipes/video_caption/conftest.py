@@ -4,17 +4,33 @@
 """Shared fixtures for video-caption contract and Lance integration tests."""
 
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.recipes.video_caption.bindings import (
+    CaptionInputBindings,
+    CaptionPublicationBindings,
+    CaptionResultBindings,
+    CaptionRunBindings,
+)
 from cosmos_curator.next.recipes.video_caption.contracts import (
     CaptionModelSpec,
+    build_terminal_result_row,
     caption_contract_digest,
     resolve_model_spec,
+    validate_terminal_row,
+    validate_terminal_value,
 )
+from cosmos_curator.next.recipes.video_caption.inference import (
+    MAPPED_INPUT_SCHEMA,
+    decompose_row_addresses,
+    result_schema,
+)
+from cosmos_curator.next.recipes.video_split.lance_sink import validate_clip_table
 from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
 
 
@@ -56,6 +72,48 @@ def caption_spec() -> CaptionModelSpec:
 def caption_digest(caption_spec: CaptionModelSpec) -> str:
     """Return the default contract digest."""
     return caption_contract_digest(caption_spec)
+
+
+@pytest.fixture
+def caption_bindings(caption_spec: CaptionModelSpec, caption_digest: str) -> CaptionRunBindings:
+    """Return the clip recipe's explicit private run bindings."""
+    return CaptionRunBindings(
+        input=CaptionInputBindings(
+            source_columns=("clip_id", "clip_uri", "clip_size_bytes"),
+            source_schema=pa.schema([CLIP_SCHEMA.field(name) for name in ("clip_id", "clip_uri", "clip_size_bytes")]),
+            mapped_schema=MAPPED_INPUT_SCHEMA,
+            project_batch=decompose_row_addresses,
+            row_id_column="clip_id",
+            media_uri_column="clip_uri",
+            media_size_column="clip_size_bytes",
+            media_sha256_column=None,
+            staged_binding_columns=("clip_id",),
+        ),
+        result=CaptionResultBindings(
+            caption_field_name=caption_spec.caption_field_name,
+            metadata_field_name=caption_spec.metadata_field_name,
+            fields=caption_spec.fields,
+            staged_schema=result_schema(caption_spec),
+            digest=caption_digest,
+            build_terminal_row=partial(build_terminal_result_row, spec=caption_spec, digest=caption_digest),
+            validate_terminal_value=partial(
+                validate_terminal_value,
+                spec=caption_spec,
+                digest=caption_digest,
+            ),
+            validate_staged_row=partial(
+                validate_terminal_row,
+                spec=caption_spec,
+                digest=caption_digest,
+            ),
+        ),
+        publication=CaptionPublicationBindings(
+            validate_base_schema=partial(validate_clip_table, uri="test-clips.lance"),
+            protected_field_names=tuple(CLIP_SCHEMA.names),
+            base_field_owner="video-split",
+            transaction_properties={"kind": "video-caption"},
+        ),
+    )
 
 
 @pytest.fixture

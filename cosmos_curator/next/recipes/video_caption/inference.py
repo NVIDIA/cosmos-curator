@@ -9,8 +9,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
 import lance
@@ -26,12 +27,15 @@ from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
-from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionInputBindings, CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     MAX_OUTPUT_TOKENS,
+    SAMPLING_PARAMS,
+    VIDEO_DO_SAMPLE_FRAMES,
+    VIDEO_FPS,
+    VIDEO_NUM_FRAMES,
     CaptionModelSpec,
-    terminal_metadata,
 )
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import (
@@ -60,12 +64,30 @@ _RETRYABLE_S3_ERROR_CODES = frozenset(
     }
 )
 _RETRYABLE_S3_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
-_CAPTION_INPUT_COLUMNS = ("clip_id", "clip_uri", "clip_size_bytes")
 _VLLM_ENGINE_STAGE_NAME = "vLLMEngineStage"
 _BYTES_PER_GIB = 1024**3
 _PREPARE_MULTIMODAL_MEMORY_BYTES = 24 * _BYTES_PER_GIB
 _CHAT_TEMPLATE_MEMORY_BYTES = 16 * _BYTES_PER_GIB
 _MEDIA_FETCH_RESOURCES = {environment.CURATOR_IO_RESOURCE_NAME: 1.0}
+
+
+@dataclass(frozen=True)
+class CaptionExecutionConfig:
+    """Inference-only settings shared by complete-MP4 caption recipes."""
+
+    storage_profile: str
+    inference_concurrency: int | Literal["auto"]
+    inference_batch_size: int
+    max_concurrent_batches: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    media_concurrency: int | Literal["auto"]
+    media_batch_size: int
+    media_cpus: float
+    media_attempts: int
+    lance_read_batch_size: int
+    parquet_rows_per_file: int
+
 
 MAPPED_INPUT_SCHEMA = pa.schema(
     [
@@ -74,15 +96,6 @@ MAPPED_INPUT_SCHEMA = pa.schema(
         pa.field("clip_id", pa.string(), nullable=False),
         pa.field("clip_uri", pa.large_string(), nullable=False),
         pa.field("clip_size_bytes", pa.int64(), nullable=False),
-    ]
-)
-
-FETCHED_INPUT_SCHEMA = pa.schema(
-    [
-        *MAPPED_INPUT_SCHEMA,
-        pa.field("video_data_url", pa.large_string()),
-        pa.field("download_error_type", pa.string()),
-        pa.field("download_error_message", pa.large_string()),
     ]
 )
 
@@ -107,7 +120,7 @@ class _CaptionLanceDatasource(Datasource):
     reopen the pinned dataset with the original storage options and fragment IDs.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- serialized datasource connection inputs are independently meaningful
         self,
         *,
         uri: str,
@@ -115,6 +128,7 @@ class _CaptionLanceDatasource(Datasource):
         fragments: tuple[_CaptionFragmentRead, ...],
         storage_options: dict[str, str] | None,
         batch_size: int,
+        source_columns: tuple[str, ...],
     ) -> None:
         super().__init__()  # type: ignore[no-untyped-call]  # Ray's public Datasource constructor lacks typing.
         self._uri = uri
@@ -122,6 +136,7 @@ class _CaptionLanceDatasource(Datasource):
         self._fragments = fragments
         self._storage_options = dict(storage_options) if storage_options is not None else None
         self._batch_size = batch_size
+        self._source_columns = source_columns
 
     @property
     def num_rows(self) -> int:
@@ -165,6 +180,7 @@ class _CaptionLanceDatasource(Datasource):
                         fragment_ids=fragment_ids,
                         storage_options=self._storage_options,
                         batch_size=self._batch_size,
+                        source_columns=self._source_columns,
                     ),
                     metadata,
                     schema=fragments[0].schema,
@@ -282,16 +298,31 @@ def _repartition_caption_inputs_for_fetch(
 def fetch_media_batch(
     batch: pa.Table,
     *,
+    input_bindings: CaptionInputBindings,
     storage_profile: str,
     attempts: int,
 ) -> pa.Table:
-    """Fetch exact MP4 bytes, validate length, and emit cross-node data URLs."""
+    """Fetch exact MP4 bytes, validate configured evidence, and emit data URLs."""
     rows = []
-    for row in batch.cast(MAPPED_INPUT_SCHEMA).to_pylist():
+    fetched_schema = pa.schema(
+        [
+            *input_bindings.mapped_schema,
+            pa.field("video_data_url", pa.large_string()),
+            pa.field("download_error_type", pa.string()),
+            pa.field("download_error_message", pa.large_string()),
+        ]
+    )
+    for row in batch.cast(input_bindings.mapped_schema).to_pylist():
         try:
-            payload = _read_clip_with_retries(str(row["clip_uri"]), storage_profile=storage_profile, attempts=attempts)
-            expected_size = int(row["clip_size_bytes"])
+            payload = _read_clip_with_retries(
+                str(row[input_bindings.media_uri_column]),
+                storage_profile=storage_profile,
+                attempts=attempts,
+            )
+            expected_size = int(row[input_bindings.media_size_column])
             _validate_clip_size(payload, expected_size=expected_size)
+            if input_bindings.media_sha256_column is not None:
+                _validate_media_sha256(payload, expected_sha256=str(row[input_bindings.media_sha256_column]))
         except _ItemMediaError as exc:
             rows.append(
                 row
@@ -311,7 +342,7 @@ def fetch_media_batch(
                 "download_error_message": None,
             }
         )
-    return pa.Table.from_pylist(rows, schema=FETCHED_INPUT_SCHEMA)
+    return pa.Table.from_pylist(rows, schema=fetched_schema)
 
 
 def caption_llm_preprocess(row: dict[str, Any]) -> dict[str, Any]:
@@ -337,27 +368,23 @@ def caption_llm_preprocess(row: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
         ],
-        "sampling_params": {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "min_p": 0.0,
-            "presence_penalty": 1.5,
-            "repetition_penalty": 1.0,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-        },
+        "sampling_params": dict(SAMPLING_PARAMS),
         # Ray's multimodal stage has already decoded and sampled the video. Qwen
         # requires this flag to avoid treating those prepared frames as raw video.
-        "mm_processor_kwargs": {"do_sample_frames": False},
+        "mm_processor_kwargs": {"do_sample_frames": VIDEO_DO_SAMPLE_FRAMES},
     }
 
 
-def caption_llm_postprocess(row: dict[str, Any]) -> dict[str, Any]:
+def caption_llm_postprocess(
+    row: dict[str, Any],
+    *,
+    staged_binding_columns: tuple[str, ...],
+) -> dict[str, Any]:
     """Keep only small inference values and physical identity after success."""
     return {
         "fragment_id": row["fragment_id"],
         "row_offset": row["row_offset"],
-        "clip_id": row["clip_id"],
+        **{name: row[name] for name in staged_binding_columns},
         "caption_text": row["generated_text"],
         "prompt_token_count": row.get("num_input_tokens"),
         "generated_token_count": row.get("num_generated_tokens"),
@@ -367,8 +394,7 @@ def caption_llm_postprocess(row: dict[str, Any]) -> dict[str, Any]:
 def canonicalize_llm_batch(
     batch: pa.Table,
     *,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
 ) -> pa.Table:
     """Convert Ray LLM success/error shapes into the exact terminal schema."""
     rows = []
@@ -380,21 +406,15 @@ def canonicalize_llm_batch(
                 prefix, separator, _ = error_message.partition(":")
                 error_type = prefix if separator and prefix else "InferenceError"
             rows.append(
-                {
-                    "fragment_id": int(raw["fragment_id"]),
-                    "row_offset": int(raw["row_offset"]),
-                    "clip_id": str(raw["clip_id"]),
-                    spec.caption_field_name: None,
-                    spec.metadata_field_name: terminal_metadata(
-                        spec,
-                        digest,
-                        status="error",
-                        prompt_token_count=None,
-                        generated_token_count=None,
-                        error_type=str(error_type),
-                        error_message=error_message,
-                    ),
-                }
+                bindings.result.build_terminal_row(
+                    raw,
+                    caption=None,
+                    status="error",
+                    prompt_token_count=None,
+                    generated_token_count=None,
+                    error_type=str(error_type),
+                    error_message=error_message,
+                )
             )
             continue
         caption_text = raw.get("caption_text")
@@ -405,31 +425,27 @@ def canonicalize_llm_batch(
         generated_tokens = _optional_int(raw.get("generated_token_count"))
         status = "truncated" if generated_tokens is not None and generated_tokens >= MAX_OUTPUT_TOKENS else "success"
         rows.append(
-            {
-                "fragment_id": int(raw["fragment_id"]),
-                "row_offset": int(raw["row_offset"]),
-                "clip_id": str(raw["clip_id"]),
-                spec.caption_field_name: caption_text,
-                spec.metadata_field_name: terminal_metadata(
-                    spec,
-                    digest,
-                    status=status,
-                    prompt_token_count=prompt_tokens,
-                    generated_token_count=generated_tokens,
-                    error_type=None,
-                    error_message=None,
-                ),
-            }
+            bindings.result.build_terminal_row(
+                raw,
+                caption=caption_text,
+                status=status,
+                prompt_token_count=prompt_tokens,
+                generated_token_count=generated_tokens,
+                error_type=None,
+                error_message=None,
+            )
         )
-    return pa.Table.from_pylist(rows, schema=result_schema(spec))
+    return pa.Table.from_pylist(rows, schema=bindings.result.staged_schema)
 
 
-def _caption_lance_datasource(
+def _caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema inputs are independently meaningful
     dataset: lance.LanceDataset,
     attempt: CaptionAttempt,
     *,
     storage_options: dict[str, str] | None,
     batch_size: int,
+    source_columns: tuple[str, ...],
+    source_schema: pa.Schema,
 ) -> _CaptionLanceDatasource:
     """Snapshot selected-fragment metadata while keeping live handles on the driver."""
     fragments = []
@@ -446,7 +462,7 @@ def _caption_lance_datasource(
                     str(data_file.path)
                     for data_file in fragment.data_files()  # type: ignore[no-untyped-call]  # Missing in Lance stubs.
                 ),
-                schema=fragment.schema,
+                schema=source_schema,
             )
         )
     return _CaptionLanceDatasource(
@@ -455,16 +471,18 @@ def _caption_lance_datasource(
         fragments=tuple(fragments),
         storage_options=storage_options,
         batch_size=batch_size,
+        source_columns=source_columns,
     )
 
 
-def _read_caption_fragments(
+def _read_caption_fragments(  # noqa: PLR0913 -- serialized read-task inputs are independently meaningful
     *,
     uri: str,
     version: int,
     fragment_ids: tuple[int, ...],
     storage_options: dict[str, str] | None,
     batch_size: int,
+    source_columns: tuple[str, ...],
 ) -> Iterator[pa.Table]:
     """Reopen a pinned Lance snapshot with credentials and stream selected fragments."""
     dataset = lance.dataset(uri, version=version, storage_options=storage_options)
@@ -476,7 +494,7 @@ def _read_caption_fragments(
             raise ValueError(msg)
         fragments.append(fragment)
     scanner = dataset.scanner(
-        columns=list(_CAPTION_INPUT_COLUMNS),
+        columns=list(source_columns),
         fragments=fragments,
         with_row_address=True,
         batch_size=batch_size,
@@ -488,9 +506,9 @@ def _read_caption_fragments(
 def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are independently meaningful
     dataset: lance.LanceDataset,
     attempt: CaptionAttempt,
-    config: ResolvedVideoCaptionConfig,
-    spec: CaptionModelSpec,
-    digest: str,
+    config: CaptionExecutionConfig,
+    bindings: CaptionRunBindings,
+    model_dir: Path,
     workspace: CaptionWorkspace,
     *,
     storage_options: dict[str, str] | None,
@@ -502,11 +520,13 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
         dataset,
         attempt,
         storage_options=storage_options,
-        batch_size=config.execution.lance_read_batch_size,
+        batch_size=config.lance_read_batch_size,
+        source_columns=bindings.input.source_columns,
+        source_schema=bindings.input.source_schema,
     )
 
     checkpoint = CheckpointConfig(
-        id_column="clip_id",
+        id_column=bindings.input.row_id_column,
         checkpoint_path=workspace.checkpoints_uri,
         delete_checkpoint_on_success=False,
         override_filesystem=workspace.filesystem,
@@ -517,35 +537,34 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             override_num_blocks=len(attempt.pending_fragment_ids),
         )
         mapped = source.map_batches(
-            decompose_row_addresses,
+            bindings.input.project_batch,
             batch_format="pyarrow",
             batch_size=None,
             zero_copy_batch=True,
         )
         fetch_inputs = _repartition_caption_inputs_for_fetch(
             mapped,
-            rows_per_block=config.execution.lance_read_batch_size,
+            rows_per_block=config.lance_read_batch_size,
         )
         # Ray accepts fn_kwargs for a keyword-only batch UDF; its public stub does not model that callable shape.
         media_compute = (
-            None
-            if config.execution.media_concurrency == "auto"
-            else ray.data.TaskPoolStrategy(size=config.execution.media_concurrency)
+            None if config.media_concurrency == "auto" else ray.data.TaskPoolStrategy(size=config.media_concurrency)
         )
         fetched = fetch_inputs.map_batches(
             fetch_media_batch,  # type: ignore[arg-type]
             batch_format="pyarrow",
-            batch_size=config.execution.media_batch_size,
+            batch_size=config.media_batch_size,
             fn_kwargs={
-                "storage_profile": config.execution.storage_profile,
-                "attempts": config.execution.media_attempts,
+                "input_bindings": bindings.input,
+                "storage_profile": config.storage_profile,
+                "attempts": config.media_attempts,
             },
-            num_cpus=config.execution.media_cpus,
+            num_cpus=config.media_cpus,
             resources=_MEDIA_FETCH_RESOURCES,
             compute=media_compute,
         )
         inference_worker_ceiling = _resolve_inference_worker_ceiling(config, caption_source.num_rows)
-        gpus_per_replica = config.execution.tensor_parallel_size * config.execution.pipeline_parallel_size
+        gpus_per_replica = config.tensor_parallel_size * config.pipeline_parallel_size
         available_gpus = float(ray.available_resources().get("GPU", 0.0))  # type: ignore[no-untyped-call]
         initial_inference_workers = _resolve_initial_inference_workers(
             available_gpus=available_gpus,
@@ -559,12 +578,13 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             inference_worker_ceiling,
             available_gpus,
             gpus_per_replica,
-            config.execution.tensor_parallel_size,
-            config.execution.pipeline_parallel_size,
+            config.tensor_parallel_size,
+            config.pipeline_parallel_size,
         )
         processor = _build_llm_processor(
             config,
-            spec,
+            model_dir,
+            bindings.input.staged_binding_columns,
             initial_inference_workers=initial_inference_workers,
             inference_worker_ceiling=inference_worker_ceiling,
         )
@@ -572,21 +592,21 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
         terminal = inferred.map_batches(
             canonicalize_llm_batch,
             batch_format="pyarrow",
-            batch_size=config.execution.inference_batch_size,
-            fn_kwargs={"spec": spec, "digest": digest},
+            batch_size=config.inference_batch_size,
+            fn_kwargs={"bindings": bindings},
             zero_copy_batch=True,
         )
         checkpoint_groups = terminal.repartition(
-            target_num_rows_per_block=config.execution.parquet_rows_per_file,
+            target_num_rows_per_block=config.parquet_rows_per_file,
             strict=True,
         )
         checkpoint_groups.write_parquet(
             workspace.results_uri,
             filesystem=workspace.filesystem,
-            max_rows_per_file=config.execution.parquet_rows_per_file,
+            max_rows_per_file=config.parquet_rows_per_file,
         )
     try:
-        record_phase_a_completion(workspace, attempt, digest)
+        record_phase_a_completion(workspace, attempt, bindings.result.digest)
     except Exception as exc:  # noqa: BLE001 -- this marker is only a restart optimization
         logger.warning(
             "Phase A results are durable, but writing completion marker {} failed; a restart will let Ray reload "
@@ -627,12 +647,12 @@ def staged_result_files(workspace: CaptionWorkspace) -> tuple[str, ...]:
     )
 
 
-def _resolve_inference_worker_ceiling(config: ResolvedVideoCaptionConfig, num_input_rows: int) -> int:
+def _resolve_inference_worker_ceiling(config: CaptionExecutionConfig, num_input_rows: int) -> int:
     """Bound the actor pool by pending work, never by a snapshot of cluster GPUs."""
     if num_input_rows < 1:
         msg = f"Caption inference requires at least one input row, got {num_input_rows}"
         raise ValueError(msg)
-    configured = config.execution.inference_concurrency
+    configured = config.inference_concurrency
     return num_input_rows if configured == "auto" else min(configured, num_input_rows)
 
 
@@ -654,8 +674,9 @@ def _resolve_initial_inference_workers(
 
 
 def _build_llm_processor(
-    config: ResolvedVideoCaptionConfig,
-    spec: CaptionModelSpec,
+    config: CaptionExecutionConfig,
+    model_dir: Path,
+    staged_binding_columns: tuple[str, ...],
     *,
     initial_inference_workers: int,
     inference_worker_ceiling: int,
@@ -678,17 +699,17 @@ def _build_llm_processor(
         raise ValueError(msg)
     cpu_stage_concurrency = (initial_inference_workers, inference_worker_ceiling)
     processor_config = vLLMEngineProcessorConfig(
-        model_source=str(spec.runtime_model_dir),
-        batch_size=config.execution.inference_batch_size,
+        model_source=str(model_dir),
+        batch_size=config.inference_batch_size,
         concurrency=(initial_inference_workers, inference_worker_ceiling),
-        max_concurrent_batches=config.execution.max_concurrent_batches,
+        max_concurrent_batches=config.max_concurrent_batches,
         should_continue_on_error=False,
         runtime_env=ray_data_gpu_runtime_env("default"),
         prepare_multimodal_stage=PrepareMultimodalStageConfig(
             enabled=True,
             concurrency=cpu_stage_concurrency,
             memory=_PREPARE_MULTIMODAL_MEMORY_BYTES,
-            model_config_kwargs={"media_io_kwargs": {"video": {"num_frames": -1}}},
+            model_config_kwargs={"media_io_kwargs": {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": VIDEO_FPS}}},
         ),
         chat_template_stage=ChatTemplateStageConfig(
             enabled=True,
@@ -699,17 +720,17 @@ def _build_llm_processor(
         tokenize_stage=TokenizerStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
         detokenize_stage=DetokenizeStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
         engine_kwargs={
-            "tensor_parallel_size": config.execution.tensor_parallel_size,
-            "pipeline_parallel_size": config.execution.pipeline_parallel_size,
-            "media_io_kwargs": {"video": {"num_frames": -1}},
+            "tensor_parallel_size": config.tensor_parallel_size,
+            "pipeline_parallel_size": config.pipeline_parallel_size,
+            "media_io_kwargs": {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": VIDEO_FPS}},
         },
     )
     processor = build_processor(
         processor_config,
         preprocess=caption_llm_preprocess,
-        postprocess=caption_llm_postprocess,
+        postprocess=partial(caption_llm_postprocess, staged_binding_columns=staged_binding_columns),
     )
-    return _ExactVLLMBatchProcessor(processor, batch_size=config.execution.inference_batch_size)
+    return _ExactVLLMBatchProcessor(processor, batch_size=config.inference_batch_size)
 
 
 def _read_clip_with_retries(uri: str, *, storage_profile: str, attempts: int) -> bytes:
@@ -758,6 +779,13 @@ def _read_clip(uri: str, *, storage_profile: str) -> bytes:
 def _validate_clip_size(payload: bytes, *, expected_size: int) -> None:
     if len(payload) != expected_size:
         msg = f"Expected {expected_size} MP4 bytes but downloaded {len(payload)}"
+        raise _ItemMediaError(msg)
+
+
+def _validate_media_sha256(payload: bytes, *, expected_sha256: str) -> None:
+    actual = sha256(payload).hexdigest()
+    if actual != expected_sha256:
+        msg = f"Expected MP4 SHA-256 {expected_sha256} but downloaded {actual}"
         raise _ItemMediaError(msg)
 
 

@@ -9,11 +9,11 @@ from enum import StrEnum
 from typing import Any
 
 import lance
+import pyarrow as pa
 from lance.fragment import FragmentMetadata, LanceFragment
 
-from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, validate_terminal_value
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_split.lance_sink import validate_clip_table
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
 from cosmos_curator.next.utils.identity import canonical_digest
 
 _OWNED_FIELD_COUNT = 2
@@ -44,7 +44,7 @@ def ensure_caption_fields(
     uri: str,
     *,
     storage_options: dict[str, str] | None,
-    spec: CaptionModelSpec,
+    bindings: CaptionRunBindings,
     attempts: int,
 ) -> lance.LanceDataset:
     """Validate or atomically add both owned fields, retrying disjoint schema races."""
@@ -54,32 +54,32 @@ def ensure_caption_fields(
     last_error: Exception | None = None
     for _ in range(attempts):
         dataset = lance.dataset(uri, storage_options=storage_options)
-        validate_clip_table(dataset, uri=uri)
-        presence = _field_set_presence(dataset, spec)
+        bindings.publication.validate_base_schema(dataset)
+        presence = _field_set_presence(dataset, bindings)
         if presence == "present":
             return dataset
         if presence == "partial":
-            msg = f"Caption field set {spec.caption_field_name!r} is partially present in {uri}"
+            msg = f"Caption field set {bindings.result.caption_field_name!r} is partially present in {uri}"
             raise ValueError(msg)
         try:
-            dataset.add_columns(spec.fields)
+            dataset.add_columns(bindings.result.fields)
         except (OSError, RuntimeError) as exc:
             # A disjoint schema commit may have won. Reopen on the next loop;
             # deterministic storage failures still surface after the bounded retries.
             last_error = exc
             continue
         registered = lance.dataset(uri, storage_options=storage_options)
-        _assert_present_fields_match(registered, spec)
+        _assert_present_fields_match(registered, bindings)
         return registered
     latest = lance.dataset(uri, storage_options=storage_options)
-    if _field_set_presence(latest, spec) == "present":
+    if _field_set_presence(latest, bindings) == "present":
         return latest
-    msg = f"Could not atomically register caption field set {spec.caption_field_name!r} on {uri}"
+    msg = f"Could not atomically register caption field set {bindings.result.caption_field_name!r} on {uri}"
     raise RuntimeError(msg) from last_error
 
 
 def validate_caption_input(dataset: lance.LanceDataset, *, uri: str) -> None:
-    """Validate the split schema, required values, and global ``clip_id`` uniqueness."""
+    """Validate video-caption's clip-owned input contract and global ``clip_id`` uniqueness."""
     validate_clip_table(dataset, uri=uri)
     query = (
         "SELECT COUNT(*) AS rows, COUNT(DISTINCT clip_id) AS clip_ids, "
@@ -107,14 +107,13 @@ def validate_caption_input(dataset: lance.LanceDataset, *, uri: str) -> None:
 def capture_attempt(
     dataset: lance.LanceDataset,
     *,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
 ) -> CaptionAttempt:
     """Classify every fragment of one pinned snapshot."""
     pending: list[int] = []
     complete: list[int] = []
     for fragment in dataset.get_fragments():
-        state = classify_fragment(fragment, spec=spec, digest=digest)
+        state = classify_fragment(fragment, bindings=bindings)
         target = pending if state is FragmentCaptionState.PENDING else complete
         target.append(int(fragment.fragment_id))
     return CaptionAttempt(
@@ -127,32 +126,42 @@ def capture_attempt(
 def classify_fragment(
     fragment: LanceFragment,
     *,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
 ) -> FragmentCaptionState:
     """Return pending/complete or reject mixed, stale, and corrupt values."""
-    scanner = fragment.scanner(columns=[spec.caption_field_name, spec.metadata_field_name])
+    result = bindings.result
     saw_pending = False
     saw_complete = False
-    for batch in scanner.to_batches():
-        captions = batch.column(spec.caption_field_name).to_pylist()
-        metadata_values = batch.column(spec.metadata_field_name).to_pylist()
-        for caption, metadata in zip(captions, metadata_values, strict=True):
+    result_columns = [result.caption_field_name, result.metadata_field_name]
+    for raw_batch in fragment.scanner(columns=result_columns).to_batches():
+        batch = pa.Table.from_batches([raw_batch])
+        for row in batch.to_pylist():
+            caption = row[result.caption_field_name]
+            metadata = row[result.metadata_field_name]
             if caption is None and metadata is None:
                 saw_pending = True
             else:
+                saw_complete = True
                 try:
-                    validate_terminal_value(caption, metadata, spec=spec, digest=digest)
+                    result.validate_terminal_value(caption, metadata)
                 except (TypeError, ValueError) as exc:
                     msg = f"Fragment {fragment.fragment_id} has incompatible or corrupt caption state: {exc}"
                     raise ValueError(msg) from exc
-                saw_complete = True
             if saw_pending and saw_complete:
                 msg = f"Fragment {fragment.fragment_id} mixes pending and terminal caption rows"
                 raise ValueError(msg)
     # Lance does not normally retain empty fragments. Treat one as complete: it
     # contains no pending work and update_columns must never be invoked for it.
-    return FragmentCaptionState.PENDING if saw_pending else FragmentCaptionState.COMPLETE
+    if saw_pending:
+        return FragmentCaptionState.PENDING
+    validate_complete_fragment = bindings.publication.validate_complete_fragment
+    if validate_complete_fragment is not None:
+        try:
+            validate_complete_fragment(fragment)
+        except (TypeError, ValueError) as exc:
+            msg = f"Fragment {fragment.fragment_id} has incompatible or corrupt caption state: {exc}"
+            raise ValueError(msg) from exc
+    return FragmentCaptionState.COMPLETE
 
 
 def fragment_metadata_json(metadata: FragmentMetadata) -> str:
@@ -199,12 +208,6 @@ def leaf_field_ids(dataset: lance.LanceDataset, field_names: tuple[str, ...]) ->
     return ids
 
 
-def protected_field_ids(dataset: lance.LanceDataset, spec: CaptionModelSpec) -> set[int]:
-    """Return every split- or selected-caption-owned physical leaf ID."""
-    names = (*CLIP_SCHEMA.names, spec.caption_field_name, spec.metadata_field_name)
-    return leaf_field_ids(dataset, names)
-
-
 def _leaf_ids(field: Any) -> set[int]:  # noqa: ANN401 -- pylance's LanceField is not exposed in its type stubs
     children = field.children()
     if not children:
@@ -215,24 +218,26 @@ def _leaf_ids(field: Any) -> set[int]:  # noqa: ANN401 -- pylance's LanceField i
     return ids
 
 
-def _field_set_presence(dataset: lance.LanceDataset, spec: CaptionModelSpec) -> str:
+def _field_set_presence(dataset: lance.LanceDataset, bindings: CaptionRunBindings) -> str:
+    result = bindings.result
     names = set(dataset.schema.names)
-    found = sum(name in names for name in (spec.caption_field_name, spec.metadata_field_name))
+    found = sum(name in names for name in (result.caption_field_name, result.metadata_field_name))
     if found == 0:
         return "absent"
     if found == _OWNED_FIELD_COUNT:
-        _assert_present_fields_match(dataset, spec)
+        _assert_present_fields_match(dataset, bindings)
         return "present"
     return "partial"
 
 
-def _assert_present_fields_match(dataset: lance.LanceDataset, spec: CaptionModelSpec) -> None:
+def _assert_present_fields_match(dataset: lance.LanceDataset, bindings: CaptionRunBindings) -> None:
+    result = bindings.result
     mismatched = [
         expected.name
-        for expected in spec.fields
+        for expected in result.fields
         if expected.name not in dataset.schema.names
         or not dataset.schema.field(expected.name).equals(expected, check_metadata=True)
     ]
     if mismatched:
-        msg = f"Existing caption field set {spec.caption_field_name!r} is incompatible: {', '.join(mismatched)}"
+        msg = f"Existing caption field set {result.caption_field_name!r} is incompatible: {', '.join(mismatched)}"
         raise ValueError(msg)

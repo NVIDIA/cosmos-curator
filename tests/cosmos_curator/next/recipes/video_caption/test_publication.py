@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from cosmos_curator.next.recipes.video_caption import publication
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
 from cosmos_curator.next.recipes.video_caption.inference import result_schema
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
@@ -45,13 +46,14 @@ def _setup_attempt(  # integration fixture inputs stay explicit
     factory: Callable[..., tuple[str, lance.LanceDataset]],
     spec: CaptionModelSpec,
     digest: str,
+    bindings: CaptionRunBindings,
     *,
     count: int = 2,
     rows_per_fragment: int = 2,
 ) -> tuple[str, CaptionAttempt, CaptionWorkspace, pa.Table]:
     uri, _ = factory(count=count, rows_per_fragment=rows_per_fragment)
-    dataset = ensure_caption_fields(uri, storage_options=None, spec=spec, attempts=3)
-    attempt = capture_attempt(dataset, spec=spec, digest=digest)
+    dataset = ensure_caption_fields(uri, storage_options=None, bindings=bindings, attempts=3)
+    attempt = capture_attempt(dataset, bindings=bindings)
     rows = []
     for fragment_id in attempt.pending_fragment_ids:
         fragment = dataset.get_fragment(fragment_id)
@@ -97,8 +99,7 @@ def _run_publication_workers_in_process(
         uri: str,
         attempt_version: int,
         workspace: CaptionWorkspace,
-        spec: CaptionModelSpec,
-        digest: str,
+        bindings: CaptionRunBindings,
         storage_options: dict[str, str] | None,
     ) -> PreparedFragmentPublication:
         payload = publication._prepare_fragment_from_workspace(
@@ -106,8 +107,7 @@ def _run_publication_workers_in_process(
             uri=uri,
             attempt_version=attempt_version,
             workspace=workspace,
-            spec=spec,
-            digest=digest,
+            bindings=bindings,
             storage_options=storage_options,
         )
         return publication._parse_prepared_publication(payload, expected_fragment_id=fragment_id)
@@ -115,13 +115,13 @@ def _run_publication_workers_in_process(
     def validate_schemas(
         files: tuple[str, ...],
         workspace: CaptionWorkspace,
-        spec: CaptionModelSpec,
+        bindings: CaptionRunBindings,
     ) -> None:
         paths = pa.Table.from_pylist([{"path": path} for path in files], schema=publication._RESULT_PATH_SCHEMA)
         publication._validate_parquet_schema_batch(
             paths,
             filesystem=workspace.filesystem,
-            expected=result_schema(spec),
+            expected=bindings.result.staged_schema,
         )
 
     def prepare_all(  # mirrors the explicit Ray plan boundary
@@ -130,8 +130,7 @@ def _run_publication_workers_in_process(
         uri: str,
         attempt: CaptionAttempt,
         workspace: CaptionWorkspace,
-        spec: CaptionModelSpec,
-        digest: str,
+        bindings: CaptionRunBindings,
         storage_options: dict[str, str] | None,
     ) -> tuple[PreparedFragmentPublication, ...]:
         del files
@@ -141,8 +140,7 @@ def _run_publication_workers_in_process(
                 uri=uri,
                 attempt_version=attempt.version,
                 workspace=workspace,
-                spec=spec,
-                digest=digest,
+                bindings=bindings,
                 storage_options=storage_options,
             )
             for fragment_id in attempt.pending_fragment_ids
@@ -159,8 +157,7 @@ def _run_publication_workers_in_process(
         uri: str,
         attempt: CaptionAttempt,
         workspace: CaptionWorkspace,
-        spec: CaptionModelSpec,
-        digest: str,
+        bindings: CaptionRunBindings,
         storage_options: dict[str, str] | None,
     ) -> PreparedFragmentPublication:
         return prepare_one(
@@ -168,8 +165,7 @@ def _run_publication_workers_in_process(
             uri=uri,
             attempt_version=attempt.version,
             workspace=workspace,
-            spec=spec,
-            digest=digest,
+            bindings=bindings,
             storage_options=storage_options,
         )
 
@@ -207,7 +203,7 @@ def _commit_disjoint_values(uri: str, *, field_name: str = "other_enrichment") -
 def test_distributed_publication_plan_hash_groups_pending_fragments(
     tmp_path: Path,
     caption_spec: CaptionModelSpec,
-    caption_digest: str,
+    caption_bindings: CaptionRunBindings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The unit suite verifies Ray plan construction without executing the plan."""
@@ -241,8 +237,7 @@ def test_distributed_publication_plan_hash_groups_pending_fragments(
         uri=str(tmp_path / "clips.lance"),
         attempt=attempt,
         workspace=workspace,
-        spec=caption_spec,
-        digest=caption_digest,
+        bindings=caption_bindings,
         storage_options=None,
     )
 
@@ -268,6 +263,7 @@ def test_distributed_publication_executes_on_ray(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Exercise the real Ray shuffle and worker boundary on a provisioned integration cluster."""
     uri, attempt, workspace, _ = _setup_attempt(
@@ -275,6 +271,7 @@ def test_distributed_publication_executes_on_ray(
         clip_dataset_factory,
         caption_spec,
         caption_digest,
+        caption_bindings,
         count=4,
         rows_per_fragment=2,
     )
@@ -283,8 +280,7 @@ def test_distributed_publication_executes_on_ray(
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=3,
     )
@@ -297,6 +293,7 @@ def test_publication_commits_each_fragment_atomically_and_recovers_exact_results
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every pending fragment commits independently and exact reruns skip it."""
@@ -313,6 +310,7 @@ def test_publication_commits_each_fragment_atomically_and_recovers_exact_results
         clip_dataset_factory,
         caption_spec,
         caption_digest,
+        caption_bindings,
         count=4,
         rows_per_fragment=2,
     )
@@ -321,8 +319,7 @@ def test_publication_commits_each_fragment_atomically_and_recovers_exact_results
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=3,
     )
@@ -330,8 +327,7 @@ def test_publication_commits_each_fragment_atomically_and_recovers_exact_results
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=3,
     )
@@ -359,9 +355,12 @@ def test_incomplete_or_corrupt_staged_groups_never_publish(
     caption_spec: CaptionModelSpec,
     caption_digest: str,
     corruption: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Missing, duplicate, or incompatible recovery rows cannot change Lance."""
-    uri, attempt, workspace, staged = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, staged = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     rows = staged.to_pylist()
     if corruption == "duplicate-offset":
         rows[1]["row_offset"] = 0
@@ -379,8 +378,7 @@ def test_incomplete_or_corrupt_staged_groups_never_publish(
             uri,
             attempt,
             workspace,
-            caption_spec,
-            caption_digest,
+            caption_bindings,
             storage_options=None,
             commit_attempts=2,
         )
@@ -392,9 +390,12 @@ def test_schema_validation_rejects_incompatible_result_files(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Every result footer is validated before preparing Lance descriptors."""
-    uri, attempt, workspace, staged = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, staged = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     fields = [
         field.with_metadata(None) if field.name == caption_spec.caption_field_name else field for field in staged.schema
     ]
@@ -406,8 +407,7 @@ def test_schema_validation_rejects_incompatible_result_files(
             uri,
             attempt,
             workspace,
-            caption_spec,
-            caption_digest,
+            caption_bindings,
             storage_options=None,
             commit_attempts=2,
         )
@@ -418,17 +418,19 @@ def test_disjoint_same_fragment_enrichment_is_preserved(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """A compatible enrichment file added before Phase B survives captioning."""
-    uri, attempt, workspace, _ = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, _ = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     _commit_disjoint_values(uri)
 
     summary = publish_staged_results(
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=3,
     )
@@ -445,17 +447,19 @@ def test_stale_descriptor_is_discarded_and_restaged_after_a_disjoint_commit_race
     caption_spec: CaptionModelSpec,
     caption_digest: str,
     monkeypatch: pytest.MonkeyPatch,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """A lost same-fragment race restages against latest without inference."""
-    uri, attempt, workspace, _ = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, _ = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     original_commit = publication.commit_prepared_update
     calls = 0
 
     def racing_commit(
         target_uri: str,
         descriptor: PreparedFragmentUpdate,
-        target_spec: CaptionModelSpec,
-        target_digest: str,
+        target_bindings: CaptionRunBindings,
         *,
         storage_options: dict[str, str] | None,
     ) -> int:
@@ -466,8 +470,7 @@ def test_stale_descriptor_is_discarded_and_restaged_after_a_disjoint_commit_race
         return original_commit(
             target_uri,
             descriptor,
-            target_spec,
-            target_digest,
+            target_bindings,
             storage_options=storage_options,
         )
 
@@ -477,8 +480,7 @@ def test_stale_descriptor_is_discarded_and_restaged_after_a_disjoint_commit_race
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=4,
     )
@@ -497,17 +499,19 @@ def test_ambiguous_commit_response_is_resolved_from_canonical_state(  # integrat
     caption_digest: str,
     monkeypatch: pytest.MonkeyPatch,
     commit_attempts: int,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """A response lost after commit is resolved even on the last allowed attempt."""
-    uri, attempt, workspace, _ = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, _ = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     original_commit = publication.commit_prepared_update
     called = False
 
     def ambiguous_commit(
         target_uri: str,
         descriptor: PreparedFragmentUpdate,
-        target_spec: CaptionModelSpec,
-        target_digest: str,
+        target_bindings: CaptionRunBindings,
         *,
         storage_options: dict[str, str] | None,
     ) -> int:
@@ -515,8 +519,7 @@ def test_ambiguous_commit_response_is_resolved_from_canonical_state(  # integrat
         result = original_commit(
             target_uri,
             descriptor,
-            target_spec,
-            target_digest,
+            target_bindings,
             storage_options=storage_options,
         )
         if not called:
@@ -531,8 +534,7 @@ def test_ambiguous_commit_response_is_resolved_from_canonical_state(  # integrat
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=commit_attempts,
     )
@@ -546,9 +548,12 @@ def test_split_owned_physical_change_is_rejected(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """A rewrite of video-split-owned physical data is never rebound."""
-    uri, attempt, workspace, _ = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, _ = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     dataset = lance.dataset(uri)
     fragment = dataset.get_fragment(0)
     assert fragment is not None
@@ -576,8 +581,7 @@ def test_split_owned_physical_change_is_rejected(
             uri,
             attempt,
             workspace,
-            caption_spec,
-            caption_digest,
+            caption_bindings,
             storage_options=None,
             commit_attempts=2,
         )
@@ -588,9 +592,12 @@ def test_split_append_after_attempt_waits_for_the_next_start(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     caption_spec: CaptionModelSpec,
     caption_digest: str,
+    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Fragments appended after V_attempt remain pending for the next start."""
-    uri, attempt, workspace, _ = _setup_attempt(tmp_path, clip_dataset_factory, caption_spec, caption_digest)
+    uri, attempt, workspace, _ = _setup_attempt(
+        tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
+    )
     appended = lance.dataset(uri, version=attempt.version).to_table(columns=CLIP_SCHEMA.names).slice(0, 1)
     replacements = {
         "source_id": pa.array(["source-99"], type=pa.string()),
@@ -609,8 +616,7 @@ def test_split_append_after_attempt_waits_for_the_next_start(
         uri,
         attempt,
         workspace,
-        caption_spec,
-        caption_digest,
+        caption_bindings,
         storage_options=None,
         commit_attempts=3,
     )

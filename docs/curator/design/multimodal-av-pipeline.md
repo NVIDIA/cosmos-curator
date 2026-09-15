@@ -420,6 +420,10 @@ processing consume the episode contract rather than the source recordings
 directly. Training-visible outputs are written into Lance refinement records
 during publication.
 
+The delivered single-camera free-form caption contract is specified in
+[`Multimodal AV Captioning`](multimodal-av-captioning.md). It consumes the canonical episode table independently of
+episode splitting and records the exact selected-camera artifact binding with each result.
+
 They may add:
 
 - episode-level labels;

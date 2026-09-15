@@ -15,13 +15,6 @@ from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
 from cosmos_curator.core.utils.storage.storage_utils import get_storage_client
-from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig
-from cosmos_curator.next.recipes.video_caption.contracts import (
-    CHECKPOINT_ADAPTER_VERSION,
-    WORKSPACE_SCHEMA_VERSION,
-    CaptionModelSpec,
-    normalized_caption_contract,
-)
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
 
@@ -46,13 +39,15 @@ class CaptionWorkspace:
 
 
 def resolve_workspace(
-    config: ResolvedVideoCaptionConfig,
-    spec: CaptionModelSpec,
+    staging_root_uri: str,
+    caption_field_name: str,
     digest: str,
+    *,
+    storage_profile: str,
 ) -> CaptionWorkspace:
     """Derive the contract workspace and its credentialed Arrow filesystem."""
-    root_uri = _join(config.output.staging_root_uri, spec.caption_field_name, digest)
-    filesystem = arrow_filesystem(root_uri, storage_profile=config.execution.storage_profile)
+    root_uri = _join(staging_root_uri, caption_field_name, digest)
+    filesystem = arrow_filesystem(root_uri, storage_profile=storage_profile)
     return CaptionWorkspace(
         root_uri=root_uri,
         manifest_uri=_join(root_uri, "workspace.json"),
@@ -64,39 +59,22 @@ def resolve_workspace(
 
 def ensure_workspace(
     workspace: CaptionWorkspace,
-    config: ResolvedVideoCaptionConfig,
-    spec: CaptionModelSpec,
-    digest: str,
+    *,
+    storage_profile: str,
+    manifest: dict[str, object],
 ) -> None:
     """Create ``workspace.json`` once or require exact compatibility."""
-    payload = {
-        "workspace_schema_version": WORKSPACE_SCHEMA_VERSION,
-        "media_root": config.input.media_root,
-        "clips_lance_uri": config.input.clips_lance_uri,
-        "caption_field": spec.caption_field_name,
-        "metadata_field": spec.metadata_field_name,
-        "field_schemas": normalized_caption_contract(spec)["fields"],
-        "model": {
-            "id": spec.model_id,
-            "revision": spec.revision,
-            "runtime_model_dir": str(spec.runtime_model_dir),
-        },
-        "caption_contract": normalized_caption_contract(spec),
-        "caption_contract_digest": digest,
-        "checkpoint_adapter_version": CHECKPOINT_ADAPTER_VERSION,
-    }
+    payload = manifest
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     created = _write_if_absent(
         workspace.manifest_uri,
         encoded,
-        storage_profile=config.execution.storage_profile,
+        storage_profile=storage_profile,
     )
     if created:
         return
     try:
-        existing = json.loads(
-            _read_bytes(workspace.manifest_uri, storage_profile=config.execution.storage_profile).decode("utf-8")
-        )
+        existing = json.loads(_read_bytes(workspace.manifest_uri, storage_profile=storage_profile).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         msg = f"Existing caption workspace manifest is unreadable: {workspace.manifest_uri}"
         raise ValueError(msg) from exc

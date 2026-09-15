@@ -42,6 +42,10 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 - [Multi-Camera Design](design/multicam.md) - multi-camera data model and implementation plan.
 - [Multimodal AV Pipeline Design](design/multimodal-av-pipeline.md) - Lance-backed aligned multiview AV clip
   contract with camera, IMU, GPS/GNSS features, and curation outputs.
+- [Multimodal AV Episode Publication](design/multimodal-av-episode-publication.md) - canonical complete-camera episode
+  rows, artifact bindings, identity, and publication semantics.
+- [Multimodal AV Captioning](design/multimodal-av-captioning.md) - single-camera free-form caption enrichment of
+  canonical multimodal episodes.
 - [Release Versioning Design](design/release-versioning.md) - tag-derived release and package versioning.
 - [Ray Data Design](design/ray-data.md) - Ray Data direction and implementation notes.
 - [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.

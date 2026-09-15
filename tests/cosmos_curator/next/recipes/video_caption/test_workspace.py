@@ -10,7 +10,12 @@ import pyarrow.fs as pafs
 import pytest
 
 from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec
+from cosmos_curator.next.recipes.video_caption.contracts import (
+    CHECKPOINT_ADAPTER_VERSION,
+    WORKSPACE_SCHEMA_VERSION,
+    CaptionModelSpec,
+    normalized_caption_contract,
+)
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import (
     CaptionWorkspace,
@@ -37,6 +42,56 @@ def _config(media_root: Path, staging_root: Path | str) -> ResolvedVideoCaptionC
     )
 
 
+def _manifest(
+    config: ResolvedVideoCaptionConfig,
+    spec: CaptionModelSpec,
+    digest: str,
+) -> dict[str, object]:
+    contract = normalized_caption_contract(spec)
+    return {
+        "workspace_schema_version": WORKSPACE_SCHEMA_VERSION,
+        "media_root": config.input.media_root,
+        "clips_lance_uri": config.input.clips_lance_uri,
+        "caption_field": spec.caption_field_name,
+        "metadata_field": spec.metadata_field_name,
+        "field_schemas": contract["fields"],
+        "model": {
+            "id": spec.model_id,
+            "revision": spec.revision,
+            "runtime_model_dir": str(spec.runtime_model_dir),
+        },
+        "caption_contract": contract,
+        "caption_contract_digest": digest,
+        "checkpoint_adapter_version": CHECKPOINT_ADAPTER_VERSION,
+    }
+
+
+def _resolve_workspace(
+    config: ResolvedVideoCaptionConfig,
+    spec: CaptionModelSpec,
+    digest: str,
+) -> CaptionWorkspace:
+    return resolve_workspace(
+        config.output.staging_root_uri,
+        spec.caption_field_name,
+        digest,
+        storage_profile=config.execution.storage_profile,
+    )
+
+
+def _ensure_workspace(
+    workspace: CaptionWorkspace,
+    config: ResolvedVideoCaptionConfig,
+    spec: CaptionModelSpec,
+    digest: str,
+) -> None:
+    ensure_workspace(
+        workspace,
+        storage_profile=config.execution.storage_profile,
+        manifest=_manifest(config, spec, digest),
+    )
+
+
 def test_workspace_layout_and_manifest_are_contract_scoped(
     tmp_path: Path,
     caption_spec: CaptionModelSpec,
@@ -44,10 +99,10 @@ def test_workspace_layout_and_manifest_are_contract_scoped(
 ) -> None:
     """Layout and manifest depend on field set and result contract, not attempts."""
     config = _config(tmp_path / "media", tmp_path / "staging")
-    workspace = resolve_workspace(config, caption_spec, caption_digest)
+    workspace = _resolve_workspace(config, caption_spec, caption_digest)
 
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
 
     expected_root = tmp_path / "staging" / caption_spec.caption_field_name / caption_digest
     assert workspace.root_uri == str(expected_root)
@@ -70,8 +125,8 @@ def test_phase_a_completion_marker_uses_fragment_level_coverage(
 ) -> None:
     """One small marker covers the completed attempt and later pending subsets."""
     config = _config(tmp_path / "media", tmp_path / "staging")
-    workspace = resolve_workspace(config, caption_spec, caption_digest)
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
+    workspace = _resolve_workspace(config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
     completed = CaptionAttempt(version=3, pending_fragment_ids=(1, 2), complete_fragment_ids=(0,))
 
     assert phase_a_completion_covers(workspace, completed, caption_digest) is False
@@ -113,15 +168,15 @@ def test_existing_incompatible_manifest_fails(
 ) -> None:
     """A manifest collision cannot silently reuse another workspace contract."""
     config = _config(tmp_path / "media", tmp_path / "staging")
-    workspace = resolve_workspace(config, caption_spec, caption_digest)
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
+    workspace = _resolve_workspace(config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
     manifest_path = Path(workspace.manifest_uri)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["clips_lance_uri"] = "/different/table"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="incompatible"):
-        ensure_workspace(workspace, config, caption_spec, caption_digest)
+        _ensure_workspace(workspace, config, caption_spec, caption_digest)
 
 
 def test_cleanup_deletes_only_the_exact_contract_root(
@@ -131,8 +186,8 @@ def test_cleanup_deletes_only_the_exact_contract_root(
 ) -> None:
     """Cleanup removes the verified digest scope without touching siblings."""
     config = _config(tmp_path / "media", tmp_path / "staging")
-    workspace = resolve_workspace(config, caption_spec, caption_digest)
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
+    workspace = _resolve_workspace(config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
     result = Path(workspace.results_uri) / "part.parquet"
     result.parent.mkdir(parents=True)
     result.write_bytes(b"result")
@@ -204,7 +259,7 @@ def test_file_uri_workspace_round_trip(
     """Local workspace helpers consistently unwrap file URIs for every filesystem operation."""
     staging_root = tmp_path / "staging"
     config = _config(tmp_path / "media", staging_root.as_uri())
-    resolved = resolve_workspace(config, caption_spec, caption_digest)
+    resolved = _resolve_workspace(config, caption_spec, caption_digest)
     workspace = CaptionWorkspace(
         root_uri=Path(resolved.root_uri).as_uri(),
         manifest_uri=Path(resolved.manifest_uri).as_uri(),
@@ -213,8 +268,8 @@ def test_file_uri_workspace_round_trip(
         filesystem=resolved.filesystem,
     )
 
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
-    ensure_workspace(workspace, config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
+    _ensure_workspace(workspace, config, caption_spec, caption_digest)
 
     assert workspace_manifest_exists(workspace) is True
     assert (Path(resolved.root_uri) / "workspace.json").is_file()

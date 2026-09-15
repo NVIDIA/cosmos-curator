@@ -21,8 +21,8 @@ from lance.fragment import FragmentMetadata, LanceFragment
 from loguru import logger
 from ray.data.expressions import col
 
-from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, validate_terminal_value
-from cosmos_curator.next.recipes.video_caption.inference import result_schema, staged_result_files
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
+from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
 from cosmos_curator.next.recipes.video_caption.lance_state import (
     CaptionAttempt,
     FragmentCaptionState,
@@ -33,12 +33,10 @@ from cosmos_curator.next.recipes.video_caption.lance_state import (
     protected_binding_fingerprint,
 )
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
 
 _BYTES_PER_GIB = 1024**3
 _PUBLICATION_PREPARE_MEMORY_BYTES = 8 * _BYTES_PER_GIB
 _FINGERPRINT_BATCH_ROWS = 4_096
-_CLIP_ID_SCHEMA = pa.schema([CLIP_SCHEMA.field("clip_id")])
 _RESULT_PATH_SCHEMA = pa.schema([pa.field("path", pa.large_string(), nullable=False)])
 PREPARED_PUBLICATION_SCHEMA = pa.schema(
     [
@@ -58,8 +56,8 @@ class AttemptFragmentGuard:
 
     fragment_id: int
     row_count: int
-    ordered_clip_ids_fingerprint: str
-    split_binding_fingerprint: str
+    ordered_row_ids_fingerprint: str
+    base_binding_fingerprint: str
     pending_binding_fingerprint: str
 
 
@@ -98,8 +96,7 @@ def publish_staged_results(  # noqa: PLR0913 -- the publication boundary keeps r
     uri: str,
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
     commit_attempts: int,
@@ -111,14 +108,14 @@ def publish_staged_results(  # noqa: PLR0913 -- the publication boundary keeps r
     logger.info(
         "Starting caption Lance publication for field {} from attempt v{}: {} selected fragment(s) "
         "({} pending, {} already complete)",
-        spec.caption_field_name,
+        bindings.result.caption_field_name,
         attempt.version,
         len(attempt.selected_fragment_ids),
         len(attempt.pending_fragment_ids),
         len(attempt.complete_fragment_ids),
     )
     if not attempt.pending_fragment_ids:
-        verify_selected_fragments(uri, attempt, spec, digest, storage_options=storage_options)
+        verify_selected_fragments(uri, attempt, bindings, storage_options=storage_options)
         return PublicationSummary(published_fragments=0, already_committed_fragments=0)
 
     # Ray Data otherwise replaces user exceptions with UserCodeException, which
@@ -128,8 +125,7 @@ def publish_staged_results(  # noqa: PLR0913 -- the publication boundary keeps r
             uri,
             attempt,
             workspace,
-            spec,
-            digest,
+            bindings,
             storage_options=storage_options,
             commit_attempts=commit_attempts,
         )
@@ -139,8 +135,7 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
     uri: str,
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
     commit_attempts: int,
@@ -155,17 +150,16 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
         len(attempt.pending_fragment_ids),
         len(files),
     )
-    _validate_parquet_schemas_distributed(files, workspace, spec)
+    _validate_parquet_schemas_distributed(files, workspace, bindings)
 
     attempt_dataset = lance.dataset(uri, version=attempt.version, storage_options=storage_options)
-    guards = _capture_fragment_guards(attempt_dataset, attempt.complete_fragment_ids, spec)
+    guards = _capture_fragment_guards(attempt_dataset, attempt.complete_fragment_ids, bindings)
     prepared_publications = _prepared_publication_dataset(
         files,
         uri=uri,
         attempt=attempt,
         workspace=workspace,
-        spec=spec,
-        digest=digest,
+        bindings=bindings,
         storage_options=storage_options,
     )
 
@@ -197,8 +191,7 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
             attempt,
             workspace,
             prepared,
-            spec,
-            digest,
+            bindings,
             storage_options=storage_options,
             commit_attempts=commit_attempts,
         )
@@ -217,8 +210,7 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
     verify_selected_fragments(
         uri,
         attempt,
-        spec,
-        digest,
+        bindings,
         storage_options=storage_options,
         guards=guards,
         staged_value_fingerprints=staged_value_fingerprints,
@@ -229,8 +221,7 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
 def verify_selected_fragments(  # noqa: PLR0913 -- explicit canonical-verification contract
     uri: str,
     attempt: CaptionAttempt,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
     guards: dict[int, AttemptFragmentGuard] | None = None,
@@ -242,28 +233,28 @@ def verify_selected_fragments(  # noqa: PLR0913 -- explicit canonical-verificati
     logger.info(
         "Verifying caption publication at Lance v{} before cleanup: field={}, {} selected fragment(s)",
         current.version,
-        spec.caption_field_name,
+        bindings.result.caption_field_name,
         len(attempt.selected_fragment_ids),
     )
     _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
-    resolved_guards = guards or _capture_fragment_guards(attempt_dataset, attempt.selected_fragment_ids, spec)
+    resolved_guards = guards or _capture_fragment_guards(attempt_dataset, attempt.selected_fragment_ids, bindings)
     staged_fingerprints = staged_value_fingerprints or {}
     for fragment_id in attempt.selected_fragment_ids:
         fragment = _require_fragment(current, fragment_id)
         guard = resolved_guards[fragment_id]
-        _assert_split_identity(current, fragment, guard)
-        state = classify_fragment(fragment, spec=spec, digest=digest)
+        _assert_split_identity(current, fragment, guard, bindings)
+        state = classify_fragment(fragment, bindings=bindings)
         if state is not FragmentCaptionState.COMPLETE:
             msg = f"Fragment {fragment_id} selected from attempt v{attempt.version} is still pending"
             raise PublicationError(msg)
         staged_fingerprint = staged_fingerprints.get(fragment_id)
-        if staged_fingerprint is not None and _caption_values_fingerprint(fragment, spec) != staged_fingerprint:
+        if staged_fingerprint is not None and _caption_values_fingerprint(fragment, bindings) != staged_fingerprint:
             msg = f"Fragment {fragment_id} is terminal but differs from its authoritative staged result"
             raise PublicationError(msg)
     logger.info(
         "Verified caption publication at Lance v{}: field={}, {} selected fragment(s), {} row(s) canonical",
         current.version,
-        spec.caption_field_name,
+        bindings.result.caption_field_name,
         len(attempt.selected_fragment_ids),
         sum(resolved_guards[fragment_id].row_count for fragment_id in attempt.selected_fragment_ids),
     )
@@ -273,23 +264,34 @@ def prepare_fragment_update(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     staged: pa.Table,
-    spec: CaptionModelSpec,
+    bindings: CaptionRunBindings,
 ) -> PreparedFragmentUpdate:
     """Write uncommitted caption column files and return their constrained descriptor."""
     source_metadata = fragment.metadata
-    expected_modified = leaf_field_ids(dataset, (spec.caption_field_name, spec.metadata_field_name))
-    pending_fields = (*CLIP_SCHEMA.names, spec.caption_field_name, spec.metadata_field_name)
+    result = bindings.result
+    expected_modified = leaf_field_ids(dataset, (result.caption_field_name, result.metadata_field_name))
+    pending_fields = (
+        *bindings.publication.protected_field_names,
+        result.caption_field_name,
+        result.metadata_field_name,
+    )
     pending_ids = leaf_field_ids(dataset, pending_fields)
     update_schema = pa.schema(
         [
-            pa.field("clip_id", pa.string(), nullable=False),
-            spec.caption_field,
-            spec.metadata_field,
+            bindings.input.mapped_schema.field(bindings.input.row_id_column),
+            result.fields.field(result.caption_field_name),
+            result.fields.field(result.metadata_field_name),
         ]
     )
-    update_table = staged.select(["clip_id", spec.caption_field_name, spec.metadata_field_name]).cast(update_schema)
+    update_table = staged.select(
+        [bindings.input.row_id_column, result.caption_field_name, result.metadata_field_name]
+    ).cast(update_schema)
     reader = pa.RecordBatchReader.from_batches(update_schema, update_table.to_batches())
-    updated_metadata, modified_field_ids = fragment.update_columns(reader, left_on="clip_id", right_on="clip_id")
+    updated_metadata, modified_field_ids = fragment.update_columns(
+        reader,
+        left_on=bindings.input.row_id_column,
+        right_on=bindings.input.row_id_column,
+    )
     descriptor = PreparedFragmentUpdate(
         fragment_id=int(fragment.fragment_id),
         source_version=int(dataset.version),
@@ -307,8 +309,7 @@ def prepare_fragment_update(
 def commit_prepared_update(
     uri: str,
     descriptor: PreparedFragmentUpdate,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
 ) -> int:
@@ -320,11 +321,11 @@ def commit_prepared_update(
             fields_modified=list(descriptor.modified_field_ids),
         ),
         transaction_properties={
-            "kind": "video-caption",
+            **bindings.publication.transaction_properties,
             "source_version": str(descriptor.source_version),
             "fragment_id": str(descriptor.fragment_id),
-            "field": spec.caption_field_name,
-            "contract_digest": digest,
+            "field": bindings.result.caption_field_name,
+            "contract_digest": bindings.result.digest,
         },
     )
     committed = lance.LanceDataset.commit(
@@ -342,8 +343,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
     prepared: PreparedFragmentPublication,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
     commit_attempts: int,
@@ -356,9 +356,9 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
         current = lance.dataset(uri, storage_options=storage_options)
         _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
         fragment = _require_fragment(current, guard.fragment_id)
-        state = classify_fragment(fragment, spec=spec, digest=digest)
+        state = classify_fragment(fragment, bindings=bindings)
         if state is FragmentCaptionState.COMPLETE:
-            if _caption_values_fingerprint(fragment, spec) == staged_values_fingerprint:
+            if _caption_values_fingerprint(fragment, bindings) == staged_values_fingerprint:
                 logger.info(
                     "Caption fragment {} is already canonical at Lance v{}: {} row(s), no commit needed",
                     guard.fragment_id,
@@ -369,7 +369,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             msg = f"Fragment {guard.fragment_id} has a terminal caption that differs from staged recovery data"
             raise PublicationError(msg)
 
-        _assert_pending_identity(current, fragment, guard, spec)
+        _assert_pending_identity(current, fragment, guard, bindings)
         current_fingerprint = fragment_fingerprint(fragment.metadata)
         if descriptor is None or descriptor.source_fingerprint != current_fingerprint:
             logger.info(
@@ -384,8 +384,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
                 uri=uri,
                 attempt=attempt,
                 workspace=workspace,
-                spec=spec,
-                digest=digest,
+                bindings=bindings,
                 storage_options=storage_options,
             )
             if reprepared.guard != guard or reprepared.staged_values_fingerprint != staged_values_fingerprint:
@@ -396,7 +395,10 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
                 continue
         _validate_descriptor(
             descriptor,
-            leaf_field_ids(current, (spec.caption_field_name, spec.metadata_field_name)),
+            leaf_field_ids(
+                current,
+                (bindings.result.caption_field_name, bindings.result.metadata_field_name),
+            ),
         )
         if not attempt.version <= descriptor.source_version <= int(current.version):
             msg = f"Prepared update source version is invalid for fragment {guard.fragment_id}"
@@ -417,8 +419,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             committed_version = commit_prepared_update(
                 uri,
                 descriptor,
-                spec,
-                digest,
+                bindings,
                 storage_options=storage_options,
             )
         except (OSError, RuntimeError) as exc:
@@ -429,8 +430,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
                 uri,
                 guard,
                 staged_values_fingerprint,
-                spec,
-                digest,
+                bindings,
                 storage_options=storage_options,
             )
             if canonical_version is not None:
@@ -449,8 +449,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             uri,
             guard,
             staged_values_fingerprint,
-            spec,
-            digest,
+            bindings,
             storage_options=storage_options,
         )
         if canonical_version is not None:
@@ -473,21 +472,20 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
     raise PublicationError(msg) from last_commit_error
 
 
-def _latest_canonical_version(  # noqa: PLR0913 -- explicit reconciliation inputs
+def _latest_canonical_version(
     uri: str,
     guard: AttemptFragmentGuard,
     staged_values_fingerprint: str,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
 ) -> int | None:
     """Return the latest version holding staged terminal values, rejecting a mismatch."""
     latest = lance.dataset(uri, storage_options=storage_options)
     latest_fragment = _require_fragment(latest, guard.fragment_id)
-    if classify_fragment(latest_fragment, spec=spec, digest=digest) is not FragmentCaptionState.COMPLETE:
+    if classify_fragment(latest_fragment, bindings=bindings) is not FragmentCaptionState.COMPLETE:
         return None
-    if _caption_values_fingerprint(latest_fragment, spec) == staged_values_fingerprint:
+    if _caption_values_fingerprint(latest_fragment, bindings) == staged_values_fingerprint:
         return int(latest.version)
     msg = f"Fragment {guard.fragment_id} committed a terminal value different from staging"
     raise PublicationError(msg)
@@ -496,44 +494,49 @@ def _latest_canonical_version(  # noqa: PLR0913 -- explicit reconciliation input
 def _capture_fragment_guards(
     dataset: lance.LanceDataset,
     fragment_ids: tuple[int, ...],
-    spec: CaptionModelSpec,
+    bindings: CaptionRunBindings,
 ) -> dict[int, AttemptFragmentGuard]:
-    split_ids = leaf_field_ids(dataset, tuple(CLIP_SCHEMA.names))
+    base_ids = leaf_field_ids(dataset, bindings.publication.protected_field_names)
     pending_ids = leaf_field_ids(
         dataset,
-        (*CLIP_SCHEMA.names, spec.caption_field_name, spec.metadata_field_name),
+        (
+            *bindings.publication.protected_field_names,
+            bindings.result.caption_field_name,
+            bindings.result.metadata_field_name,
+        ),
     )
     guards: dict[int, AttemptFragmentGuard] = {}
     for fragment_id in fragment_ids:
         fragment = _require_fragment(dataset, fragment_id)
-        guards[fragment_id] = _fragment_guard(fragment, split_ids=split_ids, pending_ids=pending_ids)
+        guards[fragment_id] = _fragment_guard(fragment, bindings=bindings, base_ids=base_ids, pending_ids=pending_ids)
     return guards
 
 
 def _fragment_guard(
     fragment: LanceFragment,
     *,
-    split_ids: set[int],
+    bindings: CaptionRunBindings,
+    base_ids: set[int],
     pending_ids: set[int],
 ) -> AttemptFragmentGuard:
-    clip_ids = fragment.to_table(columns=["clip_id"]).cast(_CLIP_ID_SCHEMA)
+    row_id_schema = pa.schema([bindings.input.mapped_schema.field(bindings.input.row_id_column)])
+    row_ids = fragment.to_table(columns=[bindings.input.row_id_column]).cast(row_id_schema)
     return AttemptFragmentGuard(
         fragment_id=int(fragment.fragment_id),
-        row_count=clip_ids.num_rows,
-        ordered_clip_ids_fingerprint=_arrow_table_fingerprint(clip_ids),
-        split_binding_fingerprint=protected_binding_fingerprint(fragment.metadata, split_ids),
+        row_count=row_ids.num_rows,
+        ordered_row_ids_fingerprint=_arrow_table_fingerprint(row_ids),
+        base_binding_fingerprint=protected_binding_fingerprint(fragment.metadata, base_ids),
         pending_binding_fingerprint=protected_binding_fingerprint(fragment.metadata, pending_ids),
     )
 
 
-def prepare_fragment_publication(  # noqa: PLR0913 -- Ray worker boundary carries an explicit recovery contract
+def prepare_fragment_publication(
     staged: pa.Table,
     *,
     uri: str,
     attempt_version: int,
     storage_options: dict[str, str] | None,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
 ) -> pa.Table:
     """Validate one Ray-grouped fragment and stage its uncommitted Lance update."""
     raw_fragment_ids = pc.unique(staged["fragment_id"]).to_pylist()
@@ -542,24 +545,24 @@ def prepare_fragment_publication(  # noqa: PLR0913 -- Ray worker boundary carrie
         raise PublicationError(msg)
     fragment_id = int(raw_fragment_ids[0])
     attempt_dataset = lance.dataset(uri, version=attempt_version, storage_options=storage_options)
-    guard = _capture_fragment_guards(attempt_dataset, (fragment_id,), spec)[fragment_id]
+    guard = _capture_fragment_guards(attempt_dataset, (fragment_id,), bindings)[fragment_id]
 
     current = lance.dataset(uri, storage_options=storage_options)
     _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
     fragment = _require_fragment(current, fragment_id)
-    table = _validate_staged_group(staged, fragment, guard, spec, digest)
-    staged_values_fingerprint = _caption_table_fingerprint(table, spec)
+    table = _validate_staged_group(staged, fragment, guard, bindings)
+    staged_values_fingerprint = _caption_table_fingerprint(table, bindings)
 
     descriptor: PreparedFragmentUpdate | None = None
-    state = classify_fragment(fragment, spec=spec, digest=digest)
+    state = classify_fragment(fragment, bindings=bindings)
     if state is FragmentCaptionState.COMPLETE:
-        _assert_split_identity(current, fragment, guard)
-        if _caption_values_fingerprint(fragment, spec) != staged_values_fingerprint:
+        _assert_split_identity(current, fragment, guard, bindings)
+        if _caption_values_fingerprint(fragment, bindings) != staged_values_fingerprint:
             msg = f"Fragment {fragment_id} has a terminal caption that differs from staged recovery data"
             raise PublicationError(msg)
     else:
-        _assert_pending_identity(current, fragment, guard, spec)
-        descriptor = prepare_fragment_update(current, fragment, table, spec)
+        _assert_pending_identity(current, fragment, guard, bindings)
+        descriptor = prepare_fragment_update(current, fragment, table, bindings)
 
     prepared = PreparedFragmentPublication(
         guard=guard,
@@ -578,14 +581,13 @@ def _prepared_publication_dataset(  # noqa: PLR0913 -- Ray plan inputs are indep
     uri: str,
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     storage_options: dict[str, str] | None,
 ) -> ray.data.Dataset:
     staged = ray.data.read_parquet(
         list(files),
         filesystem=workspace.filesystem,
-        schema=result_schema(spec),
+        schema=bindings.result.staged_schema,
         override_num_blocks=max(len(files), len(attempt.pending_fragment_ids)),
     )
     pending = staged.filter(expr=col("fragment_id").is_in(list(attempt.pending_fragment_ids)))
@@ -600,8 +602,7 @@ def _prepared_publication_dataset(  # noqa: PLR0913 -- Ray plan inputs are indep
             "uri": uri,
             "attempt_version": attempt.version,
             "storage_options": storage_options,
-            "spec": spec,
-            "digest": digest,
+            "bindings": bindings,
         },
         num_cpus=1,
         memory=_PUBLICATION_PREPARE_MEMORY_BYTES,
@@ -627,10 +628,9 @@ def _validate_staged_group(
     table: pa.Table,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
 ) -> pa.Table:
-    expected_schema = result_schema(spec)
+    expected_schema = bindings.result.staged_schema
     try:
         table = table.cast(expected_schema)
     except (pa.ArrowException, ValueError) as exc:
@@ -648,41 +648,47 @@ def _validate_staged_group(
     if offsets != list(range(guard.row_count)):
         msg = f"Staged fragment {guard.fragment_id} offsets are not exactly 0..{guard.row_count - 1}"
         raise PublicationError(msg)
-    staged_clip_ids = table.select(["clip_id"]).cast(_CLIP_ID_SCHEMA)
-    current_clip_ids = fragment.to_table(columns=["clip_id"]).cast(_CLIP_ID_SCHEMA)
+    row_id = bindings.input.row_id_column
+    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id)])
+    staged_row_ids = table.select([row_id]).cast(row_id_schema)
+    current_row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
     if (
-        _arrow_table_fingerprint(staged_clip_ids) != guard.ordered_clip_ids_fingerprint
-        or _arrow_table_fingerprint(current_clip_ids) != guard.ordered_clip_ids_fingerprint
+        _arrow_table_fingerprint(staged_row_ids) != guard.ordered_row_ids_fingerprint
+        or _arrow_table_fingerprint(current_row_ids) != guard.ordered_row_ids_fingerprint
     ):
-        msg = f"Staged fragment {guard.fragment_id} clip_id order does not match the attempt and current fragment"
+        msg = f"Staged fragment {guard.fragment_id} row-ID order does not match the attempt and current fragment"
+        raise PublicationError(msg)
+    current_bindings = _current_staged_bindings(fragment, bindings)
+    staged_bindings = table.select(list(bindings.input.staged_binding_columns)).cast(current_bindings.schema)
+    if not staged_bindings.equals(current_bindings):
+        msg = f"Staged fragment {guard.fragment_id} input bindings do not match the current fragment"
         raise PublicationError(msg)
     fragment_ids = [int(value) for value in table["fragment_id"].to_pylist()]
     if any(fragment_id != guard.fragment_id for fragment_id in fragment_ids):
         msg = f"Staged group for fragment {guard.fragment_id} contains a different fragment ID"
         raise PublicationError(msg)
-    captions = table[spec.caption_field_name].to_pylist()
-    metadata_values = table[spec.metadata_field_name].to_pylist()
-    for caption, metadata in zip(captions, metadata_values, strict=True):
+    for row in table.to_pylist():
         try:
-            validate_terminal_value(
-                caption,
-                metadata,
-                spec=spec,
-                digest=digest,
-            )
+            bindings.result.validate_staged_row(row)
         except (TypeError, ValueError) as exc:
             msg = f"Staged fragment {guard.fragment_id} contains a non-canonical terminal row: {exc}"
             raise PublicationError(msg) from exc
     return table
 
 
+def _current_staged_bindings(fragment: LanceFragment, bindings: CaptionRunBindings) -> pa.Table:
+    source = fragment.scanner(columns=list(bindings.input.source_columns), with_row_address=True).to_table()
+    projected = bindings.input.project_batch(source)
+    return projected.select(list(bindings.input.staged_binding_columns))
+
+
 def _validate_parquet_schemas_distributed(
     files: tuple[str, ...],
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
+    bindings: CaptionRunBindings,
 ) -> None:
     """Validate result footers across Ray workers instead of serially on the driver."""
-    expected = result_schema(spec)
+    expected = bindings.result.staged_schema
     paths = ray.data.from_items(
         [{"path": path} for path in files],
         override_num_blocks=len(files),
@@ -728,8 +734,7 @@ def _reprepare_fragment_with_ray(  # noqa: PLR0913 -- retry task reproduces the 
     uri: str,
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     storage_options: dict[str, str] | None,
 ) -> PreparedFragmentPublication:
     """Restage a descriptor on a worker after a same-fragment commit race."""
@@ -743,8 +748,7 @@ def _reprepare_fragment_with_ray(  # noqa: PLR0913 -- retry task reproduces the 
                 uri=uri,
                 attempt_version=attempt.version,
                 workspace=workspace,
-                spec=spec,
-                digest=digest,
+                bindings=bindings,
                 storage_options=storage_options,
             )
         )
@@ -762,8 +766,7 @@ def _prepare_fragment_from_workspace(  # noqa: PLR0913 -- remote retry inputs ar
     uri: str,
     attempt_version: int,
     workspace: CaptionWorkspace,
-    spec: CaptionModelSpec,
-    digest: str,
+    bindings: CaptionRunBindings,
     storage_options: dict[str, str] | None,
 ) -> str:
     files = staged_result_files(workspace)
@@ -777,8 +780,7 @@ def _prepare_fragment_from_workspace(  # noqa: PLR0913 -- remote retry inputs ar
         uri=uri,
         attempt_version=attempt_version,
         storage_options=storage_options,
-        spec=spec,
-        digest=digest,
+        bindings=bindings,
     )
     return str(prepared["payload"][0].as_py())
 
@@ -789,8 +791,8 @@ def _serialize_prepared_publication(prepared: PreparedFragmentPublication) -> st
         "guard": {
             "fragment_id": prepared.guard.fragment_id,
             "row_count": prepared.guard.row_count,
-            "ordered_clip_ids_fingerprint": prepared.guard.ordered_clip_ids_fingerprint,
-            "split_binding_fingerprint": prepared.guard.split_binding_fingerprint,
+            "ordered_row_ids_fingerprint": prepared.guard.ordered_row_ids_fingerprint,
+            "base_binding_fingerprint": prepared.guard.base_binding_fingerprint,
             "pending_binding_fingerprint": prepared.guard.pending_binding_fingerprint,
         },
         "staged_values_fingerprint": prepared.staged_values_fingerprint,
@@ -825,8 +827,8 @@ def _parse_prepared_publication(payload: str, *, expected_fragment_id: int) -> P
     guard = AttemptFragmentGuard(
         fragment_id=_payload_int(raw_guard, "fragment_id"),
         row_count=_payload_int(raw_guard, "row_count"),
-        ordered_clip_ids_fingerprint=_payload_string(raw_guard, "ordered_clip_ids_fingerprint"),
-        split_binding_fingerprint=_payload_string(raw_guard, "split_binding_fingerprint"),
+        ordered_row_ids_fingerprint=_payload_string(raw_guard, "ordered_row_ids_fingerprint"),
+        base_binding_fingerprint=_payload_string(raw_guard, "base_binding_fingerprint"),
         pending_binding_fingerprint=_payload_string(raw_guard, "pending_binding_fingerprint"),
     )
     if guard.fragment_id != expected_fragment_id:
@@ -928,13 +930,23 @@ def _find_publication_error(error: BaseException) -> PublicationError | None:
     return None
 
 
-def _caption_values_fingerprint(fragment: LanceFragment, spec: CaptionModelSpec) -> str:
-    table = fragment.to_table(columns=["clip_id", spec.caption_field_name, spec.metadata_field_name])
-    return _caption_table_fingerprint(table, spec)
+def _caption_values_fingerprint(fragment: LanceFragment, bindings: CaptionRunBindings) -> str:
+    result = bindings.result
+    table = fragment.to_table(
+        columns=[bindings.input.row_id_column, result.caption_field_name, result.metadata_field_name]
+    )
+    return _caption_table_fingerprint(table, bindings)
 
 
-def _caption_table_fingerprint(table: pa.Table, spec: CaptionModelSpec) -> str:
-    schema = pa.schema([CLIP_SCHEMA.field("clip_id"), spec.caption_field, spec.metadata_field])
+def _caption_table_fingerprint(table: pa.Table, bindings: CaptionRunBindings) -> str:
+    result = bindings.result
+    schema = pa.schema(
+        [
+            bindings.input.mapped_schema.field(bindings.input.row_id_column),
+            result.fields.field(result.caption_field_name),
+            result.fields.field(result.metadata_field_name),
+        ]
+    )
     normalized = table.select(schema.names).cast(schema)
     return _arrow_table_fingerprint(normalized)
 
@@ -990,12 +1002,16 @@ def _assert_pending_identity(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
-    spec: CaptionModelSpec,
+    bindings: CaptionRunBindings,
 ) -> None:
-    _assert_split_identity(dataset, fragment, guard)
+    _assert_split_identity(dataset, fragment, guard, bindings)
     pending_ids = leaf_field_ids(
         dataset,
-        (*CLIP_SCHEMA.names, spec.caption_field_name, spec.metadata_field_name),
+        (
+            *bindings.publication.protected_field_names,
+            bindings.result.caption_field_name,
+            bindings.result.metadata_field_name,
+        ),
     )
     current = protected_binding_fingerprint(fragment.metadata, pending_ids)
     if current != guard.pending_binding_fingerprint:
@@ -1007,15 +1023,21 @@ def _assert_split_identity(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
+    bindings: CaptionRunBindings,
 ) -> None:
-    clip_ids = fragment.to_table(columns=["clip_id"]).cast(_CLIP_ID_SCHEMA)
-    if clip_ids.num_rows != guard.row_count or _arrow_table_fingerprint(clip_ids) != guard.ordered_clip_ids_fingerprint:
-        msg = f"Fragment {guard.fragment_id} changed row layout or canonical clip identity after attempt capture"
+    row_id = bindings.input.row_id_column
+    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id)])
+    row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
+    if row_ids.num_rows != guard.row_count or _arrow_table_fingerprint(row_ids) != guard.ordered_row_ids_fingerprint:
+        msg = f"Fragment {guard.fragment_id} changed row layout or canonical row identity after attempt capture"
         raise PublicationError(msg)
-    split_ids = leaf_field_ids(dataset, tuple(CLIP_SCHEMA.names))
-    current = protected_binding_fingerprint(fragment.metadata, split_ids)
-    if current != guard.split_binding_fingerprint:
-        msg = f"Fragment {guard.fragment_id} changed a video-split-owned physical binding after attempt capture"
+    base_ids = leaf_field_ids(dataset, bindings.publication.protected_field_names)
+    current = protected_binding_fingerprint(fragment.metadata, base_ids)
+    if current != guard.base_binding_fingerprint:
+        msg = (
+            f"Fragment {guard.fragment_id} changed a {bindings.publication.base_field_owner}-owned physical binding "
+            "after attempt capture"
+        )
         raise PublicationError(msg)
 
 

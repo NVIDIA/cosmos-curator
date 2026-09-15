@@ -20,6 +20,18 @@ CHECKPOINT_ADAPTER_VERSION: Final = 1
 WORKSPACE_SCHEMA_VERSION: Final = 1
 DEFAULT_PROMPT: Final = "Elaborate on the visual and narrative elements of the video in detail."
 MAX_OUTPUT_TOKENS: Final = 2_048
+SAMPLING_PARAMS: Final[dict[str, float | int]] = {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0,
+    "max_tokens": MAX_OUTPUT_TOKENS,
+}
+VIDEO_NUM_FRAMES: Final = -1
+VIDEO_FPS: Final = 2
+VIDEO_DO_SAMPLE_FRAMES: Final = False
 TERMINAL_STATUSES: Final = frozenset({"success", "truncated", "error"})
 _MODEL_WEIGHT_SUFFIXES: Final = frozenset({".bin", ".pt", ".safetensors"})
 OWNER_METADATA: Final = b"cosmos_curator.owner"
@@ -145,20 +157,12 @@ def normalized_caption_contract(spec: CaptionModelSpec) -> dict[str, Any]:
             }
         ],
         "chat_template": {"source": "model", "kwargs": {"enable_thinking": False}},
-        "sampling": {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "min_p": 0.0,
-            "presence_penalty": 1.5,
-            "repetition_penalty": 1.0,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-        },
+        "sampling": dict(SAMPLING_PARAMS),
         "video": {
             "container": "exact_clip_mp4",
-            "num_frames": -1,
-            "fps": 2,
-            "do_sample_frames": False,
+            "num_frames": VIDEO_NUM_FRAMES,
+            "fps": VIDEO_FPS,
+            "do_sample_frames": VIDEO_DO_SAMPLE_FRAMES,
             "longest_edge_override": None,
             "audio": "ignored",
         },
@@ -257,6 +261,36 @@ def terminal_metadata(  # noqa: PLR0913 -- each argument maps to a persisted fie
     }
 
 
+def build_terminal_result_row(  # noqa: PLR0913 -- each argument maps to a persisted terminal value
+    row: dict[str, Any],
+    *,
+    spec: CaptionModelSpec,
+    digest: str,
+    caption: str | None,
+    status: str,
+    prompt_token_count: int | None,
+    generated_token_count: int | None,
+    error_type: str | None,
+    error_message: str | None,
+) -> dict[str, Any]:
+    """Build one clip-owned staged terminal row from shared inference values."""
+    return {
+        "fragment_id": int(row["fragment_id"]),
+        "row_offset": int(row["row_offset"]),
+        "clip_id": str(row["clip_id"]),
+        spec.caption_field_name: caption,
+        spec.metadata_field_name: terminal_metadata(
+            spec,
+            digest,
+            status=status,
+            prompt_token_count=prompt_token_count,
+            generated_token_count=generated_token_count,
+            error_type=error_type,
+            error_message=error_message,
+        ),
+    }
+
+
 def validate_terminal_value(
     caption: str | None,
     metadata: dict[str, Any] | None,
@@ -289,6 +323,21 @@ def validate_terminal_value(
         raise ValueError(msg)
     _validate_token_counts(metadata)
     _validate_terminal_outcome(caption, metadata, status=str(status))
+
+
+def validate_terminal_row(
+    row: dict[str, Any],
+    *,
+    spec: CaptionModelSpec,
+    digest: str,
+) -> None:
+    """Validate one clip-owned staged or published terminal row."""
+    validate_terminal_value(
+        row.get(spec.caption_field_name),
+        row.get(spec.metadata_field_name),
+        spec=spec,
+        digest=digest,
+    )
 
 
 def _validate_token_counts(metadata: dict[str, Any]) -> None:

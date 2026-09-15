@@ -11,6 +11,7 @@ import pytest
 
 from cosmos_curator.next.recipes.video_caption import pipeline
 from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config_data
+from cosmos_curator.next.recipes.video_caption.inference import CaptionExecutionConfig
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.publication import PublicationSummary
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
@@ -62,9 +63,22 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
     """Pending work validates model/workspace, runs one Phase A, then publishes."""
     attempt = CaptionAttempt(version=3, pending_fragment_ids=(0, 1), complete_fragment_ids=(2,))
     events = _common_mocks(monkeypatch, tmp_path, attempt)
+    config = _config(tmp_path)
     ray_init_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(pipeline, "validate_model_directory", lambda *_args: events.append("model"))
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: events.append("workspace"))
+    manifests: list[dict[str, object]] = []
+    inference_configs: list[CaptionExecutionConfig] = []
+
+    def validate_model_directory(*_args: object) -> Path:
+        events.append("model")
+        return tmp_path
+
+    monkeypatch.setattr(pipeline, "validate_model_directory", validate_model_directory)
+
+    def ensure_workspace(*_args: object, manifest: dict[str, object], **_kwargs: object) -> None:
+        manifests.append(manifest)
+        events.append("workspace")
+
+    monkeypatch.setattr(pipeline, "ensure_workspace", ensure_workspace)
     monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
     monkeypatch.setattr(
         pipeline,
@@ -84,7 +98,18 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
         "configure_ray_data_eager_actor_autoscaling",
         lambda: events.append("autoscaling"),
     )
-    monkeypatch.setattr(pipeline, "run_inference_phase", lambda *_args, **_kwargs: events.append("inference"))
+
+    def run_inference_phase(
+        _dataset: object,
+        _attempt: object,
+        inference_config: CaptionExecutionConfig,
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        inference_configs.append(inference_config)
+        events.append("inference")
+
+    monkeypatch.setattr(pipeline, "run_inference_phase", run_inference_phase)
 
     def publish(*_args: object, **_kwargs: object) -> PublicationSummary:
         events.append("publish")
@@ -93,7 +118,7 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
     monkeypatch.setattr(pipeline, "publish_staged_results", publish)
     monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: events.append("cleanup"))
 
-    summary = pipeline.run_config(_config(tmp_path))
+    summary = pipeline.run_config(config)
 
     assert events == [
         "validate",
@@ -119,6 +144,24 @@ def test_pending_attempt_runs_one_inference_phase_then_publication(
             "runtime_env_vars": {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"},
         }
     ]
+    assert manifests[0]["media_root"] == config.input.media_root
+    assert manifests[0]["clips_lance_uri"] == config.input.clips_lance_uri
+    assert inference_configs == [
+        CaptionExecutionConfig(
+            storage_profile=config.execution.storage_profile,
+            inference_concurrency=config.execution.inference_concurrency,
+            inference_batch_size=config.execution.inference_batch_size,
+            max_concurrent_batches=config.execution.max_concurrent_batches,
+            tensor_parallel_size=config.execution.tensor_parallel_size,
+            pipeline_parallel_size=config.execution.pipeline_parallel_size,
+            media_concurrency=config.execution.media_concurrency,
+            media_batch_size=config.execution.media_batch_size,
+            media_cpus=config.execution.media_cpus,
+            media_attempts=config.execution.media_attempts,
+            lance_read_batch_size=config.execution.lance_read_batch_size,
+            parquet_rows_per_file=config.execution.parquet_rows_per_file,
+        )
+    ]
 
 
 def test_storage_compatibility_is_selected_from_every_worker_visible_location(
@@ -137,7 +180,7 @@ def test_storage_compatibility_is_selected_from_every_worker_visible_location(
     compatibility_calls: list[tuple[tuple[str, ...], str]] = []
     _common_mocks(monkeypatch, tmp_path, attempt)
     monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
 
     def classify_endpoints(*locations: str, storage_profile: str) -> dict[str, str]:
@@ -173,7 +216,7 @@ def test_complete_attempt_skips_model_and_ray_and_validates_existing_workspace(
     attempt = CaptionAttempt(version=8, pending_fragment_ids=(), complete_fragment_ids=(0, 1))
     events = _common_mocks(monkeypatch, tmp_path, attempt)
     monkeypatch.setattr(pipeline, "workspace_manifest_exists", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: events.append("workspace"))
+    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: events.append("workspace"))
     monkeypatch.setattr(
         pipeline,
         "validate_model_directory",
@@ -206,7 +249,7 @@ def test_recovered_phase_a_skips_model_but_initializes_ray_for_publication(
     attempt = CaptionAttempt(version=9, pending_fragment_ids=(0,), complete_fragment_ids=())
     events = _common_mocks(monkeypatch, tmp_path, attempt)
     monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: events.append("workspace"))
+    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: events.append("workspace"))
     monkeypatch.setattr(
         pipeline,
         "validate_model_directory",
@@ -248,7 +291,7 @@ def test_cleanup_failure_does_not_invalidate_canonical_commits(
     attempt = CaptionAttempt(version=5, pending_fragment_ids=(), complete_fragment_ids=())
     _common_mocks(monkeypatch, tmp_path, attempt)
     monkeypatch.setattr(pipeline, "workspace_manifest_exists", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         pipeline,
         "publish_staged_results",

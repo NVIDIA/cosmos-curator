@@ -10,6 +10,113 @@ source sessions or infer whether a set of camera artifacts is complete.
 One row represents a synchronized interval, not one camera. That keeps shared episode facts authoritative and prevents
 different views of the same interval from receiving inconsistent episode-level enrichments.
 
+## Background and use cases
+
+A session's cameras observe a common capture-clock interval but may be stored under different recorder paths.
+`multimodal-split` emits one terminal outcome per configured camera and planned span.
+
+Camera outcomes do not append base rows independently. Publication groups them by `split_clip_id` and writes one
+episode row only when every planned `camera_key` has a successful outcome:
+
+```text
+independent camera outcomes
+  front_left  ──┐
+  front_right ──┼──> assemble complete camera set ──> one episodes.lance row
+  front_wide  ──┘
+```
+
+The published row has two complementary shapes:
+
+- `episode_id` names the logical source-session interval. It excludes camera selection, encoding, and downstream
+  models, providing the join key for later episode-scoped data.
+- `camera_media` is the complete nested list of materialized camera descriptors for the split contract, serialized
+  lexicographically by `camera_key`.
+
+```text
+episode_id = one synchronized source interval
+└── camera_media
+    ├── front_left
+    │   └── MP4 location + size/hash
+    │       timeline location + hash
+    │       observations location + hash
+    ├── front_right
+    │   └── MP4 and timing-artifact bindings
+    └── front_wide
+        └── MP4 and timing-artifact bindings
+```
+
+The displayed camera names are example `camera_key` values stored as list items, not fields in the item struct.
+
+### Why a list of structs
+
+`camera_media` is one top-level `large_list` whose item type is a fixed struct. Lance stores that struct's children as
+nested fields. The list and the nested fields are stacked parts of one representation, not competing designs:
+
+```text
+camera_media                         large_list
+└── item                             fixed struct
+    ├── camera_key                   nested primitive field
+    ├── media_location               nested primitive field
+    ├── media_sha256                 nested primitive field
+    └── ...                          nested primitive fields
+```
+
+| Representation | Shape | Decision |
+|---|---|---|
+| List of fixed structs | `camera_media: large_list<struct<...>>` | Selected: variable camera count with one typed descriptor contract |
+| Struct keyed by camera | `struct<front_left: struct<...>, front_right: struct<...>>` | Camera names become schema fields; a rig change is schema evolution |
+| Top-level camera columns | `front_left_uri`, `front_right_uri`, … | Duplicates field families and binds the table to one rig |
+| One row per camera | `(episode_id, camera_key)` per row | Every consumer must regroup rows and prove the camera set is complete |
+
+Existing clip-oriented recipes intentionally use different row units. `video-split` publishes one flat MP4 row per
+`clip_id`. `robot-action-split` publishes one independently appendable view row per `clip_id`; a consumer needing
+synchronized views groups those rows by `span_group_id`. Here the synchronized camera set, rather than an individual
+camera clip, is the canonical row.
+
+Different episodes may have different list lengths under one schema. An already-published `episode_id` whose camera set
+does not match is incompatible and fails before rewrite. The publisher writes `camera_media` as one complete value; it
+does not grow an existing row.
+
+Camera count and camera names are list data. The item struct is schema. A new per-camera descriptor property is
+producer-owned schema evolution. Consumer enrichments read `camera_media`; they do not add children inside it.
+
+The same base row supports:
+
+1. **Single-view captioning.** Resolve one required `camera_key`, verify that view's MP4, and bind the visual result
+   using:
+
+   ```text
+   (episode_id, materialization_digest, camera_key,
+    media_location, media_size_bytes, media_sha256)
+   ```
+
+2. **Multiview captioning or fusion.** Resolve an explicit ordered camera selection from one already-assembled list
+   instead of discovering and joining separate camera rows. The consumer records that selection in its own result
+   contract and binds the result to `materialization_digest`, which identifies the complete published camera set.
+
+3. **Stacked episode enrichment.** Free-form captions, other caption styles, quality passes, and later typed modality
+   tables remain independent result contracts on the same episode. Each owns its fields or table and joins through
+   `episode_id`; none rediscovers source camera paths or reassembles the camera set. A visual result additionally records
+   `materialization_digest`, its explicit camera selection, and the applicable artifact hashes so the episode-level join
+   does not erase visual provenance. Adding another result style does not change the base episode schema.
+
+4. **Artifact verification.** Use `media_size_bytes` and the per-artifact hashes to verify only the MP4 and timing files
+   a consumer reads. `materialization_digest` identifies the complete published camera set. Row presence alone does not
+   prove that referenced objects remain intact in storage.
+
+5. **Publication completeness.** At publication time, a canonical row means every camera required by that split
+   contract produced a successful terminal outcome. A missing or failed camera drops the episode. Successful sibling
+   artifacts may remain on storage for diagnosis or retry, but no partial Lance row is published.
+
+This is the multi-phase consequence of assembling cameras at publication: later phases join an already-complete
+interval and select from its published camera list instead of reconstructing a rig. Those phases share the episode and,
+when visual, media identity; they do not share result identity. Each retains its own model, prompt, schema, version,
+and writer contract.
+
+For an unchanged source interval, adding, removing, or renaming a camera leaves `episode_id` unchanged while changing
+`split_contract_digest` and `materialization_digest`. A changed camera set can also change the synchronized intervals
+that planning produces.
+
 ## State and output layout
 
 The output root has one fixed layout:
