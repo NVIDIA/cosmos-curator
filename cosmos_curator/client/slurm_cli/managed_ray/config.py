@@ -240,9 +240,23 @@ class SlurmRayHeadConfig(SlurmRayAllocationConfig):
 class SlurmRayWorkerConfig(SlurmRayAllocationConfig):
     """Slurm allocation settings shared by all Ray worker lanes.
 
-    A worker takes its accelerator node exclusively, so it states no CPU or memory request: it gets the node.
+    By default a worker takes its accelerator node exclusively, so it states no CPU or memory request: it gets
+    the node. Set ``exclusive: false`` to request a stated slice instead, which suits CPU-only recipes on a
+    shared partition: a whole-node request only fits a wholly free node, while a slice also packs onto partly
+    used ones, and a low-priority slice is far easier for the backfill scheduler to place.
     """
 
+    cpus: int = Field(
+        default=16, ge=1, description="Cores per worker lane (--cpus-per-task). Ignored when exclusive=true."
+    )
+    memory: str = Field(
+        default="64G",
+        description="Memory per worker lane (sbatch --mem format, e.g. 64G). Ignored when exclusive=true.",
+    )
+    exclusive: bool = Field(
+        default=True,
+        description="Take the entire node exclusively (--exclusive --mem=0). Set false to request cpus/memory.",
+    )
     gpus: int | None = Field(
         default=None, ge=1, description="Number of GPUs requested per worker node (--gpus, job-scoped)."
     )
@@ -253,6 +267,14 @@ class SlurmRayWorkerConfig(SlurmRayAllocationConfig):
             "GPUs per node (--gpus-per-node). Use on clusters that prohibit job-scoped GPU requests (e.g. NVL72)."
         ),
     )
+
+    @field_validator("memory")
+    @classmethod
+    def _validate_memory(cls, value: str) -> str:
+        if not _is_valid_slurm_memory(value):
+            msg = f"slurm.worker.memory must be a positive sbatch size such as 64G or 65536M, got {value!r}"
+            raise ValueError(msg)
+        return value
 
     @model_validator(mode="after")
     def _validate_gpu_fields(self) -> Self:

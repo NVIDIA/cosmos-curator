@@ -31,8 +31,11 @@ Discovery phases
 
 import io
 import json
+import multiprocessing
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from itertools import groupby
 from pathlib import Path
 from typing import Any
@@ -65,6 +68,13 @@ _VIEW_PREFIX = "observation.images."
 # just as readily, and a number is an identifier, never a label.
 _TASK_LABEL_COLUMNS = ("task", "task_name", "__index_level_0__")
 _SUBTASK_LABEL_COLUMNS = ("subtask", "subtask_name", "__index_level_0__")
+
+# Spawn, never fork, for the phases below. These workers log, and a loguru sink is guarded by a lock: forking
+# while the parent holds it -- which it does, between submissions, to report progress -- leaves the child with a
+# lock no thread will ever release, so its first log call hangs and the pool reports BrokenProcessPool. A spawned
+# worker starts from a clean interpreter with no inherited lock. It also costs an import per worker, which is
+# noise against phases that run for minutes.
+_WORKER_MP_CONTEXT = multiprocessing.get_context("spawn")
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -874,94 +884,205 @@ def _dedup(items: list[SpanWorkItem], cfg: SpanFilterConfig) -> list[SpanWorkIte
 # ---------------------------------------------------------------------------
 
 
-def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatch]:  # noqa: C901
+_ShardInfo = tuple[
+    str,
+    str,
+    dict[int, str] | None,
+    dict[int, str],
+    float,
+    list[tuple[int, int]],
+    list[str],
+    bool,
+    dict[int, dict[str, Any]],
+]
+
+
+@contextmanager
+def _captured_warnings() -> Iterator[list[str]]:
+    """Collect WARNING records emitted in this process into the yielded list.
+
+    Inherited or import-installed sinks are dropped first so each message is emitted exactly once, by the caller
+    that receives the list back.
+
+    Teardown removes *all* handlers rather than the one this added. The sink is not guaranteed to still be
+    registered: importing a module that configures loguru (``cosmos_xenna.utils.python_log`` does so at import,
+    via ``logger.remove()``) wipes the handler table, and removing a handler id that is already gone raises
+    ValueError -- which is what killed a 100-shard discovery run from inside the ``finally``.
+    """
+    captured: list[str] = []
+    logger.remove()
+    logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+    try:
+        yield captured
+    finally:
+        logger.remove()
+
+
+def _prep_shard(
+    entry: tuple[str, str],
+    requested_views: tuple[str, ...],
+    storage_profile: str,
+) -> tuple[_ShardInfo, list[str]]:
+    """Prep one shard: read its meta, views, data-file listing, and episode meta.
+
+    Module-level (not a closure) so it can run under ProcessPoolExecutor, which
+    pickles the callable to hand off to worker processes.
+
+    Warnings are returned rather than logged here. A record emitted in a worker only reaches the driver's sinks
+    by inheriting them across ``fork``; under ``spawn`` loguru is never configured in the worker and every
+    per-shard diagnostic is silently dropped. Carrying them back makes that independent of the start method.
+    """
+    with _captured_warnings() as captured:
+        source_id, shard_path = entry
+        subtask_map, task_map, fps = _read_shard_meta(shard_path, storage_profile=storage_profile)
+        views, source_is_multiview = _discover_view_names(shard_path, requested_views, storage_profile=storage_profile)
+        data_files = _list_data_files(shard_path, storage_profile=storage_profile)
+        episode_meta = _read_episode_meta(shard_path, views, storage_profile=storage_profile)
+    info = (source_id, shard_path, subtask_map, task_map, fps, data_files, views, source_is_multiview, episode_meta)
+    return info, captured
+
+
+def _build_segments_task(
+    args: tuple[Any, ...],
+    video_bitrate: str,
+    storage_profile: str,
+) -> tuple[list[SpanWorkItem], list[str]]:
+    """Build every span for one data file, returning its warnings alongside them.
+
+    Module-level (not a closure) so it can run under ProcessPoolExecutor, which pickles the callable.
+
+    The warnings have to be carried back rather than logged here. This runs in a separate process, so a record
+    emitted here never reaches the driver's sinks, and the "yielded no span" failure explicitly defers to these
+    per-file warnings to name the cause -- losing them would leave that error pointing at nothing. The inherited
+    sinks are dropped first so each message is emitted exactly once, by the caller.
+    """
+    with _captured_warnings() as captured:
+        source_id, sp, ci, fi, stm, tm, fps, views, sim, ep_meta = args
+        items = _build_segments_for_file(
+            sp,
+            source_id,
+            ci,
+            fi,
+            stm,
+            tm,
+            fps,
+            ep_meta,
+            views,
+            video_bitrate,
+            source_is_multiview=sim,
+            storage_profile=storage_profile,
+        )
+    return items, captured
+
+
+def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatch]:  # noqa: C901, PLR0912, PLR0915
     """Run span discovery for all dataset roots in the config.
 
     Returns a list of ChunkSpanBatch objects ready for Ray Data processing.
     Each batch groups all SpanWorkItems that share the same source chunk MP4
     and data parquet, so each Ray worker opens one video file.
     """
-    all_items: list[SpanWorkItem] = []
     workers = config.execution.discovery_workers
     requested_views = config.output.views
     storage_profile = config.execution.storage_profile
     video_bitrate = config.output.video_bitrate
     chunk_limit = config.input.limit
-    # seen_chunks is global across all input URIs so limit applies to the total
-    # number of chunks processed, not per-URI.
-    seen_chunks: set[str] = set()
-    data_files_read = 0
 
-    for dataset_root in config.input.uris:
-        source_id = make_source_id(dataset_root)
+    # Phase 1: list shard dirs for every URI, in parallel across URIs (not just
+    # within one). A dataset batched as many single-shard URIs -- the shape used
+    # to avoid discovery scanning a whole multi-shard root just to keep a `limit`
+    # -- would otherwise serialize this phase one URI at a time.
+    def _list_one(dataset_root: str) -> list[tuple[str, str]]:
         logger.info(f"Listing shard dirs under {dataset_root!r} (profile={storage_profile!r})")
         shard_dirs = _list_shard_dirs(dataset_root, storage_profile=storage_profile)
-        logger.info(f"Found {len(shard_dirs)} shard dir(s)")
-        if not shard_dirs:
-            continue
+        logger.info(f"Found {len(shard_dirs)} shard dir(s) under {dataset_root!r}")
+        # Identity comes from the discovered shard URI, never from the URI the caller happened to list.
+        # Listing a dataset root and listing its shards individually describe the same content, and
+        # _list_shard_dirs normalizes both to the same shard path -- so keying on the input would give one
+        # source_id to every shard under a root and a distinct one per shard when they are listed directly.
+        # Those flow into span_group_id and clip_id, so changing input shape would defeat reconciliation and
+        # append a second generation of clips to an existing table.
+        return [(make_source_id(shard_path), shard_path) for shard_path, _name in shard_dirs]
 
-        def _prep(
-            args: tuple[str, str],
-        ) -> tuple[
-            str,
-            dict[int, str] | None,
-            dict[int, str],
-            float,
-            list[tuple[int, int]],
-            list[str],
-            bool,
-            dict[int, dict[str, Any]],
-        ]:
-            shard_path, _ = args
-            subtask_map, task_map, fps = _read_shard_meta(shard_path, storage_profile=storage_profile)
-            views, source_is_multiview = _discover_view_names(
-                shard_path, requested_views, storage_profile=storage_profile
-            )
-            data_files = _list_data_files(shard_path, storage_profile=storage_profile)
-            episode_meta = _read_episode_meta(shard_path, views, storage_profile=storage_profile)
-            return shard_path, subtask_map, task_map, fps, data_files, views, source_is_multiview, episode_meta
+    uris = config.input.uris
+    if not uris:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(uris), workers)) as pool:
+        shard_entries = [entry for entries in pool.map(_list_one, uris) for entry in entries]
+    if not shard_entries:
+        return []
 
-        with ThreadPoolExecutor(max_workers=min(len(shard_dirs), workers)) as pool:
-            futures = [pool.submit(_prep, sd) for sd in shard_dirs]
-            shard_infos = [f.result() for f in futures]
+    # Phase 2: prep every shard concurrently, across all URIs together. Uses
+    # processes, not threads: this phase's cost is dominated by CPU-bound
+    # parquet parsing (per-row Python loops in _parse_episode_parquet), which
+    # holds the GIL and does not benefit from threads the way Phase 1's
+    # I/O-bound listing does.
+    total_shards = len(shard_entries)
+    log_every = max(1, total_shards // 10)
+    with ProcessPoolExecutor(max_workers=min(total_shards, workers), mp_context=_WORKER_MP_CONTEXT) as proc_pool:
+        # Keyed by submission index, not by entry: results are rebuilt in discovery order below. Completion
+        # order is arbitrary, and file_tasks -- which chunk_limit truncates -- is built straight from this list,
+        # so collecting as tasks finish would make `limit` select a different subset of chunks on every run.
+        prep_futures = {
+            proc_pool.submit(_prep_shard, entry, requested_views, storage_profile): index
+            for index, entry in enumerate(shard_entries)
+        }
+        prepped: list[_ShardInfo | None] = [None] * total_shards
+        for done, future in enumerate(as_completed(prep_futures), start=1):
+            info, warnings = future.result()
+            for warning in warnings:
+                logger.warning(warning)
+            prepped[prep_futures[future]] = info
+            if done % log_every == 0 or done == total_shards:
+                logger.info(f"Prepped {done}/{total_shards} shard(s)")
+    shard_infos = [info for info in prepped if info is not None]
 
-        file_tasks = [
-            (sp, ci, fi, stm, tm, fps, views, sim, ep_meta)
-            for sp, stm, tm, fps, data_files, views, sim, ep_meta in shard_infos
-            for ci, fi in data_files
-        ]
-        if chunk_limit is not None:
-            filtered: list[tuple[Any, ...]] = []
-            for task in file_tasks:
-                key = f"{task[0]}/chunk-{task[1]:03d}"
-                if key not in seen_chunks and len(seen_chunks) < chunk_limit:
-                    seen_chunks.add(key)
-                if key in seen_chunks:
-                    filtered.append(task)
-            file_tasks = filtered
+    file_tasks = [
+        (source_id, sp, ci, fi, stm, tm, fps, views, sim, ep_meta)
+        for source_id, sp, stm, tm, fps, data_files, views, sim, ep_meta in shard_infos
+        for ci, fi in data_files
+    ]
+    # chunk_limit applies globally across all URIs/shards, in discovery order.
+    if chunk_limit is not None:
+        seen_chunks: set[str] = set()
+        filtered: list[tuple[Any, ...]] = []
+        for task in file_tasks:
+            key = f"{task[1]}/chunk-{task[2]:03d}"
+            if key not in seen_chunks and len(seen_chunks) < chunk_limit:
+                seen_chunks.add(key)
+            if key in seen_chunks:
+                filtered.append(task)
+        file_tasks = filtered
 
-        def _build(args: tuple[Any, ...], _sid: str = source_id, _vb: str = video_bitrate) -> list[SpanWorkItem]:
-            sp, ci, fi, stm, tm, fps, views, sim, ep_meta = args
-            return _build_segments_for_file(
-                sp,
-                _sid,
-                ci,
-                fi,
-                stm,
-                tm,
-                fps,
-                ep_meta,
-                views,
-                _vb,
-                source_is_multiview=sim,
-                storage_profile=storage_profile,
-            )
-
-        data_files_read += len(file_tasks)
-        with ThreadPoolExecutor(max_workers=min(len(file_tasks) or 1, workers)) as pool:
-            all_items.extend(
-                item for r in as_completed({pool.submit(_build, t): t for t in file_tasks}) for item in r.result()
-            )
+    data_files_read = len(file_tasks)
+    logger.info(f"Building segments for {data_files_read} data file(s)")
+    build_log_every = max(1, data_files_read // 10)
+    # Processes, not threads: this phase parses a data parquet plus episode parquets per file and runs numpy
+    # boundary detection, which holds the GIL. On threads it measured ~130 files per 12 minutes -- about two
+    # hours for 1306 files -- with the driver pegged near 144% CPU, the same signature Phase 2 showed before it
+    # moved to processes.
+    with ProcessPoolExecutor(
+        max_workers=min(len(file_tasks) or 1, workers), mp_context=_WORKER_MP_CONTEXT
+    ) as build_pool:
+        # Keyed by submission index, like phase 2, and the spans are reassembled in that order below.
+        # Completion order is arbitrary, and it decides the order of ``all_items`` -- which in turn decides
+        # which spans _dedup keeps for an episode whose files complete in a different order, and the order of
+        # the returned batch list. Collecting as tasks finish would make both vary run to run.
+        build_futures = {
+            build_pool.submit(_build_segments_task, task, video_bitrate, storage_profile): index
+            for index, task in enumerate(file_tasks)
+        }
+        built_per_file: list[list[SpanWorkItem]] = [[] for _ in file_tasks]
+        span_count = 0
+        for done, build_future in enumerate(as_completed(build_futures), start=1):
+            built, warnings = build_future.result()
+            for warning in warnings:
+                logger.warning(warning)
+            built_per_file[build_futures[build_future]] = built
+            span_count += len(built)
+            if done % build_log_every == 0 or done == data_files_read:
+                logger.info(f"Built segments for {done}/{data_files_read} data file(s), {span_count} span(s) so far")
+    all_items = [item for built in built_per_file for item in built]
 
     # Data files that yield no span at all are corrupt, not empty. Returning []
     # here is indistinguishable from a dataset with nothing to do, and the caller
@@ -975,20 +1096,24 @@ def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatc
         )
         raise ValueError(msg)
 
+    logger.info(f"Filtering and deduping {len(all_items)} span(s)")
     cfg = config.split
     all_items = _filter_by_label(all_items, cfg)
     all_items = _filter_by_duration(all_items, cfg)
     all_items = _dedup(all_items, cfg)
+    logger.info(f"{len(all_items)} span(s) remain after filtering and dedup")
 
     by_chunk: dict[tuple[str, str], list[SpanWorkItem]] = {}
     for item in all_items:
         by_chunk.setdefault((item.chunk_mp4_uri, item.data_parquet_uri), []).append(item)
 
     max_per_batch = config.execution.max_segments_per_batch
-    return [
+    batches = [
         ChunkSpanBatch(
             chunk_mp4_uri=mp4_uri, data_parquet_uri=parquet_uri, items=chunk_items[start : start + max_per_batch]
         )
         for (mp4_uri, parquet_uri), chunk_items in by_chunk.items()
         for start in range(0, len(chunk_items), max_per_batch)
     ]
+    logger.info(f"Discovery produced {len(batches)} chunk span batch(es)")
+    return batches

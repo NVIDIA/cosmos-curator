@@ -141,20 +141,26 @@ def _timing_flags() -> tuple[str, ...]:
 def _ffprobe(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run ffprobe with automatic retry on transient failures, returning the completed process."""
     # Retry a failed probe a couple of times: probes read the source (possibly over a
-    # network mount / S3), so a transient blip should not fail the whole chunk. Fast
-    # failures (nonzero return) retry cheaply; a genuine timeout raises and is handled.
+    # network mount / S3, or sharing a node's disk/CPU with other concurrent probes), so
+    # a transient blip -- a nonzero return *or* a timeout -- should not fail the whole
+    # chunk outright. Only a timeout that persists across every retry propagates.
     cmd = ["ffprobe", "-v", "error", *args]
-    result = subprocess.run(  # noqa: S603
-        cmd, capture_output=True, text=True, check=False, timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL
-    )
-    for attempt in range(1, _PROBE_RETRIES + 1):
-        if result.returncode == 0:
-            break
+    attempt = 1
+    while True:
+        try:
+            result = subprocess.run(  # noqa: S603
+                cmd, capture_output=True, text=True, check=False, timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL
+            )
+        except subprocess.TimeoutExpired:
+            if attempt > _PROBE_RETRIES:
+                raise
+            time.sleep(0.5 * attempt)
+            attempt += 1
+            continue
+        if result.returncode == 0 or attempt > _PROBE_RETRIES:
+            return result
         time.sleep(0.5 * attempt)
-        result = subprocess.run(  # noqa: S603
-            cmd, capture_output=True, text=True, check=False, timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL
-        )
-    return result
+        attempt += 1
 
 
 class _Index:

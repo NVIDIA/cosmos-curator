@@ -78,6 +78,9 @@ _CONDA_ACTIVATION_ENV_VARS = (
 )
 _LAUNCHER_ENV_PREFIXES = ("CONDA_ENV_SHLVL_", "CONDA_PREFIX_")
 _SLURM_ENV_VARS_TO_FORWARD = (
+    # The worker passes this to `ray start --num-cpus` so a sliced lane advertises its allocation rather than
+    # whatever Ray autodetects from the host: three lanes sharing a 96-core node would otherwise each claim 96.
+    "SLURM_CPUS_PER_TASK",
     "SLURM_JOB_ID",
     "SLURM_JOBID",
     "SLURM_JOB_NODELIST",

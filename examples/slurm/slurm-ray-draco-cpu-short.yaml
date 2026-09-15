@@ -1,0 +1,49 @@
+schema_version: 1
+job_name: robot-action-split-draco-cpu-short
+# The cpu_short PARTITION carries QoS=cpu_short (found via `scontrol show partition`),
+# whose MaxTRESPU is cpu=960,mem=1811190M -- 5x the `cpu` partition QOS (cpu=192,mem=352G)
+# that currently caps us at 5 lanes. Same 49 nodes, 4h wall instead of 24h.
+#
+# Sliced lanes, measured against whole-node lanes on this same partition: 10 exclusive
+# 96-core lanes placed only 7 (the rest pending on (Priority)/(Resources), not on quota),
+# stranding 256 of the 960 CPUs because there were not ten wholly-free nodes. 32-core
+# slices pack into the partly-used nodes instead, so 29 lanes + a 32-core head spends the
+# budget exactly: 32 + 29*32 = 960. Extra lanes are requested so freed budget is taken
+# automatically; they pend harmlessly.
+worker_lanes: 35
+slurm:
+  account: sw_aidot
+  head:
+    partition: cpu_short
+    # `normal` as the job QOS, not `cpu_short`: sw_aidot has no association with a
+    # cpu_short job QOS ("Invalid qos specification"). The partition applies
+    # QoS=cpu_short itself, which is where the cpu=960,mem=1811190M cap comes from.
+    qos: normal
+    time: "04:00:00"
+    cpus: 32
+    memory: 128G
+  worker:
+    partition: cpu_short
+    qos: normal
+    time: "04:00:00"
+    # Same slice shape as the `cpu` partition: cut_cpus=3 runs 10 cuts per 32-core lane at
+    # ~3G RSS each, so 30G of work in a 44G lane. 29 lanes plus a 128G head is 1404G of the
+    # 1811190M (~1.73T) per-user memory cap, so CPU binds first, as intended.
+    exclusive: false
+    cpus: 32
+    memory: 44G
+runtime:
+  container_image: /lustre/fs11/portfolios/sw/projects/sw_aidot/users/cchambers/images/cosmos-curator-x86.sqsh
+  curator_path: /home/cchambers/src/cosmos-curate
+  workspace_path: /lustre/fs11/portfolios/sw/projects/sw_aidot/users/cchambers/cosmos_curator_local_workspace
+  cache_path: /lustre/fs11/portfolios/sw/projects/sw_aidot/users/cchambers/cache
+  mount_s3_creds: false
+  mounts:
+    - source: /home/cchambers/.aws/credentials
+      destination: /creds/s3_creds
+      mode: ro
+  pixi_envs:
+    - default
+ray:
+  startup_timeout: 10m
+  temp_dir: /tmp/r

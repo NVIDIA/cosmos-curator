@@ -296,8 +296,7 @@ def _batch_prelude(
 ) -> list[str]:
     """Render directives shared by head and worker allocations.
 
-    What each role asks for is not shared: a worker takes its accelerator node exclusively, while the head asks
-    for a stated slice of a CPU node it shares.
+    What each role asks for is not shared: each states its own CPU, memory, and exclusivity request.
     """
     return [
         "#!/bin/bash",
@@ -469,8 +468,11 @@ def render_worker_script(
         ),
         *_slurm_directive("gpus", str(worker.gpus) if worker.gpus is not None else None),
         *_slurm_directive("gpus-per-node", str(worker.gpus_per_node) if worker.gpus_per_node is not None else None),
-        "#SBATCH --exclusive",
-        "#SBATCH --mem=0",
+        *(
+            ["#SBATCH --exclusive", "#SBATCH --mem=0"]
+            if worker.exclusive
+            else [f"#SBATCH --cpus-per-task={worker.cpus}", f"#SBATCH --mem={worker.memory}"]
+        ),
         # Preemption requeues the same allocation rather than consuming one of the lane's, so preemption survival
         # and walltime succession compose instead of competing for the same budget.
         "#SBATCH --requeue",
@@ -502,6 +504,9 @@ def render_worker_script(
             runtime_paths,
             worker_command,
             extra_environment_keys=(WORKER_HEAD_JOB_ID_ENV, WORKER_LANE_ENV),
+            # An exclusive allocation already owns every core, but a sliced one must restate its request:
+            # since Slurm 22.05 a step does not inherit the batch job's --cpus-per-task and would land on one core.
+            extra_slurm_args=() if worker.exclusive else (f"--cpus-per-task={worker.cpus}",),
         ),
         "",
     ]

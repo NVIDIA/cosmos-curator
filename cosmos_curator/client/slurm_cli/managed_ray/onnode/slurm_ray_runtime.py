@@ -55,14 +55,19 @@ RUNTIME_MODULE_FILENAME = "slurm_ray_runtime.py"
 WORKER_HEAD_JOB_ID_ENV = "COSMOS_CURATOR_SLURM_RAY_HEAD_JOB_ID"
 WORKER_LANE_ENV = "COSMOS_CURATOR_SLURM_RAY_LANE"
 
-# Fixed ports for a worker, which owns its node exclusively and so can keep predictable ones. The head shares a
-# node with whatever else the CPU partition scheduled there, including another run's head, so it reserves free
-# ports at startup instead and publishes them in the bootstrap record.
-_OBJECT_MANAGER_PORT = 8076
-_NODE_MANAGER_PORT = 8077
-_DASHBOARD_AGENT_GRPC_PORT = 52366
-_RUNTIME_ENV_AGENT_PORT = 20267
-_METRICS_EXPORT_PORT = 9002
+# Neither role pre-selects well-known ports: both reserve free ones at startup. A worker used to keep fixed
+# ports because it owned its node, but a worker that asks for a slice can land beside another lane -- or beside
+# a head -- and the second raylet then dies binding an already-used port.
+_WORKER_PORT_NAMES = (
+    "object_manager",
+    "node_manager",
+    "runtime_env_agent",
+    "metrics_export",
+    "dashboard_agent_grpc",
+    # Named for the same reason the head names it: Ray defaults this to a fixed 52365, and a reserved port that
+    # happens to land there would collide with a default the command never stated.
+    "dashboard_agent_http",
+)
 # This module also runs as a standalone Python 3.8 script, so these mirror the
 # shared Curator resource contract instead of importing the package there.
 _CURATOR_IO_RESOURCE_NAME = "curator_io"
@@ -108,23 +113,36 @@ def _configure_logging() -> None:
         configure_stdlib_logging(text_format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def _reserve_head_ports() -> dict[str, int]:
-    """Reserve one free TCP port per head service.
+def _reserve_ports(names: tuple[str, ...]) -> dict[str, int]:
+    """Reserve one free TCP port per named service.
 
-    The head shares its node, so it cannot assume the well-known Ray ports are free: a second run's head may
-    already have them. Every socket is held open until all of them are assigned, which is what keeps the ports
-    distinct from each other. A port lost between closing the socket and Ray binding fails the head at startup.
+    Neither role can assume the well-known Ray ports are free. The head shares its node with whatever else the
+    partition scheduled there, including another run's head. A worker shares its node whenever it asks for a
+    slice rather than the whole machine, and two raylets that both pre-select the same port make the second one
+    die with "Address already in use". Every socket is held open until all of them are assigned, which is what
+    keeps the ports distinct from each other. A port lost between closing the socket and Ray binding fails
+    startup.
     """
     sockets = []
     try:
-        for _ in _HEAD_PORT_NAMES:
+        for _ in names:
             reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             reserved.bind(("", 0))
             sockets.append(reserved)
-        return dict(zip(_HEAD_PORT_NAMES, (reserved.getsockname()[1] for reserved in sockets)))
+        return dict(zip(names, (reserved.getsockname()[1] for reserved in sockets)))
     finally:
         for reserved in sockets:
             reserved.close()
+
+
+def _reserve_head_ports() -> dict[str, int]:
+    """Reserve one free TCP port per head service."""
+    return _reserve_ports(_HEAD_PORT_NAMES)
+
+
+def _reserve_worker_ports() -> dict[str, int]:
+    """Reserve one free TCP port per worker service."""
+    return _reserve_ports(_WORKER_PORT_NAMES)
 
 
 def _ray_head_command(head_node: str, ports: dict[str, int], temp_dir: Path | None) -> list[str]:
@@ -170,10 +188,34 @@ def _ray_head_command(head_node: str, ports: dict[str, int], temp_dir: Path | No
     return command
 
 
+def _allocated_cpus() -> int | None:
+    """CPUs Slurm gave this lane, or None when it did not say.
+
+    A lane that asks for a slice shares its node, so Ray must advertise the allocation rather than the machine:
+    autodetection reports the host's cores, and three 32-core lanes on a 96-core node would each claim 96 and
+    let the scheduler place three times the work the allocation can run. Returning None leaves Ray to
+    autodetect, which is right for a whole-node lane and for anything started outside Slurm.
+    """
+    raw = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+    if not raw:
+        return None
+    try:
+        cpus = int(raw)
+    except ValueError:
+        logger.warning("Ignoring unparseable SLURM_CPUS_PER_TASK=%r; letting Ray autodetect CPUs", raw)
+        return None
+    if cpus <= 0:
+        logger.warning("Ignoring non-positive SLURM_CPUS_PER_TASK=%r; letting Ray autodetect CPUs", raw)
+        return None
+    return cpus
+
+
 def _ray_worker_command(
     address: str,
+    ports: dict[str, int],
     temp_dir: Path | None,
     io_slots_per_node: int = _DEFAULT_IO_SLOTS_PER_NODE,
+    num_cpus: int | None = None,
 ) -> list[str]:
     command = [
         "ray",
@@ -184,19 +226,29 @@ def _ray_worker_command(
         "--node-ip-address",
         socket.gethostname(),
         "--object-manager-port",
-        str(_OBJECT_MANAGER_PORT),
+        str(ports["object_manager"]),
         "--node-manager-port",
-        str(_NODE_MANAGER_PORT),
+        str(ports["node_manager"]),
         "--runtime-env-agent-port",
-        str(_RUNTIME_ENV_AGENT_PORT),
+        str(ports["runtime_env_agent"]),
         "--metrics-export-port",
-        str(_METRICS_EXPORT_PORT),
+        str(ports["metrics_export"]),
         "--dashboard-agent-grpc-port",
-        str(_DASHBOARD_AGENT_GRPC_PORT),
+        str(ports["dashboard_agent_grpc"]),
+        "--dashboard-agent-listen-port",
+        str(ports["dashboard_agent_http"]),
+        # Same reason the head does this: Ray's default 10002-19999 worker range overlaps what a node with a low
+        # ip_local_port_range hands out, so a reserved port could land inside the range Ray also claims.
+        "--min-worker-port",
+        _RANDOM_WORKER_PORTS,
+        "--max-worker-port",
+        _RANDOM_WORKER_PORTS,
         "--disable-usage-stats",
         "--resources",
         json.dumps({_CURATOR_IO_RESOURCE_NAME: io_slots_per_node}),
     ]
+    if num_cpus is not None:
+        command.extend(["--num-cpus", str(num_cpus)])
     if temp_dir is not None:
         command.extend(["--temp-dir", str(temp_dir)])
     return command
@@ -383,15 +435,43 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _stop_ray(ray_module: Any, head_process: subprocess.Popen[bytes]) -> None:  # noqa: ANN401
+    """Stop only the Ray processes this allocation started.
+
+    `ray stop --force` was used here and is not scoped: it sweeps every local Ray process the user owns on the
+    node, so a head finishing would kill a co-located run's raylet. That co-location is routine now that lanes
+    can ask for a slice rather than a whole machine -- three lanes and another run's head can share one node.
+    `ray start` is launched with start_new_session, so its process group holds exactly this allocation's Ray
+    processes and signalling that group leaves every other run alone.
+    """
     try:
         ray_module.shutdown()
     except Exception:
         logger.exception("Failed to disconnect the supervisor from Ray")
-    try:
-        subprocess.run(["ray", "stop", "--force"], check=False, timeout=30)  # noqa: S607
-    except subprocess.TimeoutExpired:
-        logger.exception("Timed out while stopping local Ray processes")
+    _terminate_process_group(head_process)
     _stop_process(head_process)
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Signal the process group ``process`` leads, tolerating a group that is already gone."""
+    try:
+        group_id = os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    if group_id == os.getpgrp():
+        # No separate session: signalling this group would take down the supervisor itself.
+        logger.warning("Ray was not started in its own process group; leaving group signalling to the caller")
+        return
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group_id, signal_number)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            continue
+        else:
+            return
 
 
 def _run_head(args: argparse.Namespace) -> int:
@@ -428,7 +508,11 @@ def _supervise_head(args: argparse.Namespace, manifest_path: Path, teardown: Exi
         teardown.callback(shutil.rmtree, temp_dir, ignore_errors=True)
 
     logger.info("Starting Ray head at %s", address)
-    head_process = subprocess.Popen(_ray_head_command(head_node, ports, temp_dir))  # noqa: S603
+    # start_new_session puts `ray start` and everything it spawns in their own process group, which is what
+    # lets teardown kill this allocation's Ray and nothing else -- see _stop_ray.
+    head_process = subprocess.Popen(  # noqa: S603
+        _ray_head_command(head_node, ports, temp_dir), start_new_session=True
+    )
     teardown.callback(_stop_process, head_process)
     ray_module = _connect_to_ray(address, head_process, args.startup_timeout_seconds)
     teardown.callback(_stop_ray, ray_module, head_process)
@@ -570,14 +654,130 @@ def _run_worker(args: argparse.Namespace) -> int:
             args.run_id,
             address,
         )
-        completed = subprocess.run(  # noqa: S603
-            _ray_worker_command(address, temp_dir, args.io_slots_per_node),
-            check=False,
-        )
-        return completed.returncode
+        return _start_worker_ray(address, temp_dir, args.io_slots_per_node)
     finally:
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+_PORT_TAKEN_MARKERS = ("address already in use", "address in use", "failed to bind")
+_WORKER_START_ATTEMPTS = 3
+# Ray's root when the command names no --temp-dir.
+_DEFAULT_RAY_ROOT = Path("/tmp/ray")  # noqa: S108
+# Enough of each log to carry a startup failure without reading a lane's whole log history.
+_RAY_LOG_TAIL_BYTES = 64 * 1024
+
+
+def _ray_session_logs(temp_dir: Path | None) -> list[Path]:
+    """Ray's own logs for the current session, via the symlink Ray maintains."""
+    root = temp_dir if temp_dir is not None else _DEFAULT_RAY_ROOT
+    logs = root / "session_latest" / "logs"
+    try:
+        return sorted(logs.glob("*.err")) + sorted(logs.glob("*.out"))
+    except OSError:
+        return []
+
+
+def _ray_log_fingerprints(temp_dir: Path | None) -> dict[str, tuple[float, int]]:
+    """Snapshot ``(mtime, size)`` per Ray session log so a later scan can tell which ones moved.
+
+    Comparing a log's mtime against a wall-clock instant captured before the attempt looks equivalent and is
+    not: filesystems differ in timestamp granularity, and one that rounds to the second stamps a file written
+    during the attempt with a time *before* it -- discarding as stale the very log the retry exists to read.
+    A before-and-after comparison does not care how coarse the clock is.
+    """
+    fingerprints: dict[str, tuple[float, int]] = {}
+    for path in _ray_session_logs(temp_dir):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        fingerprints[str(path)] = (stat.st_mtime, stat.st_size)
+    return fingerprints
+
+
+def _port_taken_in_ray_logs(temp_dir: Path | None, before: dict[str, tuple[float, int]]) -> bool:
+    """Report whether Ray's own logs blame a bind failure for the attempt that just failed.
+
+    ``ray start`` does not surface this on its own output: when the raylet cannot bind a pre-selected port it
+    prints a generic startup timeout, and the "Address already in use" line only reaches ``raylet.err`` under
+    the session directory. Scanning the command's output alone therefore never sees the one failure this
+    retry exists for.
+
+    Only logs that appeared or changed since *before* are read, so an earlier attempt's bind error cannot make
+    this attempt look like a port collision.
+    """
+    for path in _ray_session_logs(temp_dir):
+        try:
+            stat = path.stat()
+            if before.get(str(path)) == (stat.st_mtime, stat.st_size):
+                continue
+            with path.open("rb") as handle:
+                handle.seek(max(0, stat.st_size - _RAY_LOG_TAIL_BYTES))
+                tail = handle.read().decode("utf-8", "replace").lower()
+        except OSError:
+            continue
+        if any(marker in tail for marker in _PORT_TAKEN_MARKERS):
+            logger.info("Ray log %s reports a port already in use", path.name)
+            return True
+    return False
+
+
+def _start_worker_ray(address: str, temp_dir: Path | None, io_slots_per_node: int) -> int:
+    """Run ``ray start`` for one lane, re-drawing ports when another lane wins the race for one.
+
+    Reserving free ports removes the hardcoded collisions but not the race: the sockets must close before Ray
+    can bind them, so two lanes starting together on one node can be handed the same port and the loser dies
+    with "Address already in use". Re-drawing is the fix -- a fresh reservation is overwhelmingly unlikely to
+    collide twice -- and the attempt budget keeps a genuinely unstartable lane from looping forever.
+
+    Only a port failure is retried. Any other nonzero exit is returned as-is so a real misconfiguration fails
+    fast instead of being retried three times. The failure is recognized from Ray's session logs as well as
+    from the command's output, because ``ray start`` prints only a generic startup timeout when the raylet
+    loses a port -- the "Address already in use" line goes to ``raylet.err``.
+    """
+    for attempt in range(1, _WORKER_START_ATTEMPTS + 1):
+        command = _ray_worker_command(address, _reserve_worker_ports(), temp_dir, io_slots_per_node, _allocated_cpus())
+        logs_before = _ray_log_fingerprints(temp_dir)
+        returncode, port_taken = _run_streaming(command)
+        # Ray reports a lost port as a generic startup timeout on its own output, so its logs decide.
+        port_taken = port_taken or _port_taken_in_ray_logs(temp_dir, logs_before)
+        if returncode == 0 or not port_taken:
+            return returncode
+        if attempt == _WORKER_START_ATTEMPTS:
+            logger.error("Ray worker lost the port race on all %s attempts; giving up", _WORKER_START_ATTEMPTS)
+            return returncode
+        logger.warning(
+            "Ray worker could not bind a pre-selected port (attempt %s/%s); retrying with fresh ports",
+            attempt,
+            _WORKER_START_ATTEMPTS,
+        )
+    msg = "unreachable: the attempt loop always returns"
+    raise AssertionError(msg)
+
+
+def _run_streaming(command: list[str]) -> tuple[int, bool]:
+    """Run *command*, forwarding its output line by line, and report whether a port was already taken.
+
+    The output is streamed rather than captured so a lane's log keeps arriving live -- ``ray start --block``
+    runs for the lifetime of the lane, so buffering it to inspect afterwards would hide everything until the
+    lane died.
+    """
+    port_taken = False
+    process = subprocess.Popen(  # noqa: S603
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    try:
+        # stdout=PIPE guarantees a stream; the check keeps type checkers honest without an assert.
+        for line in process.stdout or ():
+            stripped = line.rstrip()
+            logger.info("ray: %s", stripped)
+            lowered = stripped.lower()
+            if any(marker in lowered for marker in _PORT_TAKEN_MARKERS):
+                port_taken = True
+    finally:
+        returncode = process.wait()
+    return returncode, port_taken
 
 
 def _queued_job_states() -> dict[str, str] | None:

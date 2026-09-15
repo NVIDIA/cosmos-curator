@@ -35,7 +35,6 @@ from cosmos_curator.next.recipes.robot_action_split.contracts import (
     MEDIA_CONTRACT_VERSION,
 )
 from cosmos_curator.next.recipes.robot_action_split.discovery import ChunkSpanBatch
-from cosmos_curator.next.utils.lance_fragment_recovery import sql_string_literal
 
 _RECOVERY_COLUMNS = ("clip_id", "record_schema_version", "media_contract_version")
 
@@ -133,20 +132,25 @@ def _scan_committed(clip_ids: tuple[str, ...], *, dataset: lance.LanceDataset) -
     """
     if not clip_ids:
         return {}
-    # Use Lance's SQL filter parser rather than a PyArrow Expression, matching
-    # lance_fragment_recovery._candidate_presence: Lance's Substrait bridge
-    # cannot currently lower a string Expression once the table also contains
-    # nullable struct enrichment fields, even though only these columns are
-    # projected here.
-    literals = ",".join(sql_string_literal(clip_id) for clip_id in clip_ids)
-    id_filter = f"clip_id IN ({literals})"
-    scanner = dataset.scanner(columns=list(_RECOVERY_COLUMNS), filter=id_filter)
+    # Project the id column and intersect in Python rather than pushing a
+    # ``clip_id IN (...)`` filter down. A run's discovered set is the whole batch,
+    # so the filter carries one 64-char sha256 literal per clip: at batch-1 scale
+    # (1.2M spans) that is an ~81MB SQL string, and Lance's parser expanded it
+    # past 126GB RSS before the process was killed -- a restart could never
+    # reconcile. A projected scan is bounded by the table instead of by the
+    # filter, and the table is the smaller of the two whenever a run resumes.
+    wanted = frozenset(clip_ids)
+    scanner = dataset.scanner(columns=list(_RECOVERY_COLUMNS))
     committed: dict[str, tuple[int, int]] = {}
     for record_batch in scanner.to_batches():
-        for row in record_batch.to_pylist():
-            clip_id = str(row["clip_id"])
+        ids = record_batch.column("clip_id").to_pylist()
+        schema_versions = record_batch.column("record_schema_version").to_pylist()
+        contract_versions = record_batch.column("media_contract_version").to_pylist()
+        for clip_id, schema_version, contract_version in zip(ids, schema_versions, contract_versions, strict=True):
+            if clip_id not in wanted:
+                continue
             if clip_id in committed:
                 msg = f"Canonical table contains duplicate clip_id {clip_id}"
                 raise ValueError(msg)
-            committed[clip_id] = (int(row["record_schema_version"]), int(row["media_contract_version"]))
+            committed[clip_id] = (int(schema_version), int(contract_version))
     return committed

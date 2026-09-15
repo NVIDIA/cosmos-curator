@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
 
@@ -151,6 +151,16 @@ class RobotActionSplitExecutionConfig(BaseModel):
     model_config = _MODEL_CONFIG
 
     storage_profile: str = Field(default="default", min_length=1)
+    output_storage_profile: str = Field(
+        default="default",
+        min_length=1,
+        description=(
+            "Profile for writing clips, action payloads, and the Lance table. Defaults to "
+            "storage_profile. Set it when output lives in a different object store than the "
+            "input: a profile carries one endpoint_url, so a single profile cannot address "
+            "both (e.g. GCS-hosted source video, S3-hosted clips)."
+        ),
+    )
     cut_cpus: float = Field(default=4.0, gt=0.0, description="CPUs per smart-cut worker.")
     discovery_workers: int = Field(default=4, ge=1, description="Parquet discovery thread pool size.")
     max_segments_per_batch: int = Field(
@@ -190,6 +200,23 @@ class RobotActionSplitExecutionConfig(BaseModel):
             "single-threaded loop, e.g. for debugging."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_output_profile_to_input(cls, data: object) -> object:
+        """Fill an omitted ``output_storage_profile`` from ``storage_profile``.
+
+        Resolved here rather than at each call site so the canonical config always
+        carries a concrete value, and a single-store config keeps working unchanged.
+
+        Absence is the key being missing, not the value being falsy: an explicit
+        ``output_storage_profile: ""`` is a broken override, and rewriting it to the
+        input profile would silently send output to the wrong store instead of
+        failing the ``min_length=1`` check.
+        """
+        if isinstance(data, dict) and "output_storage_profile" not in data:
+            return {**data, "output_storage_profile": data.get("storage_profile", "default")}
+        return data
 
 
 class ResolvedRobotActionSplitConfig(BaseModel):

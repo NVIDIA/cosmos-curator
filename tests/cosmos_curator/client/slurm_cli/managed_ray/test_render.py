@@ -230,3 +230,71 @@ def test_capture_forwarded_environment_silently_skips_unset_logging_variables(
     assert [record.getMessage() for record in caplog.records] == [
         "Environment variable EXPLICIT_MISSING is not set; not forwarding it to the container"
     ]
+
+
+def test_worker_requests_a_slice_when_not_exclusive() -> None:
+    """A non-exclusive worker states cpus/memory instead of claiming the whole node.
+
+    A whole-node request only fits a wholly free node; a slice also packs onto partly used ones,
+    which is what a CPU-only recipe on a shared partition needs.
+    """
+    config = resolve_slurm_ray_config_data(
+        {
+            "schema_version": 1,
+            "job_name": "curator",
+            "worker_lanes": 2,
+            "slurm": {
+                "account": "acct",
+                "head": {"partition": "cpu", "qos": "normal", "time": "1-00:00:00"},
+                "worker": {
+                    "partition": "cpu",
+                    "qos": "cpu-free",
+                    "time": "04:00:00",
+                    "exclusive": False,
+                    "cpus": 24,
+                    "memory": "48G",
+                },
+            },
+            "runtime": {"mount_s3_creds": False},
+            "ray": {"startup_timeout": "5m"},
+        }
+    )
+    run_id = "cc-ray-deadbeef"
+    runtime_paths = resolve_runtime_paths(
+        config,
+        home=Path("/remote/home"),
+        run_id=run_id,
+        state_dir="~/slurm-ray",
+        host_path_exists=lambda _path: True,
+        forwarded_environment_keys=[],
+    )
+
+    worker_script = render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
+
+    assert "#SBATCH --cpus-per-task=24" in worker_script
+    assert "#SBATCH --mem=48G" in worker_script
+    assert "#SBATCH --exclusive" not in worker_script
+    assert "#SBATCH --mem=0" not in worker_script
+    # Since Slurm 22.05 the step does not inherit --cpus-per-task, so it must be restated or the
+    # step lands on a single core while the rest of the allocation idles.
+    assert "--cpus-per-task=24" in worker_script.split("srun")[-1]
+
+
+def test_worker_takes_whole_node_by_default() -> None:
+    """Default behaviour is unchanged: an accelerator lane still claims its node."""
+    config = make_config()
+    run_id = "cc-ray-deadbeef"
+    runtime_paths = resolve_runtime_paths(
+        config,
+        home=Path("/remote/home"),
+        run_id=run_id,
+        state_dir="~/slurm-ray",
+        host_path_exists=lambda _path: True,
+        forwarded_environment_keys=[],
+    )
+
+    worker_script = render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
+
+    assert "#SBATCH --exclusive" in worker_script
+    assert "#SBATCH --mem=0" in worker_script
+    assert "#SBATCH --cpus-per-task" not in worker_script

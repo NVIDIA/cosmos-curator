@@ -14,10 +14,16 @@
 # limitations under the License.
 """Tests for the container and compute-node entrypoints a managed Ray run executes."""
 
+import contextlib
 import json
+import os
 import signal
+import socket
 import subprocess
+import sys
+import time
 from argparse import Namespace
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock, call
 
@@ -26,17 +32,23 @@ import pytest
 from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_runtime import (
     _HEAD_PORT_NAMES,
     _HEAD_PROBE_ATTEMPTS,
+    _WORKER_PORT_NAMES,
+    _WORKER_START_ATTEMPTS,
+    _allocated_cpus,
     _parser,
     _prepare_ray_temp_dir,
     _queued_job_states,
     _ray_head_command,
     _ray_worker_command,
     _reserve_head_ports,
+    _reserve_worker_ports,
     _run_cleanup,
     _run_driver,
     _run_head,
     _run_probe_head,
+    _start_worker_ray,
     _stop_process,
+    _terminate_process_group,
     _wait_for_first_worker,
 )
 from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_state import (
@@ -269,16 +281,51 @@ def test_head_ports_never_collide_with_a_ray_default() -> None:
     _assert_no_pre_selected_port_collision(_ray_head_command("head-node", reserved, None))
 
 
-def test_worker_keeps_fixed_ports_clear_of_ray_defaults() -> None:
-    """A worker owns its node, so its ports stay fixed — but still outside the ranges Ray reserves."""
-    _assert_no_pre_selected_port_collision(_ray_worker_command("head-node:6379", None))
+def test_worker_reserved_ports_clear_ray_defaults() -> None:
+    """A worker reserves free ports, which still must not overlap the ranges Ray reserves."""
+    _assert_no_pre_selected_port_collision(_ray_worker_command("head-node:6379", _reserve_worker_ports(), None))
+
+    # Ports inside Ray's default worker range, which a node with a low ip_local_port_range can hand out.
+    hostile = (10002, 19999, 14897, 18137, 40001, 52365)
+    reserved = dict(zip(_WORKER_PORT_NAMES, hostile, strict=True))
+    _assert_no_pre_selected_port_collision(_ray_worker_command("head-node:6379", reserved, None))
+
+
+def test_one_worker_does_not_reuse_a_port_across_its_own_services() -> None:
+    """Every socket stays open until the last is assigned, so one lane's ports are distinct from each other."""
+    reserved = _reserve_worker_ports()
+
+    assert set(reserved) == set(_WORKER_PORT_NAMES)
+    assert len(set(reserved.values())) == len(_WORKER_PORT_NAMES), "one worker reused a port across services"
+
+
+def test_a_worker_avoids_ports_another_lane_still_holds() -> None:
+    """Lanes that ask for a slice can land on the same node, and a shared port kills the second raylet.
+
+    Asserting two successive reservations are disjoint would be wrong: ``_reserve_worker_ports`` closes its
+    sockets before returning, so the kernel may legitimately hand the same port to the next caller. What must
+    hold is that a lane never selects a port another lane is still bound to -- so the occupied ports are held
+    open here for the duration of the second reservation.
+    """
+    held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in _WORKER_PORT_NAMES]
+    try:
+        for sock in held:
+            sock.bind(("", 0))
+        occupied = {sock.getsockname()[1] for sock in held}
+
+        reserved = _reserve_worker_ports()
+
+        assert not occupied & set(reserved.values()), "a lane selected a port another lane still holds"
+    finally:
+        for sock in held:
+            sock.close()
 
 
 def test_runtime_ray_commands_keep_work_off_the_head() -> None:
     """The runtime advertises no application resources on the CPU head."""
     ports = _reserve_head_ports()
     head = _ray_head_command("head-node", ports, None)
-    worker = _ray_worker_command("head-node:6379", None, io_slots_per_node=9)
+    worker = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, io_slots_per_node=9)
 
     assert head[head.index("--num-cpus") + 1] == "0"
     assert head[head.index("--num-gpus") + 1] == "0"
@@ -577,3 +624,232 @@ def test_process_shutdown_escalates_after_terminate_timeout() -> None:
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
     assert process.wait.call_args_list == [call(timeout=15), call(timeout=5)]
+
+
+def test_sliced_worker_advertises_its_allocation_not_the_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lane that shares a node must tell Ray its slice, not the machine's core count.
+
+    Ray autodetects CPUs from the host, so three 32-core lanes on a 96-core node would each advertise 96 and
+    let the scheduler place three times the work the allocation can actually run.
+    """
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "32")
+
+    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+
+    assert command[command.index("--num-cpus") + 1] == "32"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "not-a-number", "0", "-4"])
+def test_worker_lets_ray_autodetect_when_slurm_gives_no_usable_cpu_count(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Whole-node lanes and non-Slurm runs must keep Ray's autodetection rather than get a bogus --num-cpus."""
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", value)
+
+    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+
+    assert "--num-cpus" not in command
+
+
+def test_worker_lets_ray_autodetect_when_slurm_cpus_per_task_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The variable is absent outside Slurm entirely."""
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+
+    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+
+    assert "--num-cpus" not in command
+
+
+def test_stopping_one_run_leaves_a_co_located_run_alive() -> None:
+    """Teardown must not reach another allocation's Ray processes on the same node.
+
+    `ray stop --force` swept every local Ray process the user owned, so a head finishing killed a co-located
+    run's raylet. Lanes that ask for a slice share nodes routinely, so this is now the normal case rather than
+    an edge one. Two real process groups stand in for the two runs here: each leader spawns a child, and
+    stopping one group must leave the other group's leader and child running.
+    """
+    script = "import time; time.sleep(60)"
+    spawn = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {script!r}]); time.sleep(60)"
+
+    mine = subprocess.Popen([sys.executable, "-c", spawn], start_new_session=True)  # noqa: S603
+    theirs = subprocess.Popen([sys.executable, "-c", spawn], start_new_session=True)  # noqa: S603
+    try:
+        _wait_until(lambda: _process_group_size(theirs) >= 2, "the co-located run to spawn its child")
+        _wait_until(lambda: _process_group_size(mine) >= 2, "this run to spawn its child")
+        survivors_before = _process_group_size(theirs)
+
+        _terminate_process_group(mine)
+
+        assert mine.poll() is not None, "this run's Ray process group outlived teardown"
+        assert theirs.poll() is None, "teardown killed the co-located run's leader"
+        assert _process_group_size(theirs) == survivors_before, "teardown killed the co-located run's children"
+    finally:
+        for process in (mine, theirs):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+
+
+def _process_group_size(process: subprocess.Popen[bytes]) -> int:
+    """Count live processes in the group *process* leads."""
+    try:
+        group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return 0
+    listing = subprocess.run(
+        ["ps", "-e", "-o", "pgid="],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return sum(1 for line in listing.stdout.split() if line.strip() == str(group_id))
+
+
+def _wait_until(condition: Callable[[], bool], description: str, timeout_seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.05)
+    msg = f"Timed out waiting for {description}"
+    raise AssertionError(msg)
+
+
+def _fake_ray_start(script: str) -> list[str]:
+    """Build a stand-in for ``ray start`` that prints *script*'s output and exits with its status."""
+    return [sys.executable, "-c", script]
+
+
+def test_worker_retries_with_fresh_ports_when_a_lane_loses_the_port_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reserving free ports does not close the race; the loser must re-draw rather than die.
+
+    The sockets have to close before Ray can bind them, so two lanes starting together on one node can be
+    handed the same port. The first attempt here fails the way Ray does, and the lane must start again on a
+    different port rather than surfacing "Address already in use" as a dead lane.
+    """
+    attempts: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        attempts.append(command)
+        failing = "import sys; print('Address already in use', file=sys.stdout); sys.exit(1)"
+        script = failing if len(attempts) == 1 else "print('started')"
+        return real_popen(_fake_ray_start(script), **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    returncode = _start_worker_ray("head-node:6379", None, 8)
+
+    assert returncode == 0, "the lane should have started on its second attempt"
+    assert len(attempts) == 2, f"expected one retry, got {len(attempts)} attempt(s)"
+
+    def ports(command: list[str]) -> set[str]:
+        return {command[i + 1] for i, flag in enumerate(command) if flag == "--node-manager-port"}
+
+    assert ports(attempts[0]) != ports(attempts[1]), "the retry reused the port that was already taken"
+
+
+def test_worker_does_not_retry_a_failure_that_is_not_a_port_collision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real misconfiguration must fail fast instead of being retried three times."""
+    attempts: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        attempts.append(command)
+        script = "import sys; print('Unknown flag --nonsense'); sys.exit(2)"
+        return real_popen(_fake_ray_start(script), **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    returncode = _start_worker_ray("head-node:6379", None, 8)
+
+    assert returncode == 2
+    assert len(attempts) == 1, "a non-port failure must not be retried"
+
+
+def test_worker_gives_up_after_bounded_port_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lane that loses every race reports the failure rather than looping forever."""
+    attempts: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        attempts.append(command)
+        script = "import sys; print('Address already in use'); sys.exit(1)"
+        return real_popen(_fake_ray_start(script), **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    returncode = _start_worker_ray("head-node:6379", None, 8)
+
+    assert returncode == 1
+    assert len(attempts) == _WORKER_START_ATTEMPTS
+
+
+def _write_ray_session_log(temp_dir: Path, name: str, text: str) -> Path:
+    """Write *text* to a log under the Ray session directory Ray would create beneath *temp_dir*."""
+    logs = temp_dir / "session_latest" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    path = logs / name
+    path.write_text(text)
+    return path
+
+
+def test_worker_retries_when_only_raylet_err_names_the_bind_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`ray start` hides a lost port behind a generic startup timeout.
+
+    Holding a pre-selected object-manager port open makes the raylet fail to bind, but the command itself
+    only prints a startup timeout -- "Address already in use" reaches `raylet.err` alone. Scanning the
+    command's output was therefore blind to the one failure the retry exists for, and the lane exited after
+    a single attempt.
+    """
+    attempts: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        attempts.append(command)
+        if len(attempts) == 1:
+            written = _write_ray_session_log(tmp_path, "raylet.err", "Failed to bind: Address already in use\n")
+            # Backdate it to what a filesystem with one-second timestamps would stamp on a file written
+            # moments ago: comparing that mtime against a clock read before the attempt calls it stale, which
+            # is exactly how this detection failed in CI while passing on a nanosecond-timestamp filesystem.
+            stale = time.time() - 1.5
+            os.utime(written, (stale, stale))
+            script = "import sys; print('Timed out while waiting for Ray to start'); sys.exit(1)"
+        else:
+            script = "print('started')"
+        return real_popen(_fake_ray_start(script), **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    returncode = _start_worker_ray("head-node:6379", tmp_path, 8)
+
+    assert returncode == 0, "the lane should have retried and started"
+    assert len(attempts) == 2, f"expected one retry, got {len(attempts)} attempt(s)"
+
+
+def test_worker_ignores_a_bind_error_left_by_an_earlier_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stale log must not make an unrelated failure look like a port collision."""
+    stale = _write_ray_session_log(tmp_path, "raylet.err", "Failed to bind: Address already in use\n")
+    os.utime(stale, (time.time() - 3600, time.time() - 3600))
+    attempts: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        attempts.append(command)
+        return real_popen(  # type: ignore[arg-type,return-value]
+            _fake_ray_start("import sys; print('Unknown flag'); sys.exit(2)"), **kwargs
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    returncode = _start_worker_ray("head-node:6379", tmp_path, 8)
+
+    assert returncode == 2
+    assert len(attempts) == 1, "a stale bind error must not trigger a retry"

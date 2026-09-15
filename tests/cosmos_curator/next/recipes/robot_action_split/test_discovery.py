@@ -46,6 +46,7 @@ import pyarrow.parquet as pq
 import pytest
 from loguru import logger
 
+from cosmos_curator.next.recipes.robot_action_split import discovery
 from cosmos_curator.next.recipes.robot_action_split.config import (
     ResolvedRobotActionSplitConfig,
     SpanFilterConfig,
@@ -804,3 +805,74 @@ def test_non_integer_index_column_names_the_file_that_holds_it(tmp_path: Path) -
 
     with pytest.raises(ValueError, match=r"tasks\.parquet: task_index value"):
         _discovered(_make_config(shard.parent))
+
+
+def test_chunk_limit_selects_the_same_chunks_on_every_run(tmp_path: Path) -> None:
+    """``limit`` must truncate a stable set of chunks, not whichever shards finished first.
+
+    Shard prep runs concurrently and results are collected as futures complete, so the order tasks finish in is
+    arbitrary. ``limit`` slices the flattened file list, so collecting in completion order would hand a different
+    subset to every run -- which defeats the point of the flag, since re-running a narrowed repro would examine
+    different data each time.
+    """
+    dataset_root = tmp_path / "dataset"
+    for index in range(6):
+        _write_shard(dataset_root / f"shard_{index:02d}")
+
+    config = ResolvedRobotActionSplitConfig.model_validate(
+        {
+            "schema_version": 1,
+            "kind": "robot-action-split",
+            "input": {"uris": [str(dataset_root)], "source_dataset": "test_dataset", "limit": 2},
+            "output": {
+                "media_root": str(tmp_path / "output"),
+                "lance_uri": str(tmp_path / "output" / "clips.lance"),
+            },
+            # Several workers, so completion order genuinely varies between runs.
+            "execution": {"storage_profile": "default", "discovery_workers": 6},
+            "split": dict(TEST_DURATION_BOUNDS),
+        }
+    )
+
+    selections = [sorted({item.data_parquet_uri for item in _discovered(config)}) for _ in range(3)]
+
+    assert selections[0], "expected the limited run to discover something"
+    assert selections[0] == selections[1] == selections[2], f"chunk_limit selected different chunks: {selections}"
+
+
+def test_warning_capture_survives_a_loguru_reconfigure_inside_the_task() -> None:
+    """A task that wipes loguru's handler table must still finish.
+
+    Any import inside a discovery worker can reconfigure loguru --
+    ``cosmos_xenna.utils.python_log`` calls ``logger.remove()`` at import time -- which drops the capture sink.
+    Tearing down by handler id then raised ValueError from a ``finally`` and killed the whole discovery run.
+    """
+    with discovery._captured_warnings() as captured:
+        logger.warning("kept")
+        logger.remove()
+        logger.warning("lost after the wipe, but must not raise")
+
+    assert captured == ["kept"]
+
+
+def test_listing_a_root_and_listing_its_shards_give_the_same_clip_ids(tmp_path: Path) -> None:
+    """Input shape must not change identities.
+
+    ``source_id`` flows into ``span_group_id`` and then ``clip_id``. Keying it on the URI the caller listed
+    gave every shard under a root one id, and a distinct id per shard when the same shards were listed
+    individually -- so switching input shape would make reconciliation miss every committed clip and append a
+    second generation of them to an existing table.
+    """
+    root = tmp_path / "dataset"
+    shards = [_write_shard(root / "shard_00"), _write_shard(root / "shard_01")]
+
+    config_by_root = _make_config(root)
+    raw = config_by_root.model_dump()
+    raw["input"]["uris"] = [str(shard) for shard in shards]
+    config_by_shard = ResolvedRobotActionSplitConfig.model_validate(raw)
+
+    by_root = sorted(item.clip_id for item in _discovered(config_by_root))
+    by_shard = sorted(item.clip_id for item in _discovered(config_by_shard))
+
+    assert by_root, "expected the root listing to discover spans"
+    assert by_root == by_shard

@@ -123,10 +123,19 @@ def test_explicit_null_account_uses_slurm_default(monkeypatch: pytest.MonkeyPatc
             "schema_version": 1,
             "slurm": {"worker": {"constraint": "h100"}},
         },
-        # A worker takes its node whole, so CPU and memory are head-only settings.
+        # A worker may state a slice, but the values still have to be sane.
         {
             "schema_version": 1,
-            "slurm": {"worker": {"cpus": 16}},
+            "slurm": {"worker": {"cpus": 0}},
+        },
+        {
+            "schema_version": 1,
+            "slurm": {"worker": {"memory": "64 GB"}},
+        },
+        # "0" is how sbatch spells "all of the node"; exclusive=true expresses that instead.
+        {
+            "schema_version": 1,
+            "slurm": {"worker": {"memory": "0"}},
         },
         {
             "schema_version": 1,

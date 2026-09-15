@@ -1,0 +1,156 @@
+schema_version: 1
+kind: robot-action-split
+input:
+  # Batch 1: shard_00 through shard_99 (100 shards, ~5000h of source video).
+  # Listed as individual shard URIs so discovery parallelizes across them.
+  uris:
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_00/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_01/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_02/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_03/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_04/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_05/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_06/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_07/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_08/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_09/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_10/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_11/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_12/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_13/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_14/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_15/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_16/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_17/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_18/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_19/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_20/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_21/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_22/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_23/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_24/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_25/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_26/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_27/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_28/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_29/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_30/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_31/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_32/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_33/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_34/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_35/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_36/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_37/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_38/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_39/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_40/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_41/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_42/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_43/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_44/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_45/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_46/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_47/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_48/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_49/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_50/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_51/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_52/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_53/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_54/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_55/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_56/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_57/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_58/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_59/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_60/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_61/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_62/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_63/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_64/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_65/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_66/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_67/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_68/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_69/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_70/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_71/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_72/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_73/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_74/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_75/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_76/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_77/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_78/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_79/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_80/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_81/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_82/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_83/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_84/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_85/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_86/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_87/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_88/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_89/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_90/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_91/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_92/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_93/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_94/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_95/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_96/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_97/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_98/
+    - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_99/
+  source_dataset: 20260509_46000h_everyday_mono_no_wrist_lerobot
+split:
+  min_duration_s: 4.0
+  max_duration_s: 20.0
+output:
+  # S3, not cluster-local Lustre: Lustre is per-cluster, so output written there
+  # is stranded when the run moves clusters. S3 keeps the Lance table and clips
+  # reachable from anywhere and survives losing a cluster entirely.
+  media_root: s3://cosmos3-action-data/mecka/robot_clips_batch01/
+  lance_uri: s3://cosmos3-action-data/mecka/robot_clips_batch01/lance/clips.lance
+  action_format: bin
+execution:
+  # Input is GCS, output is AWS S3. A profile carries exactly one endpoint_url,
+  # so these cannot be the same profile.
+  storage_profile: team-gcs-cosmos
+  output_storage_profile: egocentric-writer
+  discovery_workers: 48
+  # Measured, not guessed: 11 concurrent tasks used ~0.34 cores and ~3.0G RSS
+  # each (they are I/O-bound on GCS reads and S3 writes; the stream-copy path
+  # runs no ffmpeg threads). cut_cpus is only a Ray reservation, so 8 stranded
+  # ~23x the cores actually used.
+  #
+  # 3 runs 10 cuts per 32-core lane, needing 30G of the lane's 44G. On the
+  # cpu_short partition that is 29 lanes x 10 = ~290 concurrent cuts, which
+  # measured ~2,400 clips/min; the same recipe on the `cpu` partition (capped at
+  # cpu=192 per user, so 5 lanes) managed ~550. Dropping to 2 would buy more cuts
+  # per lane only by taking memory the head turned out to need.
+  cut_cpus: 3
+  ray_data: true
+  # Chunk MP4s stage here before cutting. A chunk is ~4h of video (~25G), and
+  # concurrent cuts land several lanes per node, so node-local /tmp ran out
+  # instantly at only 40 cuts: 1172/1172 tasks failed with "No space left on
+  # device". /config is the fs11 workspace mount (250T quota) rather than the
+  # 10G-capped home, and it carried ~290 concurrent cuts without trouble.
+  tmp_dir: /config/tmp
+  # Each commit writes exactly one Lance fragment, and every commit re-checks its
+  # ids against the fragments already committed to prove idempotence -- so commit
+  # cost grows with fragment count and the total is quadratic in commit count.
+  # Measured: a 250-id presence scan takes 70ms over 60 fragments and 1008ms over
+  # 2400, and live commits went 0.9s -> 1.24s over just 48 commits. At 250 clips
+  # per commit batch 1 needs 4860 commits and ends up spending more time
+  # committing than cutting.
+  #
+  # 2500 (10x250) cuts that to ~486 commits. The tradeoff is a driver-recovery
+  # window, not a worker one: this buffer lives on the driver, so a preempted lane
+  # replays only its own unfinished batch, while the clips it already handed back
+  # are recut when the HEAD dies. At the observed 480 clips/min that is ~5 min of
+  # recutting per head loss -- affordable on a 24h wall, and it was not on
+  # oci-aga's 4h windows, which is why that config keeps 250.
+  clips_per_publish_batch: 2500

@@ -4,9 +4,12 @@
 """Tests for driver-side reconciliation of discovered spans with committed clips."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import lance
 import pytest
 
+from cosmos_curator.next.recipes.robot_action_split import recovery
 from cosmos_curator.next.recipes.robot_action_split.contracts import (
     CLIP_RECORD_SCHEMA_VERSION,
     MEDIA_CONTRACT_VERSION,
@@ -286,3 +289,33 @@ def test_duplicate_committed_clip_id_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate clip_id"):
         reconcile_batches([batch], dataset=dataset)
+
+
+def test_reconciliation_does_not_push_discovered_ids_into_a_filter(tmp_path: Path) -> None:
+    """The scan must be bounded by the table, not by the discovered id list.
+
+    Pushing ``clip_id IN (...)`` sent one 64-char sha256 literal per discovered clip to Lance's SQL
+    parser. At batch-1 scale (1.2M spans) that filter is ~81MB of SQL and the parser grew past 126GB
+    RSS before being killed, so a resumed run could never reconcile -- the failure only appears once
+    the run is large enough to matter.
+    """
+    uri = str(tmp_path / "clips.lance")
+    committed = _item("committed-clip")
+    _commit(uri, committed)
+
+    dataset = lance.dataset(uri)
+    scanner_calls: list[dict] = []
+    original_scanner = dataset.scanner
+
+    def recording_scanner(**kwargs: object) -> object:
+        scanner_calls.append(kwargs)
+        return original_scanner(**kwargs)
+
+    monkeypatched = SimpleNamespace(scanner=recording_scanner, count_rows=dataset.count_rows)
+    scanned = recovery._scan_committed(("committed-clip", "absent-clip"), dataset=monkeypatched)
+
+    assert scanned.keys() == {"committed-clip"}
+    assert scanner_calls, "expected _scan_committed to scan the table"
+    assert all("filter" not in call for call in scanner_calls), (
+        f"discovered ids must not be pushed into a filter, got: {scanner_calls}"
+    )

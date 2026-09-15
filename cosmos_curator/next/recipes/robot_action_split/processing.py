@@ -239,6 +239,7 @@ def process_batch(  # noqa: C901, PLR0912, PLR0915
     media_root = config.output.media_root
     action_format = config.output.action_format
     storage_profile = config.execution.storage_profile
+    output_storage_profile = config.execution.output_storage_profile
     source_dataset = config.input.source_dataset
     bitrate = config.output.video_bitrate
     tmp_dir = config.execution.tmp_dir or None
@@ -339,7 +340,7 @@ def process_batch(  # noqa: C901, PLR0912, PLR0915
                 continue
 
             try:
-                write_media(clip_uri, Path(local_clip).read_bytes(), storage_profile=storage_profile)
+                write_media(clip_uri, Path(local_clip).read_bytes(), storage_profile=output_storage_profile)
             except Exception as exc:  # noqa: BLE001
                 outcomes.append(
                     {
@@ -381,7 +382,7 @@ def process_batch(  # noqa: C901, PLR0912, PLR0915
                     if action_format == "bin"
                     else _serialize_action_pickle(action_data)
                 )
-                write_media(action_uri, action_bytes, storage_profile=storage_profile)
+                write_media(action_uri, action_bytes, storage_profile=output_storage_profile)
             except Exception as exc:  # noqa: BLE001
                 outcomes.append(
                     {
@@ -398,7 +399,7 @@ def process_batch(  # noqa: C901, PLR0912, PLR0915
 
             try:
                 sidecar_data = _build_sidecar_bytes(item, artifact_uri(clip_uri), artifact_uri(action_uri))
-                write_media(sidecar_uri, sidecar_data, storage_profile=storage_profile)
+                write_media(sidecar_uri, sidecar_data, storage_profile=output_storage_profile)
             except Exception as exc:  # noqa: BLE001
                 outcomes.append(
                     {

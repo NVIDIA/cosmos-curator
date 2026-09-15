@@ -158,7 +158,7 @@ def _commit_clip_rows(rows: list[dict[str, Any]], *, config: ResolvedRobotAction
         media_contract_version=MEDIA_CONTRACT_VERSION,
     )
     candidate = write_clip_fragment(
-        table, uri=config.output.lance_uri, storage_profile=config.execution.storage_profile
+        table, uri=config.output.lance_uri, storage_profile=config.execution.output_storage_profile
     )
     if candidate is None:
         # Not just an internal invariant: any caller that hands this an all-failure
@@ -168,7 +168,7 @@ def _commit_clip_rows(rows: list[dict[str, Any]], *, config: ResolvedRobotAction
     return append_clip_fragment(
         candidate,
         uri=config.output.lance_uri,
-        storage_profile=config.execution.storage_profile,
+        storage_profile=config.execution.output_storage_profile,
         attempts=config.execution.storage_attempts,
     )
 
@@ -228,7 +228,7 @@ def run(
 
     clip_dataset: lance.LanceDataset = open_or_create_clip_table(
         uri=resolved.output.lance_uri,
-        storage_profile=resolved.execution.storage_profile,
+        storage_profile=resolved.execution.output_storage_profile,
     )
 
     if not batches:
@@ -278,7 +278,7 @@ def run(
             write_media,
             errors_uri,
             json.dumps(error_records(failed), indent=2).encode("utf-8"),
-            storage_profile=resolved.execution.storage_profile,
+            storage_profile=resolved.execution.output_storage_profile,
         ),
         max_attempts=resolved.execution.storage_attempts,
         backoff_factor=_ERROR_REPORT_BACKOFF_FACTOR,
