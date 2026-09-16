@@ -237,6 +237,7 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
         settings.annotation_version,
         metadata_input_format=settings.metadata_input_format,
         verbose=settings.common.verbose,
+        allow_unsafe_clip_location=settings.allow_unsafe_clip_location,
     )
     logger.info(f"Found {len(samples)} samples under input path {settings.input_clip_path}.")
 

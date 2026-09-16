@@ -14,6 +14,8 @@
 # limitations under the License.
 """Tests for the caption judge Ray Data actor."""
 
+from pathlib import Path
+
 import pyarrow as pa
 import pytest
 
@@ -108,6 +110,65 @@ def test_extract_window_mp4_propagates_windowing_util_errors(monkeypatch: pytest
 
     with pytest.raises(ValueError, match="No decoded frames"):
         extract_window_mp4(b"clip", start_ns=1_000_000_000, end_ns=1_500_000_000)
+
+
+def test_cached_clip_bytes_reads_location_inside_input_root(tmp_path: Path) -> None:
+    """A clip_location nested under input_root is read normally."""
+    root = tmp_path / "candidate"
+    clip = root / "clips" / "a.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"data")
+
+    data = judge_module._cached_clip_bytes(str(clip), {}, storage_clients={}, input_root=str(root))
+
+    assert data == b"data"
+
+
+def test_cached_clip_bytes_rejects_location_outside_input_root(tmp_path: Path) -> None:
+    """A tampered clip_location outside input_root is rejected before it is read."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    outside = tmp_path / "outside" / "secret.mp4"
+    outside.parent.mkdir()
+    outside.write_bytes(b"secret")
+
+    with pytest.raises(ValueError, match="outside"):
+        judge_module._cached_clip_bytes(str(outside), {}, storage_clients={}, input_root=str(root))
+
+
+def test_actor_calls_cached_clip_bytes_with_candidate_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actor validates clip_location against the config's candidate root."""
+
+    class FakeJudge:
+        def __init__(self, _config: CaptionJudgePipelineConfig) -> None:
+            pass
+
+        def setup(self) -> None:
+            pass
+
+        def judge(self, *, prompt: str, video_bytes: bytes) -> str:
+            del prompt, video_bytes
+            return '{"winner":"tie","confidence":0.5,"reason":"same","a_errors":[],"b_errors":[]}'
+
+    captured: dict[str, object] = {}
+
+    def fake_cached_clip_bytes(
+        _clip_location: str,
+        _clip_cache: dict[str, bytes],
+        *,
+        input_root: str,
+        **_kwargs: object,
+    ) -> bytes:
+        captured["input_root"] = input_root
+        return b"clip"
+
+    monkeypatch.setattr(judge_module, "_OpenAIJudgeClient", FakeJudge)
+    monkeypatch.setattr(judge_module, "_cached_clip_bytes", fake_cached_clip_bytes)
+    monkeypatch.setattr(judge_module, "extract_window_mp4", lambda *_args, **_kwargs: b"window")
+
+    CaptionJudgeActor(config=_config())(_job_table())
+
+    assert captured["input_root"] == "output-b"
 
 
 def test_actor_emits_regression_when_judge_prefers_baseline(monkeypatch: pytest.MonkeyPatch) -> None:

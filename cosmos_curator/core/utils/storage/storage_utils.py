@@ -382,6 +382,51 @@ def is_path_nested(path1: str, path2: str) -> bool:
     return _path1.startswith(_path2) or _path2.startswith(_path1)
 
 
+def resolve_clip_location(clip_location: str, input_root: str) -> StoragePrefix | pathlib.Path:
+    """Resolve ``clip_location`` and require it to remain within ``input_root``.
+
+    Local relative locations resolve against the process working directory, matching the format
+    emitted when a clip writer receives a relative output path. Remote locations must use the same
+    storage scheme and remain under the configured prefix.
+
+    Args:
+        clip_location: The untrusted clip location string from clip metadata.
+        input_root: The configured, trusted input dataset root.
+
+    Returns:
+        The resolved location as a StoragePrefix or Path within input_root.
+
+    Raises:
+        ValueError: If clip_location does not resolve inside input_root.
+
+    """
+    if is_remote_path(clip_location) != is_remote_path(input_root) or (
+        is_remote_path(input_root)
+        and (
+            is_s3path(input_root) != is_s3path(clip_location)
+            or is_azure_path(input_root) != is_azure_path(clip_location)
+        )
+    ):
+        error_msg = f"clip_location {clip_location!r} scheme does not match input root {input_root!r}"
+        raise ValueError(error_msg)
+
+    if not is_remote_path(input_root):
+        root = _local_path_from_uri(input_root).resolve()
+        candidate = _local_path_from_uri(clip_location).resolve()
+        if not candidate.is_relative_to(root):
+            error_msg = f"clip_location {clip_location!r} resolves outside input root {input_root!r}"
+            raise ValueError(error_msg)
+        return candidate
+
+    resolved = get_full_path(clip_location)
+    root_str = str(get_full_path(input_root)).rstrip("/")
+    candidate_str = str(resolved)
+    if candidate_str != root_str and not candidate_str.startswith(root_str + "/"):
+        error_msg = f"clip_location {clip_location!r} resolves outside input root {input_root!r}"
+        raise ValueError(error_msg)
+    return resolved
+
+
 def get_full_path(path: str | StoragePrefix | pathlib.Path, *args: str) -> StoragePrefix | pathlib.Path:
     """Construct a full path from a base path and additional components.
 

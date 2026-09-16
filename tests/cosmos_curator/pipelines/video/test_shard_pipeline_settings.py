@@ -374,6 +374,7 @@ def test_shard_settings_rejects_empty_input_clip_path() -> None:
         target_tar_size_mb=500,
         min_clips_per_tar=1,
         drop_small_shards=False,
+        allow_unsafe_clip_location=False,
         input_semantic_dedup_path=None,
     )
     with pytest.raises(ValueError, match="input_clip_path"):

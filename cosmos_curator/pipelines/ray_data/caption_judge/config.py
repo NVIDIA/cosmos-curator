@@ -82,6 +82,11 @@ class CaptionJudgeExecutionConfig(BaseModel):
 
     progress: bool = True
     max_workers_per_node: int = Field(default=DEFAULT_MAX_WORKERS_PER_NODE, ge=1)
+    allow_unsafe_clip_location: bool = False
+    """Skip candidate-root containment checks for clip locations.
+
+    Use only with trusted datasets that intentionally reference media outside the candidate root.
+    """
 
 
 class CaptionJudgePipelineConfig(BaseModel):

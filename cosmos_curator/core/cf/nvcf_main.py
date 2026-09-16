@@ -103,19 +103,29 @@ _NVCF_REJECTED_ARG_NAMES = frozenset(
     },
 )
 
+# Compatibility options meant only for trusted local CLI invocations are kept separate from
+# _NVCF_REJECTED_ARG_NAMES because that set tracks stage_replay.py's args exactly (see
+# test_rejected_debug_pipeline_args_cover_every_stage_replay_flag).
+_NVCF_REJECTED_SECURITY_ARG_NAMES = frozenset(
+    {
+        # Skips input-dataset containment checks for clip locations.
+        "allow_unsafe_clip_location",
+    },
+)
+
 
 def _validate_no_debug_pipeline_args(args: dict[str, Any]) -> None:
-    """Reject NVCF invoke args that are only meant for trusted CLI debugging.
+    """Reject NVCF invoke args that are only meant for trusted CLI use.
 
     Args:
         args: The raw ``args`` mapping from the invoke JSON payload, before it is
             spread into an ``argparse.Namespace``.
 
     Raises:
-        ValueError: If any rejected debug/replay arg name is present.
+        ValueError: If any rejected debug/replay or security-escape-hatch arg name is present.
 
     """
-    rejected = _NVCF_REJECTED_ARG_NAMES & args.keys()
+    rejected = (_NVCF_REJECTED_ARG_NAMES | _NVCF_REJECTED_SECURITY_ARG_NAMES) & args.keys()
     if rejected:
         error_msg = f"Unsupported NVCF invoke args: {', '.join(sorted(rejected))}"
         raise ValueError(error_msg)

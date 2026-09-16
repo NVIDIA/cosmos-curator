@@ -143,7 +143,21 @@ class ShardPipelineSettings:
             action=argparse.BooleanOptionalAction,
         ),
     )
-    # Optional CLI arg must be last: attrs forbids mandatory fields after any defaulted field.
+    allow_unsafe_clip_location: bool = attrs.field(
+        validator=validators.instance_of(bool),
+        metadata=cli(
+            help=(
+                "Skip validation that stored clip locations resolve inside --input-clip-path "
+                "(default: False). Use only with trusted datasets that intentionally reference "
+                "clips outside the input root."
+            ),
+            default=False,
+            arg_type=None,
+            action=argparse.BooleanOptionalAction,
+        ),
+    )
+    # The one field with an attrs-level default (vs. a cli()-metadata-only default like the bool
+    # flags above) must be last: attrs forbids mandatory fields after any attrs-level-defaulted one.
     input_semantic_dedup_path: str | None = attrs.field(
         default=None,
         validator=validators.optional(validators.instance_of(str)),

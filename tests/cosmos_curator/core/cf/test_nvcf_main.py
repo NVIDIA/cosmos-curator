@@ -872,6 +872,43 @@ class TestFastAPIEndpoints:
 
         assert all_dests == nvcf_main._NVCF_REJECTED_ARG_NAMES
 
+    def test_run_pipeline_rejects_allow_unsafe_clip_location(
+        self,
+        test_client: TestClient,
+        mock_request_id: str,
+    ) -> None:
+        """Reject the trusted-CLI-only clip-location compatibility option for remote invocations."""
+        fake_manager = MagicMock()
+        fake_manager.Value.return_value = SimpleNamespace(value=False)
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_thread = MagicMock()
+        fake_stop_event = threading.Event()
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch("cosmos_curator.core.cf.nvcf_main._setup_request", return_value=(fake_thread, fake_stop_event)),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline") as mock_run,
+            patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs") as mock_upload,
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"NVCF-REQID": mock_request_id},
+                json={
+                    "pipeline": "shard",
+                    "args": {
+                        "input_clip_path": "s3://bucket/in",
+                        "output_dataset_path": "s3://bucket/out",
+                        "allow_unsafe_clip_location": True,
+                    },
+                },
+            )
+
+            assert response.status_code == HTTP_BAD_REQUEST
+            assert "allow_unsafe_clip_location" in response.json()["error"]
+            mock_run.assert_not_called()
+            mock_upload.assert_not_called()
+
     def test_run_pipeline_pexec_ray_job_failure_is_logged_once_without_traceback(
         self, test_client: TestClient, mock_request_id: str
     ) -> None:

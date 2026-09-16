@@ -295,6 +295,125 @@ def test_is_path_nested_detects_relationships(tmp_path: Path) -> None:
     assert not storage_utils.is_path_nested(base, other)
 
 
+@pytest.mark.parametrize(
+    ("clip_location", "input_root", "expected", "error_match"),
+    [
+        pytest.param("{root}/clips/abc.mp4", "{root}", "{root}/clips/abc.mp4", None, id="local-nested"),
+        pytest.param("clips/abc.mp4", "{root}", None, "outside", id="local-relative-not-cwd-relative-is-rejected"),
+        pytest.param("{root}/../outside/secret.mp4", "{root}", None, "outside", id="local-traversal"),
+        pytest.param("{tmp}/var-secrets/secrets.json", "{root}", None, "outside", id="local-absolute-sibling"),
+        pytest.param(_remote_path("input", "clips", "a.mp4"), "{root}", None, "scheme", id="remote-clip-local-root"),
+        pytest.param("{root}/clips/a.mp4", _remote_path("input"), None, "scheme", id="local-clip-remote-root"),
+        pytest.param(
+            _remote_path("input", "clips", "abc.mp4"),
+            _remote_path("input"),
+            _remote_path("input", "clips", "abc.mp4"),
+            None,
+            id="remote-nested",
+        ),
+        pytest.param(
+            _remote_path("input-evil", "clips", "a.mp4"),
+            _remote_path("input"),
+            None,
+            "outside",
+            id="remote-sibling-prefix-string-startswith-is-not-containment",
+        ),
+        pytest.param(
+            "s3://other-bucket/input/clips/a.mp4",
+            _remote_path("input"),
+            None,
+            "outside",
+            id="remote-different-bucket",
+        ),
+        pytest.param(
+            "az://test-container/input/clips/a.mp4",
+            _remote_path("input"),
+            None,
+            "scheme",
+            id="remote-azure-clip-s3-root",
+        ),
+        pytest.param(
+            _remote_path("input", "clips", "a.mp4"),
+            "az://test-container/input",
+            None,
+            "scheme",
+            id="remote-s3-clip-azure-root",
+        ),
+    ],
+)
+def test_resolve_clip_location(
+    tmp_path: Path,
+    clip_location: str,
+    input_root: str,
+    expected: str | None,
+    error_match: str | None,
+) -> None:
+    """clip_location must resolve inside input_root: same scheme, no escape, no sibling-prefix confusion."""
+    root = tmp_path / "input"
+    fmt = {"root": root, "tmp": tmp_path}
+    clip_location = clip_location.format(**fmt)
+    input_root = input_root.format(**fmt)
+
+    if error_match is not None:
+        with pytest.raises(ValueError, match=error_match):
+            storage_utils.resolve_clip_location(clip_location, input_root)
+        return
+
+    result = storage_utils.resolve_clip_location(clip_location, input_root)
+    assert str(result) == expected.format(**fmt)
+
+
+@pytest.mark.parametrize(
+    ("clip_format", "root_format"),
+    [
+        pytest.param("uri", "uri", id="uri-clip-uri-root"),
+        pytest.param("uri", "path", id="uri-clip-path-root"),
+        pytest.param("path", "uri", id="path-clip-uri-root"),
+    ],
+)
+def test_resolve_clip_location_accepts_local_file_uris(
+    tmp_path: Path,
+    clip_format: str,
+    root_format: str,
+) -> None:
+    """Resolve file URIs consistently with bare local paths."""
+    root = tmp_path / "input root"
+    clip = root / "clips" / "clip name.mp4"
+    clip_location = clip.as_uri() if clip_format == "uri" else str(clip)
+    input_root = root.as_uri() if root_format == "uri" else str(root)
+
+    result = storage_utils.resolve_clip_location(clip_location, input_root)
+
+    assert result == clip.resolve()
+
+
+def test_resolve_clip_location_relative_path_is_always_cwd_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve relative clip locations against the process working directory."""
+    root = tmp_path / "input"
+    clip = root / "clips" / "abc.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"data")
+    monkeypatch.chdir(root)  # cwd == root: "clips/abc.mp4" resolves to the real file
+
+    result = storage_utils.resolve_clip_location("clips/abc.mp4", str(root))
+
+    assert result == clip.resolve()
+
+
+def test_resolve_clip_location_relative_path_outside_cwd_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative clip_location that doesn't land under input_root via cwd is rejected, not joined."""
+    root = tmp_path / "input"
+    root.mkdir()
+    monkeypatch.chdir(tmp_path)  # cwd != root; "clips/abc.mp4" would resolve outside root
+
+    with pytest.raises(ValueError, match="outside"):
+        storage_utils.resolve_clip_location("clips/abc.mp4", str(root))
+
+
 def test_get_full_path_appends_components(tmp_path: Path) -> None:
     """Build full paths for both local and remote prefixes."""
     local_base = tmp_path / "data"

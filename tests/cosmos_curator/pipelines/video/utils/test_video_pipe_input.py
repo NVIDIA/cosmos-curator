@@ -14,6 +14,7 @@
 
 import contextlib
 import json
+import uuid
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from cosmos_curator.pipelines.video.read_write.clip_metadata_lance_schema import
     CLIP_METADATA_LANCE_SCHEMA,
     build_clip_metadata_lance_table,
 )
+from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.utils.video_pipe_input import (
     _multi_cam_session_to_split_task,
     _order_video_paths,
@@ -446,6 +448,159 @@ def test_extract_shard_tasks_auto_falls_back_to_json_metadata(tmp_path: Path) ->
     assert len(samples) == 1
     assert samples[0].uuid == "clip-1"
     assert samples[0].clip_metadata == metadata
+
+
+def _write_clip_metadata(input_root: Path, metadata: dict[str, Any], *, metadata_input_format: str) -> None:
+    """Write one clip's metadata as either a Lance dataset or a per-clip JSON file.
+
+    ``metadata_input_format`` here is always the concrete format being written (``"lance"`` or
+    ``"auto"``, which exercises the JSON fallback path), never ``"json"`` directly -- both
+    call sites below also pass the same value straight through to ``extract_shard_tasks``.
+    """
+    if metadata_input_format == "lance":
+        table = build_clip_metadata_lance_table([metadata], video_uuid="video-1", clip_chunk_index=0)
+        lance.write_dataset(
+            table,
+            input_root / "lance" / "v0",
+            schema=CLIP_METADATA_LANCE_SCHEMA,
+            mode="overwrite",
+            data_storage_version=CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+        )
+    else:
+        metas_root = input_root / "metas" / "v0"
+        metas_root.mkdir(parents=True)
+        (input_root / "summary.json").write_text(json.dumps({"video": {"clips": [metadata["span_uuid"]]}}))
+        (metas_root / f"{metadata['span_uuid']}.json").write_text(json.dumps(metadata))
+
+
+def _clip_writer_stage(output_path: str) -> ClipWriterStage:
+    return ClipWriterStage(
+        output_path=output_path,
+        input_path="input",
+        output_s3_profile_name="default",
+        upload_clips=True,
+        upload_clip_info_in_chunks=False,
+        upload_clip_info_in_lance=False,
+        upload_cds_parquet=False,
+        dry_run=False,
+        generate_embeddings=False,
+        embedding_algorithm="cosmos_embed1",
+        embedding_model_version="v1",
+        generate_previews=False,
+    )
+
+
+def test_extract_shard_tasks_reads_clip_writer_relative_output_path_clip_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-trip the relative clip location emitted by ``ClipWriterStage``."""
+    monkeypatch.chdir(tmp_path)
+    output_path = "split_output"
+    input_root = tmp_path / output_path
+    clip_uuid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
+
+    writer = _clip_writer_stage(output_path)
+    clip_location = str(writer._get_clip_uri(clip_uuid, writer.get_output_path_clips(writer._output_path), "mp4"))
+    assert clip_location == f"{output_path}/clips/{clip_uuid}.mp4"
+
+    clip_path = tmp_path / clip_location
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_bytes(b"clip")
+
+    metadata = _legacy_clip_metadata(clip_path, clip_uuid=str(clip_uuid))
+    metadata["clip_location"] = clip_location
+    output_root = tmp_path / "dataset" / "v0"
+    _write_clip_metadata(input_root, metadata, metadata_input_format="auto")
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="auto",
+    )
+
+    assert len(samples) == 1
+    assert samples[0].clip_location == clip_path.resolve()
+
+
+@pytest.mark.parametrize("metadata_input_format", ["lance", "auto"])
+def test_extract_shard_tasks_skips_clip_outside_input_root(tmp_path: Path, metadata_input_format: str) -> None:
+    """A tampered clip_location outside the input root is skipped, not read, for both metadata formats."""
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    input_root.mkdir()
+    outside_clip = tmp_path / "outside" / "secret.mp4"
+    outside_clip.parent.mkdir()
+    outside_clip.write_bytes(b"secret")
+    metadata = _legacy_clip_metadata(outside_clip)
+    _write_clip_metadata(input_root, metadata, metadata_input_format=metadata_input_format)
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format=metadata_input_format,
+    )
+
+    assert samples == []
+
+
+def test_extract_shard_tasks_allow_unsafe_clip_location_restores_legacy_behavior(tmp_path: Path) -> None:
+    """The opt-in escape hatch restores the pre-fix behavior of trusting clip_location as-is."""
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    metas_root = input_root / "metas" / "v0"
+    metas_root.mkdir(parents=True)
+    outside_clip = tmp_path / "outside" / "secret.mp4"
+    outside_clip.parent.mkdir()
+    outside_clip.write_bytes(b"secret")
+    metadata = _legacy_clip_metadata(outside_clip)
+    (input_root / "summary.json").write_text(json.dumps({"video": {"clips": ["clip-1"]}}))
+    (metas_root / "clip-1.json").write_text(json.dumps(metadata))
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="auto",
+        allow_unsafe_clip_location=True,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].clip_location == outside_clip
+
+
+def test_extract_shard_tasks_allow_unsafe_clip_location_keeps_relative_path_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep relative locations unresolved when compatibility mode is enabled."""
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    metas_root = input_root / "metas" / "v0"
+    metas_root.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    metadata = _legacy_clip_metadata(Path("clips/other.mp4"))
+    (input_root / "summary.json").write_text(json.dumps({"video": {"clips": ["clip-1"]}}))
+    (metas_root / "clip-1.json").write_text(json.dumps(metadata))
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="auto",
+        allow_unsafe_clip_location=True,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].clip_location == Path("clips/other.mp4")
 
 
 def test_extract_multi_cam_split_tasks_only_uuid_dirs_are_sessions(tmp_path: Path) -> None:

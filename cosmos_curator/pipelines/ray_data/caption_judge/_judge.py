@@ -87,6 +87,8 @@ class CaptionJudgeActor:
                     row["clip_location"],
                     clip_cache,
                     storage_clients=self._storage_clients,
+                    input_root=self._config.candidate,
+                    allow_unsafe_clip_location=self._config.execution.allow_unsafe_clip_location,
                 )
                 window_mp4 = extract_window_mp4(
                     clip_bytes,
@@ -159,13 +161,20 @@ def _cached_clip_bytes(
     clip_cache: dict[str, bytes],
     *,
     storage_clients: dict[str, StorageClient | None],
+    input_root: str,
+    allow_unsafe_clip_location: bool = False,
 ) -> bytes:
     cached = clip_cache.get(clip_location)
     if cached is not None:
         return cached
-    if clip_location not in storage_clients:
-        storage_clients[clip_location] = storage_utils.get_storage_client(clip_location)
-    data = storage_utils.read_bytes(clip_location, storage_clients[clip_location])
+    resolved_location = (
+        clip_location
+        if allow_unsafe_clip_location
+        else str(storage_utils.resolve_clip_location(clip_location, input_root))
+    )
+    if resolved_location not in storage_clients:
+        storage_clients[resolved_location] = storage_utils.get_storage_client(resolved_location)
+    data = storage_utils.read_bytes(resolved_location, storage_clients[resolved_location])
     clip_cache[clip_location] = data
     return data
 

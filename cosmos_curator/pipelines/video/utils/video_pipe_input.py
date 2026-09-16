@@ -38,6 +38,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     path_exists,
     read_bytes,
     read_json_file,
+    resolve_clip_location,
 )
 from cosmos_curator.pipelines.video.utils.data_model import ClipSample, SplitPipeTask, Video
 
@@ -418,14 +419,36 @@ def _get_clip_metadata_paths_from_summary(
         return sorted(clip_metadata_paths, key=str)
 
 
+def _resolve_clip_sample_location(
+    clip_location: str,
+    input_path: str,
+    *,
+    allow_unsafe_clip_location: bool,
+) -> StoragePrefix | pathlib.Path:
+    """Resolve a metadata clip location, containing it to ``input_path`` by default.
+
+    Trusted legacy datasets can opt out when their clips intentionally live outside the input root.
+    """
+    if allow_unsafe_clip_location:
+        return get_full_path(clip_location)
+    return resolve_clip_location(clip_location, input_path)
+
+
 def _worker_read_clip_metadata(
     clip_metadata_path: StoragePrefix | pathlib.Path,
     client: StorageClient | None,
+    input_path: str,
     *,
     verbose: bool = False,
+    allow_unsafe_clip_location: bool = False,
 ) -> ClipSample | None:
     try:
         clip_metadata = read_json_file(clip_metadata_path, client)
+        clip_location = _resolve_clip_sample_location(
+            clip_metadata["clip_location"],
+            input_path,
+            allow_unsafe_clip_location=allow_unsafe_clip_location,
+        )
     except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to read clip metadata from {clip_metadata_path}: {e}")
         return None
@@ -438,7 +461,7 @@ def _worker_read_clip_metadata(
                 num_frames=clip_metadata["num_frames"],
                 framerate=clip_metadata["framerate"],
                 num_bytes=clip_metadata["num_bytes"],
-                clip_location=get_full_path(clip_metadata["clip_location"]),
+                clip_location=clip_location,
                 clip_metadata=clip_metadata,
             )
         # the clip is marked invalid by the split-annotate pipeline
@@ -458,6 +481,7 @@ def _extract_shard_tasks_from_lance(
     version: str,
     *,
     verbose: bool = False,
+    allow_unsafe_clip_location: bool = False,
 ) -> list[ClipSample]:
     lance_uri = _get_lance_metadata_uri(input_path, version)
     logger.info(f"Reading Lance clip metadata from {lance_uri} ...")
@@ -468,14 +492,34 @@ def _extract_shard_tasks_from_lance(
     rows = dataset.to_table().to_pylist()
     clip_samples = []
     for row in rows:
-        clip_sample = _lance_metadata_row_to_clip_sample(row, verbose=verbose)
+        clip_sample = _lance_metadata_row_to_clip_sample(
+            row,
+            input_path,
+            verbose=verbose,
+            allow_unsafe_clip_location=allow_unsafe_clip_location,
+        )
         if clip_sample is not None:
             clip_samples.append(clip_sample)
     return clip_samples
 
 
-def _lance_metadata_row_to_clip_sample(row: dict[str, Any], *, verbose: bool = False) -> ClipSample | None:
+def _lance_metadata_row_to_clip_sample(
+    row: dict[str, Any],
+    input_path: str,
+    *,
+    verbose: bool = False,
+    allow_unsafe_clip_location: bool = False,
+) -> ClipSample | None:
     clip_metadata = _lance_metadata_row_to_legacy_metadata(row)
+    try:
+        clip_location = _resolve_clip_sample_location(
+            clip_metadata["clip_location"],
+            input_path,
+            allow_unsafe_clip_location=allow_unsafe_clip_location,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to resolve clip_location for clip {clip_metadata.get('span_uuid')}: {e}")
+        return None
     if clip_metadata["valid"]:
         return ClipSample(
             uuid=str(clip_metadata["span_uuid"]),
@@ -484,7 +528,7 @@ def _lance_metadata_row_to_clip_sample(row: dict[str, Any], *, verbose: bool = F
             num_frames=clip_metadata["num_frames"],
             framerate=clip_metadata["framerate"],
             num_bytes=clip_metadata["num_bytes"],
-            clip_location=get_full_path(clip_metadata["clip_location"]),
+            clip_location=clip_location,
             clip_metadata=clip_metadata,
         )
     logger.warning(f"Clip {clip_metadata['span_uuid']} is invalid, skipping ...")
@@ -602,6 +646,7 @@ def extract_shard_tasks(  # noqa: PLR0913
     *,
     metadata_input_format: MetadataInputFormat = "json",
     verbose: bool = False,
+    allow_unsafe_clip_location: bool = False,
 ) -> list[ClipSample]:
     """Extract list of clip paths from the input S3 or local path."""
     clip_samples = []
@@ -614,10 +659,22 @@ def extract_shard_tasks(  # noqa: PLR0913
         error_msg = f"Expect output path {output_path} to be empty"
         raise ValueError(error_msg)
     if metadata_input_format == "lance":
-        return _extract_shard_tasks_from_lance(input_path, input_s3_profile_name, version, verbose=verbose)
+        return _extract_shard_tasks_from_lance(
+            input_path,
+            input_s3_profile_name,
+            version,
+            verbose=verbose,
+            allow_unsafe_clip_location=allow_unsafe_clip_location,
+        )
     if metadata_input_format == "auto":
         try:
-            return _extract_shard_tasks_from_lance(input_path, input_s3_profile_name, version, verbose=verbose)
+            return _extract_shard_tasks_from_lance(
+                input_path,
+                input_s3_profile_name,
+                version,
+                verbose=verbose,
+                allow_unsafe_clip_location=allow_unsafe_clip_location,
+            )
         except ValueError as e:
             if not _is_lance_dataset_not_found_error(e):
                 raise
@@ -633,7 +690,9 @@ def extract_shard_tasks(  # noqa: PLR0913
                 _worker_read_clip_metadata,
                 clip_metadata_path,
                 client_input,
+                input_path,
                 verbose=verbose,
+                allow_unsafe_clip_location=allow_unsafe_clip_location,
             )
             for clip_metadata_path in clip_metadata_paths
         ]
