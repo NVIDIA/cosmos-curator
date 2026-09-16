@@ -117,34 +117,33 @@ def read_bounds(stream: io.BufferedIOBase, configured_topic: str | None) -> tupl
     return load_start_end_ns(reader, topic)
 
 
-class McapSpanWriter:
-    """Cuts one buffered MCAP topic into a file per span.
+class McapTopicWriter:
+    """Holds one buffered MCAP open, and writes files carrying its topic's schema.
 
-    Buffered rather than streamed, unlike a camera. Windowed reads against a
-    remote object re-fetch a chunk for every span that touches it, and these
-    files are small enough to hold whole where a camera is not -- so the whole
-    object is fetched once and every span is served from memory.
+    Buffered rather than streamed. Windowed reads against a remote object re-fetch
+    a chunk for every span that touches it, and these files are small enough to
+    hold whole where a camera is not, so the object is fetched once and every span
+    is served from memory.
+
+    Shared by the two ways a sensor becomes a clip -- cutting records out of the
+    source, and writing rows derived from it -- because both produce a file whose
+    schema and topic are the source's, and only what goes in the messages differs.
     """
 
     def __init__(self, mcap_bytes: bytes, configured_topic: str | None) -> None:
-        """Open one whole MCAP for cutting, resolving which topic the spans come from."""
+        """Open one whole MCAP, resolving the topic its output will carry."""
         self._reader = make_reader(io.BytesIO(mcap_bytes))
         summary = self._reader.get_summary()
         if summary is None:
             msg = "MCAP has no summary, so its channels cannot be read without reading it whole"
             raise ValueError(msg)
         self.topic = resolve_topic(summary, configured_topic)
-        # Whether a reverse seek is available at all. Without chunk indexes the
-        # mcap reader falls back to a non-seeking scan that drops ``reverse``
-        # silently and yields ascending, so a reverse lookup would return the
-        # earliest message rather than the latest. ``load_start_end_ns`` branches
-        # on the same fact for the same reason.
-        self._seekable = bool(summary.chunk_indexes)
         channel = channel_for_topic(summary, self.topic)
         if channel is None:
             msg = f"MCAP carries no channel for topic {self.topic!r}"
             raise ValueError(msg)
         schema = schema_for_channel(summary, channel, self.topic)
+        self.schema_name = schema.name
         self._stream = McapStreamSpec(
             topic=self.topic,
             schema=McapSchemaSpec(
@@ -155,6 +154,21 @@ class McapSpanWriter:
             ),
             library=_LIBRARY,
         )
+
+
+class McapSpanWriter(McapTopicWriter):
+    """Cuts one buffered MCAP topic into a file per span."""
+
+    def __init__(self, mcap_bytes: bytes, configured_topic: str | None) -> None:
+        """Open one whole MCAP for cutting, and note whether it can be seeked."""
+        super().__init__(mcap_bytes, configured_topic)
+        # Whether a reverse seek is available at all. Without chunk indexes the
+        # mcap reader falls back to a non-seeking scan that drops ``reverse``
+        # silently and yields ascending, so a reverse lookup would return the
+        # earliest message rather than the latest. ``load_start_end_ns`` branches
+        # on the same fact for the same reason.
+        summary = self._reader.get_summary()
+        self._seekable = bool(summary is not None and summary.chunk_indexes)
 
     def iter_spans(self, spans: Sequence[Span]) -> Iterator[SpanCut]:
         """Select every span's messages in one forward pass over the topic.

@@ -158,7 +158,7 @@ def test_episode_and_materialization_digest_fixtures(
     assert split_clip_id == "06c13fc958dbf9468c99710c63777749752f320583620710c8c68e1299a2d855"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "06fc1d634468823f792d6315a66edb68087215d267cb934b3bab50edad90cadc"
+    assert split_digest == "c91a8fb19272d804f20676c71d42b4fe590272f66f4606cf0f9d7d0860274c65"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "094cd94da4adb0a2aa7331806d2a9613544badf3fcc6e8a4fb5f77eccaf3d7ec"
+        == "41ca854db4c84392b39ce278cf1bdc5de523da32a4b4ccdae5b400d6e514f640"
     )
 
 
@@ -242,3 +242,76 @@ def test_the_split_contract_digest_binds_every_mcap_sensor_and_its_topic(
     digests = {make_split_contract_digest(config) for config in (camera_only, with_ego, other_topic, other_key)}
 
     assert len(digests) == 4
+
+
+def test_the_sampling_policy_changes_the_split_contract(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The same span under each policy is different bytes, so it is a different contract.
+
+    Neither the episode id, which is geometry, nor the sensor set distinguishes
+    them. Without this a rerun that switched policy would find every episode
+    already canonical and never recut one.
+    """
+    cameras = {"front": "front.mp4"}
+    gps = {"gps": "gps.mcap"}
+
+    # Equal bounds, so only the policy differs. Under the defaults the bounds
+    # differ too, and the digest would move on the bound alone while the policy
+    # itself went unrecorded.
+    nearest = make_config(
+        tmp_path / "in",
+        tmp_path / "out",
+        cameras=cameras,
+        gps_sensors=gps,
+        sampling="nearest_neighbor",
+        max_delta_ms=750,
+    )
+    interpolate = make_config(
+        tmp_path / "in",
+        tmp_path / "out",
+        cameras=cameras,
+        gps_sensors=gps,
+        sampling="interpolate",
+        max_gap_ms=750,
+    )
+
+    assert nearest.sensors["gps"].sampling_bound_ns == interpolate.sensors["gps"].sampling_bound_ns
+    assert make_split_contract_digest(nearest) != make_split_contract_digest(interpolate)
+
+
+def test_the_sampling_bound_changes_the_split_contract(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The bound decides which clips exist, by refusing the ones it will not serve."""
+    cameras = {"front": "front.mp4"}
+    gps = {"gps": "gps.mcap"}
+
+    default = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras, gps_sensors=gps, sampling="interpolate")
+    widened = make_config(
+        tmp_path / "in", tmp_path / "out", cameras=cameras, gps_sensors=gps, sampling="interpolate", max_gap_ms=2000
+    )
+
+    assert make_split_contract_digest(default) != make_split_contract_digest(widened)
+
+
+def test_the_unused_bound_does_not_change_the_split_contract(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Only the bound the policy consults is part of the identity.
+
+    A copied sensor consults neither, so its clips must digest alike however the
+    defaults move. Carrying both would let a setting that changes nothing about
+    the output change what the output is called.
+    """
+    cameras = {"front": "front.mp4"}
+    ego = {"ego": "ego.mcap"}
+
+    first = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras, mcap_sensors=ego)
+    second = make_config(tmp_path / "in", tmp_path / "out", cameras=cameras, mcap_sensors=ego)
+
+    assert make_split_contract_digest(first) == make_split_contract_digest(second)
+    assert first.sensors["ego"].sampling_bound_ns is None

@@ -715,3 +715,79 @@ def test_a_topic_on_an_mcap_sensor_is_accepted() -> None:
 
     assert config.sensors["ego"].topic == "/ego"
     assert config.sensors["front"].topic is None
+
+
+def test_an_aligned_sensor_must_say_how_it_is_sampled() -> None:
+    """There is no defensible default, so the config has to choose.
+
+    ``nearest_neighbor`` reports only measurements that happened, carrying
+    whatever staleness the gap implies; ``interpolate`` reports values no
+    instrument did. Which is right depends on the source's accuracy and on the
+    consumer, and the choice is baked into the artifact, so picking one silently
+    would decide it for everyone downstream.
+    """
+    with pytest.raises(ValidationError, match="so sampling must be set"):
+        _resolved(
+            sensors={
+                "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+                "gps": {"sensor_type": "gps", "uri_pattern": "gps.mcap"},
+            }
+        )
+
+
+@pytest.mark.parametrize("sensor_type", ["camera", "egotrajectory"])
+def test_sampling_on_a_sensor_that_is_not_aligned_is_refused(sensor_type: str) -> None:
+    """A copied sensor is never placed on the grid, so naming a policy describes work that will not happen."""
+    sensors: dict[str, dict[str, object]] = {"front": {"sensor_type": "camera", "uri_pattern": "front.mp4"}}
+    sensors["other"] = {"sensor_type": sensor_type, "uri_pattern": "other.bin", "sampling": "interpolate"}
+
+    with pytest.raises(ValidationError, match="not placed on the clip grid"):
+        _resolved(sensors=sensors)
+
+
+@pytest.mark.parametrize(
+    ("sampling", "unused_bound"),
+    [("nearest_neighbor", "max_gap_ms"), ("interpolate", "max_delta_ms")],
+)
+def test_a_bound_belonging_to_the_other_policy_is_refused(sampling: str, unused_bound: str) -> None:
+    """Each bound applies to one policy, and a config must not state a tolerance the run ignores."""
+    with pytest.raises(ValidationError, match=f"{unused_bound} applies to"):
+        _resolved(
+            sensors={
+                "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+                "gps": {"sensor_type": "gps", "uri_pattern": "gps.mcap", "sampling": sampling, unused_bound: 900},
+            }
+        )
+
+
+@pytest.mark.parametrize("bound", ["max_delta_ms", "max_gap_ms"])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_a_non_finite_bound_is_refused(bound: str, value: float) -> None:
+    """Rounding a non-finite bound to nanoseconds raises OverflowError, not a config error."""
+    sampling = "nearest_neighbor" if bound == "max_delta_ms" else "interpolate"
+    with pytest.raises(ValidationError):
+        _resolved(
+            sensors={
+                "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+                "gps": {"sensor_type": "gps", "uri_pattern": "gps.mcap", "sampling": sampling, bound: value},
+            }
+        )
+
+
+def test_the_sampling_bounds_default_to_the_fix_interval() -> None:
+    """Unset bounds resolve to figures derived from a 1 Hz source, in policy units.
+
+    Both sit between the jitter a healthy 1 Hz receiver shows and the roughly
+    two-second gap a dropped fix leaves, so neither refuses data that is fine.
+    """
+    config = _resolved(
+        sensors={
+            "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+            "gps": {"sensor_type": "gps", "uri_pattern": "gps.mcap", "sampling": "nearest_neighbor"},
+        }
+    )
+
+    gps = config.sensors["gps"]
+    assert gps.max_delta_ms is None
+    assert gps.max_delta_ns == 750_000_000
+    assert gps.max_gap_ns == 1_500_000_000

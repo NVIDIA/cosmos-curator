@@ -125,15 +125,11 @@ def align_gps_nearest(
     device timestamps; only ``align_timestamps_ns`` changes to the requested
     canonical timestamps.
 
-    Every source row is eligible for every request. The planned post-split
-    contract adds predecessor and successor halo fixes outside a clip's span.
-    Selecting such a halo is intended: any fix beyond it is necessarily farther
-    from an in-span request, so the two planned halos are sufficient for a
-    clip-local result to equal the unsplit session's. The current splitter does
-    not yet produce GPS clip MCAPs or halo fixes, so callers with interior-only
-    data do not receive that boundary guarantee. A selected
-    ``sensor_timestamps_ns`` value may lie outside the clip span; nearest
-    provenance is not span-bounded.
+    Every source row is eligible for every request, so a selected
+    ``sensor_timestamps_ns`` may lie outside the requested range: nearest
+    provenance is not bounded by it. The splitter aligns against a whole
+    session, so the nearest fix to a clip's first or last row is available
+    whether or not it falls inside that clip.
     """
     if not isinstance(policy, NearestTimestampPolicy):
         msg = f"policy must be NearestTimestampPolicy, got {type(policy).__name__}"  # type: ignore[unreachable]
@@ -229,10 +225,9 @@ def align_gps_interpolated(
     """Derive WGS-84 GPS positions for requested timestamps by ECEF interpolation.
 
     Every requested timestamp needs either an exact valid source fix or valid
-    lower and upper source brackets. The planned clip format will contain its
-    half-open interior plus one predecessor and one successor halo fix, so
-    requests near either boundary can interpolate once that producer exists.
-    The function never extrapolates: a missing required support fix raises
+    lower and upper source brackets. The splitter aligns against a whole session
+    rather than a clip, so a request at a clip boundary has both. The function
+    never extrapolates: a missing required support fix raises
     :attr:`~cosmos_curator.core.sensors.exceptions.AlignmentFailureReason.GPS_MISSING_BRACKET`.
     Derived rows intentionally contain no source-only optional metadata; their
     bracket provenance records the canonical source times used for the position.

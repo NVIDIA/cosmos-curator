@@ -324,21 +324,30 @@ markers.
 
 #### GPS/GNSS
 
-Initial GPS/GNSS policy: interpolate position for each grid timestamp.
+GPS arrives around 1 Hz against a 30 Hz grid, so the grid is denser than the
+source and every row is placed rather than selected down. The config chooses how,
+because the two ways produce materially different data and neither is right for
+every consumer:
 
-Required configuration:
+- `sampling: nearest_neighbor` repeats the closest recorded fix, bounded by
+  `max_delta_ms`. Every row is a position that was actually measured, carrying
+  whatever staleness the gap to it implies.
+- `sampling: interpolate` derives a position between the two fixes bracketing the
+  row, bounded by `max_gap_ms`. Rows read smoothly and no instrument reported any
+  of them.
 
-- `sampling: interpolate`
-- `max_gap_ms`
+Interpolation runs in ECEF and publishes WGS-84, uses only valid bracketing
+fixes, and never extrapolates. A row it cannot serve — no bracket, or a bracket
+wider than `max_gap_ms` — fails the clip.
 
-The writer exposes latitude, longitude, ellipsoid altitude, position validity,
-and optional accuracy/status fields already represented by `GpsData`. The
-default required-GPS policy fails the episode when a row cannot be interpolated
-from valid supporting fixes or when the supporting gap exceeds `max_gap_ms`.
-Interpolation uses bracketing valid fixes on the alignment clock, with no
-extrapolation. Position interpolation occurs in a named ECEF or local ENU frame,
-then publishes WGS-84 fields. Provenance records the left and right fix
-timestamps, interpolation alpha, and support gap.
+Set the bounds between the jitter a healthy receiver shows and the gap a dropped
+fix leaves. Measured on real sessions those are about ±15 µs and about two
+seconds, so the defaults are 1500 ms for a bracket and half that for nearest
+selection. A bound set at the nominal interval refuses healthy data.
+
+Each row records how it was produced, and from which fix or pair of fixes,
+because once a position sits on the grid nothing about the row itself says
+whether it was measured or derived.
 
 #### LiDAR
 
@@ -394,7 +403,7 @@ Failures are classified by the narrowest unit that can be retried:
 | Unsupported configuration | run | Fail fast. |
 | Required camera alignment miss | episode | Fail episode. |
 | Required IMU integration invalid | episode | Fail episode. |
-| Required GPS/GNSS interpolation miss or invalid position | episode | Fail episode. |
+| Required GPS/GNSS row that cannot be placed on the grid | episode | Fail episode. |
 | Optional modality miss | episode | Write null or masked values for configured optional fields. |
 | Lance publication failure | attempt | Do not publish episode records or a completion marker for that attempt. |
 | LeRobot export failure | export attempt | Do not mark the export attempt complete; keep the Lance dataset as the durable boundary. |
@@ -574,8 +583,8 @@ sensors:
     required: true
     source: "gps.mcap"
     topic: "/gps"
-    sampling: interpolate
-    max_gap_ms: 1000
+    sampling: interpolate   # or nearest_neighbor, with max_delta_ms
+    max_gap_ms: 1500
 
 calibration:
   manifest_uri: "calibration/rig.json"

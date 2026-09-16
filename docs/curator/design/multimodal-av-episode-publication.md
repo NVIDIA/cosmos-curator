@@ -179,13 +179,14 @@ Every list item and every child of the `camera_media` struct is non-nullable:
 | `observations_sha256` | `string not null` | SHA-256 of observation-sidecar bytes |
 
 Every list item and every child of the `sensor_media` struct is likewise non-nullable. It carries no grid or
-observation sidecars: a copied sensor is not resampled onto the episode's grid, so there is no grid to record and no
-per-row account of which sample served which row.
+observation sidecars, whichever way its clip was produced. A copied sensor was never put on the episode's grid, so
+there is no grid to record. An aligned one sits on the episode's own grid rather than a timeline of its own, and
+records per-row provenance inside the rows, so there is nothing to write beside them.
 
 | Child | Arrow type | Meaning |
 |---|---|---|
 | `sensor_key` | `string not null` | Stable configured sensor key |
-| `sensor_type` | `string not null` | Configured sensor kind, such as `egotrajectory` |
+| `sensor_type` | `string not null` | Configured sensor kind, such as `egotrajectory` or `gps` |
 | `source_media_location` | `large_string not null` | Resolved session artifact the clip was cut from |
 | `media_location` | `large_string not null` | Materialized clip MCAP |
 | `media_size_bytes` | `int64 not null` | Exact MCAP byte count |
@@ -234,7 +235,7 @@ across rendering choices.
 ```text
 {
   "kind": "multimodal-av-split-contract",
-  "split_contract_digest_version": 2,
+  "split_contract_digest_version": 3,
   "media_contract_version": <media contract version>,
   "clip": {
     "duration_ns": <resolved integer duration>,
@@ -245,7 +246,13 @@ across rendering choices.
     ... sorted by camera_key
   ],
   "mcap_sensors": [
-    {"sensor_key": <key>, "sensor_type": <type>, "topic": <topic or null>},
+    {
+      "sensor_key": <key>,
+      "sensor_type": <type>,
+      "topic": <topic or null>,
+      "sampling": <policy or null>,
+      "sampling_bound_ns": <bound the policy consults, or null>
+    },
     ... sorted by sensor_key
   ],
   "video": {
@@ -340,7 +347,7 @@ inputs must use a new session location, and therefore a new source identity.
 
 Each non-reconciled sensor emits exactly one current-run outcome per planned span. Both successes and failures carry the
 complete shared episode facts and expected row count. Successes additionally carry all artifact descriptors that apply
-to that sensor kind; a copied sensor has no grid or selection sidecars, so those descriptors are null for it. Durable
+to that sensor kind; a non-camera sensor has no grid or selection sidecars, so those descriptors are null for it. Durable
 error JSON supplies detailed failure category and message but does not veto a later successful current-run outcome.
 
 Assembly groups small outcomes by `split_clip_id`, compares the complete shared facts once, and requires exactly one

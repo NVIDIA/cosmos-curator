@@ -445,10 +445,11 @@ def plan_common_spans(
     them puts the first references before another view existed.
 
     An MCAP sensor narrows the same window from its bounds rather than a
-    timeline, and for the same reason: a clip running past the last pose is a
-    clip whose trajectory stops partway through. It contributes only the window,
-    never coverage -- nothing is resampled onto the grid, so there is no
-    tolerance for it to miss.
+    timeline, and for the same reason: a clip running past the last sample is a
+    clip whose sensor stops partway through. It contributes only the window,
+    never coverage. A sensor placed on the grid does have a tolerance, but it
+    applies per row while the clip is cut, not here -- this decides which spans
+    exist, and that one decides which of them a sensor can actually serve.
     """
     starts = [int(timeline[0]) for timeline in timelines.values()]
     ends = [timeline_end_ns(timeline) for timeline in timelines.values()]

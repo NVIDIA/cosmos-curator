@@ -22,6 +22,7 @@ from typing import Any
 import av
 import numpy as np
 import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory, timestamp_pb2
 from mcap.writer import Writer as McapWriter
 
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
@@ -160,6 +161,170 @@ def make_ego_mcap() -> Callable[..., Path]:
     return build
 
 
+GPS_TOPIC = "/gps"
+
+#: The Foxglove message the fleet's recorders write GPS with, reduced to the
+#: fields the checked-in mapping reads plus the metadata map the real writer uses.
+#:
+#: Built as a descriptor rather than compiled from .proto text: a fixture that
+#: shells out to protoc depends on a binary being present and executable in the
+#: environment, which it is not here, and a unit test should not need a compiler.
+_FIELD = descriptor_pb2.FieldDescriptorProto
+
+
+def _location_fix_descriptor_set(*, timestamp_as_int: bool = False, singular_metadata: bool = False) -> bytes:
+    """Build the LocationFix descriptor set the fixture MCAPs carry."""
+    file_proto = descriptor_pb2.FileDescriptorProto(
+        name="location_fix.proto",
+        package="foxglove",
+        syntax="proto3",
+        # The real message stamps with the well-known type, and the checked-in
+        # mapping reads it as one. A lookalike of the same shape is rejected.
+        dependency=["google/protobuf/timestamp.proto"],
+    )
+
+    pair_proto = file_proto.message_type.add(name="KeyValuePair")
+    pair_proto.field.add(name="key", number=1, type=_FIELD.TYPE_STRING, label=_FIELD.LABEL_OPTIONAL)
+    pair_proto.field.add(name="value", number=2, type=_FIELD.TYPE_STRING, label=_FIELD.LABEL_OPTIONAL)
+
+    fix_proto = file_proto.message_type.add(name="LocationFix")
+    if timestamp_as_int:
+        fix_proto.field.add(name="timestamp", number=1, type=_FIELD.TYPE_INT64, label=_FIELD.LABEL_OPTIONAL)
+    else:
+        fix_proto.field.add(
+            name="timestamp",
+            number=1,
+            type=_FIELD.TYPE_MESSAGE,
+            label=_FIELD.LABEL_OPTIONAL,
+            type_name=".google.protobuf.Timestamp",
+        )
+    fix_proto.field.add(name="frame_id", number=2, type=_FIELD.TYPE_STRING, label=_FIELD.LABEL_OPTIONAL)
+    for number, name in ((3, "latitude"), (4, "longitude"), (5, "altitude")):
+        fix_proto.field.add(name=name, number=number, type=_FIELD.TYPE_DOUBLE, label=_FIELD.LABEL_OPTIONAL)
+    fix_proto.field.add(
+        name="metadata",
+        number=10,
+        type=_FIELD.TYPE_MESSAGE,
+        label=_FIELD.LABEL_OPTIONAL if singular_metadata else _FIELD.LABEL_REPEATED,
+        type_name=".foxglove.KeyValuePair",
+    )
+
+    timestamp_proto = descriptor_pb2.FileDescriptorProto()
+    timestamp_proto.ParseFromString(timestamp_pb2.DESCRIPTOR.serialized_pb)
+    return descriptor_pb2.FileDescriptorSet(file=[timestamp_proto, file_proto]).SerializeToString()
+
+
+@pytest.fixture
+def make_gps_mcap() -> Callable[..., Path]:
+    """Return a builder for a session's GPS MCAP in the recorded Foxglove schema.
+
+    Real positions rather than constants: alignment's whole job is to place a
+    value between or onto fixes, so a fixture whose fixes are identical could not
+    tell nearest selection from interpolation.
+    """
+
+    def build(
+        session: Path,
+        *,
+        first_ns: int = DEVICE_ORIGIN_NS,
+        count: int = 21,
+        rate_hz: float = 1.0,
+        uri_pattern: str = "gps/gps.mcap",
+        topic: str = GPS_TOPIC,
+        latitude: float = 37.4,
+        longitude: float = -122.25,
+        altitude: float = 30.0,
+        # Roughly 11 m of latitude per fix, a plausible 11 m/s at 1 Hz. Every
+        # component moves, and by a different amount, so a test can tell a
+        # longitude written into the altitude field from one written correctly.
+        step_deg: float = 0.0001,
+        longitude_step_deg: float = 0.00025,
+        altitude_step_m: float = 0.5,
+        # Indices to leave out, so a test can drive the bound that refuses a row
+        # whose supporting fixes are too far apart.
+        dropped: frozenset[int] = frozenset(),
+        topic_override: str | None = None,
+        # Spell a field correctly but give it the wrong shape, so a test can
+        # reach the case a name-only check would wave through.
+        timestamp_as_int: bool = False,
+        singular_metadata: bool = False,
+        # Offset the payload timestamp from log_time, which is what a converter
+        # that transforms one and not the other produces.
+        payload_skew_ns: int = 0,
+    ) -> Path:
+        descriptor = _location_fix_descriptor_set(
+            timestamp_as_int=timestamp_as_int, singular_metadata=singular_metadata
+        )
+        pool = descriptor_pool.DescriptorPool()
+        for file_descriptor in descriptor_pb2.FileDescriptorSet.FromString(descriptor).file:
+            pool.Add(file_descriptor)
+        message_cls = message_factory.GetMessageClass(pool.FindMessageTypeByName("foxglove.LocationFix"))
+
+        period_ns = int(_NS_PER_SECOND / rate_hz)
+        path = session / uri_pattern
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as handle:
+            writer = McapWriter(handle, chunk_size=10_000)
+            writer.start(library="test recorder")
+            schema_id = writer.register_schema(name="foxglove.LocationFix", encoding="protobuf", data=descriptor)
+            channel_id = writer.register_channel(
+                schema_id=schema_id, topic=topic_override or topic, message_encoding="protobuf"
+            )
+            for index in range(count):
+                if index in dropped:
+                    continue
+                log_time = first_ns + index * period_ns
+                message = message_cls()
+                payload_ns = log_time + payload_skew_ns
+                if timestamp_as_int:
+                    message.timestamp = payload_ns
+                else:
+                    message.timestamp.seconds = payload_ns // _NS_PER_SECOND
+                    message.timestamp.nanos = payload_ns % _NS_PER_SECOND
+                message.latitude = latitude + index * step_deg
+                message.longitude = longitude + index * longitude_step_deg
+                message.altitude = altitude + index * altitude_step_m
+                writer.add_message(
+                    channel_id=channel_id,
+                    log_time=log_time,
+                    data=message.SerializeToString(),
+                    publish_time=log_time,
+                    sequence=index,
+                )
+            writer.finish()
+        return path
+
+    return build
+
+
+def gps_source_fixes(
+    *,
+    first_ns: int = DEVICE_ORIGIN_NS,
+    count: int = 21,
+    rate_hz: float = 1.0,
+    latitude: float = 37.4,
+    longitude: float = -122.25,
+    altitude: float = 30.0,
+    step_deg: float = 0.0001,
+    longitude_step_deg: float = 0.00025,
+    altitude_step_m: float = 0.5,
+) -> dict[int, tuple[float, float, float]]:
+    """Return what ``make_gps_mcap`` wrote, keyed by fix time.
+
+    A test comparing a clip's rows against the source needs the source, and
+    reading it back out of the fixture MCAP would let one bug hide another.
+    """
+    period_ns = int(_NS_PER_SECOND / rate_hz)
+    return {
+        first_ns + index * period_ns: (
+            latitude + index * step_deg,
+            longitude + index * longitude_step_deg,
+            altitude + index * altitude_step_m,
+        )
+        for index in range(count)
+    }
+
+
 def split_all(
     item: dict[str, Any],
     *,
@@ -209,6 +374,13 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         mcap_sensors: dict[str, str] | None = None,
         optional_sensors: frozenset[str] = frozenset(),
         topic: str | None = None,
+        gps_sensors: dict[str, str] | None = None,
+        # No default, because the config has none: a test that forgets to say
+        # how its GPS is sampled should fail the way a config would.
+        sampling: str | None = None,
+        max_gap_ms: float | None = None,
+        max_delta_ms: float | None = None,
+        gps_topic: str | None = None,
         video_bitrate: str = "400K",
         gop_size: int = 5,
         progress: bool = False,
@@ -231,6 +403,18 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                             "required": key not in optional_cameras,
                         }
                         for key, pattern in camera_map.items()
+                    },
+                    **{
+                        key: {
+                            "sensor_type": "gps",
+                            "uri_pattern": pattern,
+                            "required": key not in optional_sensors,
+                            **({} if sampling is None else {"sampling": sampling}),
+                            **({} if max_gap_ms is None else {"max_gap_ms": max_gap_ms}),
+                            **({} if max_delta_ms is None else {"max_delta_ms": max_delta_ms}),
+                            **({} if gps_topic is None else {"topic": gps_topic}),
+                        }
+                        for key, pattern in (gps_sensors or {}).items()
                     },
                     **{
                         key: {

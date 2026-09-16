@@ -269,12 +269,12 @@ class EgoTrajectorySensor:
         Each ``sample()`` invocation decodes the configured clip source once
         before producing its first window. Every source pose in that clip is
         then eligible for every requested timestamp; windows batch output rows
-        only. The planned post-split pipeline will make a clip contain its
-        half-open interior plus, when available, immediate predecessor and
-        successor halo poses. They are eligible for nearest selection too, so a
-        selected source timestamp can lie outside the clip span. The current
-        splitter does not yet write ego-trajectory MCAPs or halos, so
-        interior-only data has no boundary-invariance guarantee. MCAP
+        only. A clip the splitter wrote holds its half-open interior plus the
+        pose immediately before it, which is eligible for nearest selection too,
+        so a selected source timestamp can lie before the clip's span. No pose
+        after the span is carried, so a request near the end of a clip selects
+        the nearest pose that clip holds even where the session had a nearer one
+        just beyond it. MCAP
         ``log_time`` selects records while decoding the clip but does not
         participate in nearest selection, tolerance checking, or output
         timestamps. Those use mapper-produced ``align_timestamps_ns``.

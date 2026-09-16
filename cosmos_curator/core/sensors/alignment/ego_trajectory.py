@@ -53,16 +53,12 @@ def align_ego_trajectory_nearest(
     row. A selected pose is copied unchanged: position, orientation, validity,
     and optional source metadata are never interpolated or otherwise derived.
 
-    The planned post-split clip format will contain its half-open interior plus,
-    when available, immediate predecessor and successor source poses as halos.
-    Every source row remains eligible, including those halos: provided
-    mapper-produced alignment timestamps are in the session clock, the two
-    halos are sufficient for this clip-local operation to return the same pose
-    as the unsplit session. The current splitter does not yet write
-    ego-trajectory MCAPs or halos, so callers with interior-only data do not
-    receive that boundary guarantee. A selected ``sensor_timestamps_ns`` value
-    may lie outside the clip span; it is source provenance, not a span-boundary
-    marker.
+    A clip the splitter wrote holds its half-open interior plus the pose
+    immediately before it, and every source row stays eligible, that one
+    included. So a selected ``sensor_timestamps_ns`` may lie before the clip's
+    span: it is source provenance, not a span-boundary marker. No pose after the
+    span is carried, so near the end of a clip this returns the nearest pose the
+    clip holds even where the unsplit session had a nearer one just beyond it.
     """
     policy = require_nearest_timestamp_policy(policy, sensor_name="align_ego_trajectory_nearest")
 

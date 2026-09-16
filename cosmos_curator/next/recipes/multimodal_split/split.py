@@ -33,17 +33,29 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 
+import cosmos_curator.core.sensors as cosmos_sensors
+from cosmos_curator.core.sensors.alignment.gps import align_gps
+from cosmos_curator.core.sensors.data.gps_data import GpsData
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
-from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
+from cosmos_curator.core.sensors.sampling.policy import (
+    GpsInterpolationPolicy,
+    GpsSamplingPolicy,
+    NearestTimestampPolicy,
+)
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.sensors.gps_sensor import GpsSensor
 from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.core.sensors.utils.validation import require_nondecreasing
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split.config import (
+    ALIGNED_SENSOR_TYPES,
+    COPIED_SENSOR_TYPES,
+    MultimodalSplitSensorConfig,
     ResolvedMultimodalSplitConfig,
 )
 from cosmos_curator.next.recipes.multimodal_split.cpu_video_encode import encode_frames_to_path
+from cosmos_curator.next.recipes.multimodal_split.gps_streams import GpsClipWriter
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, sampling_grid_ns, sampling_spec
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import McapSpanWriter, SpanCut
 from cosmos_curator.next.recipes.multimodal_split.reports import failure, write_sensor_errors
@@ -176,6 +188,131 @@ def split_camera_batch(
     return pa.Table.from_pylist(rows, schema=SENSOR_OUTCOME_SCHEMA)
 
 
+#: The schema and mapping every recorder in this fleet writes GPS with. Config
+#: does not expose them yet because nothing has needed a second producer; the
+#: sensor library takes both, so widening this is adding two fields, not a path.
+_GPS_SCHEMA_NAME = "foxglove.LocationFix"
+_GPS_PROTOBUF_MAPPING = (
+    Path(cosmos_sensors.__file__).parent / "examples" / "foxglove_location_fix_protobuf_mapping.yaml"
+)
+
+
+def _gps_policy(sensor: MultimodalSplitSensorConfig) -> GpsSamplingPolicy:
+    """Build the alignment policy the config asked for, in the units it takes."""
+    if sensor.sampling == "nearest_neighbor":
+        return NearestTimestampPolicy(max_delta_ns=sensor.max_delta_ns)
+    return GpsInterpolationPolicy(max_gap_ns=sensor.max_gap_ns)
+
+
+def split_aligned_session(
+    item: dict[str, Any],
+    *,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str = "default",
+) -> list[dict[str, Any]]:
+    """Place one sensor's samples on every planned clip's grid.
+
+    The same grid the cameras are resampled onto, so row *i* of this and frame
+    *i* of the video are one instant. That correspondence is the only reason an
+    episode has a single timeline, and a sensor-specific rate would hand a
+    consumer back the alignment problem the episode exists to remove.
+
+    Decoded once for the session and aligned per span. Every source fix is
+    eligible for every grid point, so the windows batch output rather than
+    restricting selection, and re-decoding per clip would reparse the whole
+    topic once per clip for nothing.
+    """
+    session_id = str(item["source_session_id"])
+    sensor_key = str(item["sensor_key"])
+    sensor_uri = str(item["sensor_uri"])
+    sensor = config.sensors[sensor_key]
+    entries = list(item["spans"])
+    clip_ids = [str(entry["clip_id"]) for entry in entries]
+    if len(set(clip_ids)) != len(clip_ids):
+        msg = f"Sensor {sensor_key!r} was planned with duplicate clip IDs"
+        raise ValueError(msg)
+
+    clips: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+    try:
+        with open_sensor_source(
+            sensor_uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+        ) as source:
+            payload = source.read()
+        writer = GpsClipWriter(payload, sensor.topic)
+        # Before anything is cut: the window came from log_time and the alignment
+        # runs on the payload, so a source where those disagree cannot produce a
+        # correct clip and should say so once, here, rather than once per clip.
+        writer.verify_log_time_matches_payload()
+        decoded = GpsSensor(
+            io.BytesIO(payload),
+            topic=writer.topic,
+            schema_name=_GPS_SCHEMA_NAME,
+            protobuf_mapping=_GPS_PROTOBUF_MAPPING,
+        ).read_all()
+    except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
+        failures.append(failure(session_id, sensor_key, None, "open_sensor", error))
+    else:
+        policy = _gps_policy(sensor)
+        for clip_id, entry in zip(clip_ids, entries, strict=True):
+            span = Span(start_ns=int(entry["start_ns"]), end_ns=int(entry["exclusive_end_ns"]))
+            clip, clip_failure = _write_aligned_clip(
+                writer, decoded, policy, span, clip_id, session_id, sensor_key, config, storage_profile
+            )
+            if clip is not None:
+                clips[clip_id] = clip
+            if clip_failure is not None:
+                failures.append(clip_failure)
+
+    write_sensor_errors(
+        session_id, sensor_key, failures, output_path=config.output.path, storage_profile=storage_profile
+    )
+    return [_sensor_outcome(item, entry, clips.get(str(entry["clip_id"]))) for entry in entries]
+
+
+def _write_aligned_clip(  # noqa: PLR0913 -- every argument names a different part of one clip's identity
+    writer: GpsClipWriter,
+    decoded: GpsData,
+    policy: GpsSamplingPolicy,
+    span: Span,
+    clip_id: str,
+    session_id: str,
+    sensor_key: str,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Align one clip's grid and write it, or describe why it could not be."""
+    destination = clip_media_uri(clip_dir_uri(config.output.path, session_id, clip_id), sensor_key, _MCAP_SUFFIX)
+    sampling = str(config.sensors[sensor_key].sampling)
+    try:
+        grid_ns = sampling_grid_ns(span, config)
+        aligned = align_gps(decoded, grid_ns, policy=policy)
+        with tempfile.TemporaryDirectory() as staging:
+            local = Path(staging) / f"{clip_id}{_MCAP_SUFFIX}"
+            written = writer.write_rows(aligned, sampling, local)
+            if written != len(grid_ns):
+                # A row per grid point or the clip is not on the grid it claims.
+                msg = f"aligned {written} rows for a clip whose grid has {len(grid_ns)}"
+                raise ValueError(msg)  # noqa: TRY301 -- reported as this clip's failure, like any other
+            payload = local.read_bytes()
+            write_media(destination, payload, storage_profile=storage_profile)
+    except Exception as error:  # noqa: BLE001 -- one clip's failure never ends the session
+        return None, failure(session_id, sensor_key, span, "align_sensor", error, clip_id)
+
+    return {
+        "clip_id": clip_id,
+        "clip_location": destination,
+        "clip_bytes": len(payload),
+        "media_sha256": hashlib.sha256(payload).hexdigest(),
+        # Placed on the episode's grid rather than resampled from a stream, so
+        # there is no separate timeline to record: the grid is the episode's.
+        "timeline_location": None,
+        "timeline_sha256": None,
+        "observations_location": None,
+        "observations_sha256": None,
+    }, None
+
+
 def split_mcap_session(
     item: dict[str, Any],
     *,
@@ -293,11 +430,21 @@ def split_mcap_batch(
     storage_profile: str = "default",
 ) -> pa.Table:
     """Cut one Arrow block of MCAP plans while preserving the terminal outcome schema."""
-    rows = [
-        outcome
-        for plan in plans.to_pylist()
-        for outcome in split_mcap_session(plan, config=config, storage_profile=storage_profile)
-    ]
+    rows = []
+    for plan in plans.to_pylist():
+        # Both kinds come from an MCAP and both are cheap next to video, so they
+        # share a stage. How the clip is written is the only difference -- and a
+        # kind in neither set is refused rather than falling through to a copy
+        # nobody chose for it.
+        sensor_type = str(plan["sensor_type"])
+        if sensor_type in ALIGNED_SENSOR_TYPES:
+            cut = split_aligned_session
+        elif sensor_type in COPIED_SENSOR_TYPES:
+            cut = split_mcap_session
+        else:
+            msg = f"sensor_type {sensor_type!r} comes from an MCAP but names no way to cut it into a clip"
+            raise ValueError(msg)
+        rows.extend(cut(plan, config=config, storage_profile=storage_profile))
     return pa.Table.from_pylist(rows, schema=SENSOR_OUTCOME_SCHEMA)
 
 

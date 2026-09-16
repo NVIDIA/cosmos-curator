@@ -17,8 +17,10 @@
 
 A run discovers candidate sessions and splits each one into clips: one MP4 per
 configured camera, resampled onto the clip's grid, and one MCAP per configured
-non-camera sensor, copied at the rate it was recorded. It then publishes one
-canonical Lance row per clip that every configured sensor could serve.
+non-camera sensor. A non-camera sensor is either copied at the rate it was
+recorded, where resampling would discard signal, or placed on the clip's grid,
+where the grid is denser than the source. It then publishes one canonical Lance
+row per clip that every configured sensor could serve.
 """
 
 from collections.abc import Sequence
@@ -49,6 +51,11 @@ def _template_payload() -> dict[str, Any]:
                 "example": {
                     "front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"},
                     "ego": {"sensor_type": "egotrajectory", "uri_pattern": "*/egotrajectory.mcap"},
+                    "gps": {
+                        "sensor_type": "gps",
+                        "uri_pattern": "*/gps.mcap",
+                        "sampling": "interpolate",
+                    },
                 },
             },
             {"path": "output.path", "example": "s3://example-bucket/media"},

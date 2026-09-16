@@ -214,17 +214,16 @@ request timeline. Callers populate it with mapper-produced alignment timestamps,
 and provide requested timestamps in that same clock. Nearest output retains the
 selected source `sensor_timestamps_ns`; derived interpolation output uses the
 requested time in both timestamp arrays and records its support times in
-`source_bracket_timestamps_ns`. The planned post-split clip format will supply
-in-span fixes with one predecessor and one successor halo fix when available.
-The current splitter does not yet write GPS MCAPs or halos, so an interior-only
-clip can raise `GPS_MISSING_BRACKET` near a boundary; GPS interpolation never
-extrapolates across missing support.
+`source_bracket_timestamps_ns`. The splitter decodes a session's fixes once and
+aligns every clip's grid against all of them, rather than against a clip-local
+subset, so a fix near a clip boundary is available to a row on either side of
+it. `GPS_MISSING_BRACKET` is now raised only when a request falls outside the
+session's fixes entirely; GPS interpolation never extrapolates across missing
+support.
 
-Once halos are produced, nearest selection may return one too, keeping a
-clip-local result identical to the unsplit session's. A nearest
-`sensor_timestamps_ns` value can therefore fall outside the clip span it was
-requested for, so it records true source provenance rather than a span-bounded
-value.
+Because alignment sees the whole session, a nearest `sensor_timestamps_ns`
+value can fall outside the clip span it was requested for, so it records true
+source provenance rather than a span-bounded value.
 
 `host_timestamps_ns` is optional receive-time metadata. For DriveWorks, it can
 map to host timestamp output modes when configured. It should not replace

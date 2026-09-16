@@ -380,15 +380,18 @@ class GpsSensor:
         Each ``sample()`` invocation decodes the configured source once before
         producing its first window. Every source fix in that MCAP is then
         eligible for every requested timestamp; windows batch output rows only.
-        The planned post-split pipeline will make the MCAP a clip-local GPS
-        source with its half-open interior plus one predecessor and one
-        successor halo fix when available. The current splitter does not yet
-        write GPS MCAPs or halos, so interpolation of interior-only clip data
-        can raise ``GPS_MISSING_BRACKET`` near a boundary rather than
-        extrapolating.
+        The splitter aligns a whole session at once and writes the rows, so a
+        GPS clip arrives already on the episode's grid rather than as a
+        clip-local source to align later. Every fix is present when alignment
+        runs, which is what gives a boundary request brackets on both sides.
 
-        Alignment decisions use mapper-produced ``align_timestamps_ns``. MCAP
-        ``log_time`` is used only to traverse the source records.
+        A message's MCAP ``log_time`` and the measurement timestamp in its
+        payload are one instant recorded twice. ``log_time`` is the one worth
+        working from: it sits in the index, so a source timeline costs two seeks,
+        while the payload's is knowable only by decoding every message. A
+        converter that lets the two diverge breaks that, and splitting -- which
+        bounds a clip window from the index and never decodes to plan -- is where
+        it shows up.
         """
         policy = require_gps_sampling_policy(policy, sensor_name=type(self).__name__)
         source = self.read_all()

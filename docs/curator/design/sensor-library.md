@@ -430,31 +430,30 @@ Earth-centered, Earth-fixed (ECEF) coordinates. Derived interpolation rows use
 the requested timestamp in both timestamp arrays, clear source-only optional
 metadata, and record `source_bracket_timestamps_ns` provenance.
 
-The caller owns clip-boundary semantics. The planned post-split GPS MCAP format
-will contain all records in its half-open clip span plus, when available, one
-immediate source fix before the start and one at or after the end. The current
-splitter does not yet write GPS MCAPs or these halo fixes. Until it does,
-interior-only clip data can raise a structured `GPS_MISSING_BRACKET`
-`AlignmentError` near a boundary rather than extrapolating, reading another
-clip, or inventing a position.
+The caller owns clip-boundary semantics. The splitter decodes a session's GPS
+fixes once and aligns every clip's grid against the whole session rather than
+against a clip-local subset, so a fix near a clip boundary is available to a
+row on either side of it without a separate halo mechanism. A request can still
+raise a structured `GPS_MISSING_BRACKET` `AlignmentError`, but only when it
+falls outside the session's fixes entirely, rather than extrapolating, reading
+another clip, or inventing a position.
 
 Both policies treat every source row as eligible, so nearest selection may also
-return a future halo rather than only using one as interpolation support. That
-is deliberate. Any fix beyond a halo is necessarily farther from an in-span
-request than the halo itself, so the two planned halo rows are exactly sufficient
-for clip-local nearest to return the same fix the unsplit session would, and
-splitting or re-splitting a session would not change alignment answers.
-Restricting nearest to the clip span would instead make the selected fix depend
-on where the cut landed. The cost is that nearest output
+return a fix recorded outside the requesting clip's own span rather than only
+using one as interpolation support. That is deliberate: aligning against the
+whole session makes clip-local nearest return the same fix the unsplit session
+would, and splitting or re-splitting a session does not change alignment
+answers. Restricting nearest to the clip span would instead make the selected
+fix depend on where the cut landed. The cost is that nearest output
 `sensor_timestamps_ns` may lie outside the clip span, so consumers must not
 treat nearest provenance as span-bounded.
 
-Halo sufficiency assumes the two clocks agree closely. Splitting selects records
-by MCAP `log_time`, because a schema-agnostic raw copy cannot read mapped time,
-while alignment selects and brackets by mapper-produced `align_timestamp_ns`.
-Under a significant offset between them a halo chosen in `log_time` can fall on
-the wrong side of a request in alignment time, which surfaces as a
-`GPS_MISSING_BRACKET` failure rather than a wrong position.
+Session-wide alignment assumes the two clocks agree closely. Splitting selects
+records by MCAP `log_time`, because a schema-agnostic raw copy cannot read
+mapped time, while alignment selects and brackets by mapper-produced
+`align_timestamps_ns`. Under a significant offset between them, a fix that is
+close in `log_time` can fall on the wrong side of a request in alignment time,
+which surfaces as a `GPS_MISSING_BRACKET` failure rather than a wrong position.
 
 ### Pure ego-trajectory alignment
 

@@ -27,23 +27,28 @@ import av
 import numpy as np
 import pyarrow as pa
 import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf.descriptor import FieldDescriptor
 from mcap.reader import make_reader as mcap_make_reader
 
 from cosmos_curator.core.sensors.sensors import camera_sensor
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, write_timestamps_ns
+from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
-from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans
+from cosmos_curator.next.recipes.multimodal_split.gps_streams import GpsClipWriter
+from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans, sampling_grid_ns
 from cosmos_curator.next.recipes.multimodal_split.plan import MCAP_PLAN, PLANNING_RESULT_SCHEMA, span_planner
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri, sensor_error_uri
 from cosmos_curator.next.recipes.multimodal_split.split import (
     SENSOR_OUTCOME_SCHEMA,
+    split_aligned_session,
     split_mcap_batch,
     split_mcap_session,
 )
 
-from .conftest import DEVICE_ORIGIN_NS, split_all
+from .conftest import DEVICE_ORIGIN_NS, gps_source_fixes, split_all
 
 _S = 1_000_000_000
 _SOURCE_FPS = 30
@@ -1518,3 +1523,379 @@ def test_an_mcap_block_round_trips_through_the_terminal_schema(
     assert [row["status"] for row in rows] == ["success"] * 3
     assert all(row["timeline_location"] is None for row in rows)
     assert all(row["sensor_type"] == "egotrajectory" for row in rows)
+
+
+def _gps_clips(
+    session: Path,
+    config: ResolvedMultimodalSplitConfig,
+) -> list[dict[str, object]]:
+    """Plan one session and align its GPS sensor, as the pipeline does."""
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    gps_plan = next(row for row in plans if row["sensor_key"] == "gps")
+    return split_aligned_session(gps_plan, config=config)
+
+
+def _rows(location: object) -> list[tuple[int, int, float, float, float, dict[str, str]]]:
+    """Read a clip's GPS back as (log_time, payload_ns, lat, lon, alt, provenance)."""
+    path = Path(str(location))
+    with path.open("rb") as stream:
+        reader = mcap_make_reader(stream)
+        schema = next(iter(reader.get_summary().schemas.values()))
+        pool = descriptor_pool.DescriptorPool()
+        for file_descriptor in descriptor_pb2.FileDescriptorSet.FromString(schema.data).file:
+            pool.Add(file_descriptor)
+        message_cls = message_factory.GetMessageClass(pool.FindMessageTypeByName(schema.name))
+        rows = []
+        for _s, _c, message in reader.iter_messages(log_time_order=True):
+            fix = message_cls.FromString(message.data)
+            rows.append(
+                (
+                    message.log_time,
+                    fix.timestamp.seconds * 1_000_000_000 + fix.timestamp.nanos,
+                    fix.latitude,
+                    fix.longitude,
+                    fix.altitude,
+                    {kv.key: kv.value for kv in fix.metadata},
+                )
+            )
+        return rows
+
+
+@pytest.mark.parametrize("sampling", ["nearest_neighbor", "interpolate"])
+def test_gps_lands_on_the_same_grid_the_cameras_do(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    sampling: str,
+) -> None:
+    """Row i of the position is the instant of frame i, which is the point of one timeline.
+
+    A sensor-specific rate would hand a consumer back the correspondence problem
+    the episode exists to remove, so the grid is the camera's regardless of what
+    rate the fixes arrived at. The payload carries the same instant as the
+    envelope, matching the source, where the two agree.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling=sampling, duration_s=1.0
+    )
+
+    outcomes = _gps_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success"] * 3
+    for outcome in outcomes:
+        rows = _rows(outcome["media_location"])
+        grid = sampling_grid_ns(
+            Span(start_ns=int(outcome["start_ns"]), end_ns=int(outcome["exclusive_end_ns"])), config
+        )
+        assert [log_time for log_time, *_rest in rows] == [int(value) for value in grid]
+        assert [payload for _t, payload, *_rest in rows] == [int(value) for value in grid]
+        assert len(rows) == outcome["expected_row_count"]
+
+
+def test_nearest_selection_copies_the_fix_it_names(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Every row is a recorded position, equal to the fix its provenance points at.
+
+    Checking every component against the source is what distinguishes a correct
+    row from one holding the right latitude in the wrong field, or the nearest
+    fix's time beside a different fix's position.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    source = gps_source_fixes()
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling="nearest_neighbor", duration_s=1.0
+    )
+
+    rows = _rows(_gps_clips(session, config)[0]["media_location"])
+
+    assert len(rows) == 30
+    for log_time, _payload, lat, lon, alt, meta in rows:
+        assert meta["cosmos_curator.sampling"] == "nearest_neighbor"
+        named = int(meta["cosmos_curator.source_timestamp_ns"])
+        assert (lat, lon, alt) == source[named]
+        # The fix it names is the nearest one, not merely one that exists.
+        assert named == min(source, key=lambda fix_ns: (abs(fix_ns - log_time), fix_ns))
+    # A 1 Hz source against a 30 Hz grid repeats: two fixes bracket a one-second
+    # clip, so the rows hold two distinct positions rather than thirty.
+    assert len({row[2] for row in rows}) == 2
+
+
+def test_interpolation_places_each_row_between_the_fixes_it_names(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A derived row sits on the line between its two bracketing fixes, in every component.
+
+    Asserting only that rows ascend would accept any monotonic sequence, so this
+    pins each row against the fixes its own provenance names.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    source = gps_source_fixes()
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling="interpolate", duration_s=1.0
+    )
+
+    rows = _rows(_gps_clips(session, config)[0]["media_location"])
+
+    assert len({row[2] for row in rows}) == len(rows)
+    for log_time, _payload, lat, lon, alt, meta in rows:
+        assert meta["cosmos_curator.sampling"] == "interpolate"
+        lower, upper = (int(value) for value in meta["cosmos_curator.source_bracket_timestamps_ns"].split(","))
+        assert lower <= log_time <= upper
+        # The brackets are the adjacent pair, not merely a pair that straddles.
+        assert upper - lower <= 1_000_000_000
+        alpha = 0.0 if upper == lower else (log_time - lower) / (upper - lower)
+        # Interpolation runs in ECEF, so a derived point sits on the chord between
+        # the two fixes rather than on the geodetic-linear line. Over a second of
+        # driving that is about a micrometre of altitude -- far below these
+        # tolerances, which are in turn far below the per-fix step a swapped
+        # component or a wrong alpha would show.
+        for index, value, tolerance in ((0, lat, 1e-7), (1, lon, 1e-7), (2, alt, 1e-3)):
+            expected = source[lower][index] + alpha * (source[upper][index] - source[lower][index])
+            assert value == pytest.approx(expected, abs=tolerance)
+
+
+def test_a_stale_fix_beyond_the_tolerance_refuses_only_its_own_clip(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A dropped fix costs the clips it left unsupported, and no others.
+
+    The bound exists to separate a fix that arrived late from one that never
+    arrived. Without a test that trips it, a bound wired to the wrong policy or
+    ignored entirely would look identical to one doing its job.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session, dropped=frozenset({3, 4}))
+    config = make_config(
+        root,
+        tmp_path / "media",
+        gps_sensors={"gps": "gps/gps.mcap"},
+        sampling="nearest_neighbor",
+        duration_s=1.0,
+    )
+
+    outcomes = _gps_clips(session, config)
+
+    statuses = [outcome["status"] for outcome in outcomes]
+    assert "failure" in statuses
+    assert "success" in statuses
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "gps")).read_bytes())
+    assert report["failures"][0]["stage"] == "align_sensor"
+    assert "max_delta" in report["failures"][0]["message"]
+
+
+def test_an_unreadable_gps_source_fails_every_span_and_says_so(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A sensor that cannot be opened reports one failure per planned span.
+
+    Per span, not one for the sensor: the outcome stream is terminal, and a span
+    absent from it cannot be told apart from a worker that died holding it.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    gps = make_gps_mcap(session)
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling="interpolate", duration_s=1.0
+    )
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    gps_plan = next(row for row in plans if row["sensor_key"] == "gps")
+    gps.write_bytes(b"not an mcap")
+
+    outcomes = split_aligned_session(gps_plan, config=config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["failure"] * 3
+    assert all(outcome["media_location"] is None for outcome in outcomes)
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "gps")).read_bytes())
+    assert report["failures"][0]["stage"] == "open_sensor"
+
+
+def test_a_source_message_without_the_fields_gps_rows_need_is_refused_once(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+) -> None:
+    """Naming the missing field beats an AttributeError raised once per clip.
+
+    The writer fills named position fields, so a producer whose message lacks one
+    cannot be written at all. Finding that out when the sensor opens reports it
+    once, against the sensor, rather than once per clip as an unclassified fault.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+
+    missing = make_gps_mcap(session, uri_pattern="a.mcap").read_bytes()
+    with pytest.raises(ValueError, match=r"carries no heading field"):
+        GpsClipWriter(
+            missing,
+            "/gps",
+            required_fields=(("heading", FieldDescriptor.TYPE_DOUBLE, FieldDescriptor.LABEL_OPTIONAL, ()),),
+        )
+
+    # Spelled right, shaped wrong. A check that only looked at names would wave
+    # these through and fail identically once per clip, which is the whole thing
+    # it exists to prevent.
+    wrong_timestamp = make_gps_mcap(session, uri_pattern="b.mcap", timestamp_as_int=True).read_bytes()
+    with pytest.raises(ValueError, match=r"has timestamp as type"):
+        GpsClipWriter(wrong_timestamp, "/gps")
+
+    singular = make_gps_mcap(session, uri_pattern="c.mcap", singular_metadata=True).read_bytes()
+    with pytest.raises(ValueError, match=r"has metadata where a repeated one is needed"):
+        GpsClipWriter(singular, "/gps")
+
+
+def test_a_block_routes_each_sensor_to_the_cut_its_kind_needs(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """One stage, two cuts: the trajectory is copied and the position is placed on the grid.
+
+    Both arrive as the same plan kind because both come from an MCAP and both are
+    cheap next to video. Only how the clip is written differs, and a block holding
+    one of each is where that dispatch is actually exercised.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_ego_mcap(session)
+    make_gps_mcap(session)
+    config = make_config(
+        root,
+        tmp_path / "media",
+        mcap_sensors={"ego": "ego/egotrajectory.mcap"},
+        gps_sensors={"gps": "gps/gps.mcap"},
+        sampling="interpolate",
+        duration_s=1.0,
+    )
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    block = pa.Table.from_pylist(
+        [row for row in plans if row["result_kind"] == MCAP_PLAN], schema=PLANNING_RESULT_SCHEMA
+    )
+
+    outcomes = split_mcap_batch(block, config=config).to_pylist()
+
+    assert len(outcomes) == 6
+    assert all(row["status"] == "success" for row in outcomes)
+    by_sensor = {row["sensor_key"]: row for row in outcomes}
+    assert set(by_sensor) == {"ego", "gps"}
+    # The trajectory keeps its recorded rate; the position is one row per grid point.
+    ego_rows = len(_rows_log_times(by_sensor["ego"]["media_location"]))
+    gps_rows = len(_rows_log_times(by_sensor["gps"]["media_location"]))
+    assert gps_rows == by_sensor["gps"]["expected_row_count"]
+    assert ego_rows != gps_rows
+
+
+def _rows_log_times(location: object) -> list[int]:
+    """Return every message time in a clip, whatever its schema."""
+    with Path(str(location)).open("rb") as stream:
+        return [message.log_time for _s, _c, message in mcap_make_reader(stream).iter_messages()]
+
+
+def test_a_tightened_tolerance_refuses_rows_the_default_would_serve(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The configured bound is the one applied, not the default it replaced.
+
+    On an undropped 1 Hz source the furthest a grid row sits from the nearest fix
+    is half a second, which the default tolerates and 400 ms does not. So a run
+    that ignored the configured value -- or read the interpolation bound instead
+    -- would publish these clips rather than refuse them, and no assertion about
+    healthy data could tell.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    config = make_config(
+        root,
+        tmp_path / "media",
+        gps_sensors={"gps": "gps/gps.mcap"},
+        sampling="nearest_neighbor",
+        max_delta_ms=400,
+        duration_s=1.0,
+    )
+
+    outcomes = _gps_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["failure"] * 3
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "gps")).read_bytes())
+    assert "max_delta" in report["failures"][0]["message"]
+
+    # And the same data under the default bound is served, so the refusal above
+    # is the tolerance biting rather than the fixture being unservable.
+    relaxed = make_config(
+        root, tmp_path / "media2", gps_sensors={"gps": "gps/gps.mcap"}, sampling="nearest_neighbor", duration_s=1.0
+    )
+    assert [outcome["status"] for outcome in _gps_clips(session, relaxed)] == ["success"] * 3
+
+
+def test_a_source_whose_envelope_and_payload_disagree_is_refused(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A converter that transforms one clock and not the other cannot produce a clip.
+
+    Planning bounds the window by log_time and alignment runs on the payload, so
+    when they disagree the window and the samples describe different clocks.
+    Every clip then fails with something that reads like missing data. Refusing
+    the sensor once, naming the gap, is what makes the converter the suspect.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session, payload_skew_ns=200_000_000)
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling="interpolate", duration_s=1.0
+    )
+    plans = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+    gps_plan = next(row for row in plans if row["sensor_key"] == "gps")
+
+    outcomes = split_aligned_session(gps_plan, config=config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["failure"] * len(outcomes)
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "gps")).read_bytes())
+    assert report["failures"][0]["stage"] == "open_sensor"
+    assert "a gap of 200000000 ns" in report["failures"][0]["message"]
+
+
+def test_a_source_whose_clocks_agree_is_not_refused(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The check must not refuse the healthy case it is meant to let through."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    config = make_config(
+        root, tmp_path / "media", gps_sensors={"gps": "gps/gps.mcap"}, sampling="interpolate", duration_s=1.0
+    )
+
+    assert [outcome["status"] for outcome in _gps_clips(session, config)] == ["success"] * 3

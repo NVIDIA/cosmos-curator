@@ -330,7 +330,8 @@ def clip_dataset(plans: ray.data.Dataset, config: ResolvedMultimodalSplitConfig)
     )
     # Two stages rather than one branching on sensor type, because their costs
     # have nothing in common: a camera decodes and re-encodes video, while an
-    # MCAP is copied. Scheduling both under the camera's memory reservation would
+    # MCAP is copied or aligned from a handful of fixes. Scheduling both under
+    # the camera's memory reservation would
     # price the cheap one at the expensive one's rate.
     mcap_clips = plans.filter(expr=col("result_kind") == MCAP_PLAN).map_batches(
         cast("Any", split_mcap_batch),

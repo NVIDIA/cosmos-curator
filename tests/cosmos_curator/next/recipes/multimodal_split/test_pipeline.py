@@ -642,3 +642,90 @@ def test_a_trajectory_that_fails_to_cut_drops_the_episode_rather_than_publishing
     episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
     assert len(episodes) == 2
     assert all(len(episode["sensor_media"]) == 1 for episode in episodes)
+
+
+@pytest.mark.integration
+def test_a_run_publishes_an_episode_carrying_a_gridded_sensor(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A placed sensor reaches the catalogue like a copied one, with null grid sidecars.
+
+    A gridded sensor sits on the episode's own timeline, so it has no timeline or
+    observations artifact of its own. Its outcome row carries nulls where a
+    camera's carries those descriptors, and assembly refuses a successful outcome
+    missing any descriptor that applies to its kind -- so this is where a sensor
+    kind is published or silently dropped.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session)
+    media = tmp_path / "media"
+
+    summary = run_config(
+        make_config(root, media, gps_sensors={"gps": "gps/gps.mcap"}, sampling="interpolate", duration_s=1.0)
+    )
+
+    assert summary["episodes_newly_published"] == 3
+    assert summary["episodes_dropped"] == 0
+    assert summary["failures"] == 0
+    assert summary["sensor_clips_written"] == 3
+
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    assert len(episodes) == 3
+    for episode in episodes:
+        gps = next(sensor for sensor in episode["sensor_media"] if sensor["sensor_key"] == "gps")
+        assert gps["sensor_type"] == "gps"
+        # A gridded sensor sits on the episode's own timeline, so it has neither a
+        # timeline of its own nor a per-row record of which sample served which
+        # row -- and those are absent from its catalogue entry rather than null
+        # within it, which is the difference from a camera.
+        assert set(gps) == {
+            "sensor_key",
+            "sensor_type",
+            "source_media_location",
+            "media_location",
+            "media_size_bytes",
+            "media_sha256",
+        }
+        sidecars = {"timeline_location", "timeline_sha256", "observations_location", "observations_sha256"}
+        assert sidecars.isdisjoint(gps)
+        assert sidecars <= set(episode["camera_media"][0])
+        payload = Path(gps["media_location"]).read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == gps["media_sha256"]
+        assert Path(gps["media_location"]).parent == Path(episode["camera_media"][0]["media_location"]).parent
+
+
+@pytest.mark.integration
+def test_a_gps_sensor_that_cannot_be_aligned_drops_its_episode(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_gps_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A clip whose position cannot be placed is not published without it."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_gps_mcap(session, dropped=frozenset({1}))
+    media = tmp_path / "media"
+
+    summary = run_config(
+        make_config(
+            root,
+            media,
+            gps_sensors={"gps": "gps/gps.mcap"},
+            sampling="interpolate",
+            max_gap_ms=1200,
+            duration_s=1.0,
+        )
+    )
+
+    assert summary["episodes_dropped"] > 0
+    assert summary["episodes_newly_published"] == summary["episodes_planned"] - summary["episodes_dropped"]
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    # Non-empty first: ``all`` over nothing is true, so a run that dropped every
+    # episode would otherwise satisfy the line below.
+    assert episodes
+    assert all(any(s["sensor_key"] == "gps" for s in e["sensor_media"]) for e in episodes)

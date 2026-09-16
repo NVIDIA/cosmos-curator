@@ -31,6 +31,19 @@ from cosmos_curator.next.core.config import apply_dotted_overrides
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 _NS_PER_SECOND = 1_000_000_000
 _SENSOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Both defaults separate a fix that arrived late from one that never arrived.
+#
+# A 1 Hz receiver does not tick at exactly 1 Hz: measured across real sessions,
+# consecutive fixes land within about +/-15 us of the nominal second. A dropped
+# fix instead leaves a gap near two seconds. So the useful bound sits well above
+# the jitter and well below a drop, and anything set at the nominal interval
+# itself refuses healthy data -- which is what an interval of 1000.002 ms did.
+#
+# Half the gap bound, because the furthest a grid point can sit from the nearer
+# of two fixes is half the distance between them.
+_DEFAULT_MAX_DELTA_MS = 750.0
+_DEFAULT_MAX_GAP_MS = 1500.0
 _BITRATE_SUFFIXES = frozenset({"K", "M"})
 _BITRATE_PATTERN = r"^[1-9][0-9]*(?:\.[0-9]+)?[KkMm]$"
 _SUPPORTED_SCHEMES = frozenset({"s3", "file"})
@@ -49,9 +62,29 @@ MultimodalSplitVideoEncoder = Literal["libopenh264"]
 
 # Widened as each kind lands. A config naming a kind the recipe cannot process
 # yet is refused at load, rather than discovering it after a listing pass.
-MultimodalSplitSensorType = Literal["camera", "egotrajectory"]
+MultimodalSplitSensorType = Literal["camera", "egotrajectory", "gps"]
 
-#: Kinds cut by copying MCAP records rather than by sampling onto the clip grid.
+#: How a sensor's samples are placed on the clip's grid.
+#:
+#: ``nearest_neighbor`` selects the closest recorded sample for each grid point
+#: and invents nothing, so a row is a measurement that really happened, carrying
+#: whatever staleness the gap to it implies. ``interpolate`` derives a value
+#: between the two fixes bracketing the grid point, which reads more smoothly
+#: and is a value no instrument reported.
+#:
+#: Which is right depends on the source and on what a consumer does with it,
+#: which is why it is configured rather than decided here.
+MultimodalSplitSampling = Literal["nearest_neighbor", "interpolate"]
+
+SENSOR_TYPE_CAMERA = "camera"
+
+#: Kinds whose source artifact is an MCAP, so planning takes their bounds from a
+#: topic rather than from a timeline sidecar. Says nothing about how they are cut.
+MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "gps"})
+
+#: Kinds cut by copying records at the rate they were recorded. With
+#: ``ALIGNED_SENSOR_TYPES`` this partitions ``MCAP_SENSOR_TYPES``, and the
+#: splitter refuses a kind in neither rather than guessing how to cut it.
 #:
 #: An egotrajectory is recorded at 100 Hz and consumed at that rate -- lidar
 #: motion compensation wants a pose at each point's own instant, not at a video
@@ -59,8 +92,17 @@ MultimodalSplitSensorType = Literal["camera", "egotrajectory"]
 #: before any consumer saw it, so the clip carries what the sensor recorded and
 #: ``core.sensors.alignment.ego_trajectory`` derives poses from that when a
 #: consumer wants them on a grid.
-SENSOR_TYPE_CAMERA = "camera"
-MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory"})
+COPIED_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory"})
+
+#: Kinds cut by placing samples on the clip's grid, the same grid the cameras
+#: are resampled onto.
+#:
+#: The opposite situation from a copied sensor: GPS arrives at 1 Hz against a
+#: 30 Hz grid, so the grid is denser than the source and this is upsampling, not
+#: discarding. Sharing the cameras' grid is what makes row *i* of the video and
+#: row *i* of the position the same instant, which is the whole reason an
+#: episode has one timeline.
+ALIGNED_SENSOR_TYPES: frozenset[str] = frozenset({"gps"})
 
 
 class MultimodalSplitInputConfig(BaseModel):
@@ -313,6 +355,89 @@ class MultimodalSplitSensorConfig(BaseModel):
         default=True,
         description="Whether a session missing this sensor is refused, or produces episodes without it.",
     )
+    sampling: MultimodalSplitSampling | None = Field(
+        default=None,
+        description=(
+            "How samples are placed on the clip grid. Required for a sensor that is aligned rather than copied."
+        ),
+    )
+    max_delta_ms: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+        description=(
+            f"How stale a nearest-neighbour row may be before the clip is refused. Defaults to "
+            f"{_DEFAULT_MAX_DELTA_MS:g}."
+        ),
+    )
+    max_gap_ms: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+        description=(
+            f"How far apart the two fixes bracketing an interpolated row may be before the clip is refused. "
+            f"Defaults to {_DEFAULT_MAX_GAP_MS:g}."
+        ),
+    )
+
+    @property
+    def max_delta_ns(self) -> int:
+        """Return the nearest-neighbour tolerance in the units the policy takes.
+
+        Rounded rather than truncated, for the reason the video tolerance is:
+        flooring a sub-nanosecond remainder makes the bound quietly tighter than
+        what was configured.
+        """
+        return round((self.max_delta_ms if self.max_delta_ms is not None else _DEFAULT_MAX_DELTA_MS) * 1_000_000)
+
+    @property
+    def max_gap_ns(self) -> int:
+        """Return the interpolation bracket bound in the units the policy takes, rounded."""
+        return round((self.max_gap_ms if self.max_gap_ms is not None else _DEFAULT_MAX_GAP_MS) * 1_000_000)
+
+    @property
+    def sampling_bound_ns(self) -> int | None:
+        """Return the bound the configured policy actually applies, or None if none does.
+
+        One number rather than both, because only one is ever consulted. Carrying
+        the unused one into an identity would let a setting that changes nothing
+        about the output change what the output is called.
+        """
+        if self.sampling == "nearest_neighbor":
+            return self.max_delta_ns
+        if self.sampling == "interpolate":
+            return self.max_gap_ns
+        return None
+
+    @model_validator(mode="after")
+    def _validate_sampling_applies(self) -> Self:
+        """Require a policy where there is a choice, and refuse one where there is not.
+
+        A copied sensor is not placed on the grid at all, so naming a policy for
+        it describes work the run will not do. An aligned sensor has no defensible
+        default: ``nearest_neighbor`` reports only measurements that happened and
+        ``interpolate`` reports values no instrument did, and which is right
+        depends on the source's accuracy and on the consumer. Choosing silently
+        would bake that into the artifact without anyone deciding.
+        """
+        aligned = self.sensor_type in ALIGNED_SENSOR_TYPES
+        if aligned and self.sampling is None:
+            msg = f"sensor_type {self.sensor_type!r} is placed on the clip grid, so sampling must be set"
+            raise ValueError(msg)
+        if not aligned and self.sampling is not None:
+            msg = f"sensor_type {self.sensor_type!r} is not placed on the clip grid, so sampling cannot be set"
+            raise ValueError(msg)
+
+        # Each bound belongs to one policy. Accepting the other one silently
+        # would let a config state a tolerance the run never applies.
+        bound_for = {"nearest_neighbor": "max_delta_ms", "interpolate": "max_gap_ms"}
+        for policy, field in bound_for.items():
+            unused = self.sampling != policy and getattr(self, field) is not None
+            if unused:
+                applies = f"sampling {policy!r}" if self.sampling is not None else "an aligned sensor"
+                msg = f"{field} applies to {applies}, so it cannot be set here"
+                raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _validate_topic_applies(self) -> Self:
@@ -527,7 +652,12 @@ class ResolvedMultimodalSplitConfig(BaseModel):
 
     @property
     def mcap_sensors(self) -> dict[str, MultimodalSplitSensorConfig]:
-        """Return the sensors copied into a clip rather than sampled onto its grid."""
+        """Return the sensors whose source is an MCAP, however their clip is written.
+
+        Planning takes their bounds from a topic rather than a timeline sidecar,
+        which is all this set decides. ``COPIED_SENSOR_TYPES`` and
+        ``ALIGNED_SENSOR_TYPES`` partition it by how the clip is produced.
+        """
         return {key: sensor for key, sensor in self.sensors.items() if sensor.sensor_type in MCAP_SENSOR_TYPES}
 
     @field_validator("sensors")
@@ -557,9 +687,13 @@ _TEMPLATE_BASE: dict[str, Any] = {
 # an operator would otherwise never discover are named here instead.
 _TEMPLATE_PREAMBLE = """\
 # Every setting with a non-null default is shown; unchanged settings may be removed.
-# Three optional settings default to null and are omitted: input.session_id_list_path reads session
-# IDs from a file instead of listing the prefix, input.limit caps how many sessions are kept, and
-# sensors.<key>.topic names which topic to cut from an MCAP carrying more than one.
+# These default to null, so they are omitted above and are named here instead:
+#   input.session_id_list_path  read session IDs from a file instead of listing the prefix
+#   input.limit                 cap how many sessions are kept
+#   sensors.<key>.topic         which topic to cut from an MCAP carrying more than one
+#   sensors.<key>.sampling      nearest_neighbor or interpolate; required for a gps sensor
+#   sensors.<key>.max_delta_ms  how stale a nearest_neighbor row may be
+#   sensors.<key>.max_gap_ms    how far apart the fixes bracketing an interpolated row may be
 """
 
 

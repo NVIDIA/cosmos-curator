@@ -35,6 +35,8 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # identity schemes -- ids from either would be version 1 and indistinguishable.
 MEDIA_CONTRACT_VERSION = 2
 EPISODE_IDENTITY_VERSION = 1
+# 3: how an MCAP sensor is sampled joined the contract, because a sensor placed
+# on the grid produces different bytes under each policy.
 # 2: MCAP sensors joined the contract. A clip published under version 1 was cut
 # from cameras alone, so it cannot be said to satisfy a config that also asks for
 # a trajectory.
@@ -43,7 +45,7 @@ EPISODE_IDENTITY_VERSION = 1
 # identity matches but whose contract does not is a conflict, and
 # ``reconcile_planned_episode`` raises. So adding a sensor to a config that has
 # already published needs a new output path, not a rerun into the old one.
-SPLIT_CONTRACT_DIGEST_VERSION = 2
+SPLIT_CONTRACT_DIGEST_VERSION = 3
 # 2: non-camera sensor artifacts joined the digest. An episode published under
 # version 1 was its cameras and nothing else, so it cannot be compared byte for
 # byte against one that also carries a trajectory.
@@ -142,7 +144,18 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
             # belongs here for the same reason: the same clip cut from a
             # different topic is different bytes under an unchanged identity.
             "mcap_sensors": [
-                {"sensor_key": key, "sensor_type": sensor.sensor_type, "topic": sensor.topic}
+                {
+                    "sensor_key": key,
+                    "sensor_type": sensor.sensor_type,
+                    "topic": sensor.topic,
+                    # How a sensor is placed on the grid decides what its clip
+                    # holds, not merely how it was produced: the same span under
+                    # nearest selection and under interpolation is different
+                    # bytes. So is the bound, which decides which clips exist at
+                    # all by refusing the ones it will not serve.
+                    "sampling": sensor.sampling,
+                    "sampling_bound_ns": sensor.sampling_bound_ns,
+                }
                 for key, sensor in sorted(config.mcap_sensors.items())
             ],
             "video": {
