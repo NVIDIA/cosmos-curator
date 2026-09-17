@@ -368,6 +368,15 @@ class MultimodalSplitSensorConfig(BaseModel):
         default=True,
         description="Whether a session missing this sensor is refused, or produces episodes without it.",
     )
+    allow_pts_fallback: bool = Field(
+        default=False,
+        description=(
+            "Whether a camera missing its capture timeline may fall back to the container's own "
+            "presentation timestamps instead of being refused as broken. Off by default: a "
+            "constant-frame-rate mux regenerates PTS on a fixed grid, so a timeline read from it "
+            "describes the encoder rather than the hardware."
+        ),
+    )
     sampling: MultimodalSplitSampling | None = Field(
         default=None,
         description=(
@@ -462,6 +471,18 @@ class MultimodalSplitSensorConfig(BaseModel):
         """
         if self.topic is not None and self.sensor_type not in MCAP_SENSOR_TYPES:
             msg = f"sensor_type {self.sensor_type!r} carries no topics, so topic cannot be set"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pts_fallback_applies(self) -> Self:
+        """Reject PTS fallback on a sensor that has no capture timeline to fall back from.
+
+        Only a camera reads a capture timeline in the first place, so only a
+        camera has anything to fall back from.
+        """
+        if self.allow_pts_fallback and self.sensor_type != SENSOR_TYPE_CAMERA:
+            msg = f"sensor_type {self.sensor_type!r} has no capture timeline, so allow_pts_fallback cannot be set"
             raise ValueError(msg)
         return self
 

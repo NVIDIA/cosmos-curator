@@ -119,8 +119,11 @@ def build_episode_record(
     sensor_media: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build one canonical row, enforcing the capture-grid and camera contracts."""
-    if facts.timestamp_source is not TimestampSource.CAPTURE:
-        msg = f"Canonical multimodal episodes require capture timestamps, got {facts.timestamp_source.value!r}"
+    if facts.timestamp_source not in (TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS):
+        msg = (
+            f"Canonical multimodal episodes require capture or container-PTS timestamps, "
+            f"got {facts.timestamp_source.value!r}"
+        )
         raise ValueError(msg)
     _, _, timestamps_ns = make_ts_grid(
         facts.start_ns,

@@ -35,6 +35,10 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # identity schemes -- ids from either would be version 1 and indistinguishable.
 MEDIA_CONTRACT_VERSION = 2
 EPISODE_IDENTITY_VERSION = 1
+# 4: a camera's allow_pts_fallback joined the contract, because it decides
+# whether the camera can produce output at all and which clock its timeline
+# came from -- result-defining, not execution tuning, so a rerun that flips it
+# must not reconcile against episodes planned under the old setting.
 # 3: how an MCAP sensor is sampled joined the contract, because a sensor placed
 # on the grid produces different bytes under each policy.
 # 2: MCAP sensors joined the contract. A clip published under version 1 was cut
@@ -45,7 +49,7 @@ EPISODE_IDENTITY_VERSION = 1
 # identity matches but whose contract does not is a conflict, and
 # ``reconcile_planned_episode`` raises. So adding a sensor to a config that has
 # already published needs a new output path, not a rerun into the old one.
-SPLIT_CONTRACT_DIGEST_VERSION = 3
+SPLIT_CONTRACT_DIGEST_VERSION = 4
 # 2: non-camera sensor artifacts joined the digest. An episode published under
 # version 1 was its cameras and nothing else, so it cannot be compared byte for
 # byte against one that also carries a trajectory.
@@ -136,7 +140,12 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
                 "sampling_fps": config.clip.sampling_fps,
             },
             "cameras": [
-                {"camera_key": key, "sensor_type": camera.sensor_type} for key, camera in sorted(config.cameras.items())
+                {
+                    "camera_key": key,
+                    "sensor_type": camera.sensor_type,
+                    "allow_pts_fallback": camera.allow_pts_fallback,
+                }
+                for key, camera in sorted(config.cameras.items())
             ],
             # Every sensor that puts an artifact in a clip, so adding one makes
             # published clips stale rather than leaving them reconciling as

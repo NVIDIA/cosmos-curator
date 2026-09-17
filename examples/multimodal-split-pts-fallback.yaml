@@ -1,0 +1,31 @@
+schema_version: 1
+kind: multimodal-split
+input:
+  input_path_prefix: s3://bucket_name/golden_v52_v1/test/clips
+sensors:
+  front:
+    sensor_type: camera
+    uri_pattern: '*/camera_front.mp4'
+    required: true
+    # A session missing its timestamps.npy capture sidecar falls back to the
+    # container's own presentation timestamps instead of being refused. Off by
+    # default; only turn this on for sources known to lack the sidecar.
+    allow_pts_fallback: true
+output:
+  path: s3://bucket_name/golden_v52_v1/test/multimodal-split-output
+clip:
+  duration_s: 10.0
+  sampling_fps: 30
+video:
+  max_delta_s: 0.05
+  encoder:
+    video_encoder: libopenh264
+    video_bitrate: 4M
+    gop_size: 30
+    faststart: true
+execution:
+  progress: false
+  storage_profile: default
+  span_planner:
+    num_cpus: 0.125
+  split_session: {}

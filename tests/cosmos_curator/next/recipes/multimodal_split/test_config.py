@@ -736,6 +736,38 @@ def test_an_imu_sensor_is_copied_like_egotrajectory() -> None:
     assert list(config.mcap_sensors) == ["imu"]
 
 
+def test_allow_pts_fallback_defaults_to_false() -> None:
+    """A camera missing its capture timeline is refused unless a config opts in."""
+    config = _resolved(sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4"}})
+
+    assert config.sensors["front"].allow_pts_fallback is False
+
+
+def test_allow_pts_fallback_on_a_camera_is_accepted() -> None:
+    """The one sensor type that carries a capture timeline may opt into its fallback."""
+    config = _resolved(
+        sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4", "allow_pts_fallback": True}}
+    )
+
+    assert config.sensors["front"].allow_pts_fallback is True
+
+
+def test_allow_pts_fallback_on_an_mcap_sensor_is_refused_rather_than_ignored() -> None:
+    """Only a camera reads a capture timeline, so only a camera has one to fall back from."""
+    with pytest.raises(ValidationError, match="has no capture timeline"):
+        _resolved(
+            sensors={
+                "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+                "ego": {
+                    "sensor_type": "egotrajectory",
+                    "uri_pattern": "ego.mcap",
+                    "topic": "/ego",
+                    "allow_pts_fallback": True,
+                },
+            }
+        )
+
+
 def test_an_aligned_sensor_must_say_how_it_is_sampled() -> None:
     """There is no defensible default, so the config has to choose.
 

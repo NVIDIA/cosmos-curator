@@ -158,7 +158,7 @@ def test_episode_and_materialization_digest_fixtures(
     assert split_clip_id == "06c13fc958dbf9468c99710c63777749752f320583620710c8c68e1299a2d855"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "c91a8fb19272d804f20676c71d42b4fe590272f66f4606cf0f9d7d0860274c65"
+    assert split_digest == "415d9f45b07ac04b04f3d9d407b48f3715df81a0d57f71d7ebe87204c3484c39"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "41ca854db4c84392b39ce278cf1bdc5de523da32a4b4ccdae5b400d6e514f640"
+        == "ffdbbb6d8d10ea11e26c26b5eb2fce097c1e7f0655c7f99f4c0f01fc7441a39b"
     )
 
 
@@ -183,6 +183,22 @@ def test_split_contract_includes_rendering_but_excludes_execution(
 
     assert make_split_contract_digest(defining) != make_split_contract_digest(baseline)
     assert make_split_contract_digest(execution) == make_split_contract_digest(baseline)
+
+
+def test_allow_pts_fallback_changes_the_split_contract(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A camera's fallback setting is result-defining, not execution tuning.
+
+    It decides whether the camera can produce output at all and which clock its
+    timeline came from, so a rerun that flips it must not reconcile against
+    episodes planned under the old setting.
+    """
+    without_fallback = make_config(tmp_path / "input", tmp_path / "output")
+    with_fallback = make_config(tmp_path / "input", tmp_path / "output", pts_fallback_cameras=frozenset({"front"}))
+
+    assert make_split_contract_digest(with_fallback) != make_split_contract_digest(without_fallback)
 
 
 def _sensor(key: str, marker: str) -> dict[str, object]:

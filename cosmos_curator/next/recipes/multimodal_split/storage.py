@@ -32,6 +32,7 @@ import numpy.typing as npt
 import smart_open
 
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
+from cosmos_curator.core.sensors.utils.video import make_index_and_metadata
 from cosmos_curator.core.utils.storage.s3_client import S3Client
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_files_relative,
@@ -109,6 +110,31 @@ def load_timeline_ns(
         # open_sensor_source is typed to DataSource's BufferedIOBase arm; np.load
         # wants the narrower BinaryIO, and every stream reachable here satisfies it.
         return read_timestamps_ns(cast("BinaryIO", stream))
+
+
+def load_container_pts_ns(
+    sensor_uri: str, *, storage_profile: str = "default", read_buffer_bytes: int | None = None
+) -> npt.NDArray[np.int64]:
+    """Read a camera's presentation timestamps by indexing its own container.
+
+    The fallback for a camera with no capture timeline: indexing is the only way
+    to learn a container's PTS, which is the eager pass ``load_timeline_ns``
+    exists to avoid paying when a capture timeline is already on hand.
+
+    Raises:
+        ValueError: If the video stream has no displayable frames. Mirrors
+            ``CameraSensor``'s own check on the same array: an empty timeline
+            would otherwise read as a valid fallback and fail later, wherever
+            something asks it for a first or last timestamp.
+
+    """
+    with open_sensor_source(sensor_uri, storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes) as stream:
+        video_index, _ = make_index_and_metadata(stream)
+        timestamps_ns = video_index.display_pts_ns
+        if len(timestamps_ns) == 0:
+            msg = f"{sensor_uri} has no displayable frames, so it has no container PTS to fall back to"
+            raise ValueError(msg)
+        return timestamps_ns
 
 
 def load_mcap_bounds(

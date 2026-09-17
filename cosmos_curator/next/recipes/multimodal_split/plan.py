@@ -60,10 +60,12 @@ from cosmos_curator.next.recipes.multimodal_split.reports import (
 )
 from cosmos_curator.next.recipes.multimodal_split.storage import (
     list_session_paths,
+    load_container_pts_ns,
     load_mcap_bounds,
     load_timeline_ns,
     resolve_sensor_pattern,
 )
+from cosmos_curator.next.recipes.multimodal_split.uris import timeline_uri
 
 CAMERA_PLAN = "camera_plan"
 MCAP_PLAN = "mcap_plan"
@@ -139,7 +141,7 @@ def open_cameras(
     *,
     config: ResolvedMultimodalSplitConfig,
     storage_profile: str,
-) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], list[dict[str, Any]]]:
+) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], set[str], list[dict[str, Any]]]:
     """Resolve and read every camera in *session_uri*, and say which ones failed.
 
     Failures are per sensor, so one names the camera that failed. Attributing all
@@ -160,9 +162,22 @@ def open_cameras(
     sensor changes the window every clip is planned from -- so two runs of one
     immutable session could plan different episode sets, and the second would
     then fail reconciliation against the first.
+
+    A camera missing its capture timeline is still a fault unless its config sets
+    ``allow_pts_fallback``, in which case its timeline is read from the
+    container's own presentation timestamps instead -- returned in the third
+    element, the keys whose timeline came from that fallback rather than from a
+    capture sidecar. "Missing" is decided the same way a camera's own absence
+    is: against the listing, not from whatever ``load_timeline_ns`` raises. A
+    sidecar the listing does carry is read, and if that read fails -- a
+    truncated write, a wrong dtype, a non-ascending timeline -- it is a fault,
+    the same as a broken video would be, and never falls back: the fallback
+    exists for a sidecar that was never written, not for one that was written
+    badly.
     """
     sensor_uris: dict[str, str] = {}
     timelines: dict[str, npt.NDArray[np.int64]] = {}
+    pts_fallback_keys: set[str] = set()
     failures: list[dict[str, Any]] = []
     for key, camera in config.cameras.items():
         # Resolving and reading are separate because only the first can say the
@@ -180,19 +195,39 @@ def open_cameras(
         except Exception as error:  # noqa: BLE001 -- an ambiguous pattern is one failed sensor
             failures.append(failure(session_id, key, None, "open_sensor", error))
             continue
-        try:
-            timelines[key] = load_timeline_ns(
-                uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
-            )
-        except Exception as error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
-            failures.append(failure(session_id, key, None, "open_sensor", error))
-            continue
+        # The listing, not an exception type, decides whether the sidecar is
+        # missing -- the same reason ``resolve_sensor_pattern`` above is given
+        # the listing rather than being let to raise and be sniffed. Relative to
+        # session_uri because session_paths is: resolve_sensor_uri's own join,
+        # reversed.
+        relative_match = uri.removeprefix(f"{session_uri.rstrip('/')}/")
+        if timeline_uri(relative_match) not in session_paths:
+            if not camera.allow_pts_fallback:
+                missing_timeline = FileNotFoundError(f"no capture timeline sidecar for {uri}")
+                failures.append(failure(session_id, key, None, "open_sensor", missing_timeline))
+                continue
+            try:
+                timelines[key] = load_container_pts_ns(
+                    uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+                )
+            except Exception as pts_error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
+                failures.append(failure(session_id, key, None, "open_sensor", pts_error))
+                continue
+            pts_fallback_keys.add(key)
+        else:
+            try:
+                timelines[key] = load_timeline_ns(
+                    uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+                )
+            except Exception as timeline_error:  # noqa: BLE001 -- a listed-but-broken sidecar is one failed sensor
+                failures.append(failure(session_id, key, None, "open_sensor", timeline_error))
+                continue
         sensor_uris[key] = uri
 
     if not sensor_uris and not failures:
         no_camera = ValueError("no configured camera could be opened")
         failures.append(failure(session_id, None, None, "open_sensor", no_camera))
-    return sensor_uris, timelines, failures
+    return sensor_uris, timelines, pts_fallback_keys, failures
 
 
 def open_mcap_sensors(
@@ -273,7 +308,7 @@ def span_planner(
         )
         return []
 
-    sensor_uris, timelines, failures = open_cameras(
+    sensor_uris, timelines, pts_fallback_keys, failures = open_cameras(
         session_id, session_uri, session_paths, config=config, storage_profile=storage_profile
     )
     mcap_uris, mcap_bounds, mcap_failures = open_mcap_sensors(
@@ -315,6 +350,13 @@ def span_planner(
     camera_sources = {key: sensor_uris[key] for key in camera_keys}
     sensor_sources = {key: mcap_uris[key] for key in mcap_keys}
     split_contract_digest = make_split_contract_digest(config)
+    # A clip is one moment across everything the rig promised, so one camera
+    # reading its timeline from container PTS instead of a capture sidecar marks
+    # the whole episode CONTAINER_PTS -- there is no per-camera timestamp_source
+    # on the row for a mixed episode to carry.
+    timestamp_source = (
+        TimestampSource.CONTAINER_PTS if pts_fallback_keys & set(camera_keys) else TimestampSource.CAPTURE
+    )
     planned: list[dict[str, Any]] = []
     already_canonical: list[dict[str, Any]] = []
     existing_by_episode_id = (reconciliation or {}).get(source_id, {})
@@ -331,7 +373,7 @@ def span_planner(
             # The delivered half-open grid is authoritative. Publication
             # regenerates it so a carried row count cannot diverge silently.
             "expected_row_count": len(sampling_grid_ns(span, config)),
-            "timestamp_source": TimestampSource.CAPTURE.value,
+            "timestamp_source": timestamp_source.value,
             "record_schema_version": RECORD_SCHEMA_VERSION,
             "media_contract_version": MEDIA_CONTRACT_VERSION,
             "split_contract_digest": split_contract_digest,

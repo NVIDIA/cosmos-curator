@@ -114,14 +114,22 @@ def test_record_builder_sorts_cameras_and_camera_resolution_is_exact() -> None:
         resolve_camera_media(record, "rear")
 
 
-def test_record_builder_rejects_the_wrong_clock_or_row_count() -> None:
-    """The base schema version pins capture-clock and delivered-grid semantics."""
+def test_record_builder_accepts_capture_or_container_pts_clock() -> None:
+    """Both clocks a camera can legally report reach canonical output.
+
+    ``CONTAINER_PTS`` is the ``allow_pts_fallback`` result, and is accepted on
+    the same terms as ``CAPTURE``: canonical output just needs a well-formed
+    grid, not a specific source for the timeline.
+    """
     facts = _facts()
-    with pytest.raises(ValueError, match="capture timestamps"):
-        build_episode_record(
-            replace(facts, timestamp_source=TimestampSource.CONTAINER_PTS),
-            [_camera("front", "1")],
-        )
+    for source in (TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS):
+        record = build_episode_record(replace(facts, timestamp_source=source), [_camera("front", "1")])
+        assert record["timestamp_source"] == source.value
+
+
+def test_record_builder_rejects_a_row_count_the_grid_disagrees_with() -> None:
+    """The base schema version pins delivered-grid semantics."""
+    facts = _facts()
     with pytest.raises(ValueError, match="row_count=29"):
         build_episode_record(replace(facts, row_count=29), [_camera("front", "1")])
 

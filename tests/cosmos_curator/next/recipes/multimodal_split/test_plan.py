@@ -224,6 +224,138 @@ def test_a_missing_optional_camera_leaves_the_session_planning(
     assert not Path(plan_error_uri(config.output.path, "session-000")).exists()
 
 
+def test_a_camera_missing_its_timeline_is_refused_without_the_fallback_flag(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A recording with video and no capture timeline stays a broken camera by default."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000", write_timestamps=False)
+    config = make_config(root, tmp_path / "media")
+
+    results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+
+    assert results == []
+    report = json.loads(Path(plan_error_uri(config.output.path, "session-000")).read_bytes())
+    assert [entry["sensor_key"] for entry in report["failures"]] == ["front"]
+
+
+def test_a_camera_missing_its_timeline_falls_back_to_container_pts_when_allowed(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """``allow_pts_fallback`` reads a camera's timeline from its own container instead of refusing it."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000", write_timestamps=False)
+    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+
+    results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+
+    assert not Path(plan_error_uri(config.output.path, "session-000")).exists()
+    assert [row["sensor_key"] for row in results] == ["front"]
+    assert results[0]["spans"]
+    assert all(span["timestamp_source"] == "container_pts" for span in results[0]["spans"])
+
+
+def test_a_camera_whose_container_pts_also_fails_is_an_open_sensor_failure(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """``allow_pts_fallback`` is a fallback, not a second guarantee: a camera that fails both stays failed.
+
+    The session's video is unreadable garbage rather than missing, so
+    ``load_timeline_ns`` fails for the usual reason (no sidecar) and the
+    fallback then fails too, for a different one (no parseable container).
+    Both are camera-read faults, and the second must not escape as anything
+    other than the same per-camera ``open_sensor`` failure the first is.
+    """
+    root = tmp_path / "recordings"
+    camera_path = root / "session-000" / "camera" / "front.mp4"
+    camera_path.parent.mkdir(parents=True)
+    camera_path.write_bytes(b"not a video container")
+    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+
+    results = span_planner(
+        {"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config
+    )
+
+    assert results == []
+    report = json.loads(Path(plan_error_uri(config.output.path, "session-000")).read_bytes())
+    assert [entry["sensor_key"] for entry in report["failures"]] == ["front"]
+    assert [entry["stage"] for entry in report["failures"]] == ["open_sensor"]
+
+
+def test_a_malformed_timeline_sidecar_never_falls_back(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A present-but-corrupt sidecar is a fault, not a missing one, even with the flag set.
+
+    ``allow_pts_fallback`` exists for a sidecar that was never written, not one
+    that was written badly: a truncated or malformed ``timestamps.npy`` in the
+    listing must fail the camera outright, the same as it would with the flag
+    off, rather than being quietly reinterpreted as container PTS.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    (session / "camera" / "front.mp4.timestamps.npy").write_bytes(b"not a valid npy timeline")
+    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+
+    results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+
+    assert results == []
+    report = json.loads(Path(plan_error_uri(config.output.path, "session-000")).read_bytes())
+    assert [entry["sensor_key"] for entry in report["failures"]] == ["front"]
+
+
+def test_a_mixed_session_marks_the_whole_episode_container_pts(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One camera falling back to container PTS taints the whole episode's timestamp_source.
+
+    A clip is one moment across every view the rig promised, so a reader must
+    not be able to read ``timestamp_source`` as "capture" for an episode where
+    only one of two cameras actually has a capture timeline.
+
+    ``load_container_pts_ns`` is faked to land on the same clock as ``left``'s
+    real capture timeline: a real container's own PTS restarts at 0 per file
+    (see ``CameraSensor``'s docstring on why it's an inferior fallback), so two
+    cameras on genuinely unrelated clocks would cover no common window at all --
+    a real planning failure, but not the one this test is pinning.
+    """
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", uri_pattern="camera/front.mp4", write_timestamps=False)
+    make_session(root, "session-000", uri_pattern="camera/left.mp4", write_timestamps=True)
+    config = make_config(
+        root,
+        tmp_path / "media",
+        cameras={"front": "camera/front.mp4", "left": "camera/left.mp4"},
+        pts_fallback_cameras=frozenset({"front"}),
+    )
+
+    def fake_load_container_pts_ns(*_args: object, **_kwargs: object) -> np.ndarray:
+        period_ns = round(1_000_000_000 / 30)
+        return np.array([DEVICE_ORIGIN_NS + index * period_ns for index in range(90)], dtype=np.int64)
+
+    monkeypatch.setattr(plan_module, "load_container_pts_ns", fake_load_container_pts_ns)
+
+    results = span_planner(
+        {"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config
+    )
+
+    assert not Path(plan_error_uri(config.output.path, "session-000")).exists()
+    assert sorted(row["sensor_key"] for row in results) == ["front", "left"]
+    for row in results:
+        assert row["spans"]
+        assert all(span["timestamp_source"] == "container_pts" for span in row["spans"])
+
+
 def test_every_camera_optional_and_absent_still_records_a_reason(
     tmp_path: Path,
     make_config: Callable[..., ResolvedMultimodalSplitConfig],

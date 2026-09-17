@@ -158,7 +158,7 @@ The ordered producer-owned Arrow schema is:
 | `exclusive_end_ns` | `int64 not null` | Exclusive capture-clock end |
 | `sampling_fps` | `int32 not null` | Shared regular-grid rate |
 | `row_count` | `int64 not null` | Grid points and encoded frames per camera |
-| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; currently `capture` |
+| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; `capture`, or `container_pts` when a camera's `allow_pts_fallback` fires |
 | `split_contract_digest` | `string not null` | Result-defining split configuration identity |
 | `materialization_digest` | `string not null` | Exact sorted camera-artifact-set identity |
 | `camera_media` | `large_list<struct<...>> not null` | Complete camera descriptors, sorted by `camera_key` |
@@ -235,14 +235,14 @@ across rendering choices.
 ```text
 {
   "kind": "multimodal-av-split-contract",
-  "split_contract_digest_version": 3,
+  "split_contract_digest_version": 4,
   "media_contract_version": <media contract version>,
   "clip": {
     "duration_ns": <resolved integer duration>,
     "sampling_fps": <resolved sampling rate>
   },
   "cameras": [
-    {"camera_key": <key>, "sensor_type": <type>},
+    {"camera_key": <key>, "sensor_type": <type>, "allow_pts_fallback": <bool>},
     ... sorted by camera_key
   ],
   "mcap_sensors": [
@@ -310,7 +310,10 @@ damaged already-canonical artifact. Repair requires an explicit verification-and
 
 ### Capture-clock grid
 
-Version 1 publishes half-open intervals `[start_ns, exclusive_end_ns)` with `timestamp_source="capture"`.
+Version 1 publishes half-open intervals `[start_ns, exclusive_end_ns)` on the capture clock. `timestamp_source` is
+`"capture"` unless a camera's `allow_pts_fallback` config fired because its capture-timeline sidecar was missing, in
+which case the episode is `"container_pts"` instead: one camera reading its timeline from the container taints the
+whole episode, since a clip is one moment across every view the rig promised.
 
 ```text
 step_ns = 1_000_000_000.0 / sampling_fps
