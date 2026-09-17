@@ -4,7 +4,7 @@
 """Private recipe bindings for the complete-MP4 caption state machine."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import lance
@@ -60,9 +60,29 @@ class CaptionPublicationBindings:
 
 
 @dataclass(frozen=True)
+class CaptionInferenceBindings:
+    """Model-specific settings consumed by the shared Ray vLLM processor.
+
+    Public recipes select one of these static bindings. They are deliberately
+    not user configuration: per-run execution sizing belongs in
+    ``CaptionExecutionConfig`` and model behavior belongs in the result
+    contract.
+    """
+
+    assistant_prefill: str | None = None
+    chat_template_kwargs: Mapping[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+    video_fps: int | float = 2
+    prepare_model_config_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    request_mm_processor_kwargs: Mapping[str, Any] = field(default_factory=lambda: {"do_sample_frames": False})
+    sampling_params: Mapping[str, float | int] | None = None
+    engine_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class CaptionRunBindings:
     """The complete private binding value supplied by one public caption recipe."""
 
     input: CaptionInputBindings
     result: CaptionResultBindings
     publication: CaptionPublicationBindings
+    inference: CaptionInferenceBindings = field(default_factory=CaptionInferenceBindings)

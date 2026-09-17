@@ -12,6 +12,7 @@ from typing import Any, Final
 import pyarrow as pa
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings
 from cosmos_curator.next.recipes.video_caption.config import ModelVariant
 from cosmos_curator.next.utils.identity import canonical_digest
 
@@ -36,6 +37,20 @@ TERMINAL_STATUSES: Final = frozenset({"success", "truncated", "error"})
 _MODEL_WEIGHT_SUFFIXES: Final = frozenset({".bin", ".pt", ".safetensors"})
 OWNER_METADATA: Final = b"cosmos_curator.owner"
 FIELD_SET_METADATA: Final = b"cosmos_curator.field_set"
+
+
+def resolved_sampling_params(inference: CaptionInferenceBindings) -> dict[str, float | int]:
+    """Return one binding's sampling values, falling back to the legacy Qwen contract."""
+    return dict(SAMPLING_PARAMS if inference.sampling_params is None else inference.sampling_params)
+
+
+def resolved_max_output_tokens(inference: CaptionInferenceBindings) -> int:
+    """Return the model-bound generation cutoff used for terminal-state classification."""
+    max_tokens = resolved_sampling_params(inference).get("max_tokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        msg = f"Caption inference sampling max_tokens must be a positive integer, got {max_tokens!r}"
+        raise ValueError(msg)
+    return max_tokens
 
 
 @dataclass(frozen=True)

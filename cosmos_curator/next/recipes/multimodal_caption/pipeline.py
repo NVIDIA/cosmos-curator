@@ -25,6 +25,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     RESULT_VARIANT,
     build_terminal_result_row,
     caption_contract_digest,
+    caption_inference_bindings,
     normalized_caption_contract,
     resolve_model,
     result_field_names,
@@ -117,6 +118,7 @@ def run_config(config: ResolvedMultimodalCaptionConfig) -> dict[str, object]:
                 metadata_field_name=metadata_field,
             ),
         ),
+        inference=caption_inference_bindings(model.key),
     )
     inference_config = CaptionExecutionConfig(
         storage_profile=storage_profile,

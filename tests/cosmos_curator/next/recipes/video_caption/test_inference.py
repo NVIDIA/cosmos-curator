@@ -5,6 +5,7 @@
 
 import base64
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,12 +23,13 @@ from lance.fragment import LanceFragment
 from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.next.recipes.video_caption import inference
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings, CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     MAX_OUTPUT_TOKENS,
     CaptionModelSpec,
+    resolved_sampling_params,
 )
 from cosmos_curator.next.recipes.video_caption.inference import (
     MAPPED_INPUT_SCHEMA,
@@ -358,7 +360,11 @@ def test_preprocess_matches_the_caption_contract() -> None:
     video_data_url = "data:video/mp4;base64,AAAA"
     row = {"video_data_url": video_data_url, "download_error_type": None}
 
-    output = caption_llm_preprocess(row)
+    output = caption_llm_preprocess(
+        row,
+        request_mm_processor_kwargs=CaptionInferenceBindings().request_mm_processor_kwargs,
+        sampling_params=resolved_sampling_params(CaptionInferenceBindings()),
+    )
 
     assert output["messages"] == [
         {
@@ -384,7 +390,11 @@ def test_preprocess_matches_the_caption_contract() -> None:
 
 def test_download_error_bypasses_llm() -> None:
     """A terminal download failure is marked for every LLM stage to bypass."""
-    output = caption_llm_preprocess({"download_error_type": "ItemMediaError", "download_error_message": "missing"})
+    output = caption_llm_preprocess(
+        {"download_error_type": "ItemMediaError", "download_error_message": "missing"},
+        request_mm_processor_kwargs=CaptionInferenceBindings().request_mm_processor_kwargs,
+        sampling_params=resolved_sampling_params(CaptionInferenceBindings()),
+    )
 
     assert output == {"__inference_error__": "ItemMediaError: missing"}
 
@@ -402,7 +412,11 @@ def test_download_error_preserves_identity_through_terminal_adapter(
         "download_error_type": "ItemMediaError",
         "download_error_message": "missing",
     }
-    preprocessed = source | caption_llm_preprocess(source)
+    preprocessed = source | caption_llm_preprocess(
+        source,
+        request_mm_processor_kwargs=CaptionInferenceBindings().request_mm_processor_kwargs,
+        sampling_params=resolved_sampling_params(CaptionInferenceBindings()),
+    )
     terminal = canonicalize_llm_batch(
         pa.Table.from_pylist([preprocessed]),
         bindings=caption_bindings,
@@ -460,7 +474,21 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     )
 
     assert isinstance(processor, inference._ExactVLLMBatchProcessor)
-    assert captured["preprocess"] is caption_llm_preprocess
+    preprocess = cast("Any", captured["preprocess"])
+    assert preprocess.func is caption_llm_preprocess
+    assert preprocess.keywords == {
+        "assistant_prefill": None,
+        "request_mm_processor_kwargs": {"do_sample_frames": False},
+        "sampling_params": {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+            "max_tokens": 2_048,
+        },
+    }
     assert cast("Any", captured["postprocess"]).func is caption_llm_postprocess
     processor_config = captured["config"]
     assert isinstance(processor_config, ray_data_llm.vLLMEngineProcessorConfig)
@@ -481,6 +509,213 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     assert chat_template_config.concurrency == (3, 4)
     assert chat_template_config.memory == 16 * 1024**3
     assert processor_config.engine_kwargs["media_io_kwargs"] == expected_media_io_kwargs["media_io_kwargs"]
+
+
+def test_llm_processor_applies_model_runtime_bindings(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static model bindings reach Ray's chat and vLLM stages without changing execution sizing."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+        }
+    )
+
+    class _BuiltProcessor:
+        def __init__(self, processor_config: object) -> None:
+            self.config = processor_config
+
+        def list_stage_names(self) -> list[str]:
+            return ["vLLMEngineStage"]
+
+    captured: dict[str, object] = {}
+
+    def build_processor(
+        processor_config: object,
+        *,
+        preprocess: object,
+        postprocess: object,
+    ) -> object:
+        captured.update(config=processor_config, preprocess=preprocess, postprocess=postprocess)
+        return _BuiltProcessor(processor_config)
+
+    monkeypatch.setattr(ray_data_llm, "build_processor", build_processor)
+    bindings = CaptionInferenceBindings(
+        assistant_prefill="<think></think>",
+        chat_template_kwargs={},
+        video_fps=4,
+        prepare_model_config_kwargs={"hf_overrides": {"architectures": ["Cosmos3ForConditionalGeneration"]}},
+        request_mm_processor_kwargs={},
+        engine_kwargs={"mm_encoder_tp_mode": "data"},
+    )
+
+    inference._build_llm_processor(
+        config.execution,
+        caption_spec.runtime_model_dir,
+        ("clip_id",),
+        inference_bindings=bindings,
+        initial_inference_workers=1,
+        inference_worker_ceiling=1,
+    )
+
+    preprocess = cast("Any", captured["preprocess"])
+    assert preprocess.func is caption_llm_preprocess
+    assert preprocess.keywords == {
+        "assistant_prefill": "<think></think>",
+        "request_mm_processor_kwargs": {},
+        "sampling_params": {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+            "max_tokens": 2_048,
+        },
+    }
+    processor_config = captured["config"]
+    assert isinstance(processor_config, ray_data_llm.vLLMEngineProcessorConfig)
+    assert processor_config.chat_template_stage.chat_template_kwargs == {}
+    assert processor_config.prepare_multimodal_stage.model_config_kwargs == {
+        "media_io_kwargs": {"video": {"num_frames": -1, "fps": 4}},
+        "hf_overrides": {"architectures": ["Cosmos3ForConditionalGeneration"]},
+    }
+    assert processor_config.engine_kwargs["media_io_kwargs"] == {"video": {"num_frames": -1, "fps": 4}}
+    assert processor_config.engine_kwargs["mm_encoder_tp_mode"] == "data"
+
+
+def test_llm_processor_deep_copies_model_engine_kwargs(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each processor build receives fresh nested model engine settings."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+        }
+    )
+    captured_configs: list[object] = []
+
+    class _BuiltProcessor:
+        def __init__(self, processor_config: object) -> None:
+            self.config = processor_config
+
+        def list_stage_names(self) -> list[str]:
+            return ["vLLMEngineStage"]
+
+    def build_processor(processor_config: object, **_: object) -> object:
+        captured_configs.append(processor_config)
+        return _BuiltProcessor(processor_config)
+
+    monkeypatch.setattr(ray_data_llm, "build_processor", build_processor)
+    bindings = CaptionInferenceBindings(
+        prepare_model_config_kwargs={"hf_overrides": {"architectures": ["Cosmos3ForConditionalGeneration"]}},
+        engine_kwargs={"limit_mm_per_prompt": {"images": 0, "video": 1}},
+    )
+
+    for _ in range(2):
+        inference._build_llm_processor(
+            config.execution,
+            caption_spec.runtime_model_dir,
+            ("clip_id",),
+            inference_bindings=bindings,
+            initial_inference_workers=1,
+            inference_worker_ceiling=1,
+        )
+
+    first, second = (cast("Any", processor_config) for processor_config in captured_configs)
+    first.engine_kwargs["limit_mm_per_prompt"]["video"] = 9
+    first.prepare_multimodal_stage.model_config_kwargs["hf_overrides"]["architectures"][0] = "other"
+
+    assert second.engine_kwargs["limit_mm_per_prompt"] == {"images": 0, "video": 1}
+    assert second.prepare_multimodal_stage.model_config_kwargs["hf_overrides"] == {
+        "architectures": ["Cosmos3ForConditionalGeneration"]
+    }
+    assert bindings.prepare_model_config_kwargs["hf_overrides"] == {
+        "architectures": ["Cosmos3ForConditionalGeneration"]
+    }
+    assert bindings.engine_kwargs["limit_mm_per_prompt"] == {"images": 0, "video": 1}
+
+
+@pytest.mark.parametrize(
+    "reserved_key",
+    ["tensor_parallel_size", "pipeline_parallel_size", "media_io_kwargs"],
+)
+def test_llm_processor_rejects_model_overrides_of_shared_engine_settings(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+    reserved_key: str,
+) -> None:
+    """A model binding cannot retune parallelism or frame decode behind the shared builder."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+        }
+    )
+    bindings = CaptionInferenceBindings(engine_kwargs={reserved_key: "ignored"})
+
+    with pytest.raises(ValueError, match=rf"cannot override shared engine setting\(s\): {reserved_key}"):
+        inference._build_llm_processor(
+            config.execution,
+            caption_spec.runtime_model_dir,
+            ("clip_id",),
+            inference_bindings=bindings,
+            initial_inference_workers=1,
+            inference_worker_ceiling=1,
+        )
+
+
+def test_llm_processor_rejects_model_override_of_shared_preparation_setting(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+) -> None:
+    """A model binding cannot replace the shared prepared-video settings."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+        }
+    )
+
+    with pytest.raises(ValueError, match="cannot override shared preparation setting: media_io_kwargs"):
+        inference._build_llm_processor(
+            config.execution,
+            caption_spec.runtime_model_dir,
+            ("clip_id",),
+            inference_bindings=CaptionInferenceBindings(prepare_model_config_kwargs={"media_io_kwargs": {}}),
+            initial_inference_workers=1,
+            inference_worker_ceiling=1,
+        )
 
 
 def test_exact_vllm_batch_processor_inserts_strict_repartition() -> None:
@@ -671,6 +906,29 @@ def test_canonicalization_emits_success_truncated_and_error_rows(
     assert [row[caption_spec.metadata_field_name]["status"] for row in rows] == ["success", "truncated", "error"]
     assert rows[2][caption_spec.caption_field_name] is None
     assert rows[2][caption_spec.metadata_field_name]["error_type"] == "ItemMediaError"
+
+
+def test_canonicalization_uses_the_model_bound_output_limit(caption_bindings: CaptionRunBindings) -> None:
+    """Terminal state follows the model binding's request limit, not a module default."""
+    bindings = replace(caption_bindings, inference=CaptionInferenceBindings(sampling_params={"max_tokens": 5}))
+    raw = pa.Table.from_pylist(
+        [
+            {
+                "fragment_id": 0,
+                "row_offset": 0,
+                "clip_id": "model-bound-limit",
+                "caption_text": "caption",
+                "prompt_token_count": 7,
+                "generated_token_count": 5,
+                "download_error_type": None,
+                "__inference_error__": "",
+            }
+        ]
+    )
+
+    terminal = canonicalize_llm_batch(raw, bindings=bindings).to_pylist()[0]
+
+    assert terminal[caption_bindings.result.metadata_field_name]["status"] == "truncated"
 
 
 def test_checkpoint_config_is_always_cleared(tmp_path: Path) -> None:

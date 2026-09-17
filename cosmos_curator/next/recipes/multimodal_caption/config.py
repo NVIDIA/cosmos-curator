@@ -22,7 +22,7 @@ _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 SchemaVersion = Literal[1]
 MultimodalCaptionKind = Literal["multimodal-caption"]
 ContextVariant = Literal["video_only"]
-ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b"]
+ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"]
 
 
 def _normalize_location(location: str, *, label: str) -> str:

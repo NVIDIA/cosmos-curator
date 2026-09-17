@@ -4,8 +4,9 @@
 """Phase A: checkpoint-filtered media fetch, Ray Data LLM, and durable Parquet."""
 
 import base64
+import copy
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -27,15 +28,17 @@ from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionInputBindings, CaptionRunBindings
+from cosmos_curator.next.recipes.video_caption.bindings import (
+    CaptionInferenceBindings,
+    CaptionInputBindings,
+    CaptionRunBindings,
+)
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
-    MAX_OUTPUT_TOKENS,
-    SAMPLING_PARAMS,
-    VIDEO_DO_SAMPLE_FRAMES,
-    VIDEO_FPS,
     VIDEO_NUM_FRAMES,
     CaptionModelSpec,
+    resolved_max_output_tokens,
+    resolved_sampling_params,
 )
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import (
@@ -345,8 +348,14 @@ def fetch_media_batch(
     return pa.Table.from_pylist(rows, schema=fetched_schema)
 
 
-def caption_llm_preprocess(row: dict[str, Any]) -> dict[str, Any]:
-    """Create the exact Qwen user turn, or mark a download failure to bypass LLM stages."""
+def caption_llm_preprocess(
+    row: dict[str, Any],
+    *,
+    assistant_prefill: str | None = None,
+    request_mm_processor_kwargs: Mapping[str, Any],
+    sampling_params: Mapping[str, float | int],
+) -> dict[str, Any]:
+    """Create one model's chat turn, or mark a download failure to bypass LLM stages."""
     # Ray's processor keeps every top-level input value through its internal
     # stages. Move the large data URL into the message instead of retaining a
     # second reference after multimodal preparation has replaced the message.
@@ -358,21 +367,26 @@ def caption_llm_preprocess(row: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(video_data_url, str):
         msg = "Successful media fetch must provide a video_data_url string"
         raise TypeError(msg)
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "video_url", "video_url": {"url": video_data_url}},
-                    {"type": "text", "text": DEFAULT_PROMPT},
-                ],
-            }
-        ],
-        "sampling_params": dict(SAMPLING_PARAMS),
-        # Ray's multimodal stage has already decoded and sampled the video. Qwen
-        # requires this flag to avoid treating those prepared frames as raw video.
-        "mm_processor_kwargs": {"do_sample_frames": VIDEO_DO_SAMPLE_FRAMES},
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": video_data_url}},
+                {"type": "text", "text": DEFAULT_PROMPT},
+            ],
+        }
+    ]
+    if assistant_prefill is not None:
+        messages.append({"role": "assistant", "content": assistant_prefill})
+    request: dict[str, Any] = {
+        "messages": messages,
+        "sampling_params": copy.deepcopy(dict(sampling_params)),
     }
+    # Ray's multimodal stage has already decoded and sampled the video. Qwen
+    # requires its bound flag to avoid treating those prepared frames as raw video.
+    if request_mm_processor_kwargs:
+        request["mm_processor_kwargs"] = copy.deepcopy(dict(request_mm_processor_kwargs))
+    return request
 
 
 def caption_llm_postprocess(
@@ -397,6 +411,7 @@ def canonicalize_llm_batch(
     bindings: CaptionRunBindings,
 ) -> pa.Table:
     """Convert Ray LLM success/error shapes into the exact terminal schema."""
+    max_output_tokens = resolved_max_output_tokens(bindings.inference)
     rows = []
     for raw in batch.to_pylist():
         error_message = str(raw.get("__inference_error__") or "")
@@ -423,7 +438,7 @@ def canonicalize_llm_batch(
             raise TypeError(msg)
         prompt_tokens = _optional_int(raw.get("prompt_token_count"))
         generated_tokens = _optional_int(raw.get("generated_token_count"))
-        status = "truncated" if generated_tokens is not None and generated_tokens >= MAX_OUTPUT_TOKENS else "success"
+        status = "truncated" if generated_tokens is not None and generated_tokens >= max_output_tokens else "success"
         rows.append(
             bindings.result.build_terminal_row(
                 raw,
@@ -585,6 +600,7 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             config,
             model_dir,
             bindings.input.staged_binding_columns,
+            inference_bindings=bindings.inference,
             initial_inference_workers=initial_inference_workers,
             inference_worker_ceiling=inference_worker_ceiling,
         )
@@ -673,11 +689,12 @@ def _resolve_initial_inference_workers(
     return min(worker_ceiling, max(1, schedulable_replicas))
 
 
-def _build_llm_processor(
+def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to independent Ray settings
     config: CaptionExecutionConfig,
     model_dir: Path,
     staged_binding_columns: tuple[str, ...],
     *,
+    inference_bindings: CaptionInferenceBindings | None = None,
     initial_inference_workers: int,
     inference_worker_ceiling: int,
 ) -> Any:  # noqa: ANN401
@@ -697,7 +714,18 @@ def _build_llm_processor(
             f"{initial_inference_workers} and {inference_worker_ceiling}"
         )
         raise ValueError(msg)
+    bindings = inference_bindings or CaptionInferenceBindings()
+    sampling_params = resolved_sampling_params(bindings)
+    reserved_engine_keys = {"tensor_parallel_size", "pipeline_parallel_size", "media_io_kwargs"}
+    conflicting_engine_keys = sorted(reserved_engine_keys & set(bindings.engine_kwargs))
+    if conflicting_engine_keys:
+        msg = f"Model inference bindings cannot override shared engine setting(s): {', '.join(conflicting_engine_keys)}"
+        raise ValueError(msg)
+    if "media_io_kwargs" in bindings.prepare_model_config_kwargs:
+        msg = "Model inference bindings cannot override shared preparation setting: media_io_kwargs"
+        raise ValueError(msg)
     cpu_stage_concurrency = (initial_inference_workers, inference_worker_ceiling)
+    video_media_io_kwargs = {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": bindings.video_fps}}
     processor_config = vLLMEngineProcessorConfig(
         model_source=str(model_dir),
         batch_size=config.inference_batch_size,
@@ -709,25 +737,35 @@ def _build_llm_processor(
             enabled=True,
             concurrency=cpu_stage_concurrency,
             memory=_PREPARE_MULTIMODAL_MEMORY_BYTES,
-            model_config_kwargs={"media_io_kwargs": {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": VIDEO_FPS}}},
+            model_config_kwargs={
+                "media_io_kwargs": copy.deepcopy(video_media_io_kwargs),
+                **copy.deepcopy(dict(bindings.prepare_model_config_kwargs)),
+            },
         ),
         chat_template_stage=ChatTemplateStageConfig(
             enabled=True,
             concurrency=cpu_stage_concurrency,
             memory=_CHAT_TEMPLATE_MEMORY_BYTES,
-            chat_template_kwargs={"enable_thinking": False},
+            chat_template_kwargs=dict(bindings.chat_template_kwargs),
         ),
         tokenize_stage=TokenizerStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
         detokenize_stage=DetokenizeStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
         engine_kwargs={
             "tensor_parallel_size": config.tensor_parallel_size,
             "pipeline_parallel_size": config.pipeline_parallel_size,
-            "media_io_kwargs": {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": VIDEO_FPS}},
+            "media_io_kwargs": copy.deepcopy(video_media_io_kwargs),
+            **copy.deepcopy(dict(bindings.engine_kwargs)),
         },
+    )
+    preprocess = partial(
+        caption_llm_preprocess,
+        assistant_prefill=bindings.assistant_prefill,
+        request_mm_processor_kwargs=bindings.request_mm_processor_kwargs,
+        sampling_params=sampling_params,
     )
     processor = build_processor(
         processor_config,
-        preprocess=caption_llm_preprocess,
+        preprocess=preprocess,
         postprocess=partial(caption_llm_postprocess, staged_binding_columns=staged_binding_columns),
     )
     return _ExactVLLMBatchProcessor(processor, batch_size=config.inference_batch_size)

@@ -51,3 +51,10 @@ def test_template_uses_an_explicit_example_camera_without_a_camera_default() -> 
     """The template labels an explicit camera choice for users to replace."""
     template = config_template()
     assert template["context"] == {"variant": "video_only", "camera_key": "front_wide"}
+
+
+def test_cosmos3_nano_is_a_supported_model_variant(tmp_path: Path) -> None:
+    """The public recipe accepts the pinned base Cosmos3-Nano model."""
+    config = resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"model": {"variant": "cosmos3_nano"}})
+
+    assert config.model.variant == "cosmos3_nano"

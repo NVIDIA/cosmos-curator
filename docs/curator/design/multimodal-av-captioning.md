@@ -7,11 +7,15 @@
 complete episode rows, and captioning later selects one explicitly configured camera from each row. Captioning does not
 invoke splitting, rediscover source recordings, or assemble camera sets.
 
-The initial `video_only` variant runs the existing complete-MP4 free-form Qwen caption treatment once per episode. It
-uses the same prompt, 2 FPS sampling, model pins, terminal states, durable checkpointing, recovery, staging, and
-fragment-atomic Lance publication engine documented for [`video-caption`](curator-next-video-captioning.md).
-`video-caption` retains its existing `CLIP_SCHEMA`, `clip_id`, and single-MP4 public contract; the recipes share only
-private execution machinery.
+The `video_only` variant runs a complete-MP4 free-form caption treatment once per episode. It uses the same prompt,
+model pins, terminal states, durable checkpointing, recovery, staging, and fragment-atomic Lance publication engine
+documented for [`video-caption`](curator-next-video-captioning.md). `video-caption` retains its existing `CLIP_SCHEMA`,
+`clip_id`, and single-MP4 public contract; the recipes share only private execution machinery.
+
+Frame sampling and vLLM launch settings are fixed per model rather than shared: the Qwen variants sample at 2 FPS, and
+`cosmos3_nano` samples at 4 FPS and launches through vLLM's native Cosmos3 executor with a closed-reasoning assistant
+prefill. These are static per-variant bindings, not user configuration, and every one of them is recorded in the caption
+contract digest, so changing a model's runtime changes its result identity.
 
 ## Input and camera binding
 
@@ -55,17 +59,26 @@ execution:
   storage_profile: default
 ```
 
-`context.variant` is required and currently accepts only `video_only`. `output.staging_root_uri` defaults to
-`<episodes.lance parent>/staging/multimodal-caption`. Model weights must already exist under the standard model mount on
-every inference worker; the recipe never downloads them.
+`context.variant` is required and currently accepts only `video_only`. `model.variant` accepts `qwen3_8_27b_fp8`
+(the default), `qwen3_8_27b`, or `cosmos3_nano`. `output.staging_root_uri` defaults to
+`<episodes.lance parent>/staging/multimodal-caption`.
+
+Model weights must already exist under the standard model mount on every inference worker; the recipe never downloads
+them. `cosmos3_nano` is excluded from the default weight set because of its size, so it has to be staged explicitly
+before a run:
+
+```bash
+pixi run --as-is model-download --models cosmos3_nano
+```
 
 ## Result contract
 
 The recipe atomically registers one nullable caption field and its nullable metadata field, owned by
 `multimodal-caption`:
 
-- `caption_video_only_qwen3_8_27b_fp8_v1` and its `_metadata` field; or
-- `caption_video_only_qwen3_8_27b_v1` and its `_metadata` field.
+- `caption_video_only_qwen3_8_27b_fp8_v1` and its `_metadata` field;
+- `caption_video_only_qwen3_8_27b_v1` and its `_metadata` field; or
+- `caption_video_only_cosmos3_nano_v1` and its `_metadata` field.
 
 Each terminal metadata value records the schema version, `video_only` variant, caption contract digest, episode and
 materialization identities, selected camera key and MP4 hash, terminal status, pinned model identity and revision,
