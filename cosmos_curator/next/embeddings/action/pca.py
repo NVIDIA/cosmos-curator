@@ -417,9 +417,12 @@ class PcaArtifactStore:
         client = self._get_client()
         if not path_exists(uri, client):
             msg = (
-                f"action PCA basis {fingerprint!r} referenced by the action group is missing at {uri}; the "
-                "immutable artifact was deleted or never persisted. Restore it, or reset the group with "
-                "--reset-group action and rerun to refit a basis."
+                f"action PCA basis {fingerprint!r} is missing at {uri}; the immutable artifact was deleted "
+                "or never persisted. Restore it - the name is the hash of its own bytes, so any copy of "
+                "those bytes is the same basis. Refitting is not an alternative while rows still reference "
+                "this one: a fresh basis would project them into an incomparable space. If the reference "
+                "came from an interrupted run's staging workspace rather than from the published rows, "
+                "discarding that workspace drops it."
             )
             raise ValueError(msg)
         pca = _from_archive_bytes(read_bytes(uri, client))

@@ -19,8 +19,9 @@ Two layers, both runnable in the default CPU job:
 
 - Pure driver-logic tests (no Ray): the fixed modality cascade, the action-only
   weight-staging no-op, the missing-table failure, the schema-widening commit, the
-  no-work short circuit, the basis-staleness refusal, the total-outage guard, and
-  the PCA sampling helpers. None of them starts a worker.
+  no-work short circuit, the total-outage guard, and the PCA sampling helpers.
+  None of them starts a worker. Which basis a run binds is
+  ``test_action_pca.py``'s subject, not this file's.
 - One actor-pool dispatch test (``ray_local``): it starts a real actor but embeds
   nothing. It exists because the sampling-helper tests feed hand-built batches and
   therefore cannot catch a mis-scheduled extractor. It drops the pixi
@@ -46,24 +47,26 @@ import pytest
 
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.next.embeddings.action.embedder import DualWristMotionReadConfig
-from cosmos_curator.next.embeddings.action.pca import action_pca_root_uri
+from cosmos_curator.next.embeddings.action.pca import PcaArtifact, action_pca_root_uri
 from cosmos_curator.next.embeddings.action.wrist_motion import DESCRIPTOR_DIM, DESCRIPTOR_VERSION
 from cosmos_curator.next.embeddings.schemas import (
     ACTION_COLUMN_GROUP,
     ACTION_DIM,
     ACTION_GROUP_SCHEMA,
+    IMAGE_DIM,
     descriptor_batch,
 )
 from cosmos_curator.next.recipes.embeddings import action_pca, embed
 from cosmos_curator.next.recipes.embeddings.action_pca import (
+    ActionPca,
     _collect_pca_sample,
     _extract_candidates,
     _ranked_distinct_uris,
     _sample_rank,
     check_action_outcome,
-    resolve_action_pca,
 )
 from cosmos_curator.next.recipes.embeddings.config import Modality
+from cosmos_curator.next.recipes.embeddings.datasource import EmbeddingScanPlan
 from cosmos_curator.next.recipes.embeddings.embed import (
     _enabled_groups,
     _generic_fills,
@@ -186,12 +189,132 @@ def test_stage_weights_is_a_noop_for_action_only(
     assert not called
 
 
+def test_a_modality_that_owes_nothing_downloads_no_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    make_clips_table: ClipsTableFactory,
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """Planning precedes weight acquisition, so a current table pays no download.
+
+    Every clip here has an empty ``clip_uri``, so image's applicability filter
+    selects nothing and the run owes no work. Downloading a multi-gigabyte
+    checkpoint to then discover that is the cost this order exists to avoid, and
+    it is invisible in the run's counts -- they read ``0/0`` either way.
+    """
+    staged: list[list[str]] = []
+    monkeypatch.setattr(embed, "download_models", lambda names, _path: staged.append(list(names)))
+    clips_uri = make_clips_table(rows=2, clip_uris=["", ""])
+
+    run_embedding_pipeline(make_embeddings_config(clips_lance_uri=clips_uri, modalities=["image"]))
+
+    assert staged == []
+
+
+def test_weights_are_staged_before_ray_is_initialized_and_before_any_staging_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    make_clips_table: ClipsTableFactory,
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """The three steps run in exactly this order: download, ``ray.init``, then the staging pass.
+
+    ``download_models`` forks a child that initializes and tears down its own
+    Ray, which a process that has already initialized Ray cannot do -- so a
+    download after the init hangs or dies rather than returning wrong results.
+    Nothing in a run's output records the order, and only a real multi-modality
+    GPU run would expose it, so the sequence is asserted directly.
+
+    The staging pass raises to end the run at the point being measured; the rest
+    of the pipeline is covered by the tests above.
+    """
+    calls: list[str] = []
+
+    def _stop_after_recording(*_args: object, **_kwargs: object) -> None:
+        calls.append("stage")
+        msg = "stop the run here"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(embed, "download_models", lambda *_a, **_k: calls.append("download"))
+    monkeypatch.setattr(embed, "ensure_ray_initialized", lambda **_k: calls.append("ray-init"))
+    monkeypatch.setattr(embed, "stage_embedding_group", _stop_after_recording)
+    clips_uri = make_clips_table(rows=2)
+    config = make_embeddings_config(clips_lance_uri=clips_uri, modalities=["image"])
+
+    with pytest.raises(RuntimeError, match="stop the run here"):
+        run_embedding_pipeline(config)
+
+    assert calls == ["download", "ray-init", "stage"]
+
+
+def test_ray_data_stability_is_configured_before_the_first_staging_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    make_clips_table: ClipsTableFactory,
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """The retried-error family is enabled before any Ray Data work is submitted.
+
+    It backstops the publication phase, where a transient write fault has no row
+    to become a failure in and would otherwise end a phase whose every other
+    fragment succeeded. Configured after the dataset exists it would not apply to
+    it, and a run that never enabled it looks identical until a network blip.
+    """
+    calls: list[str] = []
+
+    def _stop_after_recording(*_args: object, **_kwargs: object) -> None:
+        calls.append("stage")
+        msg = "stop the run here"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(embed, "download_models", lambda *_a, **_k: None)
+    monkeypatch.setattr(embed, "ensure_ray_initialized", lambda **_k: calls.append("ray-init"))
+    monkeypatch.setattr(embed, "configure_ray_data_stability", lambda: calls.append("stability"))
+    monkeypatch.setattr(embed, "stage_embedding_group", _stop_after_recording)
+    clips_uri = make_clips_table(rows=2)
+
+    with pytest.raises(RuntimeError, match="stop the run here"):
+        run_embedding_pipeline(make_embeddings_config(clips_lance_uri=clips_uri, modalities=["image"]))
+
+    assert calls == ["ray-init", "stability", "stage"]
+
+
 def test_missing_clips_table_fails(tmp_path: pathlib.Path, make_embeddings_config: EmbeddingsConfigFactory) -> None:
     """A clips URI resolving to no table fails before any modality runs."""
     config = make_embeddings_config(clips_lance_uri=str(tmp_path / "absent.lance"), modalities=["action"])
 
     with pytest.raises(ValueError, match="not found"):
         run_embedding_pipeline(config)
+
+
+def test_a_group_stored_at_another_width_stops_the_run_before_it_spends_anything(
+    monkeypatch: pytest.MonkeyPatch,
+    make_clips_table: ClipsTableFactory,
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """A vector width that differs from the group's is fail-closed, not adapted to.
+
+    A narrower stored vector cannot hold this model's output, so the only correct
+    answers are to refuse or to migrate the column, and migrating is an operator
+    decision because it discards every published vector. Refusing at this point
+    is what makes the refusal free: no checkpoint downloaded, no actor pool, and
+    nothing staged that a later run would have to reconcile.
+    """
+    spent: list[str] = []
+    monkeypatch.setattr(embed, "download_models", lambda *_a, **_k: spent.append("download"))
+    monkeypatch.setattr(embed, "ensure_ray_initialized", lambda **_k: spent.append("ray-init"))
+    monkeypatch.setattr(embed, "stage_embedding_group", lambda *_a, **_k: spent.append("stage"))
+    clips_uri = make_clips_table(rows=2)
+    lance.dataset(clips_uri).add_columns(
+        pa.schema(
+            [
+                pa.field("embedding_image", pa.list_(pa.field("item", pa.float32(), nullable=False), IMAGE_DIM - 1)),
+                pa.field("embedding_image_model_id", pa.string()),
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="embedding_image' has type"):
+        run_embedding_pipeline(make_embeddings_config(clips_lance_uri=clips_uri, modalities=["image"]))
+
+    assert spent == []
 
 
 def test_action_run_widens_schema_with_only_the_action_group(
@@ -213,6 +336,32 @@ def test_action_run_widens_schema_with_only_the_action_group(
     assert not any(name.startswith("embedding_image") for name in names)
 
 
+def test_when_action_owes_no_rows_the_run_result_carries_no_basis(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """``EmbeddingRunResult.action`` stays None when the owed-work plan is empty.
+
+    A basis may still be resolved for identity, but callers use ``action is
+    None`` to mean the action leg did no embed work this run.
+    """
+    clips_uri = _write_clips_table(tmp_path, ["c0"], ["act0.bin"], ["not_dexterous"])
+    fake_pca = ActionPca(
+        artifact=PcaArtifact(
+            mean=np.zeros(DESCRIPTOR_DIM, dtype=np.float64),
+            components=np.zeros((ACTION_DIM, DESCRIPTOR_DIM), dtype=np.float64),
+        ),
+        samples_used=None,
+    )
+    monkeypatch.setattr(embed, "resolve_action_pca", lambda *_a, **_k: fake_pca)
+    monkeypatch.setattr(embed, "_plan_modality", lambda *_a, **_k: EmbeddingScanPlan(fragments=()))
+
+    result = run_embedding_pipeline(make_embeddings_config(clips_lance_uri=clips_uri, modalities=["action"]))
+
+    assert result.action is None
+
+
 def test_driver_starts_no_worker_when_the_action_leg_has_nothing_to_embed(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -228,10 +377,12 @@ def test_driver_starts_no_worker_when_the_action_leg_has_nothing_to_embed(
     """
 
     def _fail(*_args: object, **_kwargs: object) -> object:
-        msg = "no fill worker may start when the modality has nothing to embed"
+        msg = "no staging pass may start when the modality has nothing to embed"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(embed, "fill_embedding_group", _fail)
+    # Staging is the first step that touches Ray at all, so patching it is what
+    # makes "no actor pool" assertable without a cluster.
+    monkeypatch.setattr(embed, "stage_embedding_group", _fail)
     clips_uri = _write_clips_table(tmp_path, ["c0", "c1"], ["", ""], ["not_dexterous", "not_dexterous"])
 
     result = run_embedding_pipeline(make_embeddings_config(clips_lance_uri=clips_uri, modalities=["action"]))
@@ -283,25 +434,6 @@ def test_a_rerun_that_adds_no_column_reports_no_version_of_its_own(
     assert second.ending_version is None
 
 
-def test_a_group_embedded_under_another_descriptor_version_refuses_to_load_its_basis(
-    tmp_path: pathlib.Path,
-    make_embeddings_config: EmbeddingsConfigFactory,
-) -> None:
-    """Descriptors whose meaning has changed cannot be re-projected onto the old basis.
-
-    The refusal happens before the artifact is read, so the operator is told to
-    reset the group rather than seeing the mismatch surface as a raw
-    archive-validation error from inside the load.
-    """
-    clips_uri = _write_embedded_action_table(
-        tmp_path, descriptor_version=f"not-{DESCRIPTOR_VERSION}", fingerprint="deadbeef"
-    )
-    config = make_embeddings_config(clips_lance_uri=clips_uri, modalities=["action"])
-
-    with pytest.raises(ValueError, match="descriptor version"):
-        resolve_action_pca(lance.dataset(clips_uri), config, root_uri=str(tmp_path / "pca"))
-
-
 def test_an_action_fill_that_produced_nothing_at_all_fails_the_run(
     make_clips_table: ClipsTableFactory,
 ) -> None:
@@ -313,7 +445,13 @@ def test_an_action_fill_that_produced_nothing_at_all_fails_the_run(
     """
     uri = make_clips_table(rows=2)
     add_group_columns(uri, ACTION_GROUP_SCHEMA)
-    outage = ModalityResult(modality=Modality.ACTION, selected=2, filled=0, skipped_fragments=0, committed_version=None)
+    outage = ModalityResult(
+        modality=Modality.ACTION,
+        result_identity={"embedding_action_pca_fingerprint": "deadbeef"},
+        selected=2,
+        filled=0,
+        committed_version=None,
+    )
 
     with pytest.raises(ValueError, match="failed on all"):
         check_action_outcome(outage, lance.dataset(uri))
@@ -330,7 +468,11 @@ def test_a_run_whose_rows_all_failed_is_tolerated_when_the_group_already_holds_e
     """
     clips_uri = _write_embedded_action_table(tmp_path, descriptor_version=DESCRIPTOR_VERSION, fingerprint="deadbeef")
     all_failed = ModalityResult(
-        modality=Modality.ACTION, selected=2, filled=0, skipped_fragments=0, committed_version=None
+        modality=Modality.ACTION,
+        result_identity={"embedding_action_pca_fingerprint": "deadbeef"},
+        selected=2,
+        filled=0,
+        committed_version=None,
     )
 
     check_action_outcome(all_failed, lance.dataset(clips_uri))

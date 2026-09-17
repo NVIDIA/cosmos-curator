@@ -73,7 +73,7 @@ def _stub_text_embedder(monkeypatch: pytest.MonkeyPatch) -> SentenceTransformerT
     fake_module = types.ModuleType("sentence_transformers")
     fake_module.SentenceTransformer = _StubEncoder  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
-    return SentenceTransformerTextEmbedder(spec=DEFAULT_TEXT_MODEL, device="cpu")
+    return SentenceTransformerTextEmbedder(spec=DEFAULT_TEXT_MODEL, result_fingerprint="stub-fp", device="cpu")
 
 
 class _NormAwareEncoder:
@@ -116,23 +116,23 @@ def _norm_aware_text_embedder(monkeypatch: pytest.MonkeyPatch) -> SentenceTransf
     fake_module = types.ModuleType("sentence_transformers")
     fake_module.SentenceTransformer = _NormAwareEncoder  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
-    spec = TextModelSpec("bge_small_en_v1_5", "bge-test-id", TEXT_DIM)
-    return SentenceTransformerTextEmbedder(spec=spec, device="cpu")
+    spec = TextModelSpec("bge_small_en_v1_5", "bge-test-model-id", TEXT_DIM)
+    return SentenceTransformerTextEmbedder(spec=spec, result_fingerprint="bge-test-fingerprint", device="cpu")
 
 
 def _image_embedder_without_weights(*, read_concurrency: int = 1) -> HfVisionImageEmbedder:
     """Build an ``HfVisionImageEmbedder`` without running its weight-loading constructor.
 
     The row-level contract (frame read, NULL-on-failure path, scatter-back) needs
-    no model; only ``_embed`` does, and tests stub that separately. ``_model_id``
-    is set independently of the spec so the provenance pin asserts a distinctive
-    value. ``read_concurrency`` is explicit rather than inherited from the config,
-    so a test that reads a batch concurrently states the width it needs and no
-    test depends on a production default.
+    no model; only ``_embed`` does, and tests stub that separately. The result
+    fingerprint is set independently of the spec so the provenance pin asserts a
+    distinctive value. ``read_concurrency`` is explicit rather than inherited from
+    the config, so a test that reads a batch concurrently states the width it
+    needs and no test depends on a production default.
     """
     embedder = object.__new__(HfVisionImageEmbedder)
     embedder._spec = DEFAULT_IMAGE_MODEL
-    embedder._model_id = "stub"
+    embedder._result_fingerprint = "stub"
     embedder._reader = ClipFrameReader(storage_profile="default", read_concurrency=read_concurrency)
     return embedder
 
@@ -432,7 +432,7 @@ def test_image_embedder_pins_torchvision_backend(monkeypatch: pytest.MonkeyPatch
     fake_transformers.AutoModel = _FakeModel  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    HfVisionImageEmbedder(spec=DEFAULT_IMAGE_MODEL, device="cpu")
+    HfVisionImageEmbedder(spec=DEFAULT_IMAGE_MODEL, result_fingerprint="stub-fp", device="cpu")
 
     assert recorded.get("backend") == "torchvision"
     assert recorded.get("local_files_only") is True
@@ -492,22 +492,25 @@ def test_text_leg_emits_distinct_task_and_subtask_vectors_per_row(monkeypatch: p
     assert not np.allclose(subtask, task)
 
 
-def test_text_leg_records_model_id_on_every_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The text leg stamps its ``model_id`` provenance on every emitted row.
+def test_text_leg_records_its_result_fingerprint_on_every_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The text leg stamps the fingerprint it was constructed with on every emitted row.
 
-    Provenance lets a group accidentally built by two producers be detected by a
-    ``group_by``; dropping or blanking it here is the regression this pin catches.
+    The stored value is what a later run's selection predicate compares to decide
+    whether a row is current, so a blanked or omitted stamp makes a complete row
+    indistinguishable from a stale one. It comes from the constructor argument
+    rather than from the spec, which is why the fixture's fingerprint and its
+    ``model_id`` are deliberately allowed to differ.
     """
     embedder = _norm_aware_text_embedder(monkeypatch)
     batch = pa.table({"task_name": ["t1", "t2", "t3"], "subtask_name": ["s1", "s2", "s3"]})
     out = embedder(batch)
-    assert out.column("embedding_text_model_id").to_pylist() == ["bge-test-id"] * 3
+    assert out.column("embedding_text_model_id").to_pylist() == ["bge-test-fingerprint"] * 3
 
 
-def test_image_leg_records_model_id_on_every_embedded_row(
+def test_image_leg_records_its_result_fingerprint_on_every_embedded_row(
     monkeypatch: pytest.MonkeyPatch, make_clip: Callable[..., None], tmp_path: pathlib.Path
 ) -> None:
-    """The image leg stamps its ``model_id`` provenance on every survivor row.
+    """The image leg stamps the fingerprint it was constructed with on every survivor row.
 
     The image embedding's L2 normalization lives inside ``_embed`` (torch), so it
     is pinned by the env-gated real-model test, not here; this CPU pin covers the

@@ -7,10 +7,12 @@
 > schema is the `*_GROUP_SCHEMA` definitions and the `EMBEDDING_COLUMN_GROUPS`
 > registry in
 > [`cosmos_curator/next/embeddings/schemas.py`](../../../cosmos_curator/next/embeddings/schemas.py);
-> schema evolution and state validation are owned by
-> [`columns.py`](../../../cosmos_curator/next/recipes/embeddings/columns.py)
-> and the distributed column write, with its single commit, by
-> [`fill.py`](../../../cosmos_curator/next/recipes/embeddings/fill.py).
+> schema evolution and the owed-work predicate are owned by
+> [`columns.py`](../../../cosmos_curator/next/recipes/embeddings/columns.py),
+> the distributed compute by
+> [`fill.py`](../../../cosmos_curator/next/recipes/embeddings/fill.py), and the
+> single commit by
+> [`publication.py`](../../../cosmos_curator/next/recipes/embeddings/publication.py).
 > Each modality **adds** its group's columns to `clips.lance` in one metadata
 > commit and **fills** them with a column-local atomic `LanceOperation.Update`; a
 > group is absent from the table until its modality runs, so a consumer that wants
@@ -246,9 +248,9 @@ its own `embedding_<modality>_*` columns on the **same** `clips.lance` row (§3)
 not in a separate table. A consumer reads only the modality columns it needs, and
 a new modality is added later by adding its column group, without rewriting the
 others.
-- **Regenerated independently** — each modality re-runs on its own (a model swap
-or a descriptor bump replaces one group via `--reset-group` plus a refill; the
-other groups' columns are untouched).
+- **Regenerated independently** — each modality re-runs on its own. A model swap
+or a descriptor bump makes that group's rows stale, so an ordinary re-run replaces
+them in place (§7); the other groups' columns are untouched.
 - **Used singly or combined** — a pipeline may cluster on one modality (e.g.
 appearance-only dedup) or fuse several (§1.6) for a task+look+motion distance.
 - **No join to realign the modalities** — because all three groups sit on one
@@ -472,36 +474,42 @@ manifest, and the rows are read inside the workers.
 
 1. **URI** — `config.clips_lance_uri` (+ `storage_profile`, resolved into Lance
   storage options). The same URI is the write target (§3).
-2. **Derive the work** — the first lines of
-  [`fill_embedding_group`](../../../cosmos_curator/next/recipes/embeddings/fill.py)
-   read the **manifest only**: the dataset's version, the fragment id list
-   (`dataset.get_fragments()`), and the row predicate
-   (`columns.pending_filter`). No row is scanned and no row is counted, so this
-   costs one metadata read and is O(fragments). There is no planning *object* and
-   no planning *step* — the three values are locals inside the fill.
-3. **Distribute fragment ids** — the fill turns the id list into a Ray Data
-  dataset (`ray.data.from_items`) and maps it over an actor pool. The unit of
-   work is a **fragment id**, so nothing but integers crosses the driver boundary.
-4. **Scan inside the worker** — each worker re-opens the table at the pinned
-  version, takes **its own** fragment, and scans it with
-   `columns=source_columns` and `filter=row_filter` — only that modality's source
-   columns, and only the rows it still owes work on (applicability AND primary
-   vector IS NULL, §7). It never projects an `embedding_*` vector column.
-5. **Optional dev cap** — `config.max_fragments` truncates the **fragment list**
-  (not the row set); `[:None]` is the identity slice, so an uncapped run pays
-   nothing for the knob.
+2. **Plan the work** —
+  [`plan_embedding_scan`](../../../cosmos_curator/next/recipes/embeddings/datasource.py)
+   reads the manifest for the version and the fragment list, then asks each
+   fragment for one **filtered `count_rows`** under the missing-or-stale predicate
+   (`columns.pending_filter`, §7). It reads only the predicate's own columns — no
+   vector payload — and yields an `EmbeddingScanPlan` naming exactly the fragments
+   that owe work and how many rows each owes. Fragments owing nothing are dropped
+   here and never visited again.
+3. **Distribute owed fragments** — the plan becomes a Ray Data dataset through
+  `read_datasource(EmbeddingScanDatasource, override_num_blocks=<owed fragments>)`,
+   so there is one read task per owed fragment and nothing but the plan crosses the
+   driver boundary.
+4. **Scan inside the read task** — each task re-opens the table at the pinned
+  version, takes **its own** fragment, and scans it with `columns=source_columns`
+   and the same predicate — only that modality's source columns, and only the rows
+   it owes. It never projects an `embedding_*` vector column; it projects Lance's
+   `_rowaddr` alongside them as `__checkpoint_id`, which is what Ray marks complete
+   when a staged file commits (§7).
+5. **Optional dev cap** — `config.max_fragments` bounds the **owed fragment
+   count** (not the row set). It is applied after the current fragments are
+   dropped, so a capped run always works on rows that are actually owed, and it
+   stops the walk rather than truncating its result, so the counts for the
+   fragments beyond the cap are never taken.
 
-Because the fragment is the work unit, the table's fragment geometry is this
-leg's parallelism ceiling, and the run logs it once before the first fill:
+Because the fragment is the read's work unit, the table's fragment geometry is this
+leg's parallelism ceiling, and the run logs it once before the first modality:
 `embedding source s3://…/clips.lance v41: 8,412,900 rows, 1,052 fragments
 (min=4,900 median=8,000 max=8,000 per fragment), 31 fields`. The
-fragment count bounds how many workers can run at all, and the largest fragment
+fragment count bounds how many read tasks exist, and therefore how wide the actor
+pool is allowed to grow (§7); the largest fragment
 bounds how long the last one keeps the others waiting — so a table that is coarse
 or lopsided is visible before any GPU time is spent on it rather than inferred
 afterwards from a long tail. The line is summarised from manifest metadata by
 [`report_table_shape`](../../../cosmos_curator/next/utils/lance_utils.py) and
 reads no column data. Read after `ensure_embedding_columns`, so its version and
-field count describe the schema the fills actually scan.
+field count describe the schema the modalities actually scan.
 
 That same helper appends a note to the same record — never a second one, and
 never at a level above `INFO` — when at least half the fragments hold fewer rows
@@ -530,19 +538,22 @@ robot_action_split
         ▼
    clips.lance
         │
-        │  driver, per modality: fill_embedding_group derives
-        │                        pinned version + row filter
-        │                        + fragment ids   [:max_fragments]
+        │  driver, per modality: plan_embedding_scan derives
+        │                        pinned version + missing-or-stale filter
+        │                        + owed fragments  (walk stops at max_fragments)
         ▼
-   from_items([fragment ids]) ─▶ actor pool
-                                   │  each worker, on its own fragment:
-                                   │  fragment.scanner(columns = <modality inputs>,
+   read_datasource(plan) ────────▶ read tasks (one per owed fragment)
+                                   │  fragment.scanner(columns = <modality inputs>
+                                   │                             + _rowaddr,
                                    │                   filter  = applicable
-                                   │                             AND primary IS NULL)
+                                   │                             AND missing-or-stale)
                                    ▼
-                                 embed ─▶ update_columns (§3)
+                              actor pool: embed ─▶ staged Parquet  (phase 1, §7)
+                                                        │
+                                                        ▼
+                                          update_columns ─▶ one commit (phase 2, §7)
 
-   text  ──▶  image  ──▶  action      (each its own fill and pool; sequential, §10.1)
+   text  ──▶  image  ──▶  action      (each its own plan and pool; sequential, §10.1)
 ```
 
 
@@ -620,16 +631,18 @@ is meaningful only once the image group has been added.
 
 | Column                    | Type                          | Notes                                        |
 | ------------------------- | ----------------------------- | -------------------------------------------- |
-| `embedding_text_subtask`  | `fixed_size_list<float32,384>`| subtask vector, **L2-normalized**; the group's **primary vector** (its NULL state marks the row pending) |
+| `embedding_text_subtask`  | `fixed_size_list<float32,384>`| subtask vector, **L2-normalized**; the group's **primary vector** (its NULL state marks the row owed) |
 | `embedding_text_task`     | `fixed_size_list<float32,384>`| task vector, **L2-normalized**               |
-| `embedding_text_model_id` | `string`                      | producer id, e.g. `BAAI/bge-small-en-v1.5` (the group's provenance column) |
+| `embedding_text_model_id` | `string`                      | the group's **provenance column**: a digest of the **result identity** — registry key, model id, pinned revision, pooling, and `result_version` (§7) — not a readable model name |
 
 
 Two vectors are stored rather than one blended string so the subtask signal (the
 dominant curation term) stays clean while task-level grouping is still available
 without re-embedding (§4.3). All three fields transition together: a complete text
-group has both vectors and the model id, so a row with one text vector but not the
-other is **corrupt**, not pending (§7).
+group has both vectors and the identity digest, so a row with one text vector but
+not the other is **corrupt**, not owed (§7). The column name is historical: it
+holds a digest of the whole computation rather than a model name, which is what
+lets a re-pin behind an unchanged checkpoint name make the rows owed (§7).
 
 ### 3.2 Image — `embedding_image_*` (`IMAGE_GROUP_SCHEMA`)
 
@@ -637,7 +650,7 @@ other is **corrupt**, not pending (§7).
 | Column                     | Type                          | Notes                                        |
 | -------------------------- | ----------------------------- | -------------------------------------------- |
 | `embedding_image`          | `fixed_size_list<float32,384>`| image vector, **L2-normalized**; the group's **primary vector** |
-| `embedding_image_model_id` | `string`                      | producer id, e.g. `facebook/dinov2-small` (provenance column) |
+| `embedding_image_model_id` | `string`                      | **provenance column**: a digest of the **result identity** (registry key, model id, pinned revision, pooling, `result_version` — §7) |
 
 
 The image group is applicable only where `clip_uri` is present (non-null and
@@ -655,11 +668,12 @@ all-NULL image group (retried next run), preserving one output per selected row.
 
 `embedding_action_pca_fingerprint` identifies **which** basis produced a vector:
 `descriptor_version` alone cannot, since two bases fit from the same descriptors
-are incomparable under one version. Both provenance columns are checked to hold at
-most one distinct value across the group, so a table accidentally built from two
-bases (or two descriptor versions) is detected before a fill (§7). Rows reference
-the basis by fingerprint; the basis bytes live in a content-addressed artifact
-(§3.4).
+are incomparable under one version. The two columns are therefore read differently.
+Two distinct **fingerprints** under the running descriptor version are a refusal —
+one run projects onto one basis, and two bases are incomparable (§5.5). An older
+**descriptor version** is not: those rows describe a different contract, so they are
+stale work and an ordinary run recomputes them (§7). Rows reference the basis by
+fingerprint; the basis bytes live in a content-addressed artifact (§3.4).
 
 
 ### 3.4 Action PCA artifact (`clips.lance__action_pca/<fingerprint>.npz`)
@@ -686,7 +700,9 @@ Content addressing decouples the artifact write from the Lance commit: the basis
 is persisted *before* the commit, and each row references it by fingerprint, so a
 failed commit leaves only a harmless unreferenced object — never new basis bytes
 paired with old action vectors. An append reuses the fingerprint the group's rows
-already carry; a reset group fits a new basis under a new fingerprint (§5, §11).
+already carry; a new descriptor version fits a new basis under a new fingerprint,
+because the lookup of the published rows' basis is scoped to the current contract
+and so binds nothing from an older one (§5, §11).
 There is no mutable "current PCA" pointer.
 
 ### 3.5 One clip, end to end (worked example)
@@ -722,9 +738,9 @@ fields omitted for brevity):**
 { "clip_id": "a1b2c3d4…",
   "embedding_text_subtask": [0.031, -0.088, ...],   // 384 floats, ||v|| = 1
   "embedding_text_task":    [0.012,  0.104, ...],   // 384 floats, ||v|| = 1
-  "embedding_text_model_id": "BAAI/bge-small-en-v1.5",
+  "embedding_text_model_id": "4f1c9e…",              // result-identity digest (§7)
   "embedding_image": [-0.05, 0.07, ...],            // 384 floats, ||v|| = 1
-  "embedding_image_model_id": "facebook/dinov2-small",
+  "embedding_image_model_id": "b70d21…",            // result-identity digest (§7)
   "embedding_action": [1.83, -0.44, ...],           // 97 floats, raw PCA coords
   "embedding_action_descriptor_version": "dual-wrist-v3",
   "embedding_action_pca_fingerprint": "9c1f0a…" }
@@ -955,8 +971,8 @@ two together is **not** required.
 
 The lever that does divide the decode floor is **actor count**: separate actors
 are separate processes and therefore separate GILs. It is not a knob here — it is
-bounded by the fill's work-item count, which is the table's fragment geometry up
-to a block cap ("How many fill workers actually run", §7).
+bounded by what the cluster can place and by the owed fragment count
+("How many staging actors run", §7).
 
 **Why the first frame, and why DINOv2.** A clip is one continuous subtask from a
 head-mounted camera, so its frames are highly correlated; one frame answers "does
@@ -1461,31 +1477,46 @@ while the explained-variance figure misleadingly reads 100%.
 - **Zero total variance** (all descriptors identical) or **effective rank below
 97** — the retained tail would be noise, not motion.
 
-**Load-by-fingerprint or fit-then-save (basis selection is a predicate on the
-group, not a file flag).** Because every basis is an immutable, content-addressed
-artifact (§3.4) and every action row records the
-`embedding_action_pca_fingerprint` it was projected under, the action leg decides
-what to do from the group's own state:
+**One basis per run: reuse the bound one, or fit.** Because every basis is an
+immutable, content-addressed artifact (§3.4) and every action row records the
+`embedding_action_pca_fingerprint` it was projected under, the leg does not need a
+"current basis" file or a flag — it reads which basis this run is already
+committed to from two sources and binds it:
 
-- **Group already holds embedded rows** (an incremental append) — it reads the
-single surviving fingerprint (`validate_group_state` has proven there is at most
-one) and **loads that exact basis**, re-projecting the new descriptors into the
-identical coordinate system. This is a semantic no-op for the existing rows and is
-logged so an operator expecting a refit sees why they did not get one.
-- **Group is empty** (a first fit, including the state left by `--reset-group`) —
-it **fits a fresh basis** from the run's descriptor sample and persists it
+- **Staged rows of an interrupted attempt** (§7) — read first as a *source*, not
+as a precedence: an attempt that crashed between staging and publication will
+publish exactly those vectors, so a group that still looks empty may already be
+committed to a basis.
+- **Canonical rows** (an incremental append, or a wave of a capped rebuild) — the
+group's own `embedding_action_pca_fingerprint` values.
+
+The rule over those two is **one basis, not an ordering**: if both are present and
+agree, that basis is loaded and the new descriptors are re-projected into the
+identical coordinate system — a semantic no-op for existing rows, logged so an
+operator expecting a refit sees why they did not get one. If they **disagree**, or
+if either source holds two values, the run refuses: two bases are incomparable, so
+there is no correct answer to pick. With neither source holding a fingerprint, the
+leg **fits a fresh basis** from the run's descriptor sample and persists it
 content-addressed (`save_if_absent` writes `<fingerprint>.npz`, reads it back, and
-validates it), then projects. The whole group is then computed under the new
-fingerprint.
+validates it) before projecting.
 
-`max_fragments` does not bias the fit. It caps the **fragments the fill visits**,
+Only a **missing referenced artifact** is an operator-facing fault: a fingerprint
+is recorded but its `.npz` is gone. It is content-addressed, so it cannot be
+regenerated from a different fit — it has to be restored. (If the reference came
+from a crashed attempt's staged rows, discarding that staging workspace removes
+the reference.)
+
+A recorded `descriptor_version` older than the running code's is **not** a
+refusal: those rows are stale work. Their basis is deliberately *not* loaded — it
+describes a different descriptor contract — so they are selected for recompute and
+the run fits a fresh basis for them (§7). There is no reset and no "delete the
+`.npz`" step.
+
+`max_fragments` does not bias the fit. It caps the **fragments a run visits**,
 while the candidate scan reads the whole table's `action_data_uri` column, so a
-truncated run fits from the same population an untruncated one would.
-A recorded `descriptor_version` differing from the running code's is stale: the
-leg refuses to load and directs the operator to `--reset-group action` (§11.1).
-There is **no** "delete the `.npz`" step and no mutable current-basis file —
-emptying the group is what refits, because content addressing makes an append
-reuse the existing fingerprint and only an empty group fit a new one.
+truncated run fits from the same population an untruncated one would. What keeps
+successive capped waves consistent is the basis binding above: the first wave's
+published fingerprint is what the next wave loads.
 
 **How the fit sample is drawn (URI-first, no full-corpus pass).** A fit needs a
 *representative* sample, not every descriptor. The driver therefore samples
@@ -1560,14 +1591,14 @@ buffers rather than N cores, and shipping decoded arrays across a process
 boundary would cost more than the geometry they feed.
 
 **Ceilings bound the leg, and the read width moves only past the first two.** The
-per-actor ceiling splits by pass, because a fill and the PCA pass source their work
-items differently.
+per-actor ceiling splits by pass, because the staging phase and the PCA pass source
+their work items differently.
 
 | Ceiling | Mechanism | Lever |
 |---|---|---|
 | storage connection pool | the actor's readers share one client per backend, sized by `BaseClientConfig.max_concurrent_threads` (100), so a width of 32 does not queue behind it | raise the client's pool size |
 | per **actor** | the ~31 ms geometry is GIL-held numpy, so it serializes however wide the reads are | none — this is the floor |
-| per **fill** | a fill's work item is a Lance fragment, so actor count is the table's fragment count | fragment geometry, owned by the producer (§7) |
+| per **staging phase** | the read is one task per owed Lance fragment, so the actor pool cannot grow past the owed fragment count | fragment geometry, owned by the producer (§7) |
 | per **PCA pass** | it builds work items from a URI list, not from fragments, so its pool is bounded by the CPUs allocated | allocate more CPUs |
 
 Read the ceilings against the measurement: threaded **reads alone** reach
@@ -1654,220 +1685,302 @@ has to re-derive it:
 ## 7. Persistence and re-run semantics
 
 Embeddings own only the `embedding_*` column groups on `clips.lance`; they never
-mutate a base column and never create a side table. Schema evolution and state
-validation are owned by
-[`columns.py`](../../../cosmos_curator/next/recipes/embeddings/columns.py);
-deriving the work, writing it, and committing it are owned by
-[`fill.py`](../../../cosmos_curator/next/recipes/embeddings/fill.py). "Planning"
-is not a separate responsibility anywhere — it is three local values at the top of
-`fill_embedding_group`.
+mutate a base column and never create a side table. Schema evolution and the
+selection predicate are owned by
+[`columns.py`](../../../cosmos_curator/next/recipes/embeddings/columns.py); the
+pinned plan and the read tasks by
+[`datasource.py`](../../../cosmos_curator/next/recipes/embeddings/datasource.py);
+the recovery namespace by
+[`workspace.py`](../../../cosmos_curator/next/recipes/embeddings/workspace.py);
+the compute phase by
+[`fill.py`](../../../cosmos_curator/next/recipes/embeddings/fill.py); and the
+commit by
+[`publication.py`](../../../cosmos_curator/next/recipes/embeddings/publication.py).
+[`staged.py`](../../../cosmos_curator/next/recipes/embeddings/staged.py) holds the
+Arrow contract the two halves meet on.
 
-Every modality runs the same sequence. Text and image take it with no branch at
-all; action takes one explicit driver branch before its fill (see **Action
-pre-step** below).
+The run is **two phases with a durable boundary between them**. Nothing a GPU
+computed reaches `clips.lance` until every owed row of that modality has been
+computed, and nothing a crash destroys has to be computed twice:
+
+```text
+plan (driver-side filtered counts)
+  │
+  ▼
+stage ──────────────────────────────► staged Parquet + Ray row checkpoint
+  │  read owed rows → embed → write     (the workspace; see below)
+  │
+  ▼
+publish ────────────────────────────► one LanceOperation.Update
+     per-fragment update_columns         (vectors + provenance, atomically)
+  │
+  ▼
+drop the workspace
+```
+
+Every modality runs that sequence. Text and image take it with no branch at all;
+action binds its PCA basis first (see **Action pre-step**).
 
 - **Ensure schema** — `ensure_embedding_columns` adds the missing fields of only
 the enabled groups in one `add_columns` metadata commit. A group already present
-must match its own schema exactly; a partial or wrong group raises. A text-only
-run adds only the three text columns and never creates image/action columns. That
-`add_columns` is a **commit**, so a first run advances the table's version even
-when every fill then finds nothing pending: the run reports that version and
-names the fill's absence, rather than reporting the table as unchanged. It is the
-run's *first* commit, so any fill that does commit supersedes it as the reported
-version (§11.3).
-- **Validate group state** — `validate_embedding_group` enforces that the group's
-complete rows carry at most one producer identity per provenance column, and —
-where the modality configures an expected producer — that it is that one. A stale
-producer (e.g. a different model id) fails and directs the operator to
-`--reset-group`. Action passes no expected provenance: its producer identity is
-the PCA fingerprint its own rows carry, so only the single-producer rule applies
-and the basis is then read back from that fingerprint (§5). A mixed NULL /
-non-NULL *partial* row is not checked because it is unreachable: one
-`update_columns` call writes every field of a row's group together. Proving a
-column holds a single producer needs every non-null value looked at — no Lance
-fragment statistic or index metadata answers it — so the check is expressed as a
-`SELECT DISTINCT ... LIMIT` and Lance does that pass over one encoded column,
-returning a bounded result; the driver never holds a value per row. The same
-bounded read (`lance_utils.distinct_non_null_values`) is what the Curate leg's
-preflight uses to refuse *fusing* a group that carries two identities, since one
-table can be filled by two runs whose configs differed and only a later reader of
-the whole column can see it — see
-[Producer identity](curator-next-curation.md#producer-identity-is-part-of-the-source-contract).
-- **Fill** — `fill_embedding_group` derives the version, the fragment ids and the
-pending predicate (`applicable AND primary vector IS NULL`) from the manifest —
-a **metadata read**: no row is scanned and no row is counted on the driver — and
-runs one actor pool over those ids. Each worker scans its own fragment's pending
-rows, calls the embedder (which returns exactly one row per scanned row, in scan
-order, an all-NULL group for a per-row failure), attaches `clip_id` positionally,
-and writes the group's columns back into that fragment.
-- **Commit** — one `LanceOperation.Update` naming only the fragments that were
-written (see "Atomic column write" below). A run commits nothing when no fragment
-had a pending row, or when the table has no fragments at all. Committing nothing
-*while a fragment failed* is not one of those cases: it raises (see "Total
-outage" below).
+must match its own schema exactly, so a **width change is fail-closed**: the run
+raises before any plan, download, actor, or commit (§11.3). A text-only run adds
+only the text columns and never creates image/action columns. That `add_columns`
+is a commit, so a first run advances the table's version even when every modality
+then finds nothing owed: the run reports that version and names the absence of a
+fill rather than reporting the table as unchanged.
+- **Plan** — one filtered `count_rows` per fragment, on the driver, over the
+missing-or-stale predicate below. It reads only the predicate's own columns: no
+vector payload is materialized, no worker starts, and no checkpoint is downloaded.
+A **text or image** modality whose plan is empty is skipped for that modality — it
+never reaches a workspace or an actor pool for that modality. `ray.init` is
+run-level: `run_embedding_pipeline` calls it only when `_will_execute` is true
+(any spec-driven modality owes fragments **or** action is enabled), so an empty
+text or image plan **on its own** does not trigger `ray.init`; a sibling modality
+with owed work or an enabled action modality can. Action is not planned at this
+step at all and makes the weaker claim described under **Action pre-step**.
+- **Stage** — one Ray Data job per modality, read-to-write, with Ray's job-level
+row checkpoint installed. Owed rows are read from the pinned version, embedded,
+and written as Hive-partitioned Parquet. The staged rows are the phase's output;
+`clips.lance` is untouched.
+- **Publish** — every planned fragment is prepared in parallel (a per-fragment
+`update_columns` streaming its staged partition), then all of them are committed
+as **one** `LanceOperation.Update`.
+- **Drop the workspace** — the staged copy is redundant once the commit lands, so
+the namespace is deleted. A cleanup failure is logged and does not fail the run.
 
 **Action pre-step.** Before the action fill exists, the driver binds the run's one
 PCA basis with
 [`resolve_action_pca`](../../../cosmos_curator/next/recipes/embeddings/action_pca.py)
-(§5). This is an explicit `if` in
-[`embed.py`](../../../cosmos_curator/next/recipes/embeddings/embed.py), not a
-lifecycle hook the other modalities also carry. A `None` return is how a run with
-no action data is skipped: with no clip carrying an `action_data_uri` there is
-nothing to load and nothing to fit, so the run reports a skipped modality
-**without ever starting an actor pool**. Because the basis is a required argument
-of `build_action_fill`, "workers exist but no basis is bound" is not a
-constructible state.
+(§5). A `None` return is how a run with no action data is skipped: with no clip
+carrying an `action_data_uri` there is nothing to load and nothing to fit, so the
+run reports a skipped modality **without ever starting an actor pool**. Because
+the basis is a required argument of `build_action_fill`, "workers exist but no
+basis is bound" is not a constructible state.
 
-### NULL state semantics
+Action's no-op is therefore cheaper than a fill but dearer than text's or image's,
+and the ordering is what makes it so. `_will_execute` counts action as "may
+execute" whenever it is enabled, so the run pays one `ray.init` before any
+modality runs; and `_run_action_modality` resolves the action **workspace first**,
+because `staged_action_fingerprints` reads it to learn which basis an interrupted
+attempt already committed to. Only then can the basis be bound, and only then is
+there a fill to plan against. So action reaches both a workspace and `ray.init`
+before it can discover that it owes nothing — it just never reaches an actor pool.
+Resolving a workspace writes and claims nothing, so the skip still leaves no trace
+on storage.
 
-There are no status columns. A row's state for one modality is read from its group
-columns and the modality's applicability predicate:
+### What one run owes: missing or stale
 
-| State | Group columns | Meaning |
-|---|---|---|
-| not applicable | all NULL | the predicate is false for this row (e.g. no `clip_uri` for image) |
-| applicable, pending | all NULL | not embedded yet (a fresh row, or a prior per-row failure) |
-| failed this run | all NULL | a per-row decode / geometry failure; retried next run |
-| successful | all non-NULL | a complete group with a single producer identity |
-| stale | all non-NULL | complete but the provenance differs from the configured producer; a run fails and requires `--reset-group <modality>` |
+There is one definition of owed work, in `pending_filter`, and every part of the
+run derives from it — the plan, the scan each read task performs, and the rows
+publication expects to find staged:
 
-A **mixed** NULL / non-NULL group on one row is not a state the write path can
-produce: a row's whole group is written by a single `update_columns` call, so it
-transitions atomically. There is no partial-row check because there is no partial
-row to find.
+```text
+applicable AND (primary vector IS NULL
+                OR any provenance column IS NULL
+                OR any provenance column ≠ this run's result identity)
+```
 
-Pending and failed are intentionally the **same** persisted NULL state; per-row
-failure reasons are logged and counted in the run summary, not stored as durable
-error columns. A modality that has never run has **no** column at all (a distinct
-condition from a present NULL — §3).
+Staleness is therefore **selected work, not a refusal**. A model change, a pooling
+change, or a `result_version` bump makes the affected rows owed, and an ordinary
+re-run recomputes and overwrites them in place. No reset command, no force flag,
+and no run mode exist, because "rebuild" and "top up" are the same operation over
+a different owed set.
 
-### Incremental fill and group reset
+The `IS NULL` arm of each provenance column is not redundant with the `≠` arm:
+under SQL three-valued logic `NULL ≠ 'x'` is *unknown* rather than true, so a row
+holding a vector with no recorded identity would silently drop out of the
+selection. The identity value is interpolated as a single-quoted SQL literal
+through the shared escaper, and column names stay **bare** — on Lance's
+scanner-filter surface a double-quoted name parses as a string literal, which
+would compare two constants and match the wrong rows instead of raising.
 
-Incremental is the **only** run mode. There is no rebuild option: a run embeds
-only applicable rows whose primary vector is still NULL, and already-complete rows
-are untouched. New base rows appended after the pinned version stay NULL and are
-picked up next run.
+### Result identity: what a provenance column means
 
-Replacing a group is therefore a separate **maintenance operation**, not a run
-mode. An ordinary run is config-driven (§9); a replacement instead goes through
-the reset-only
-[maintenance runner](../../../cosmos_curator/next/recipes/embeddings/examples/run_embedding_pipeline.py),
-whose `--reset-group <modality>` calls
-[`drop_embedding_group`](../../../cosmos_curator/next/recipes/embeddings/columns.py)
-for each named group, re-adds the columns empty, and exits without embedding
-anything; the next ordinary run refills the group from scratch. Making it a
-separate invocation is deliberate: a config field could be left in a YAML file and
-silently re-executed by a scheduled run, and an accidental group replacement burns
-a full corpus of GPU time.
+A stored provenance value names **the computation**, not merely the checkpoint.
+For text and image it is `canonical_digest({weights_name, model_id, revision,
+pooling, result_version})` — the spec's registry key, the registry's resolved id
+and pinned revision, and the spec's pooling reduction and `result_version` (§3).
+A re-pin behind an unchanged `weights_name` moves it; so does a pooling change;
+so does a deliberate bump for a change with no other footprint. For action the
+identity is the pair the group already carried: `descriptor_version` + the
+content-addressed PCA fingerprint.
 
-Three measured behaviors of the drop are worth knowing before you use it:
+`weights_name` is in the digest and is not redundant with the two registry facts
+beside it. Both embedders load `get_local_dir_for_weights_name(spec.weights_name)`,
+so the key selects the **directory** the weights come from, and `all_models.json`
+admits two keys that agree on everything the digest would otherwise see —
+`seedvr2_7b` and `seedvr2_7b_sharp` share one `model_id`, one `version` and one
+`precision` while naming different `.pth` files. Without the key, swapping a spec
+between such siblings would leave every existing row reading as current while new
+rows came from different weights under the same provenance value.
 
-- **Dropping an absent group is a no-op.** `drop_embedding_group` narrows to the
-fields the schema actually carries and skips the call entirely when none are
-present, so it returns `0` and the table's version is **unchanged** — a reset of a
-modality that never ran leaves no trace in the version history. (Lance's own
-`drop_columns([])` does not raise but does commit a version; the guard is what
-keeps the no-op off the history.)
-- **A partially present group drops only what is there.** `drop_columns` rejects a
-name the schema does not carry and then drops *nothing*, so passing a partial
-group whole would fail the entire reset instead of clearing what exists.
-- **Lance reuses field ids after a drop / re-add cycle.** The re-added columns can
-carry the same field ids the dropped ones had. Field ids are therefore not a
-stable identity for a group across a reset; column names are.
+The registry's `precision` stays out, and a control test pins that: neither
+embedder passes a dtype, so including it would make a whole corpus stale for a
+change that cannot alter one vector.
 
-The consequence to plan around is the **all-NULL window**: between the reset and
-the refill the group is present and entirely NULL, which every consumer reads as
-"not embedded yet". A partial refill is safe rather than mixed, because the drop
-detaches the old data file — the fragments a refill never reaches read NULL, not
-pre-reset values.
+One value is computed once per modality per run and spent twice — as the value a
+row must already hold to count as current, and as the value this run's rows will
+carry. That is what makes the selection predicate and the written provenance
+impossible to disagree.
 
-### Atomic column write (no staging tree, no tombstones)
+### The staging workspace
 
-The fill writes each group **directly into `clips.lance`** with no application
-staging layer and no shuffle:
+The workspace **namespace is derived and never claimed**; only the **staging root**
+is configurable (`staging_root_uri`, §9). Its path is
 
-1. The driver turns the planned fragment ids into work items
-(`ray.data.from_items`) and maps them over an actor pool, one fragment per
-`__call__`. Nothing but integers leaves the driver.
-2. Each worker opens the table at the pinned `read_version`, takes its fragment,
-and **streams**: scan a batch of pending rows → embed it → hand it straight to
-`update_columns`. Peak worker memory is one batch of vectors, not one fragment's
-worth.
-3. `LanceFragment.update_columns(reader, left_on="clip_id")` writes a **new column
-file** holding only the group's columns for that fragment's existing rows, and
-returns the fragment's updated **metadata** plus the field ids it rebound. The
-worker sends the driver **one JSON string per touched fragment** — `_RESULT_SCHEMA`
-is a single `large_string` column, so it cannot carry column data back at all
-without changing type — which is what makes driver state O(touched fragments)
-rather than O(rows) a structural guarantee instead of a convention.
-4. The driver commits every written fragment in **one** `LanceOperation.Update`
-against the pinned version, so the group's vectors and provenance become visible
-together, atomically. `fields_modified` scopes the commit to this group's field
-ids, and `transaction_properties` tags it (`kind=curator-next-embedding`, plus the
-group name) so the commit is attributable in the table's version history.
+```text
+<staging root>/<modality>/<namespace>/results/fragment_id=<id>/*.parquet
+<staging root>/<modality>/<namespace>/checkpoints/
+```
 
-**Why this never creates a tombstone.** Both write steps are additive at the
-storage layer:
+where the default staging root is a *sibling* of the table
+(`clips.lance__embedding_staging`, never inside it, so nothing a run stages is
+ever mistaken for table data), and `<namespace>` is a sha256 over exactly the five
+facts that decide whether one attempt's staged rows are usable by another:
 
-- `add_columns` with an all-nullable schema is **metadata-only**. Lance records the
-new fields in the manifest and reads them as NULL for every existing row; no data
-file is rewritten and no row is replaced.
-- `update_columns` **rebinds field ids to a new file** rather than replacing rows.
-The new file holds the group's columns for the fragment's existing rows in their
-existing offset order; row addresses, row count, and every other column's file are
-untouched. Because no row is superseded, Lance writes **no deletion vector**. The
-previous column file stays on disk referenced only by older versions.
+| Input | Why it is in the namespace |
+|---|---|
+| source table URI | rows staged from another table are not these rows |
+| pinned read version | a source append moves row addresses, so the checkpoint ids no longer name the same rows |
+| recovery contract | the computation being performed (the result identity for text/image; descriptor version + dimensions for action) |
+| staging protocol version | the layout and partitioning the reader assumes |
+| staged-schema fingerprint | the column names and types the staged Parquet carries |
 
-`update_columns` joins with **left-outer** semantics, so a fragment row absent from
-the update table keeps its previous value. That is what makes it safe to write only
-the *pending subset* of a fragment. A fragment with nothing pending is not
-rewritten at all: the worker probes the scanner for a first batch before calling
-`update_columns`, so an unchanged rerun of a fully embedded table commits nothing.
+The last two change no vector, so neither may invalidate a canonical row — but
+both change how a staged row is *read back*, so work across either boundary is
+incompatible with a resume. The namespace is the only place that distinction
+belongs. The modality is deliberately **not** digested: it is already a path
+segment, and both the contract and the staged fingerprint are derived from the
+modality's own column names.
 
-**Why `clip_id` is a sound join key here.** It is an ordinary persisted column, so
-it survives the update (unlike a virtual row address, which is a physical
-coordinate). The upstream leg makes no uniqueness guarantee, and Lance resolves a
-duplicate key by taking one matching row's value, so this path **assumes rows
-sharing a `clip_id` agree** — same source columns, hence the same computed value and
-the same applicability. Under that assumption every duplicate receives the value it
-would have computed for itself. Rows that share a key but disagree on their source
-columns are malformed input: the write path neither detects nor reconciles them,
-because doing so would cost a de-duplicating shuffle on every run to guard against
-data the producer is not supposed to emit.
+Two attempts that agree on all five share a namespace, which is precisely what
+makes a resume free of any state file: **recovery state is the checkpoint and the
+staged Parquet, nothing else.** There is no marker, manifest, claim, or JSON
+sidecar to reconcile.
 
-### How many fill workers actually run
+### Phase 1 — checkpointed staging
 
-The fill's concurrency is set by its **work-item count**, not by the actor pool's
-size and not by the cluster's GPU count alone. `ray.data.from_items` emits one
-block per work item up to a 200-block ceiling, and one block is walked by one
-actor:
+The staging job is deliberately shaped as `read → map → write`, because that is
+the only DAG shape Ray Data 2.58's job-level `CheckpointConfig` supports: the read
+is where the completed-row filter is inserted and the write is the only point at
+which a row is provably finished. A `materialize()` terminal would disable the
+whole mechanism with nothing but a warning, so the absence of that warning is
+asserted by a test.
 
-| Fragments visited | Blocks | Concurrent fragments |
-|---|---|---|
-| N ≤ 200 | N | N — one fragment per task, so a slow fragment delays only itself |
-| N > 200 | 200 | 200 — each block carries ⌈N / 200⌉ fragment ids that one actor walks serially |
+- The **checkpoint id** is Lance's `_rowaddr` — the packed
+  `(fragment_id << 32) | offset` — projected by the read as `__checkpoint_id` and
+  carried untouched through the worker into the staged file, because Ray reads it
+  back off the sink to mark a row complete. Keyed per row rather than per
+  fragment, so a crash mid-fragment still retains what it computed.
+- **What a crash costs is one write bundle per actor**, not the phase. Rows in
+  bundles that already committed are filtered out at the read on the next attempt,
+  so their GPU time is never paid twice. The bundle is sized by the larger of the
+  two row minimums downstream of the read — the modality's `batch_size` and
+  `parquet_rows_per_file` (§9) — not by the source fragment.
+- The sink appends (`SaveMode.APPEND`) so a resume adds to what an earlier attempt
+  staged; the checkpoint guarantees the two sets are disjoint.
+- A **fully checkpointed** phase still runs, and hands the embedder nothing. The
+  phase is not skipped, because running it is what lets Ray reclaim a torn shard
+  the crash left behind.
+- A **worker fault is fatal to the attempt.** Nothing tolerates a lost partition
+  of rows: publishing around a failed subset would produce a group that reads as
+  complete while an unknown set of rows holds nothing. The checkpoint is what
+  makes fatality affordable — a re-run resumes rather than restarting.
 
-So the ceiling is `min(fragments visited, 200, free cluster slices)`. The concrete
-consequences an operator hits:
+### Phase 2 — exact publication
 
-- **400 fragments, 64 GPUs** → 64 concurrent image actors: blocks (200) exceed the
-  cluster's slices, so the cluster is the binding term.
-- **1 fragment, 64 GPUs** → **one** actor. Adding GPUs changes nothing, because
-  there is only one work item. This is the failure mode to check first when a leg
-  is slow with idle GPUs; the fix is the producer's fragment geometry, not a config
-  knob here.
+Publication reads the staged partitions of exactly the fragments the plan named,
+and refuses anything else:
 
-Every run logs the fragment count it found and the ceiling it derived, so the
-number that actually capped the run is in the log rather than inferred from GPU
-utilisation.
+| Fault | Verdict |
+|---|---|
+| a planned fragment has no staged partition, or an empty one | refuse — the staging phase did not finish, so its rows are not available to publish |
+| a staged file is unreadable | refuse — staging already reported success, so this is corruption rather than a torn shard |
+| a staged vector does not cast to the stored type | refuse, naming both schemas |
+| two payloads claim one fragment | refuse — committing two metadata versions of one fragment would make the outcome depend on ordering |
+| a payload's metadata names another fragment | refuse — the envelope's id cannot be trusted to place it |
+| the prepared set differs from the plan in either direction | refuse — fewer means reporting success over rows still owed, more means committing a foreign attempt's rows |
+| a fragment's staged row tally differs from its planned owed count | refuse — the `update_columns` left-outer join cannot tell a row the plan never owed from one it owed and lost, so only the plan's own count separates a short partition from a legitimate subset |
 
-`override_num_blocks=len(fragment_ids)` would lift the 200-block ceiling. It is
-deliberately **not** passed, and the trade-off is accepted rather than overlooked:
-at the deployed 8-GPU shape the cluster term binds long before the block ceiling,
-so the argument would add a knob with no effect while taking over Ray Data's own
-block sizing. The cost of that choice is that a table with more than 200 fragments
-cannot exceed 200 concurrent actors — revisit when one modality is given more than
-200 usable cluster slices.
+The last two are separate checks because the set check answers "was every owed
+fragment prepared" and the tally answers "did each one carry every owed row". A
+partition can satisfy the first and fail the second: it stays readable, produces
+a payload, and holds only some of its rows, at which point the omitted rows keep
+their previous value and the commit reports success over vectors that are still
+stale. The plan already records each fragment's exact owed count, so the tally
+costs one comparison per fragment on the driver.
+
+The tally is exact in both directions, and two edits can make a resume trip it
+rather than continue. Deleting `checkpoints/` while leaving `results/` makes the
+next attempt re-stage rows the partition already holds, and *narrowing* an
+applicability filter between attempts shrinks the owed count while resolving the
+same namespace, because the namespace digest covers the recovery contract and
+not that predicate. Both refuse with the "more staged than owed" arm, and the
+remedy in each case is the one the message names: delete the staging namespace
+and let the modality recompute.
+
+Every refusal happens **before** the commit, so the previous version stays
+current. Each fragment's preparation streams its partition straight into
+`update_columns`, so peak memory is one batch rather than one fragment, and the
+driver receives one JSON string per fragment — the result schema is a single
+`large_string` column, so it *cannot* carry vectors back.
+
+The fan-out is one task per fragment, and it says so: `from_items` is given
+`override_num_blocks=<planned fragments>` because task count follows *block*
+count, and `from_items` autodetects `min(len(items), max(200, 2 × avail_cpus))`
+— a cluster-sized figure with no reason to equal the fragment count (measured at
+Ray 2.58.0 over `n=2000`: 200 blocks at both 4 and 64 CPUs, 512 at 256). Left to
+autodetect, a one-fragment `batch_size` would buy that many tasks each walking
+its block's fragments in series, and every fragment after the first in a block
+would commit only once its predecessors had — on the one phase a crash cannot
+resume halfway. The override cannot over-split, since the autodetected value is
+itself clamped to the item count; it only lifts the cluster-derived figure to
+the work count, making the owed-fragment number already in the log the width.
+
+The commit carries `transaction_properties`: `kind=curator-next-embedding`, the
+group name, the digest of the result identity, and a per-attempt marker. The
+marker exists for the one failure a commit cannot otherwise classify: a response
+lost after the manifest was written raises exactly as an outright rejection does.
+On any commit error the driver re-opens the table at latest and looks for its own
+marker in the versions after its read — finding it proves the commit landed and
+the run continues with a warning; not finding it is a genuine failure, reported as
+"the commit did not land and the group is untouched".
+
+A **row whose recompute failed** publishes as NULL over whatever it held: vector
+and provenance together. Keeping the old vector would leave two geometries under
+one identity, and keeping the old provenance would hide the row from the next
+run's selection. Both going NULL is what keeps the row owed.
+
+### How many staging actors run
+
+The actor ceiling is the smaller of two bounds, and never below one:
+
+- **What the cluster can place** — an unbounded pool autoscales against queue
+  pressure, and an actor Ray cannot place still counts in the pool's own
+  occupancy, so an over-large ceiling makes a saturated stage report slack it does
+  not have. The free capacity is divided by **every** resource the modality
+  reserves and the tightest quotient wins: image holds a GPU, *also* reserves CPUs
+  for host-side decode, and *also* reserves an 8 GiB heap for the clips in flight,
+  so dividing by the GPU alone would over-count on a CPU-poor or memory-poor node
+  and produce exactly those unplaceable actors. `memory` counts because Ray admits
+  an actor against the `memory=` request exactly as it does against GPU and CPU —
+  that Ray does not *enforce* the figure against real RSS is a separate fact, and
+  no reason to leave it out of the division. The log names which resource bound
+  it, and reports the memory bound in GiB so it can be read against `memory_gb`.
+- **The owed fragment count** — the read is one task per owed fragment, so a
+  fragment-poor table cannot feed a pool wider than that however much GPU is free.
+  This is the bound to check first when a leg is slow with idle GPUs; the fix is
+  the producer's fragment geometry, not a knob here.
+
+A non-strict `repartition` then splits a large fragment into `batch_size`-sized
+blocks *without* coalescing across fragments, so one block still belongs to one
+fragment — which is what keeps the sink's Hive partition a property of the read
+rather than of a shuffle, and what bounds a worker's in-flight memory to one
+batch.
+
+Both inputs and the derived ceiling are logged, so the term that actually capped
+the run is in the log rather than inferred from GPU utilisation.
 
 ### Why not a higher-level Lance API
 
@@ -1879,7 +1992,7 @@ many workers, without moving vectors through the driver:
 
 | Candidate | Why it cannot be used here |
 |---|---|
-| `merge_insert(clip_id).when_matched_update_all()` | Two independent disqualifiers. It takes a driver-side `RecordBatchReader`, so feeding it from Ray streams **every vector in the corpus through the driver process**; and it implements an update as delete-plus-append (`REWRITE_ROWS`), writing a deletion vector per touched fragment and reordering rows on a table `robot_action_split` owns and other legs read |
+| `merge_insert(clip_id).when_matched_update_all()` | Two independent disqualifiers. It takes a driver-side `RecordBatchReader`, so feeding it streams **every vector in the corpus through the driver process**; and it implements an update as delete-plus-append (`REWRITE_ROWS`), writing a deletion vector per touched fragment and reordering rows on a table `robot_action_split` owns and other legs read |
 | `LanceDataset.merge(table, key)` | Add-only. A column that exists on both sides raises (`OSError: Column ... exists in both sides`) |
 | `fragment.merge_columns` + `LanceOperation.Merge` | Add-only, demands the **complete** fragment list rather than the touched subset, and is marked "Internal API" upstream |
 | `dataset.update()` | Takes SQL expressions, so it cannot write a vector |
@@ -1887,268 +2000,111 @@ many workers, without moving vectors through the driver:
 | `ray.data.Dataset.write_lance` | An append sink, not a column update — and broken on the current Ray / pylance pin |
 
 The chosen path is the only one that is simultaneously column-local, atomic,
-partially fillable, and distributed: a per-fragment
-`LanceFragment.update_columns` keyed on `clip_id`, committed once as a
-`LanceOperation.Update` naming only the touched fragments, as detailed under
-[Atomic column write](#atomic-column-write-no-staging-tree-no-tombstones). The
-table above is the write-primitive comparison in full; the upstream reference is
+partially fillable, and distributed. The upstream reference is
 [Lance data evolution](https://lance.org/guide/data_evolution/).
+
+**Why this never creates a tombstone.** Both write steps are additive at the
+storage layer. `add_columns` with an all-nullable schema is metadata-only: Lance
+records the new fields in the manifest and reads them as NULL for every existing
+row. `update_columns` rebinds field ids to a **new column file** rather than
+replacing rows, so row addresses, row count, and every other column's file are
+untouched and Lance writes no deletion vector. It joins with **left-outer**
+semantics, which is what makes it safe to publish only the owed subset of a
+fragment: a row absent from the update keeps its previous value. Columns outside
+the group survive because each prepared `FragmentMetadata` enumerates every one of
+its fragment's column files, not merely the file this write produced.
+
+**Why `clip_id` is a sound join key here.** It is an ordinary persisted column, so
+it survives the update (unlike a row address, which is a physical coordinate). The
+upstream leg makes no uniqueness guarantee, and Lance resolves a duplicate key by
+taking one matching row's value, so this path **assumes rows sharing a `clip_id`
+agree** — same source columns, hence the same computed value. Under that
+assumption every duplicate receives the value it would have computed for itself.
+Rows that share a key but disagree are malformed input: detecting them would cost
+a de-duplicating shuffle on every run to guard against data the producer is not
+supposed to emit.
 
 ### The quiescent-source contract
 
 `clips.lance` is assumed **complete and quiescent** for the duration of a run: no
-concurrent `robot_action_split` append, and no second embedding writer. This is a
-first-class assumption of the design, not a detail of the commit — it is why the
-pinned version is a correctness convenience (one schema per run, and a base
-version for the `Update`) rather than a concurrency mechanism, and why the recipe
-carries no coordination protocol. The concurrency subsection below says what
-actually happens if the contract is broken in each direction.
+concurrent `robot_action_split` append, and exactly one embedding writer. This is
+a first-class assumption, not a detail of the commit. It is why the pinned version
+is a correctness convenience (one schema per run, one base version for the
+`Update`, and one row-address space for the checkpoint) rather than a concurrency
+mechanism, and why the recipe carries no coordination protocol.
 
-### Fragment-level failures are skipped, not fatal
+An append between a crash and its retry is tolerated but not free: the read
+version moves, so the namespace moves, and the interrupted attempt's staged rows
+are abandoned rather than reused. The cost is an orphaned directory (§15).
 
-A fragment that raises for **any** reason is skipped rather than failing the
-modality: the worker logs a WARNING naming the fragment id and the exception,
-emits an error payload instead of its metadata, and the run commits every fragment
-that did succeed. The per-modality summary line reports how many were skipped.
+### NULL state semantics
 
-The reason to prefer this to failing fast is asymmetric cost. The alternative
-aborts the whole modality on any single fragment failure and **discards every
-other fragment's completed work** — on a GPU workload, potentially hours — for a
-fault that is often transient.
+There are no status columns. A row's state for one modality is read from its group
+columns, the modality's applicability predicate, and the recorded identity:
 
-No retry machinery is needed, because a skipped fragment was never written. Any
-rows it still owed stay pending, so the ordinary pending predicate re-selects them
-and the **next run refills them with no operator action**. Note that "skipped"
-does not imply "had work": the fault window opens before the worker can tell
-whether the fragment held a pending row at all. A skipped fragment
-also contributes nothing to `selected` or `filled`: from the table's point of view
-the run never visited it. Fragment-level failure therefore behaves exactly like
-the per-row failure semantics of §8, instead of being a special catastrophic case.
-
-Because a skipped fragment contributes to no row count, the count of skipped
-fragments is itself carried on `ModalityResult.skipped_fragments` rather than only
-logged. That is not a reporting nicety: it is the **only** field that distinguishes
-a run which lost work from one which had none to do, and the total-outage refusal
-below is expressed on it.
-
-One consequence is accepted deliberately, recorded here so it is not rediscovered
-as a bug: **intra-run retry becomes inter-run retry.** Because the worker catches
-the failure, Ray never observes a task failure and its own task retry never fires.
-A fault Ray would have retried within the run is retried by the *next* run
-instead. A retry costs a re-scan of one fragment either way, but a run's
-wall-clock no longer absorbs transient faults.
-
-### Total outage: where the skip policy ends
-
-The skip spends one fragment's work to keep the rest of the run's. That is a trade
-only while there **is** a rest. A run that wrote **no** fragment while at least one
-failed has kept nothing, left the group exactly as it was, and — because a skipped
-fragment contributes to no row count — reports `selected=0, filled=0,
-committed_version=None`: byte-for-byte the result of a run over an
-already-complete table.
-[`FillContractError`](../../../cosmos_curator/next/recipes/embeddings/fill.py)
-refuses that case, on the driver, before any commit.
-
-The discriminator is the **skip count**, not a ratio, because the two outcomes
-differ in *kind* rather than in degree:
-
-| written | skipped | Verdict |
+| State | Group columns | Meaning |
 |---|---|---|
-| ≥ 1 | 0 | ordinary success |
-| ≥ 1 | ≥ 1 | success; the skipped rows stay pending and refill next run — unchanged skip policy |
-| 0 | 0 | success: nothing was owed (an idempotent re-run, or a table with no fragments) |
-| 0 | ≥ 1 | **`FillContractError`** — nothing written while a fragment failed |
+| not applicable | all NULL | the predicate is false for this row (e.g. no `clip_uri` for image) |
+| applicable, owed | all NULL | not embedded yet (a fresh row, or a prior per-row failure) |
+| failed this run | all NULL | a per-row decode / geometry failure; owed again next run |
+| current | all non-NULL | complete, and the provenance names this run's computation |
+| stale | all non-NULL | complete, but the provenance names another computation — **owed work**, recomputed by an ordinary re-run |
 
-The last row deliberately claims less than "every fragment that had work failed",
-because the driver cannot establish that. A fragment can fail while opening the
-dataset or pulling its first batch — before it could report whether it had a
-pending row — and a fragment with nothing pending returns no result at all. So a
-**complete** table with one faulting fragment lands in that row too: zero written,
-one skipped, nothing owed. Refusing it is still right (an unreadable data file is
-a real fault, and a re-run either clears it or confirms it), but the message says
-only what is known and does not blame lost work. The cost is that an idempotent
-re-run is no longer *unconditionally* green: it is green unless a fragment faults,
-and under a `max_fragments: N` cap a single fault is enough because `N` is the
-whole visited set. The alternative — having workers report "I had pending rows"
-so the guard fires only on a *known* loss — was rejected as strictly worse: an outage
-that kills every fragment at open time reports no pending rows either, so the
-guard would go silent on the most severe case it exists for.
+A **mixed** NULL / non-NULL group on one row is not a state the write path can
+produce: a row's whole group is written by one `update_columns` call, so it
+transitions atomically. Owed and failed are intentionally the same persisted NULL
+state; per-row failure reasons are logged and counted, not stored as durable error
+columns. A modality that has never run has **no** column at all (a distinct
+condition from a present NULL — §3).
 
-Three shapes were rejected:
+### Migration: the first run after result identities shipped
 
-- **A skip-ratio threshold** (fail above *N%* skipped) is a knob whose only
-  defensible value is "all of them", and a knob with one sensible value should not
-  exist. An earlier iteration of this recipe carried a 50% action *drop*-ratio
-  warning for the same reason and it was deleted, because the expectation is that
-  every row is written.
-- **Keying on the commit alone** ("a run that committed nothing fails") breaks
-  idempotency outright: an unchanged re-run over a complete table legitimately
-  commits nothing and must stay green. Distinguishing "nothing to do" from
-  "everything failed" is the entire point, and only the skip count does it — it
-  preserves idempotency for every re-run in which nothing faults, which the
-  commit-alone rule does not.
-- **Comparing skips against the fragments *visited*** (`skipped == len(fragments)`)
-  looks equivalent but is strictly weaker and fails silently where it matters most:
-  a fragment with nothing pending reports no result at all, so on a table that is
-  99% embedded the skip count can never reach the visited count — the guard would
-  go quiet on exactly the incremental top-up runs it exists for.
+Rows written before provenance meant a result fingerprint carry a bare model id,
+which no current identity equals. They are therefore stale, and the first run
+after this change **re-embeds every text and image row** — a full corpus
+re-embed, on purpose, because the old values cannot be attributed to a
+computation. The action group is unaffected: its identity pair is unchanged.
 
-The outage is raised as `FillContractError`, the same type as a violated invariant,
-and **the two prognoses are carried by the message text, not by the type**. They
-genuinely differ — a contract violation means the run's own inputs are wrong and no
-retry can fix it, whereas an outage is usually the environment failing every
-fragment alike, where re-running is the first remedy — but that guidance only ever
-reached an operator through the message, since the generic runtime reports every
-exception a run raises identically as a `runtime` failure (below) and nothing in
-the tree branched on the narrower type. A second type distinguishable only by
-reading the source was judged not to earn its place; the outage message
-therefore opens with "Re-run first", and the invariant messages name the input to
-fix. The cost of the collapse is accepted openly: a caller that one day needs to
-retry only outages would have to re-introduce the distinction rather than find it
-hidden behind a sentinel field or a subclass by another name.
-
-One systemic class never reaches this guard at all: a broken projection or row
-filter. Those are the run's shared scan inputs, and the driver refuses them upfront
-rather than letting every fragment skip on them (below). That includes the case
-worth naming, because it looks like it should mis-fire here: a **group whose
-columns were never added**. The pending filter names the group's primary vector, so
-`explain_plan` rejects it with "No field named …" before any actor exists — a
-config fault is never reported with the outage message's "re-run first" advice.
-
-### `FillContractError`: what stops the run instead
-
-[`FillContractError`](../../../cosmos_curator/next/recipes/embeddings/fill.py) is
-the one exception the skip does not swallow. Its contract is deliberately broad:
-**a failure the run must stop for rather than skip past**. That covers the total
-outage of the previous section, plus a violated invariant of the fill itself — a
-property of the run's own inputs, which no retry can fix — as opposed to the
-environment and data faults a fragment is skipped for. Four checks raise it: the
-driver's precondition check on the run's shared scan inputs (below), an embedder
-that returned a different number of rows than it was given, an embedder whose
-columns do not cast to the stored schema, and a fragment id that is absent at the
-pinned version (the derived fragment list and the table disagree).
-
-**Wrong row count and wrong schema are one fault, so they are treated alike.** Both
-mean the embedder is broken and will fail every fragment identically; the schema
-half surfaces only at the cast to the stored types, where a missing, renamed, extra
-or *reordered* column raises a plain `ValueError` and an uncastable dtype or wrong
-vector width raises `ArrowNotImplementedError` / `ArrowTypeError` — measured on
-pyarrow 24, and worth stating because none of those is the `ArrowInvalid` one would
-guess. Those three types are caught individually rather than through their common
-`pa.ArrowException` base, which would also catch `ArrowMemoryError`: an allocation
-failure during the cast is transient, and promoting it here would discard every
-other fragment's work. Letting the schema half fall through to the
-broad per-fragment handler still failed the run, via the outage guard, but replaced
-one precise sentence with *N* skip warnings and a generic outage message.
-
-**The inputs every fragment shares are checked once, on the driver.** The
-projection and the row filter do not vary by fragment, so a broken one — a source
-column that is missing, renamed, or absent from the projection; a predicate that
-does not parse — is not a fragment fault at all: it would fail identically on every
-fragment, and under the skip policy the modality would report a successful run over
-an untouched group. `fill_embedding_group` therefore resolves the scan plan before
-any actor is created, and raises. `LanceScanner.explain_plan` is what makes that
-affordable: it resolves and optimizes the scan — which is where an unknown column or
-an unparsable predicate is rejected — **without reading a row**, so a re-run with
-nothing pending still reads nothing. It is also what leaves the per-fragment handler
-free to be broad: by the time it runs, the faults still reachable there are
-genuinely local ones.
-
-Both obvious alternatives are wrong, which is why the distinction is a named
-exception rather than an exception-type filter:
-
-- **Excluding `ValueError` broadly from the skip** would make an ordinary
-  *storage* `ValueError` fatal — defeating the skip policy exactly when it matters
-  most, since transient object-store faults are the failures it exists for.
-- **Excluding nothing** would let a broken embedder skip every fragment and leave
-  an empty group. The run would still fail — the outage guard below catches
-  "nothing written while fragments failed" — but it would be reported as a
-  transient outage whose advice is to re-run, when no re-run can help until the
-  embedder is fixed. The cost is misdiagnosis, not silence.
-
-**It travels back to the driver as a payload, not as an exception.** Ray Data
-replaces whatever a `map_batches` UDF raises with a `UserCodeException` wrapper and
-does not carry the original object across the task boundary, so a worker's raise
-reaches the driver as a `RayTaskError` that is *not* an instance of its own cause —
-measured, not assumed. The worker therefore logs the violation at ERROR level and
-emits a distinct **fatal** payload, and `fill_embedding_group` raises
-`FillContractError` on the first such payload it sees, while the results are still
-streaming in, so the fragments not yet started are abandoned rather than computing a
-result nothing will commit.
-
-**The classification does not depend on which batch violated the contract.** Only a
-fragment's first scanned batch is embedded on the worker's own stack; Lance pulls the
-rest itself, through an Arrow C data interface that carries an error *message* but not
-the Python exception object — measured, not assumed: a `FillContractError` raised
-there re-emerges from `update_columns` as a bare `RuntimeError`. Unhandled, that would
-be read as an ordinary fault and the fragment would be SKIPPED, so a broken embedder
-would skip every fragment and be misreported as a transient outage — but only on a
-table whose fragments exceed one scan batch, which is every production table and no
-small test fixture. The worker
-therefore records the violation as the exception leaves the batch generator and
-re-raises it on its own stack once `update_columns` returns, which is what keeps
-fatal-versus-skip a property of the violation rather than of the scan geometry.
-
-Being raised on the driver is what makes the type useful: it stops the modality
-**before** any commit, so the previous version stays current and the failure is
-reported by the runtime rather than discovered later by a reader. It subclasses
-`ValueError` alongside the recipe's other pre-commit refusals (a stale group, a
-missing basis, a failed commit), which keeps the family one catchable type — but
-no exit code depends on that base any more. A run goes through the generic
-[`run-pipeline`](../../../cosmos_curator/client/pipeline_cli/pipeline_runtime.py)
-runtime, which catches every exception the run raises alike: with `--json` it
-prints `{"ok": false, "error": "runtime", "message": …}` and exits **2**, and
-without it the exception re-raises as an ordinary traceback. (A *config* fault is
-distinct: it surfaces from `prepare_run` before Ray starts, so it never reaches
-this code, and is reported as `error: "invalid"` — also exit **2**.) The one
-surviving
-`except ValueError -> exit 1` belongs to the reset-only maintenance runner, and a
-reset runs no fill, so it covers only a missing or unreadable clips table.
-
-### Provenance and staleness
-
-Because each group records its producer identity (`embedding_text_model_id` /
-`embedding_image_model_id` for the model modalities; `embedding_action_descriptor_version`
-+ `embedding_action_pca_fingerprint` for action), a model or basis change is
-detectable before a fill. Re-embedding a group under a new checkpoint is
-`--reset-group <modality>` followed by an ordinary run. For action, a
-`descriptor_version` bump is a stale group: the load refuses it and directs the
-operator to reset, after which the next run extracts descriptors and fits a fresh
-content-addressed basis together (§5); there is no separate "delete the basis"
-step.
+While that rebuild is in flight the group holds two identities at once, which is
+a normal transient here and a refusal downstream: the Curate leg will not fuse a
+group whose rows name two producers (§11.3). The remedy is to finish the
+embeddings run, not to reset anything. `max_fragments: N` bounds one attempt's
+footprint, so the rebuild can be taken in waves; each wave publishes its own
+commit and the next wave plans what the previous one did not finish.
 
 ### Failure recovery, concurrency, and maintenance
 
-- **Per-row failures** stay NULL and retryable; the next run's row predicate picks
-them up.
-- **Fragment-level failures** are skipped, not fatal (above): the surviving
-fragments still commit, and the skipped ones refill on the next run.
-- **Systemic failures** (a bad schema, a stale group, a missing PCA artifact, a
-total action outage, a violated fill contract) raise on the driver **before** the
-commit, so the previous committed version stays current and no partial group is
-published.
-- **A duplicated fragment result is refused.** Each fragment is a single work item,
-so two results for one fragment mean a retried task's write was also counted;
-committing two metadata versions of one fragment would make the outcome depend on
-ordering, so `_collect` raises instead.
+- **Per-row failures** stay NULL and owed; the next run's predicate picks them up.
+- **A worker fault** ends the attempt, and the next run resumes from the
+  checkpoint instead of restarting.
+- **Systemic failures** (a mismatched stored width, a missing PCA artifact, two
+  action bases, a violated embedder contract, an unusable staged partition, a
+  failed commit) raise on the driver **before** the commit, so the previous
+  committed version stays current and no partial group is published.
+- Every exception a run raises reaches the operator through the generic
+  [`run-pipeline`](../../../cosmos_curator/client/pipeline_cli/pipeline_runtime.py)
+  runtime: with `--json` it prints `{"ok": false, "error": "runtime", "message":
+  …}` and exits **2**, and without it the exception re-raises as an ordinary
+  traceback. A *config* fault surfaces from `prepare_run` before Ray starts and is
+  reported as `error: "invalid"`, also exit **2**.
 - A task or commit failure can leave **uncommitted, unreferenced** Lance column
-files (orphans) inside the table directory. They are invisible to readers (absent
-from the manifest) and are reclaimed only by the operator's own maintenance.
-**The recipe never compacts, cleans, or deletes the shared table** — it owns
-columns, not the table's lifecycle.
-- **Concurrency** — the contract is quiescence (above), but the commit is
-nonetheless tolerant of the one way it is likely to be broken by accident. The
-recipe passes no `max_retries` to `lance.LanceDataset.commit`, so Lance's own
-default (20 on the pinned pylance) applies and a commit that loses a race is
-**rebased** onto the newer manifest. That is desirable rather than merely
-tolerated: the transaction names specific fragments and specific field ids, so a
-producer's append of *new* fragments cannot conflict with it. The replayed
-`Update` still lands this run's fills, the appended rows keep their NULL group
-values, and the next ordinary run fills them through the pending path. Two
-concurrent *embedding* writers on one group would be a genuine conflict — they
-collide on the same field ids — but that is what the quiescence contract forbids;
-if it happens anyway, exhausting the rebases surfaces as a `ValueError` naming the
-group and the version, not as a merged result.
+  files (orphans) inside the table directory. They are invisible to readers
+  (absent from the manifest) and are reclaimed only by the operator's own
+  maintenance. **The recipe never compacts, cleans, or deletes the shared
+  table** — it owns columns, not the table's lifecycle.
+- **Concurrency** — the contract is quiescence, but the commit is nonetheless
+  tolerant of the one way it is likely to be broken by accident. No `max_retries`
+is passed to `lance.LanceDataset.commit`, so Lance's own default (20 on the
+pinned pylance) applies and a commit that loses a race is **rebased** onto the
+newer manifest. That is
+  desirable rather than merely tolerated: the transaction names specific fragments
+  and specific field ids, so a producer's append of *new* fragments cannot
+  conflict with it. The replayed `Update` still lands this run's vectors, the
+  appended rows keep their NULL groups, and the next run fills them. Two
+  concurrent embedding writers on one group collide on the same field ids, which
+  is what the quiescence contract forbids; if it happens anyway, exhausting the
+  rebases surfaces as a raised error naming the group and the version, not as a
+  merged result.
 
 ---
 
@@ -2204,17 +2160,17 @@ pending; a clip key would name only one of them, and the driver's PCA-fit pass h
 no clip key at all (§10.2).
 A run that fails **every** selected action row **and** finds the action group
 otherwise empty raises (a total outage, indistinguishable from a
-misconfiguration); a partial per-row loss is left to the next run's pending
-predicate with no threshold and no warning (§11.3).
+misconfiguration); a partial per-row loss is left to the next run's missing-or-stale
+selection with no threshold and no warning (§11.3).
 
-`check_action_outcome` is the **per-row** total-outage check and is disjoint from
-the per-fragment refusal of §7, not covered by it: it fires only once fragments
-*were* written and committed — which is what makes `selected` non-zero — and every
-row inside them still embedded to NULL. The two conditions are mutually exclusive
-on `written == 0` versus `selected > 0`, which is a statement about counts and not
-about exception types, so collapsing §7's refusal into `FillContractError` leaves
-that proof untouched. Its "re-run first, transient S3 errors cause this" guidance
-applies to both.
+`check_action_outcome` is a **post-commit** judgement, and it is the only one in
+the recipe. That is not an exception to §7's "refuse before the commit" rule but a
+consequence of it: the condition it tests is "rows were selected and published, and
+every one of them landed NULL", which cannot be evaluated until the commit that
+published them exists. Nothing is rolled back — the NULLs are the correct persisted
+state for rows that failed, and they keep those rows owed — so the raise is a
+verdict on the run, not an attempt to undo it. Its guidance is to re-run first,
+since a transient object-store outage produces exactly this shape.
 
 ---
 
@@ -2238,25 +2194,40 @@ clustering / curation knobs.
 | `image`                    | `num_gpus=1.0, num_cpus=2.0, batch_size=64, memory_gb=8, read_concurrency=32` | image resources (`ImageEmbeddingConfig`). `read_concurrency` sets how many clips one actor fetches at once; it widens the download only, since the decode it feeds is GIL-serialized, and 32 already sits at the knee where that decode floor overtakes the download term (§4.2). It may not exceed `batch_size` — enforced by a `model_validator`, not merely documented. `num_cpus` is declared rather than defaulted to prevent a silent oversubscription, and does **not** scale with `read_concurrency` for the same GIL reason. Only the image modality declares a `memory_gb` footprint (its decoded-frame batch is the binding constraint); the text modality relies on Ray Data's default |
 | `action`                   | `num_cpus=1.0, batch_size=256, read_concurrency=32, pca_sample_size=50000`  | wrist-motion resources + PCA sample (`ActionEmbeddingConfig`, `pca_sample_size >= ACTION_DIM + 1`). `read_concurrency` sets how many distinct artifacts one actor fetches at once; it widens the network wait only, since the wrist geometry it feeds is GIL-serialized, so an actor's throughput ceiling does not move with it (§5.6). It may not exceed `batch_size` — enforced by a `model_validator`, not merely documented. Dividing the per-actor ceiling takes more actors, which for a fill is the table's fragment count (§7) |
 | `model_weights_path`       | placeholder bucket                                     | base for `download_models`                              |
-| `max_fragments`            | `None`                                                 | dev cap on the **fragments** each modality visits; does not narrow the PCA candidate scan. Fragment-granular rather than row-granular because the unit of work *is* a fragment: a row cap could not be honoured across independent workers without a shared counter |
+| `staging_root_uri`         | `None`                                                 | root of the transient checkpoint + staged-row namespace a crashed run resumes from (§7). `None` derives a **sibling** of the table (`clips.lance__embedding_staging`), so recovery needs no configuration; set it only to put staged rows on different storage from the table. The namespace *inside* it is derived, never configured, so this cannot be pointed at another run's staged rows by mistake |
+| `parquet_rows_per_file`    | `4096`                                                 | rows per staged Parquet file, requested of Ray's sink as a hint. One file is one write bundle, so with the modality's `batch_size` it sets the recovery granularity: a crash costs the **larger** of the two. Smaller buys finer recovery at the cost of more files to list and open |
+| `max_fragments`            | `None`                                                 | dev cap on the **fragments** each modality visits; does not narrow the PCA candidate scan. Fragment-granular rather than row-granular because the unit of work *is* a fragment: a row cap could not be honoured across independent workers without a shared counter. Repeated capped runs converge: each plans the fragments the previous one did not finish, and each publishes its own commit. Narrowing the cap between a crash and its retry is safe but wasteful — publication commits exactly the planned set, so any staged fragment outside the new plan is discarded with the workspace and recomputed by a later run |
 
-There is no `rebuild` field. Replacing a group is the `--reset-group` maintenance
-operation (§7), not a run mode, so a destructive replacement cannot be left
-in a YAML file and re-executed by a scheduled run. The config model is
+There is no `rebuild` field and no reset command, because there is nothing for
+either to do: a run selects every applicable row whose recorded provenance is
+missing or names another computation, so a re-pin, a pooling change, or a
+`result_version` bump is picked up by an ordinary run (§7). The config model is
 `extra="forbid"`, so an old file still carrying `rebuild:` (or the removed
 `text.encode_batch_size:`) fails loudly at assembly rather than being ignored.
 
+There is likewise no `force` or `reset` field, which is what keeps a destructive
+replacement from being left in a YAML file and re-executed by a scheduled run:
+the only way to replace a group's contents is to change what the vectors *are*,
+and that change is the identity the rows are then measured against.
+
 
 There is no worker-count or write-concurrency knob. Each modality's pool floors at
-one actor and grows to whatever the cluster slices and the work-item count allow
-("How many fill workers actually run", §7), so a `column_write_concurrency`-style
+one actor and grows to whatever the cluster can place and the owed fragment count
+allows ("How many staging actors run", §7), so a `column_write_concurrency`-style
 setting would only duplicate what the resource request and the table's fragment
-geometry already express. `batch_size` is the only fill-shaping knob, and it shapes
-**rows per scan batch**, not fragments per task: a Ray work item is pinned at
-exactly one fragment, which bounds a worker's in-flight memory to one fragment's
-batch. Up to the 200-block ceiling that also gives one block per fragment, so a
-slow fragment delays only itself; above it a block carries several fragment ids
-that one actor walks serially.
+geometry already express. `batch_size` is the only compute-shaping knob. It does
+not change fragments per task — a read task is pinned at exactly one owed
+fragment, which is what makes the owed fragment count the parallelism ceiling —
+but it does set three things at once: the repartition target that splits a
+fragment into blocks, Ray's `map_batches` batch size, and hence the embedder's
+input width. So raising it coarsens block geometry as well as widening the batch.
+
+`parquet_rows_per_file` shapes *recovery*, but not independently of `batch_size`.
+Both are row minimums on the path from the read to the sink, and what a crash
+costs is one write bundle sized by the **larger** of the two. At the shipped
+defaults (256 text / 64 image rows per batch against 4096 rows per file) the file
+size is the larger and therefore the bound; raise a `batch_size` past it and the
+batch becomes the bound while `parquet_rows_per_file` stops being one.
 
 
 There is deliberately **no** `source_lance_uri`, no side-table URIs, and no
@@ -2291,11 +2262,11 @@ cosmos-curator pipeline render embeddings.yaml
 pixi run --as-is run-pipeline embeddings.yaml
 cosmos-curator local launch -- pixi run --as-is run-pipeline /config/embeddings.yaml
 cosmos-curator slurm ray submit CLUSTER_CONFIG -- pixi run --as-is run-pipeline RECIPE_CONFIG
-
-# maintenance only, never a run mode (§7): reset a group, then re-run to refill
-python -m cosmos_curator.next.recipes.embeddings.examples.run_embedding_pipeline \
-    --clips-lance-uri s3://bucket/run/clips.lance --reset-group text
 ```
+
+A re-embed is the same command as a first embed. There is no maintenance
+entrypoint and no second invocation shape: the run itself decides which rows are
+owed (§7).
 
 `--set PATH=VALUE` is accepted by `validate`, `render`, and the run alike. An
 assignment is applied to the loaded mapping **before** validation, so an
@@ -2315,23 +2286,54 @@ environment can see (`/config/...` for the default local mount).
 
 `run_embedding_pipeline` runs the enabled modalities **one after another** on the
 driver — text, then image, then action — not concurrently. "Independent" here
-means *decoupled and separately re-runnable*, **not** simultaneous:
+means *decoupled and separately re-runnable*, **not** simultaneous.
+
+The driver's own order is three steps rather than a loop: **plan** every
+spec-driven modality, **stage weights** for only the modalities that owe work, then
+**execute** them one at a time. Planning needs no weights and no cluster, so putting
+it first is what makes "nothing is owed" cheap: when action is disabled and every
+spec-driven modality's plan is empty, a text-and-image run over a fully embedded
+table downloads no checkpoint and never calls `ray.init`. Cheap, not free —
+planning is a filtered `count_rows` per fragment, which reads the predicate's columns
+rather than answering from fragment metadata (only an *unfiltered* count does that),
+so a no-op run still pays one corpus-wide projected read per modality on the driver.
+Its duration is logged next to the owed-row count for exactly that reason.
+`max_fragments` *does* bound it: the walk stops at the cap rather than counting
+every fragment and slicing the result, so a capped run reads only as far as the
+fragments it takes on. Zero is not a valid cap — `EmbeddingPipelineConfig`
+rejects values below 1 at assembly (`ge=1`); omit the field or set `null` for no
+cap. The plan is the same manifest-order prefix either way, which is why the
+saving is asserted by counting the counts rather than by comparing plans. (Enabling action
+costs one `ray.init` regardless, because what action owes is not knowable until a
+basis is bound, and binding one can require the distributed candidate scan.)
+
+Weights are staged before Ray exists, and once for the whole run, because
+`download_models` forks a child that initialises and tears down its own Ray. That
+makes per-modality just-in-time staging impossible rather than merely wasteful:
+image's download would otherwise fork out of a process in which text's Ray Data
+execution had already initialised Ray.
+
+The reasons the execution itself stays sequential:
 
 - Each modality is itself a **whole-cluster** Ray Data job that already
   parallelizes across all workers and saturates the GPUs. Running two model
   modalities at once would contend for the same GPUs and memory — lowering
   throughput and risking OOM, not raising it. The parallelism that matters is
   **within** a modality, not across them.
-- **One commit per group keeps the version history legible.** Each modality's fill
-  ends in a single `Update` scoped to its own field ids, so a sequential run leaves
-  one attributable commit per modality. Concurrency here would buy nothing: the
-  groups are disjoint, so the writes do not compete for correctness, only for the
-  same GPUs.
+- **One commit per group keeps the version history legible.** Each modality ends
+  in a single `Update` scoped to its own field ids, so a sequential run leaves one
+  attributable commit per modality. Concurrency here would buy nothing: the groups
+  are disjoint, so the writes do not compete for correctness, only for the same
+  GPUs. It would also cost something — Lance treats two `Update` commits touching
+  one fragment as conflicting even on disjoint column groups, so overlapping
+  modalities would have to rebase against each other.
 - The action modality resolves its **PCA basis on the driver** before any compute
   starts (§5), so its fill cannot begin until that decision is made.
-- Each modality re-opens the latest committed version, so image and action see the
-  columns text just added; and sequential execution keeps failure isolation and
-  the per-modality fill logs (§7) readable one modality at a time.
+- Each modality re-opens the table, so it reads — and commits against — the
+  version the previous modality committed. The plan survives that re-open: an
+  `Update` rewrites a fragment's column files without changing fragment ids or row
+  counts. Sequential execution also keeps failure isolation and the per-modality
+  staging and publication logs (§7) readable one modality at a time.
 
 ### 10.2 No corpus materialization
 
@@ -2342,8 +2344,8 @@ is one batch of one fragment's rows.
 The action leg's PCA fit is the only step that could plausibly need the whole
 corpus, and it avoids it by **sampling on URI before extracting**: a narrow
 `action_data_uri` scan, ranked by `sha256(uri)`, extracts only a bounded candidate
-set (§5). The fit therefore reads a bounded number of artifacts, and the fill
-decodes each artifact inside the worker that owns its row.
+set (§5). The fit therefore reads a bounded number of artifacts, and the staging
+phase decodes each artifact inside the worker that owns its row.
 
 The alternative — extract every descriptor, then sample — needs the full corpus
 resident to pick the sample, and makes the fit a barrier the whole leg waits behind.
@@ -2354,13 +2356,14 @@ sample would have produced. Bases are immutable and content-addressed, so that i
 
 ### 10.3 Where models load
 
-Every modality runs through the same `_FragmentWorker` actor pool
-(`ActorPoolStrategy(min_size=1)`). The worker constructs its embedder in `__init__`,
-so a model loads **once per actor** — never per fragment, per batch, or per clip.
-The pool pins no maximum: Ray places at most one actor per free resource slice, so
-the cluster's GPU (or CPU) count is one of the ceilings, with no driver-side
-capacity check. The other is the work-item count (§7), which is what makes a
-fragment-poor table starve a large pool.
+Every modality runs through the same `EmbeddingBatchWorker` actor pool
+(`ActorPoolStrategy(min_size=1, max_size=…)`). The worker constructs its embedder in
+`__init__`, so a model loads **once per actor** — never per fragment, per batch, or
+per clip. The maximum is computed on the driver from the smaller of what the cluster
+can place and what the run owes ("How many staging actors run", §7), which is what
+makes a fragment-poor table starve a large pool. The worker holds **no Lance
+handle**: it embeds a batch and returns it, and the only thing it carries through
+untouched is the checkpoint id the sink needs.
 
 | Modality | Resource request | Why |
 |---|---|---|
@@ -2393,61 +2396,83 @@ class with a `__call__` and is handed to `map_batches` as a class plus
   probe GET whose body is discarded unread before the managed transfer re-resolves
   the size), which large-object callers such as the video stages pay. Neither
   touches the GIL-held geometry, which is the per-actor floor (§5.6).
-- **A fragment with nothing pending is never rewritten** — the worker probes its
-  scanner before writing, so an unchanged re-run over a fully embedded table reads
-  metadata and stops (§7).
+- **A fragment with nothing owed is never visited** — the plan is one filtered
+  `count_rows` per fragment on the driver, reading only the predicate's columns, so
+  an unchanged re-run stops without a vector read, a checkpoint download, or an
+  actor (§7).
+- **A crash costs one write bundle per actor, not a phase** — the staged rows and
+  Ray's row checkpoint are what a retry resumes from, so recovery is the reason
+  GPU time is never paid twice rather than a reason it is paid slowly (§7).
 
 ---
 
-## 11. Re-run, reset, and failure scenarios
+## 11. Re-run, recovery, and failure scenarios
 
 A quick reference consolidating §5, §7, and §8.
 
 ### 11.1 Re-run scenarios
 
+Every row is the same command: run the config again. What changes is what the run
+finds owed.
+
 | Scenario | Do | Effect |
 |---|---|---|
-| second run, nothing new | run again | every applicable row's primary vector is already non-NULL, so the selection is empty, no fragment is rewritten, no commit; idempotent |
-| new clips appended to `clips.lance` | run again | the new rows read their `embedding_*` columns as NULL, so the next run selects and fills only them; action loads the existing basis by fingerprint |
-| partial failure last run (NULL groups, skipped fragments, or a modality that raised before commit) | run again | already-complete rows are skipped; only the still-NULL rows fill. No operator action is needed to retry a skipped fragment (§7) |
-| model swap (text / image checkpoint) | `--reset-group <modality>`, then run | validation would otherwise refuse the group as stale; the reset empties it and the run recomputes it, recording the new `*_model_id` |
-| descriptor-semantics change (e.g. `dual-wrist-v2` → `dual-wrist-v3`) | `--reset-group action`, then run | an empty group is what makes the leg fit a fresh content-addressed basis, so the group and its basis are recomputed together; a stale version is otherwise refused at load (§5) — no "delete the basis" step |
+| second run, nothing new | run again | every applicable row already holds a vector whose provenance names this computation, so the owed-work planning scans find nothing to fill: no actor pool and no publication commit; idempotent |
+| new clips appended to `clips.lance` | run again | the new rows read their `embedding_*` columns as NULL, so the run selects and fills only them; action loads the existing basis by fingerprint |
+| per-row failures last run | run again | the failed rows are still NULL, so they are selected again; the complete rows are not |
+| a crashed run (a worker fault, a lost node, a killed job) | run again | the staged rows and Ray's row checkpoint are reused, so only what was not yet staged is recomputed. Nothing was published, so the table never held a partial group (§7) |
+| model swap, re-pin, or pooling change (text / image) | run again | the recorded provenance no longer equals the new result identity, so those rows are **stale and therefore owed**. The run recomputes and overwrites them in place, recording the new identity |
+| deliberate recompute with no other footprint | bump `result_version`, run again | the same mechanism: the identity moves, so every row under the old one is owed |
+| descriptor-semantics change (e.g. `dual-wrist-v2` → `dual-wrist-v3`) | run again | rows recorded under the older `descriptor_version` are stale work, so their basis is *not* loaded; the run fits a fresh content-addressed basis and refills them together (§5). There is no "delete the basis" step and no reset |
+| vector **width** change for an existing group | migrate the column, then run | the only case that is not an ordinary run. A stored group whose type differs is fail-closed (§11.3), because overwriting in place is impossible and dropping the column discards every published vector — an operator decision. Drop and re-add the group at the new width; the next ordinary run refills it |
 | change fusion weights / normalization downstream | *not a re-embed* | applied at consumption by the curation leg; the stored scale is fixed (§6) |
 
-### 11.2 Why replacement is a separate invocation
+### 11.2 Why there is no rebuild mode
 
-There is no `rebuild` run mode; §7 describes `--reset-group` in full. The
-short version, and the reason it reads as an extra step rather than a config
-field: a field left in a YAML file can be silently re-executed by a scheduled run,
-and an accidental group replacement burns a full corpus of GPU time. Requiring two
-deliberate invocations makes that cost impossible to pay by accident.
+There is no `rebuild` field, no `force` flag, and no reset command, because a
+replacement is not a *mode* — it is a different computation, and the identity the
+rows record is what makes the difference visible. A run that finds a row recorded
+under another identity recomputes it; a run that finds it recorded under this one
+leaves it alone. Both are the same code path.
 
-The `rebuild` field's other behaviors do not need replacing. A reset already
-NULLs every row, so the "recompute rows that are no longer applicable" case
-collapses into the ordinary pending path, and `--reset-group` composes with a
-`max_fragments` cap (a capped refill simply leaves the rest pending) where
-`rebuild` had to forbid the combination.
+This is also what keeps a destructive replacement out of a YAML file: there is no
+field a scheduled run could re-execute to blank a corpus. The only way to make a
+corpus of GPU time owed again is to change what the vectors *are* — the registry
+key, the model id, the pinned revision, the pooling, or `result_version` — which
+is a visible edit to the spec, not a boolean.
+
+A rebuild composes with `max_fragments`, so it can be taken in bounded waves: each
+run plans what the previous one did not finish and publishes its own commit (§9).
+While it is in flight the group holds two identities at once, which the Curate leg
+refuses to fuse (§11.3) — the remedy there is to finish the rebuild.
 
 ### 11.3 Failure taxonomy
 
 | Scope | Cause | Result | Reported as |
 |---|---|---|---|
-| one row | missing / undecodable media (image); unreadable / malformed / non-mecka artifact (action) | that row's whole group left **all-NULL**; retried on the next run (the pending predicate still selects NULL rows). This does **not** make the run incomplete: the row was attempted and the NULL group was committed — contrast the skipped fragment below, which was never attempted | logged count; counted in `failed` |
-| one fragment | any exception inside a worker that is not a `FillContractError` — a transient object-store fault, an unreadable data file — **while at least one other fragment was written** | the fragment is **not written** and is excluded from the commit; its rows stay pending and the next run refills them. The commit stands, but the run then **raises**, so it is not reported as finished | WARNING per fragment, plus `ModalityResult.skipped_fragments`; the run ends in `IncompleteRunError` — a `RuntimeError`, deliberately outside the `FillContractError` family below, raised *after* the commit by the pipeline-kind adapter (§7, §15) |
-| one modality does nothing | nothing pending in the fragments the run visited, the table has no fragments, or no clip carries action data — **and no fragment failed** | no commit **from the fill**; on a modality's first run the schema widening (§7) has already committed | `committed_version=None`, `skipped_fragments=0`. The run-level `ending_version` is the widening's version when it added columns **and no other modality committed** — `clips.lance at v<N> (columns added, no fill committed)`; a sibling modality that did commit supersedes it, and `null` (`clips.lance unchanged`) is reported only when the run committed nothing at all |
-| whole modality fails loudly | a `FillContractError` — nothing written while at least one fragment failed; an embedder that changed a batch's row count or returned columns that do not cast to the stored schema; a fragment absent at the pinned version; plus a missing / renamed / mistyped source column; a stale or multi-producer group needing `--reset-group`; a missing referenced PCA basis; the same fragment reported twice; every action row failing with the group otherwise empty (per-row total outage); a commit that could not be rebased | raises on the driver; **no fill commits**, so no vectors land and the last data-bearing version stays current — though a first run's schema widening (§7) has already committed the empty columns, which a re-run then finds present and adds nothing to. One exception: the per-row action total outage is checked *after* its own commit, so that group's version stands | exception (`ValueError`, or its `FillContractError` subclass) |
+| one row | missing / undecodable media (image); unreadable / malformed / non-mecka artifact (action) | that row's whole group is published **all-NULL** — including over a vector it previously held, so the row stays owed rather than keeping a value from another computation. The rest of the modality still publishes | logged count; `failed` in the modality's result |
+| one modality owes nothing | no applicable row is missing or stale, the table has no fragments, or no clip carries action data | no actor pool and no publication commit for that modality. Text and image with nothing owed reach no workspace and no actor pool for that modality; `ray.init` is run-level and still runs when `_will_execute` is true (a sibling owes work or action is enabled). Action reaches workspace and `ray.init` before it can tell, and only skips the actor pool (§7) — neither writes anything. On a modality's first run the schema widening (§7) has already committed | `committed_version=None`. The run-level `ending_version` is the widening's version when it added columns **and no other modality committed** — `clips.lance at v<N> (columns added, no fill committed)`; a sibling modality that did commit supersedes it, and `null` (`clips.lance unchanged`) is reported only when the run committed nothing at all |
+| the staging attempt | any exception inside a worker: a transient object-store fault, an unreadable data file, a lost node, or an embedder that changed a batch's row count or returned columns that do not cast to the stored schema; or a missing / renamed / mistyped source column rejected when the staging phase resolves its per-fragment scan on the driver before the actor pool starts | **fatal to the attempt** — nothing is published, so the group is untouched. What the phase already staged survives, and the next run resumes from it (§7) | exception on the driver; the re-run needs no operator action |
+| the publication | a planned fragment with no staged partition or an empty one, an unreadable staged file, a vector that does not cast to the stored type, two payloads claiming one fragment, a payload naming another fragment, a prepared set that differs from the plan, or a fragment whose staged row tally differs from its planned owed count | raises **before** the commit, so the previous version stays current and no partial group is published | `EmbeddingPublicationError` (a `ValueError`) naming the group and the fault |
+| the commit | a commit that could not be rebased, or a lost response the table then confirms did not land | raises; no vectors land. A lost response whose marker **is** found in the table's later versions is instead treated as success, with a warning (§7) | exception naming the group and the version |
+| the whole modality, before actors or commit | a stored group whose type differs from the model's width; a missing referenced PCA artifact; a staged and canonical PCA basis that disagree; two action bases in one group | raises on the driver before that modality's actor pool, staging, or commit (model weights may already have been staged for other modalities) | `ValueError` |
+| the whole action modality, after its commit | every selected action row failed while the group was otherwise empty (a per-row total outage, indistinguishable from a misconfiguration) | the NULLs stand — they are the correct state for failed rows and keep them owed — and the run raises a verdict on itself (§8) | `ValueError` from `check_action_outcome` |
 
 The **text modality never fails a row** — `task_name` / `subtask_name` are
 non-null and an empty string still embeds to a valid vector (§4.1).
 
-Note what separates row three from the total-outage case in row four: it is
-the **skip count**, not the commit. Both commit nothing, and a skipped fragment
-contributes to no row count, so `selected` and `filled` are zero in both. Only
-`skipped_fragments` tells a run that lost work from a run that had none to do —
-which is why the distinction is carried by the exit code and not only by a log
-pattern (§7).
-Rows one and two both *do* commit: a failed row is still written (as all-NULL),
-and row two is by definition a run where another fragment succeeded.
+Two properties hold across the whole table. First, **no row ever holds a vector
+from a computation it does not name**: a row is published with its vector and its
+provenance in one `update_columns`, and a failure publishes NULL over both.
+Second, **every failure except the last row is pre-commit**, so a failed run leaves
+the last good version current rather than a half-filled group. The last row is not
+an exception to that rule but a consequence of it: its condition can only be
+evaluated once the rows it judges have been published.
+
+A **first run's schema widening** is the one commit that outlives a failure. It is
+metadata-only, adds all-NULL columns, and a re-run finds them present and adds
+nothing — which is why it is reported as "columns added, no fill committed" rather
+than as an unchanged table.
 
 ---
 
@@ -2584,8 +2609,9 @@ if evidence shows rotvec is the bottleneck:
 
 Each case is an **opt-in descriptor bump**, not a silent swap: `DESCRIPTOR_VERSION`
 must change, PCA refits on the new width (~900-d if rot channels go 3→6 with
-the same 50 stations and two arms), and action rows re-embed from scratch
-(`--reset-group action`, then a run — §11).
+the same 50 stations and two arms), and action rows re-embed from scratch — which
+is an ordinary re-run, because a changed `DESCRIPTOR_VERSION` makes every action
+row stale and therefore owed (§7, §11).
 
 ### 13.4 Why not rot9d
 
@@ -2631,21 +2657,26 @@ accident in a downstream notebook.
   regeneration with no modality-to-modality join — §3.
 - **How do the modalities realign?** They share one row, so a clip's text / image /
   action vectors are already aligned — there is no realignment step. `clip_id` is
-  both the row's identity and the key each fill joins on — §2.1, §3, §7.
+  both the row's identity and the key publication joins on — §2.1, §3, §7.
 - **Can I regenerate only one modality?** Yes — `modalities` selects which run;
   each fills its own `embedding_<modality>_*` group — §9.
-- **Can I re-run safely?** Yes — a re-run fills only still-NULL rows, which is
-  also how a skipped fragment is retried; replacing a whole group is the separate
-  `--reset-group` operation — §7, §11.
-- **A fragment failed. What do I do?** Nothing — the surviving fragments committed
-  and the next ordinary run refills the skipped rows. Read the WARNING lines to
-  decide whether the cause was transient — §7.
-- **The run failed with "no fragment was written while N fragment(s) failed". What
-  now?** Re-run it first. Nothing was committed, so the group is untouched, and a
-  transient storage fault fails fragments alike with no in-run retries. If it
-  persists, the per-fragment WARNING lines name the actual cause. Note this also
-  fires when the table was *already* complete and a fragment merely faulted — the
-  message does not claim work was lost, only that nothing was written — §7.
+- **Can I re-run safely?** Yes — a re-run selects only the rows that are missing
+  or whose recorded provenance names another computation, so an unchanged re-run
+  does nothing at all and a changed model re-embeds exactly its own group. There is
+  no reset command and no rebuild mode — §7, §11.
+- **How do I re-embed a group under a new checkpoint?** Change the spec and run
+  again. The rows' recorded identity no longer matches, so they are owed — §7.
+- **The run crashed. Do I lose the GPU time?** No. Whatever the staging phase
+  finished is on the staging root, and Ray's row checkpoint records which rows it
+  covers, so the retry recomputes only what was not staged. Nothing was published,
+  so the table never held a partial group — §7.
+- **Can I delete the staging root?** Yes, between runs: it holds only transient
+  recovery state, and a successful run deletes its own namespace. Deleting it
+  during or after a crash is also safe — it only costs the recompute — §7.
+- **A modality raised before the commit. What do I do?** Read the message: it
+  names the fault and the group. The previous version is still current, so re-run
+  once the cause is addressed; a transient storage fault usually needs only the
+  re-run — §11.3.
 - **Why are some clips NULL / missing in one modality?** A modality leaves the
   row's group all-NULL when it cannot embed it (missing media / bad artifact) or
   the row is inapplicable; a modality that never ran has **no** column at all; a
@@ -2653,10 +2684,10 @@ accident in a downstream notebook.
 - **Can I run without a GPU?** The model modalities need staged weights and are
   meant for GPU (CPU works but is slow); the action modality is CPU-only.
 - **What if I delete a PCA `.npz`?** Bases are immutable and content-addressed, so
-  deleting one that live rows reference makes the next action run fail with a
-  clear missing-basis error. To refit, run `--reset-group action` and then re-run:
-  an empty group fits a fresh basis under a new fingerprint and recomputes the
-  group with it — §5 / §11.
+  deleting one that live rows reference makes the next action run fail with a clear
+  missing-basis error — it cannot be regenerated, only restored. A refit happens on
+  its own terms: bump `DESCRIPTOR_VERSION` and the rows become stale, so the run
+  fits a fresh basis and recomputes them under the new fingerprint — §5 / §11.
 
 ---
 
@@ -2673,41 +2704,28 @@ unsupported, and Lance would collide on the same field ids anyway. A concurrent
 base-row *Append* is the one violation that is benign: `fields_modified` scopes
 the commit to the group's own field ids, so Lance rebases the update onto it and
 the appended rows simply read NULL until the next run.
-- **A partial fragment loss commits the survivors and then fails the run.** The
-commit itself stands, by design (§7): the fragments that were written are durable,
-the skipped rows stay pending, and the next run refills them. But the adapter
-([`recipes/embeddings/pipeline_kind.py`](../../../cosmos_curator/next/recipes/embeddings/pipeline_kind.py))
-raises `IncompleteRunError` instead of returning, so
-[`run-pipeline`](../../../cosmos_curator/client/pipeline_cli/pipeline_runtime.py)
-exits non-zero and a scheduled job cannot record the attempt as finished while work
-is still owed. There is deliberately no skip-ratio threshold — one skipped fragment
-is enough.
-The cost is the **structured summary**: a raise is reported as a fault (§7), so the
-payload is replaced rather than joined by it. The exception's message *is* the run's
-own summary line, so `ending_version`, the per-modality `filled/selected`, and the
-skip total survive as prose — but a caller that wanted them as fields has to parse
-that line, and the table URI and per-modality `committed_version`s are not in it.
-The raise also fires when the skipped fragments owed no rows at all, because a
-fragment can fault before its scan could say (§7) — the same unknowability that
-makes the total-outage guard claim no lost rows. Since the fill is idempotent, the
-remedy is the same cheap one either way: run it again.
-- **A faulting fragment on an already-complete table fails the run.** The outage
-guard cannot tell a fragment that failed *with* pending rows from one that failed
-before it could say, so a re-run over a fully embedded table raises instead of
-exiting 0 if any fragment faults (§7 explains why claiming less is the right
-trade). The fault is real, so the exit is not spurious — but it is reported as
-"nothing written while a fragment failed", not as lost work.
-- **An outage in one modality hides the earlier modalities' summary.** The driver
-returns `EmbeddingRunResult` only after every requested modality, so a raise in the
-image leg discards the accounting for a text commit that already landed durably.
-The commit itself is safe and visible in the table's version history; only the
-summary line is lost. Pre-existing for a violated invariant, but an outage is
-environmental and so more likely to strike mid-run.
+- **A crashed attempt leaves an orphaned staging namespace.** Recovery state is
+deleted by the run that publishes it, so an attempt that never publishes leaves its
+staged Parquet and checkpoint behind. The next run reuses them when the five
+namespace inputs still agree (§7) — but if the source table was appended to in
+between, the read version moves, the namespace moves, and the old directory is
+never read again. It costs storage only, and the recipe will not delete it: nothing
+distinguishes an abandoned namespace from one a retry is about to resume from.
+- **An exception in one modality hides the earlier modalities' summary.** The
+driver returns `EmbeddingRunResult` only after every requested modality, so a raise
+in the image leg discards the accounting for a text commit that already landed
+durably. The commit itself is safe and visible in the table's version history; only
+the summary line is lost.
+- **The counts describe the run, not the group.** `filled/selected` is what this
+run published; a top-up that embedded four new clips onto a million filled rows
+reads `4/4`. Nothing reports group completeness, because nothing asserts it — the
+owed-work predicate is re-evaluated every run.
 - **Maintenance is operator-owned.** The recipe never compacts, cleans, or
 restores `clips.lance`; orphaned uncommitted column files from a failed run are
 reclaimed only by the operator's own version cleanup (§7). A whole-table
 restore to roll back a bad group would also drop later base appends and other
-modality commits — reset the group and refill forward instead.
+modality commits — change the spec and let the next run replace the group forward
+instead (§11.1).
 - The hand skeleton joint count (21) is **dataset-specific**; a different
 skeleton would reject every clip. Parametrize only when such a dataset appears.
 - Reads and writes go to **one** `storage_profile`; a split read/write profile is
@@ -2747,15 +2765,16 @@ not modeled in this milestone.
 | **mecka**                               | The ACT2 `spec_name` for the dexterous dual-wrist datasets this leg can embed (see `ACTION_BINARY_SPEC_BY_DATASET`); gates the `WRIST_FRAME_ALIGN_MECKA` alignment.                                                                                                    |
 | **LeRobot**                             | The upstream episodic robot-dataset layout that `robot_action_split` cuts into the clips table.                                                                                                                                                                        |
 | **span / view**                         | A `span` is one cut segment of an episode; a multi-camera source yields several `view`s per span, each a distinct `clip_id` but sharing one action artifact.                                                                                                           |
-| `clip_id`                               | The stable per-(span, view) identity minted by `robot_action_split` (a SHA-256 digest of `span_group_id`, optional `view_name`, and bitrate — not a readable string). Embeddings carry it on each row, join each fill on it, and consumers use it to join `clips.lance` to *other* keyed tables. Uniqueness is not guaranteed upstream; the write path does not depend on it (§7).                                                         |
+| `clip_id`                               | The stable per-(span, view) identity minted by `robot_action_split` (a SHA-256 digest of `span_group_id`, optional `view_name`, and bitrate — not a readable string). Embeddings carry it on each row, publish each update by joining on it, and consumers use it to join `clips.lance` to *other* keyed tables. Uniqueness is not guaranteed upstream; the write path does not depend on it (§7).                                                         |
 | **Lance**                               | The columnar table format `clips.lance` is stored in; embeddings are added to it as nullable column groups via metadata-only `add_columns` plus fragment-local `update_columns` published in one `LanceOperation.Update`.                                                |
 | **Arrow /** `fixed_size_list<float32>`  | Apache Arrow in-memory format; embeddings are stored as `fixed_size_list<float32, dim>` columns whose width is a schema guarantee (no per-row `embedding_dim`).                                                                                                         |
 | **Column group**                        | A modality's `embedding_<modality>_*` columns (vectors + provenance) added directly onto `clips.lance` as one atomic unit: added together in one `add_columns`, filled together in one `LanceOperation.Update`, and validated together (absent-as-a-whole or present-and-complete).                                                                                        |
-| **Fragment**                            | Lance's unit of physical storage: a slice of the table's rows with its own per-column data files. It is also this leg's **unit of work** — a worker is handed a fragment id, and scans, embeds, and writes that fragment alone.                                          |
-| **Pending row**                         | An applicable row whose group primary vector is still NULL — the single definition of "work this modality still owes", expressed by `columns.pending_filter` and used unchanged by every run. |
-| **Group reset**                         | Dropping a group's columns and re-adding them empty (`--reset-group` -> `drop_embedding_group`), which makes every row pending again so the next ordinary run refills the group from scratch — §7, §11. |
-| **Fill contract violation**             | An invariant of the fill itself that no retry can fix: an embedder that returned the wrong row count or columns that do not cast to the stored schema, or a fragment absent at the pinned version. Raised as `FillContractError` and, unlike an ordinary fragment failure, it stops the run — §7. That type also carries the total outage below, its contract being "a failure the run must stop for rather than skip past"; which of the two occurred, and whether to re-run or fix an input, is in the message — §7. |
-| **Total outage**                        | A run that wrote **no** fragment while at least one failed: the per-fragment skip kept nothing, so the group is untouched and the counts are those of a run that owed no work. Raised as `FillContractError`, the same type as a violated invariant: the "re-run first" prognosis lives in the message, not in the type — §7. The per-**row** analogue (fragments committed, but every row in them NULL) is `check_action_outcome` — §8. |
+| **Fragment**                            | Lance's unit of physical storage: a slice of the table's rows with its own per-column data files. It is also this leg's **unit of scheduling** — the plan names owed fragments, the read is one task per owed fragment, and each staged partition and each `update_columns` call is one fragment's (§7).                                          |
+| **Owed row**                            | An applicable row whose group primary vector is NULL, or whose recorded provenance is NULL or names another computation — the single definition of "work this modality still owes", expressed by `columns.pending_filter` and used unchanged by the plan, the scan, and publication's expectations — §7. |
+| **Result identity**                     | The mapping a row's provenance columns record, naming the **computation** that produced its vector: registry key, model id, pinned revision, pooling, and `result_version` for text and image; `descriptor_version` + PCA fingerprint for action. One value per modality per run, spent both as the selection predicate and as the written provenance — §7. |
+| **Staging workspace**                    | The derived, transient namespace holding one attempt's staged Parquet rows and Ray row checkpoint, under `<staging root>/<modality>/<namespace>/`. Two attempts share it only when the source URI, pinned version, recovery contract, staging protocol version, and staged-schema fingerprint all agree. It is the recipe's **only** recovery state — there is no marker or manifest file — and the publishing run deletes it — §7. |
+| **Checkpoint id**                        | Lance's `_rowaddr` (fragment id in the high 32 bits, row offset in the low 32), projected by the read as `__checkpoint_id` and carried untouched through the worker to the staged file, where Ray reads it back to mark a row complete. Physical and unstable, which is why the namespace is keyed on the read version — §7. |
+| **Publication**                          | The second phase: prepare every planned fragment's `update_columns` in parallel, then commit all of them as one `LanceOperation.Update` stamped with the result identity and a per-attempt marker. Refuses before the commit on any staged-row, duplicate, or prepared-set fault — §7. |
 | **Tombstone / deletion vector**         | Lance's record of rows logically deleted from a fragment. This leg creates none: `add_columns` is metadata-only and `update_columns` rebinds field ids to a new column file without replacing any row (§7).                                                             |
 | `map_batches` **/** `ActorPoolStrategy` | Ray Data's batch transform and its actor-pool compute strategy. Under `ActorPoolStrategy` the UDF must be a **callable class**, not a bound method — the class is constructed once per actor, which is how each actor loads its model once.                             |
 

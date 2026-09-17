@@ -56,7 +56,7 @@ from loguru import logger
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix, create_s3_client, is_s3path
 from cosmos_curator.next.recipes.robot_action_caption.request import staged_schema_fingerprint
-from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
+from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path, normalize_location_root
 from cosmos_curator.next.utils.identity import canonical_digest
 
 _NAMESPACE_SEGMENT: Final = "inference"
@@ -94,17 +94,6 @@ _CHECKPOINTS_SEGMENT: Final = "checkpoints"
 # separately: none of those changes alters a caption's text, so a bump must
 # isolate old workspaces without recaptioning a single canonical row.
 STAGING_PROTOCOL_VERSION: Final = 1
-
-
-def _normalize_staging_root(staging_root: str) -> str:
-    """Remove redundant trailing separators without erasing filesystem roots."""
-    normalized = staging_root.strip()
-    parsed = urlsplit(normalized)
-    # POSIX "/" and the path in "file:///" need their final slash to remain
-    # absolute roots; non-root locations retain the existing slash-free form.
-    if normalized == "/" or (parsed.scheme.lower() == "file" and parsed.path == "/"):
-        return normalized
-    return normalized.rstrip("/")
 
 
 @attrs.frozen
@@ -170,7 +159,7 @@ def resolve_workspace(
     # A blank root would resolve the namespace against whichever directory the
     # process happens to be running in, which for a Ray worker is not the
     # directory the driver would resolve.
-    base = _normalize_staging_root(staging_root)
+    base = normalize_location_root(staging_root)
     if not base:
         msg = "staging_root must be a non-empty absolute URI or path"
         raise ValueError(msg)

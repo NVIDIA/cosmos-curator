@@ -25,44 +25,41 @@ handle, rather than trusting shared state to have refreshed itself.
 
     dataset (opened by the caller - its version is the version read)
         |
-        +--> SCHEMA   widen one group in, or detach one group out; each is a
-        |             single metadata commit and groups stay independent, so a
-        |             text-only run never creates the image or action columns
+        +--> SCHEMA   widen one group in; a single metadata commit, and groups
+        |             stay independent, so a text-only run never creates the
+        |             image or action columns
         |
-        +--> STATE    a filled group has at most one producer, and it is the
-        |             configured one - checked before any compute is spent
-        |
-        +--> READ     the pending predicate, filled counts, and a one-column
+        +--> READ     the owed-work predicate, filled counts, and a one-column
                       stream
 
-The reads are deliberately cheap. The pending predicate is only BUILT here and is
-evaluated later, per fragment, by the worker that owns it; the filled count is
-resolved inside Lance and returns a bounded result whatever the table's length;
-and the one function that streams rows projects a single column. The producer
-identifies the state check reads come from ``lance_utils``, which owns the bounded
-distinct-value read.
+There is no state VALIDATION here, and its absence is a decision rather than a
+gap: a group whose stored rows name a different computation than the current one
+is owed WORK, not a reason to refuse. A corpus part-way through a rebuild is a
+normal transient that an ordinary re-run finishes, so the comparison that used to
+refuse now lives inside ``pending_filter`` and selects instead.
 
-The physical write and its commit are NOT here; they belong to the fill path.
-Splitting them lets schema and state be tested with no dependency on the
-distributed write.
+The reads are deliberately cheap. The owed-work predicate is only BUILT here; it
+is evaluated per fragment, first by the driver's plan and then by the read task
+that owns that fragment - one string, two evaluators; the filled count is
+resolved inside Lance and returns a bounded result whatever the table's length;
+and the one function that streams rows projects a single column.
+
+The physical write and its commit are NOT here; they belong to the publication
+path. Splitting them lets schema and selection be tested with no dependency on
+the distributed write.
 
 All failures raise a plain, informative ``ValueError`` (the CLI's
 ``except ValueError -> exit(1)`` handler catches them); no custom exception
 hierarchy is introduced.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import lance
 import pyarrow as pa
-from loguru import logger
 
 from cosmos_curator.next.embeddings.schemas import EmbeddingColumnGroup
-from cosmos_curator.next.utils.lance_utils import distinct_non_null_values
-
-# Validation only has to tell "one producer" from "more than one", so it asks for
-# one value beyond the single one it tolerates and never for the whole column.
-_MAX_PRODUCERS_INSPECTED = 2
+from cosmos_curator.next.utils.lance_fragment_recovery import sql_string_literal
 
 
 def _assert_present_group_matches(schema: pa.Schema, group: EmbeddingColumnGroup) -> None:
@@ -151,102 +148,66 @@ def ensure_embedding_columns(
     return 0, None
 
 
-def drop_embedding_group(dataset: lance.LanceDataset, group: EmbeddingColumnGroup) -> int:
-    """Detach one group's columns, taking it back to absent so a later run refills it.
-
-    ``drop_columns`` detaches the group's data file from every fragment and a
-    refill writes a brand-new one, which is what makes a partial refill safe: the
-    fragments it never reaches read NULL rather than pre-drop values.
-
-    Returns:
-        The number of columns dropped (0 when the group was already absent).
-
-    """
-    names = set(dataset.schema.names)
-    # Narrow to the fields that are really there: drop_columns rejects a name the
-    # schema does not carry and then drops NOTHING, so passing a partially present
-    # group whole would fail the entire reset instead of clearing what exists.
-    present = [name for name in group.field_names if name in names]
-    if not present:
-        # drop_columns([]) does not raise, but it does commit a version. Skipping
-        # the call keeps a no-op reset off the table's version history entirely.
-        return 0
-    dataset.drop_columns(present)
-    logger.info(f"detached embedding column group {group.name!r} from {dataset.uri}: dropped {present}")
-    return len(present)
-
-
-def validate_embedding_group(
-    dataset: lance.LanceDataset,
+def pending_filter(
     group: EmbeddingColumnGroup,
-    expected_provenance: dict[str, str] | None,
-) -> None:
-    """Validate a group is safe to fill: at most one (expected) producer.
+    applicability_filter: str | None,
+    result_identity: Mapping[str, str],
+) -> str:
+    """Return the predicate selecting rows this modality still owes work on.
 
-    The group's rows are all-empty or all-complete by construction, so a mixed
-    NULL/non-NULL partial row is unreachable and is not checked here. The
-    guarantee comes from the producer, not from the write: the group-batch
-    builders in ``embeddings.schemas`` derive every field of a row from ONE
-    per-row validity mask, so a failed row's vector and provenance go NULL
-    together, and ``update_columns`` then writes that whole group row at once.
-
-    Enforces that the complete rows carry at most one distinct producer identity
-    per provenance column, and that identity equals the configured one in
-    ``expected_provenance``. Because a single distinct tuple over the provenance
-    columns is equivalent to each provenance column having at most one distinct
-    non-null value, this is checked column by column.
+    The single definition of owed work: an applicable row is owed when its primary
+    vector is missing, when any other group field is missing (companion vectors
+    are not provenance but still required for a complete row), OR when what it
+    already holds came from a different computation than the one this run
+    performs. Staleness is therefore SELECTED WORK rather than a refusal - a
+    corpus part-way through a rebuild is a normal transient, and an ordinary
+    re-run finishes it.
 
     Args:
-        dataset: The clips table to read.
-        group: The group to validate.
-        expected_provenance: ``{provenance_column: expected_value}`` for the
-            staleness comparison, or ``None`` to enforce only the single-producer
-            rule. The action leg passes ``None`` here and reads the single
-            surviving fingerprint via ``distinct_non_null_values``.
+        group: The column group whose rows are being selected.
+        applicability_filter: Predicate restricting the rows this modality can
+            embed at all, or ``None`` when every row is applicable.
+        result_identity: ``{provenance_column: value}`` naming this run's
+            computation. Every one of ``group.provenance_columns`` must appear;
+            ``ModalityFill`` enforces that, and a missing key here would silently
+            stop selecting rows that are stale in the omitted column.
+
+    Returns:
+        A predicate for Lance's scanner-filter surface (``count_rows(filter=...)``,
+        ``scanner(filter=...)``), NOT for ``dataset.sql``.
 
     Raises:
-        ValueError: If the group is absent, has more than one producer, or is
-            stale versus ``expected_provenance``.
+        ValueError: If ``result_identity`` does not cover every provenance column.
 
     """
-    missing = [name for name in group.field_names if name not in set(dataset.schema.names)]
+    missing = [column for column in group.provenance_columns if column not in result_identity]
     if missing:
         msg = (
-            f"embedding column group {group.name!r} is not present on {dataset.uri} (missing {missing}); "
-            f"ensure_embedding_columns must run before validation"
+            f"embedding column group {group.name!r}: result_identity is missing {missing}; "
+            f"it must cover every provenance column {list(group.provenance_columns)}"
         )
         raise ValueError(msg)
+    # Identifiers stay BARE. On Lance's scanner-filter surface a double-quoted
+    # name parses as a STRING LITERAL, so `"col" IS NOT NULL` compares two
+    # constants and matches every row instead of raising. Values go through the
+    # shared escaper. `!=` rather than `<>` is the spelling already proven against
+    # this surface in robot_action_caption/table.py.
+    #
+    # The IS NULL arm is not redundant with `!=`: under SQL three-valued logic
+    # `NULL != 'x'` is unknown rather than true, so a row whose identity column is
+    # NULL while its vector is present would drop out of the selection entirely.
+    owed = [f"{group.primary_vector} IS NULL"]
     for column in group.provenance_columns:
-        producers = distinct_non_null_values(dataset, column, max_values=_MAX_PRODUCERS_INSPECTED)
-        if len(producers) > 1:
-            msg = (
-                f"embedding column group {group.name!r} provenance column {column!r} has multiple producers "
-                f"{list(producers)}; reset the group with --reset-group {group.name} and rerun to replace it"
-            )
-            raise ValueError(msg)
-        if producers and expected_provenance is not None:
-            expected = expected_provenance.get(column)
-            if expected is not None and producers[0] != expected:
-                msg = (
-                    f"embedding column group {group.name!r} is stale: {column!r} is {producers[0]!r} but the "
-                    f"configured producer is {expected!r}; reset the group with --reset-group {group.name} "
-                    f"and rerun to recompute it"
-                )
-                raise ValueError(msg)
-
-
-def pending_filter(group: EmbeddingColumnGroup, applicability_filter: str | None) -> str:
-    """Return the "pending" predicate: applicable rows whose primary vector is NULL.
-
-    This is the single definition of "a row this modality still owes work on", used
-    to build the incremental row filter. For text (``applicability_filter is
-    None``, every row applicable) it degrades to the bare "primary vector IS NULL"
-    clause.
-    """
-    primary_null = f"{group.primary_vector} IS NULL"
+        owed.append(f"{column} IS NULL")
+        owed.append(f"{column} != {sql_string_literal(result_identity[column])}")
+    for column in group.field_names:
+        if column == group.primary_vector or column in group.provenance_columns:
+            continue
+        owed.append(f"{column} IS NULL")
+    disjunction = " OR ".join(owed)
     if applicability_filter:
-        return f"({applicability_filter}) AND {primary_null}"
-    return primary_null
+        return f"({applicability_filter}) AND ({disjunction})"
+    return f"({disjunction})"
 
 
 def count_filled(dataset: lance.LanceDataset, group: EmbeddingColumnGroup) -> int:

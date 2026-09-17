@@ -527,3 +527,33 @@ def test_filesystem_path_decodes_a_file_uri_exactly_once() -> None:
     give the same answer there.
     """
     assert arrow_utils.filesystem_path("file:///staging/my%2520dir") == "/staging/my%20dir"
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        pytest.param("/staging/", "/staging", id="trailing separator"),
+        pytest.param("/staging///", "/staging", id="repeated separators"),
+        pytest.param("  /staging  ", "/staging", id="surrounding whitespace"),
+        pytest.param("/staging", "/staging", id="already normal"),
+        pytest.param("file:///tmp///", "file:///tmp", id="file uri"),
+        pytest.param("FILE:///tmp/", "file:///tmp", id="case variant file uri"),
+        pytest.param("file://localhost/tmp/", "file:///tmp", id="localhost file authority"),
+        pytest.param("s3://bucket///", "s3://bucket", id="s3 uri"),
+    ],
+)
+def test_normalize_location_root_collapses_spellings_of_one_directory(location: str, expected: str) -> None:
+    """Two spellings of one root must normalize to one, or derived work lands in two places."""
+    assert arrow_utils.normalize_location_root(location) == expected
+
+
+@pytest.mark.parametrize("root", ["/", "file:///", "  file:///  "])
+def test_normalize_location_root_keeps_a_filesystem_roots_final_slash(root: str) -> None:
+    """At a root the final slash is not redundant - it is what makes the path absolute.
+
+    The case a bare ``rstrip`` gets wrong, and gets wrong silently: ``"/"`` would
+    become ``""``, which resolves against the process working directory (a Ray
+    worker's is not the driver's), and ``"file:///"`` would become
+    ``"file://"``, an authority rather than a path.
+    """
+    assert arrow_utils.normalize_location_root(root) == root.strip()

@@ -43,10 +43,17 @@ from typing import Any
 
 import attrs
 
+from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.next.embeddings.action.embedder import DualWristMotionEmbedder, DualWristMotionReadConfig
 from cosmos_curator.next.embeddings.action.pca import PcaArtifact
+from cosmos_curator.next.embeddings.action.wrist_motion import DESCRIPTOR_VERSION
 from cosmos_curator.next.embeddings.image.embedder import HfVisionImageEmbedder
-from cosmos_curator.next.embeddings.model_specs import DEFAULT_IMAGE_MODEL, DEFAULT_TEXT_MODEL, ModelSpec
+from cosmos_curator.next.embeddings.model_specs import (
+    DEFAULT_IMAGE_MODEL,
+    DEFAULT_TEXT_MODEL,
+    ModelSpec,
+    VisionModelSpec,
+)
 from cosmos_curator.next.embeddings.schemas import (
     ACTION_COLUMN_GROUP,
     IMAGE_COLUMN_GROUP,
@@ -55,6 +62,7 @@ from cosmos_curator.next.embeddings.schemas import (
 )
 from cosmos_curator.next.embeddings.text.embedder import SentenceTransformerTextEmbedder
 from cosmos_curator.next.recipes.embeddings.config import EmbeddingPipelineConfig, Modality
+from cosmos_curator.next.utils.identity import canonical_digest
 
 # The Pixi environment whose interpreter holds torch / transformers /
 # sentence_transformers - and the pyarrow / lance the fill worker itself needs.
@@ -102,9 +110,13 @@ class WorkerResources:
     ``memory_bytes``.
 
     Attributes:
-        scan_batch_size: Rows per Arrow batch handed to the embedder. This is the
-            worker's own fragment-scan granularity, NOT Ray's work-item batch size
-            (a Ray batch is always exactly one fragment id).
+        scan_batch_size: Rows per Arrow batch handed to the embedder. One value
+            drives three things that have to agree: the repartition target that
+            splits an owed fragment into blocks, Ray's ``map_batches`` batch size,
+            and hence the embedder's input width. Raising it therefore coarsens
+            block geometry as well as widening the batch, and block geometry is
+            one of the two row minimums that size what one checkpoint makes
+            durable (the other is ``parquet_rows_per_file``).
         env_name: Pixi environment the worker's interpreter runs in.
         num_gpus: GPUs reserved per worker, or ``None`` for a CPU modality. A
             fractional value lets Ray pack several workers per physical GPU.
@@ -145,11 +157,12 @@ class ModalityFill:
             reads it, but the fill joins the computed group back on it.
         applicability_filter: SQL predicate selecting the rows this modality can
             embed, or ``None`` when every row is applicable.
-        expected_provenance: ``{provenance_column: expected_value}`` an already
-            populated group is checked against, so a group produced by a different
-            source is refused as stale. ``None`` when the modality's producer
-            identity is discovered from the table rather than configured, leaving
-            only the single-producer uniqueness check.
+        result_identity: ``{provenance_column: value}`` naming the computation this
+            run performs, covering every one of ``group.provenance_columns``. It is
+            the single answer to "which computation produced these columns": the
+            selection predicate re-computes a row whose stored values differ, and
+            the rows this run writes carry these very values. A row holding a
+            different value is therefore selected work, not a refusal.
         embedder_cls: The callable class the worker constructs once and calls per
             batch. Its ``__call__`` takes an Arrow batch of ``source_columns`` and
             returns exactly ``group``'s columns, one row per input row in input
@@ -166,11 +179,29 @@ class ModalityFill:
     group: EmbeddingColumnGroup
     source_columns: tuple[str, ...]
     applicability_filter: str | None
-    expected_provenance: dict[str, str] | None
+    result_identity: dict[str, str]
     embedder_cls: type
     embedder_kwargs: dict[str, Any]
     resources: WorkerResources
     weights_name: str | None
+
+    def __attrs_post_init__(self) -> None:
+        """Refuse an identity that does not cover exactly the group's provenance columns.
+
+        The selection predicate iterates ``group.provenance_columns`` and reads
+        ``result_identity`` for each. A missing key would silently narrow the
+        predicate to the columns that happen to be present, so a row stale in the
+        uncovered column would read as current and never be recomputed - a wrong
+        answer that no later stage can detect. An extra key is the same mistake
+        seen from the other side: a value nothing compares.
+        """
+        expected = set(self.group.provenance_columns)
+        if set(self.result_identity) != expected:
+            msg = (
+                f"{self.modality} result_identity keys {sorted(self.result_identity)} "
+                f"must be exactly {sorted(expected)}"
+            )
+            raise ValueError(msg)
 
 
 @attrs.frozen(kw_only=True)
@@ -182,14 +213,15 @@ class ModalityResult:
 
     Attributes:
         modality: Which modality produced this result.
-        selected: Rows this run computed, summed from what the workers scanned.
+        result_identity: The computation this run published, copied from the
+            spec it ran. Reported because it is the one fact that answers "did my
+            model change take effect" against a group whose counts look the same
+            either way. Empty only when no computation could be identified at
+            all, which is not the same as a run that identified one and owed
+            nothing.
+        selected: Rows this run published, summed from what the publication
+            tasks streamed.
         filled: Rows whose group became complete this run (non-null primary vector).
-        skipped_fragments: Fragments that failed and were left unwritten. Their
-            rows are counted in no other field: nothing was written for them, so
-            from the table's point of view the run never visited them. Reported
-            rather than merely logged because it is the ONLY thing separating a
-            run that had nothing to do from one whose fragments failed - both
-            leave every row count at zero.
         committed_version: Table version after the group's ``Update`` commit.
             ``None`` means NOTHING was committed, and it is the only encoding of
             that state - do not re-derive it from the counts.
@@ -197,9 +229,9 @@ class ModalityResult:
     """
 
     modality: Modality
+    result_identity: dict[str, str]
     selected: int
     filled: int
-    skipped_fragments: int
     committed_version: int | None
 
     @property
@@ -208,24 +240,66 @@ class ModalityResult:
         return self.selected - self.filled
 
     @classmethod
-    def nothing_to_do(cls, modality: Modality) -> "ModalityResult":
+    def nothing_to_do(cls, modality: Modality, result_identity: dict[str, str]) -> "ModalityResult":
         """Return the result of a modality that owed no work and therefore committed nothing.
 
         Named for the success it reports, not for the empty counts it carries: a
         modality whose work all FAILED also leaves every count at zero, and that
         one raises rather than returning, so this constructor cannot express it.
+
+        Args:
+            modality: The modality that owed nothing.
+            result_identity: The computation it would have performed. Pass an
+                empty mapping only when none could be identified - a modality
+                whose rows are all current still has one, and reporting it is
+                what tells an operator WHICH computation they are current with.
+
         """
-        return cls(modality=modality, selected=0, filled=0, skipped_fragments=0, committed_version=None)
+        return cls(
+            modality=modality,
+            result_identity=result_identity,
+            selected=0,
+            filled=0,
+            committed_version=None,
+        )
 
 
-def _model_provenance(group: EmbeddingColumnGroup, spec: ModelSpec) -> dict[str, str]:
-    """Return the provenance value a checkpoint-backed group is expected to carry.
+def _model_result_fingerprint(spec: ModelSpec) -> str:
+    """Hash the facts that decide what this model's vectors contain.
 
-    A model modality has exactly one provenance column - the checkpoint's model id -
-    so a complete group holding a different id was produced by other weights and is
-    stale rather than merely different.
+    A checkpoint id alone answers "which weights" and not "which computation", so
+    it cannot separate two runs that pooled the same backbone differently or
+    formatted the same text differently. Hashing the registry key and its
+    resolved id and revision together with the pooling reduction and
+    ``result_version`` gives one value that moves whenever the vectors would
+    differ - which is what makes a stored value usable both as this run's
+    provenance and as the staleness test.
+
+    ``revision`` comes from the registry rather than the spec because that is
+    where the weights are actually pinned: a re-pin behind an unchanged
+    ``weights_name`` must move the fingerprint.
     """
-    return {group.provenance_columns[0]: spec.model_id}
+    registered = resolve_registered_model(spec.weights_name)
+    return canonical_digest(
+        {
+            # The registry key, and NOT a redundant restatement of the two facts
+            # below it. It is what both embedders pass to
+            # ``get_local_dir_for_weights_name``, so it selects the DIRECTORY the
+            # weights load from, and the registry admits two keys that agree on
+            # everything else: seedvr2_7b and seedvr2_7b_sharp share one model_id,
+            # one revision and one precision while naming different .pth files.
+            # Digested from the spec rather than from ``registered``, because the
+            # spec's value is the one that reaches the filesystem.
+            "weights_name": spec.weights_name,
+            "model_id": registered.model_id,
+            "revision": registered.revision,
+            # isinstance rather than getattr: it narrows the union for mypy, so the
+            # payload stays typed instead of becoming Any at the one place whose
+            # exact contents define every stored fingerprint.
+            "pooling": spec.pooling if isinstance(spec, VisionModelSpec) else None,
+            "result_version": spec.result_version,
+        }
+    )
 
 
 def build_text_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
@@ -234,14 +308,22 @@ def build_text_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
     Text applies to every row, so it declares no applicability filter, and the leg
     never fails per row: every pending row it visits comes back complete.
     """
+    # Computed once and spent twice - as the value rows must already hold to count
+    # as current, and as the value this run's rows will carry. Two derivations
+    # could drift; one local cannot.
+    fingerprint = _model_result_fingerprint(DEFAULT_TEXT_MODEL)
     return ModalityFill(
         modality=Modality.TEXT,
         group=TEXT_COLUMN_GROUP,
         source_columns=SentenceTransformerTextEmbedder.SOURCE_COLUMNS,
         applicability_filter=None,
-        expected_provenance=_model_provenance(TEXT_COLUMN_GROUP, DEFAULT_TEXT_MODEL),
+        result_identity={TEXT_COLUMN_GROUP.provenance_columns[0]: fingerprint},
         embedder_cls=SentenceTransformerTextEmbedder,
-        embedder_kwargs={"spec": DEFAULT_TEXT_MODEL, "encode_batch_size": config.text.batch_size},
+        embedder_kwargs={
+            "spec": DEFAULT_TEXT_MODEL,
+            "result_fingerprint": fingerprint,
+            "encode_batch_size": config.text.batch_size,
+        },
         # No memory_bytes: unlike image, the text worker's heap is dominated by the
         # model weights rather than by decoded inputs, and no measured figure exists
         # to reserve.
@@ -257,12 +339,14 @@ def build_image_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
     returns one group row per scanned row, emitting a NULL group for a clip whose
     media cannot be decoded so that cardinality is preserved.
     """
+    # Computed once and spent twice; see build_text_fill.
+    fingerprint = _model_result_fingerprint(DEFAULT_IMAGE_MODEL)
     return ModalityFill(
         modality=Modality.IMAGE,
         group=IMAGE_COLUMN_GROUP,
         source_columns=HfVisionImageEmbedder.SOURCE_COLUMNS,
         applicability_filter=_IMAGE_APPLICABILITY_FILTER,
-        expected_provenance=_model_provenance(IMAGE_COLUMN_GROUP, DEFAULT_IMAGE_MODEL),
+        result_identity={IMAGE_COLUMN_GROUP.provenance_columns[0]: fingerprint},
         embedder_cls=HfVisionImageEmbedder,
         # Both fields are the frame reader's, forwarded through the embedder that
         # builds it: only the profile NAME and a plain int travel, and the reader
@@ -270,6 +354,7 @@ def build_image_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
         # thread pool has to survive pickling.
         embedder_kwargs={
             "spec": DEFAULT_IMAGE_MODEL,
+            "result_fingerprint": fingerprint,
             "storage_profile": config.storage_profile,
             "read_concurrency": config.image.read_concurrency,
         },
@@ -310,10 +395,15 @@ def build_action_fill(config: EmbeddingPipelineConfig, pca: PcaArtifact) -> Moda
         group=ACTION_COLUMN_GROUP,
         source_columns=DualWristMotionEmbedder.SOURCE_COLUMNS,
         applicability_filter=ACTION_APPLICABILITY_FILTER,
-        # Action's producer identity is the PCA fingerprint its own rows carry, not a
-        # configured value, so there is nothing to compare against: the group check
-        # enforces only single-producer uniqueness and the basis is read from there.
-        expected_provenance=None,
+        # Action needs no digest: both of its facts are already the identity. The
+        # descriptor version names the semantics and the artifact fingerprint names
+        # the exact basis, so the pair is what a resume has to match - which is why
+        # the caller binds the basis before this builder runs rather than letting a
+        # worker discover one.
+        result_identity={
+            "embedding_action_descriptor_version": DESCRIPTOR_VERSION,
+            "embedding_action_pca_fingerprint": pca.fingerprint,
+        },
         embedder_cls=DualWristMotionEmbedder,
         embedder_kwargs={
             "config": DualWristMotionReadConfig(

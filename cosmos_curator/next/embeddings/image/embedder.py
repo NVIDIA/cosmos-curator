@@ -78,6 +78,7 @@ class HfVisionImageEmbedder:
         self,
         spec: VisionModelSpec,
         *,
+        result_fingerprint: str,
         storage_profile: str = "default",
         device: str | None = None,
         read_concurrency: int = 1,
@@ -87,7 +88,12 @@ class HfVisionImageEmbedder:
         Args:
             spec: The checkpoint identity, output width, and pooling strategy.
                 Weights resolve only from ``spec.weights_name`` - there is no
-                runtime override, so the recorded ``model_id`` is trustworthy.
+                runtime override, so what this actor computes really is what the
+                caller's fingerprint names.
+            result_fingerprint: Identity of the computation these vectors come
+                from, written into every row's provenance column. Supplied rather
+                than derived here so the value the caller's selection predicate
+                compares and the value the rows carry cannot diverge.
             storage_profile: Storage profile for reading clip media.
             device: Torch device override; ``None`` auto-selects cuda/cpu.
             read_concurrency: Width the frame reader is built with; see
@@ -111,7 +117,7 @@ class HfVisionImageEmbedder:
             backend="torchvision",
         )
         self._model = AutoModel.from_pretrained(weights_dir, local_files_only=True).to(self._device).eval()
-        self._model_id = spec.model_id
+        self._result_fingerprint = result_fingerprint
         self._reader = ClipFrameReader(storage_profile=storage_profile, read_concurrency=read_concurrency)
 
     def __call__(self, batch: pa.Table) -> pa.Table:
@@ -143,7 +149,7 @@ class HfVisionImageEmbedder:
             # _embed clears ``frames`` (frees decoded RGB before the forward pass);
             # scatter the survivors' vectors back to their original row positions.
             matrix[frame_rows] = self._embed(frames)
-        return image_columns_batch(rows, matrix, self._model_id, valid)
+        return image_columns_batch(rows, matrix, self._result_fingerprint, valid)
 
     def _embed(self, frames: list[npt.NDArray[np.uint8]]) -> npt.NDArray[np.float32]:
         """Run the backbone on RGB frames, returning an L2-normalized ``(N, spec.dim)`` matrix.

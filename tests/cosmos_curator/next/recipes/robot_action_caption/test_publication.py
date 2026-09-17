@@ -1201,3 +1201,42 @@ def test_the_staged_partition_carries_exactly_the_published_columns(
     stage(0, [staged_row("c0")])
 
     assert staged_captions(workspace, 0).schema.names == ["clip_id", *CAPTION_COLUMNS]
+
+
+def test_every_fragment_in_the_wave_gets_its_own_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fan-out states its block count instead of letting Ray autodetect one.
+
+    Task count follows block count, and ``from_items`` autodetects
+    ``min(len(items), max(200, 2 * avail_cpus))`` (measured at Ray 2.58.0) - a
+    cluster-sized figure with no reason to equal the wave's fragment count. Ray
+    is stubbed out here because the width is decided before any task runs.
+    """
+    recorded: list[tuple[int, int | None]] = []
+
+    class _Results:
+        def iter_rows(self) -> list[dict[str, str]]:
+            return [{"result_json": '{"fragment_id": 0}'}]
+
+    class _Items:
+        def map_batches(self, *_args: object, **_kwargs: object) -> "_Results":
+            return _Results()
+
+    def _record(items: list[dict[str, int]], **kwargs: object) -> "_Items":
+        override = kwargs.get("override_num_blocks")
+        recorded.append((len(items), None if override is None else int(str(override))))
+        return _Items()
+
+    monkeypatch.setattr(publication_module.ray.data, "from_items", _record)
+    dataset = type("_Pinned", (), {"uri": "memory://t.lance", "version": 3})()
+
+    publication_module._prepare_fragments(
+        dataset,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        (0, 1, 2, 3, 4),
+        digest=DIGEST,
+        model_id=MODEL,
+        row_filter=ROW_FILTER,
+        storage_options=None,
+    )
+
+    assert recorded == [(5, 5)]

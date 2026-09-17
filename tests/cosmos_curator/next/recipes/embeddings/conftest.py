@@ -32,6 +32,14 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.embeddings.schemas import (
+    ACTION_DIM,
+    ACTION_GROUP_SCHEMA,
+    IMAGE_DIM,
+    IMAGE_GROUP_SCHEMA,
+    TEXT_DIM,
+    TEXT_GROUP_SCHEMA,
+)
 from cosmos_curator.next.recipes.embeddings.config import EmbeddingPipelineConfig
 from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 
@@ -65,6 +73,73 @@ ClipsTableFactory = Callable[..., str]
 def _sentinel_uri(row_index: int, kind: str) -> str:
     """Return a deterministic non-empty media/action URI for a row."""
     return f"{kind}{row_index}.bin"
+
+
+def vector_of(seed: int, dim: int) -> list[float]:
+    """Return a deterministic non-null vector of width ``dim``."""
+    return [float(seed)] * dim
+
+
+def fixed_size_list(values: Sequence[list[float] | None], dim: int) -> pa.Array:
+    """Build a ``fixed_size_list<float32, dim>`` array; a ``None`` entry is a null row."""
+    return pa.array(values, type=pa.list_(pa.float32(), dim))
+
+
+def write_clips_dataset(
+    tmp_path: pathlib.Path,
+    *,
+    rows: int,
+    clip_uris: Sequence[str | None] | None = None,
+    action_uris: Sequence[str | None] | None = None,
+    text: dict[str, list] | None = None,
+    image: dict[str, list] | None = None,
+    action: dict[str, list] | None = None,
+    rows_per_file: int = 3,
+    name: str = "clips.lance",
+) -> str:
+    """Write a ``clips.lance`` with base columns and optionally populated embedding groups.
+
+    Each of ``text`` / ``image`` / ``action`` (when given) carries per-row column
+    value lists (a vector list or ``None`` per row, and the provenance strings),
+    so a test can model empty, complete, corrupt, or stale group rows directly.
+    Unlike :func:`add_group_columns` (metadata-only, all NULL), this writes the
+    values into the base table so selection and basis binding have data to read.
+
+    ``clip_uris`` / ``action_uris`` override the per-row media and action artifact
+    URIs; an entry may be ``""`` or ``None`` to model a clip a modality cannot
+    embed. Both default to a distinct non-empty URI per row.
+    """
+    clip_ids = [f"c{i}" for i in range(rows)]
+    uris = list(clip_uris) if clip_uris is not None else [f"clip{i}.bin" for i in range(rows)]
+    actions = list(action_uris) if action_uris is not None else [_sentinel_uri(i, "act") for i in range(rows)]
+    arrays: dict[str, pa.Array] = {
+        "clip_id": pa.array(clip_ids, pa.string()),
+        "task_name": pa.array([f"task{i}" for i in range(rows)], pa.string()),
+        "subtask_name": pa.array([f"subtask{i}" for i in range(rows)], pa.string()),
+        "clip_uri": pa.array(uris, pa.large_string()),
+        "action_data_uri": pa.array(actions, pa.large_string()),
+        "source_dataset": pa.array(["ds_under_test"] * rows, pa.string()),
+    }
+    fields = list(CLIPS_BASE_SCHEMA)
+    if text is not None:
+        arrays["embedding_text_subtask"] = fixed_size_list(text["subtask"], TEXT_DIM)
+        arrays["embedding_text_task"] = fixed_size_list(text["task"], TEXT_DIM)
+        arrays["embedding_text_model_id"] = pa.array(text["model_id"], pa.string())
+        fields += list(TEXT_GROUP_SCHEMA)
+    if image is not None:
+        arrays["embedding_image"] = fixed_size_list(image["image"], IMAGE_DIM)
+        arrays["embedding_image_model_id"] = pa.array(image["model_id"], pa.string())
+        fields += list(IMAGE_GROUP_SCHEMA)
+    if action is not None:
+        arrays["embedding_action"] = fixed_size_list(action["action"], ACTION_DIM)
+        arrays["embedding_action_descriptor_version"] = pa.array(action["descriptor_version"], pa.string())
+        arrays["embedding_action_pca_fingerprint"] = pa.array(action["fingerprint"], pa.string())
+        fields += list(ACTION_GROUP_SCHEMA)
+    schema = pa.schema(fields)
+    table = pa.table({column: arrays[column] for column in schema.names}, schema=schema)
+    uri = str(tmp_path / name)
+    lance.write_dataset(table, uri, max_rows_per_file=rows_per_file, data_storage_version=LANCE_DATA_STORAGE_VERSION)
+    return uri
 
 
 @pytest.fixture

@@ -21,8 +21,9 @@ are driver-side functions over a dataset the CALLER opened::
 
     resolve_action_pca()  ->  ActionPca | None      (driver, once per run)
         |
-        |  reuse: read the fingerprint the group's rows already carry and load
-        |         that exact basis - no descriptor is extracted
+        |  reuse: take the one fingerprint referenced by the STAGED rows of an
+        |         interrupted attempt or by the group's CANONICAL rows at the
+        |         current descriptor contract, and load that exact basis
         |
         |  first fit: narrow action_data_uri scan -> rank by sha256(uri) ->
         |         extract only the bounded candidate set -> keep the
@@ -43,14 +44,21 @@ the driver, and then travels as data inside the fill spec.
   gate - a non-dexterous or malformed artifact is not filtered out but rejected per
   row by the extractor's geometry checks, yielding a NULL group that is retried next
   run rather than being silently excluded from the denominator.
-- Basis selection is a predicate on the group, not a mode the operator picks. A group
-  that already holds rows reuses the fingerprint they carry (a semantic no-op that
-  re-projects to identical vectors); an empty group fits a fresh basis and persists it
-  under its own fingerprint. ``max_fragments`` does not bias the basis: the candidate
-  scan reads the whole table's ``action_data_uri`` column, so a truncated run fits
-  from the same population an untruncated one would. A group whose recorded
-  ``descriptor_version`` differs from this code's is stale: it refuses to load and
-  directs the operator to reset the group.
+- Basis selection is a predicate on what already exists, not a mode the operator
+  picks. A basis referenced by rows STAGED but not yet published counts exactly as
+  one referenced by the group's CANONICAL rows, because staged rows are terminal:
+  an attempt that crashed between staging and publication will publish exactly the
+  vectors it staged, so a group that looks empty may already be committed. Two
+  bases across those sources refuse; only with none is a fresh one fit and
+  persisted under its own fingerprint. Reading staged rows this way rests on the
+  single-writer precondition stated in ``workspace.py``. ``max_fragments`` does
+  not bias the basis: the candidate scan reads the whole table's
+  ``action_data_uri`` column, so a truncated run fits from the same population an
+  untruncated one would.
+- Rows recorded under an older ``descriptor_version`` neither supply a basis nor
+  refuse the run: they are stale results, which the ordinary pending filter selects
+  for recompute. The canonical fingerprint read is therefore scoped to the CURRENT
+  contract, so an old contract's basis can neither be loaded nor block a fresh fit.
 
 Sampling by URI BEFORE extraction (rather than extracting the whole corpus and then
 sampling) is what removes the old full-corpus materialization barrier. Because some
@@ -89,6 +97,10 @@ from cosmos_curator.next.recipes.embeddings.modalities import (
     ModalityResult,
     WorkerResources,
 )
+from cosmos_curator.next.recipes.embeddings.publication import staged_distinct_values
+from cosmos_curator.next.recipes.embeddings.workspace import EmbeddingWorkspace
+from cosmos_curator.next.utils.identity import canonical_digest
+from cosmos_curator.next.utils.lance_fragment_recovery import sql_string_literal
 from cosmos_curator.next.utils.lance_utils import distinct_non_null_values
 
 # The action group's two provenance columns, unpacked once by position from the
@@ -96,10 +108,10 @@ from cosmos_curator.next.utils.lance_utils import distinct_non_null_values
 # fails loudly here rather than silently swapping version and fingerprint reads).
 _DESCRIPTOR_VERSION_COLUMN, _PCA_FINGERPRINT_COLUMN = ACTION_COLUMN_GROUP.provenance_columns
 
-# Distinct provenance values read when binding the basis. Group validation has
-# already proven at most one producer, so one value is all there is to read; asking
-# for a second only keeps a corrupt multi-producer group from being read as if it
-# were single-producer.
+# Distinct provenance values read when binding the basis. Two is the whole question:
+# one basis is bindable and more than one is not, so a third value would change no
+# decision while costing a wider scan. This read IS the multi-producer gate - nothing
+# in the write path prevents a group from referencing two bases.
 _PROVENANCE_VALUES_READ = 2
 
 # Rows per batch of the driver's narrow ``action_data_uri`` candidate scan. Larger
@@ -139,32 +151,77 @@ class ActionPca:
         return self.artifact.fingerprint
 
 
+def action_recovery_contract() -> str:
+    """Return the digest keying action's staging namespace, knowable BEFORE a basis is bound.
+
+    Action cannot key its namespace on its result identity the way text and image
+    do: that identity carries the basis fingerprint, and the fingerprint is the
+    very thing a pre-basis resume reads the namespace to FIND. The descriptor
+    contract is the part of the identity that is fixed by code rather than
+    discovered during the run - what a descriptor MEANS plus both widths it is
+    projected between - so it separates incompatible staged rows with no
+    circularity. Two runs at one contract may still bind different bases; the
+    single-basis check, not the path, is what refuses that.
+    """
+    return canonical_digest(
+        {
+            "descriptor_version": DESCRIPTOR_VERSION,
+            "action_dim": ACTION_DIM,
+            "descriptor_dim": DESCRIPTOR_DIM,
+        }
+    )
+
+
+def staged_action_fingerprints(workspace: EmbeddingWorkspace) -> tuple[str, ...]:
+    """Return the distinct PCA bases an interrupted attempt's staged rows reference.
+
+    Separate from :func:`resolve_action_pca` because the two answer different
+    questions: this one reads a workspace the DRIVER resolved, while the resolver
+    decides what to bind from values alone. Keeping the read here is what keeps
+    the fingerprint column and the two-value ceiling owned by the module that
+    knows why two is enough - a caller passing its own ceiling could silently
+    widen or defeat the single-basis check.
+
+    Args:
+        workspace: Action's namespace for this run's descriptor contract. One
+            that was never staged into yields no values.
+
+    """
+    return staged_distinct_values(workspace, _PCA_FINGERPRINT_COLUMN, max_values=_PROVENANCE_VALUES_READ)
+
+
 def resolve_action_pca(
-    dataset: lance.LanceDataset, config: EmbeddingPipelineConfig, *, root_uri: str
+    dataset: lance.LanceDataset,
+    config: EmbeddingPipelineConfig,
+    *,
+    root_uri: str,
+    staged_fingerprints: tuple[str, ...],
 ) -> ActionPca | None:
-    """Bind the one PCA basis every action worker projects onto: reuse the group's, or fit it.
+    """Bind the one PCA basis every action worker projects onto: reuse a bound one, or fit it.
 
     Args:
         dataset: The clips table, already open at the version to read.
         config: Storage profile plus the action sampling knobs.
         root_uri: Content-addressed directory holding every fitted basis.
+        staged_fingerprints: Distinct fingerprints found in the run's staged rows,
+            bounded by the caller. Empty on a first attempt.
 
     Returns:
-        The bound basis, or ``None`` when the group is empty AND no clip carries an
-        ``action_data_uri``: nothing to load and nothing to fit from, so the caller
-        skips action without ever starting an actor pool.
+        The bound basis, or ``None`` when nothing is staged, the group is empty AND
+        no clip carries an ``action_data_uri``: nothing to load and nothing to fit
+        from, so the caller skips action without ever starting an actor pool.
 
     Raises:
-        ValueError: If the group's descriptor version is stale, the referenced basis
-            is missing or incompatible, or too few distinct descriptors survived.
+        ValueError: If two bases are in play, the referenced basis is missing or
+            incompatible, or too few distinct descriptors survived a fresh fit.
 
     """
     store = PcaArtifactStore(root_uri, storage_profile=config.storage_profile)
-    loaded = _load_existing_basis(dataset, store)
-    if loaded is not None:
+    bound = _bound_fingerprint(dataset, staged_fingerprints)
+    if bound is not None:
         # samples_used stays None: this run fit nothing, it re-projects onto the
-        # basis the group's existing rows already reference.
-        return ActionPca(artifact=loaded, samples_used=None)
+        # basis the staged or canonical rows already reference.
+        return ActionPca(artifact=_load_bound_basis(store, bound), samples_used=None)
     candidates = _candidate_uris(dataset, config)
     if not candidates:
         logger.info("no clip carries an action_data_uri; skipping the action group (no basis to fit)")
@@ -185,20 +242,21 @@ def resolve_action_pca(
 
 
 def check_action_outcome(result: ModalityResult, dataset: lance.LanceDataset) -> None:
-    """Fail the run when every action row the fill actually WROTE came back empty.
+    """Fail the run when every action row it published came back empty.
 
-    The per-ROW counterpart of the fill's own total-outage refusal, and disjoint
-    from it rather than covered by it: that one fires when no fragment was written
-    at all, this one only once fragments were written and committed - which is what
-    makes ``selected`` non-zero - and every row inside them still embedded to NULL.
+    The recipe's only POST-commit judgement, which the condition itself forces:
+    "rows were published and every one of them landed NULL" is not decidable until
+    the commit publishing them exists. Nothing is rolled back - those NULLs are the
+    correct state for rows that failed, and they keep the rows owed - so this is a
+    verdict on the run rather than an attempt to undo it.
 
     A partial per-row loss is NOT judged here: a row that failed stayed all-NULL
-    and is re-selected by the ordinary pending filter next run, and the count is
-    already in the fill's own summary. Only the total outage is actionable, because
-    it cannot be told apart from a misconfiguration by looking at the table.
+    and is re-selected by the ordinary missing-or-stale predicate next run, and the
+    count is already in the run's own summary. Only the total outage is actionable,
+    because it cannot be told apart from a misconfiguration by looking at the table.
 
     Args:
-        result: The action fill's result; its ``failed`` count is the per-row loss.
+        result: The action modality's result; its ``failed`` count is the per-row loss.
         dataset: The clips table re-opened after the commit, so the "group holds
             nothing at all" test sees this run's own writes.
 
@@ -208,14 +266,14 @@ def check_action_outcome(result: ModalityResult, dataset: lance.LanceDataset) ->
             nothing to embed, indistinguishable from a misconfiguration.
 
     """
-    # A zero selection means the fill owed no work: the run whose every fragment
-    # failed raises inside the fill rather than returning zeroed counts, so this
-    # early return can no longer swallow that case.
+    # A zero selection means the modality owed no work: a staging attempt that lost
+    # rows raises before publication rather than returning zeroed counts, so this
+    # early return cannot swallow that case.
     if result.selected == 0:
         return
     if result.failed >= result.selected and count_filled(dataset, ACTION_COLUMN_GROUP) == 0:
         msg = (
-            f"action embedding failed on all {result.selected} row(s) it visited and the group holds no "
+            f"action embedding failed on all {result.selected} row(s) it published and the group holds no "
             "embeddings: every artifact failed to read or was geometrically rejected, so there is nothing to "
             "embed. Re-run before investigating (transient S3 errors cause this without map retries), then "
             "check the export if it persists."
@@ -223,39 +281,109 @@ def check_action_outcome(result: ModalityResult, dataset: lance.LanceDataset) ->
         raise ValueError(msg)
 
 
-def _load_existing_basis(dataset: lance.LanceDataset, store: PcaArtifactStore) -> PcaArtifact | None:
-    """Load the basis the group's rows reference by fingerprint, or ``None`` if empty.
+def _bound_fingerprint(dataset: lance.LanceDataset, staged_fingerprints: tuple[str, ...]) -> str | None:
+    """Return the one basis fingerprint this run is bound to, or ``None`` to fit fresh.
 
-    Reads the single surviving fingerprint (``validate_embedding_group`` has already
-    proven the group carries at most one). ``None`` means the group holds no embedded
-    rows yet, so the caller fits a fresh basis. A recorded descriptor version
-    differing from this code's is caught here - before the load - so the operator is
-    directed to reset the group rather than seeing the mismatch surface as a raw
-    archive-validation error deeper in the load.
+    The rule is ONE basis across both sources, not a precedence between them:
+    disagreement raises, so which source is read first changes no outcome. Staged
+    rows count as a source at all because they are already projected and are
+    terminal - an attempt that crashed between staging and publication will
+    publish exactly those vectors, so a group that looks empty may already be
+    committed to a basis. Both present and AGREEING is the ordinary
+    ``max_fragments`` wave case and proceeds.
+
+    Args:
+        dataset: The clips table at the version to read.
+        staged_fingerprints: Distinct fingerprints the staged rows carry.
+
+    Returns:
+        The fingerprint to load, or ``None`` when nothing is bound yet.
 
     Raises:
-        ValueError: If the group's descriptor version is stale, or the referenced
-            basis is missing / incompatible (via ``store.load``).
+        ValueError: If two fingerprints are in play from any combination of
+            sources. Two bases have no safe automatic winner: choosing either
+            silently makes part of the group incomparable with the rest, and only
+            the operator knows which half is worth keeping.
 
     """
-    fingerprints = distinct_non_null_values(dataset, _PCA_FINGERPRINT_COLUMN, max_values=_PROVENANCE_VALUES_READ)
-    if not fingerprints:
-        return None
-    fingerprint = fingerprints[0]
-    versions = distinct_non_null_values(dataset, _DESCRIPTOR_VERSION_COLUMN, max_values=_PROVENANCE_VALUES_READ)
-    if versions and versions[0] != DESCRIPTOR_VERSION:
+    staged = _single_fingerprint(staged_fingerprints, source="the staged rows")
+    canonical = _single_fingerprint(
+        _canonical_fingerprints(dataset),
+        source=f"the action group at descriptor version {DESCRIPTOR_VERSION!r}",
+    )
+    if staged is not None and canonical is not None and staged != canonical:
         msg = (
-            f"action group was embedded under descriptor version {versions[0]!r} but this code produces "
-            f"{DESCRIPTOR_VERSION!r}; the persisted basis is semantically incompatible. Reset the group with "
-            f"--reset-group {ACTION_COLUMN_GROUP.name} and rerun to re-extract descriptors and refit the basis "
-            "together."
+            f"action rows staged under PCA basis {staged!r} disagree with the basis {canonical!r} the "
+            f"published rows of {dataset.uri} carry; the two projections are mutually incomparable and "
+            "neither can be chosen automatically. Discard the staging workspace: the published basis is "
+            "the one the rest of the corpus already sits in, and a re-run re-stages against it."
         )
         raise ValueError(msg)
-    pca = store.load(fingerprint)
-    logger.info(
-        f"loaded action PCA basis {fingerprint[:12]} (fit on {pca.n_fit_rows} rows) referenced by the action "
-        "group; re-projecting existing basis, not refitting"
+    bound = staged or canonical
+    if bound is not None:
+        # The source is logged, not because it changes the binding, but because a
+        # basis bound from staged rows alone means an earlier attempt got as far as
+        # staging - which nothing else in the run's output says.
+        source = "staged rows" if staged is not None else "the published group"
+        logger.info(f"action PCA basis {bound[:12]} bound from {source}; re-projecting, not refitting")
+    return bound
+
+
+def _canonical_fingerprints(dataset: lance.LanceDataset) -> tuple[str, ...]:
+    """Return the basis fingerprints the published rows carry at the CURRENT contract.
+
+    An older contract's rows are stale work rather than a refusal, so their
+    fingerprint must neither be loaded nor counted towards the single-basis check;
+    the pending filter re-selects those rows for recompute. Scoping the read is
+    what makes both true at once.
+    """
+    if _PCA_FINGERPRINT_COLUMN not in dataset.schema.names:
+        # A group whose columns do not exist yet carries no basis, which is a
+        # complete answer rather than a failure. Checked here so binding a STAGED
+        # basis does not depend on the caller having already widened the table -
+        # matching ``count_filled``, which reads an absent group as zero filled.
+        return ()
+    # DataFusion SQL, not the scanner-filter dialect: single quotes are literals,
+    # which is what sql_string_literal produces.
+    return distinct_non_null_values(
+        dataset,
+        _PCA_FINGERPRINT_COLUMN,
+        max_values=_PROVENANCE_VALUES_READ,
+        where=f"{_DESCRIPTOR_VERSION_COLUMN} = {sql_string_literal(DESCRIPTOR_VERSION)}",
     )
+
+
+def _single_fingerprint(fingerprints: tuple[str, ...], *, source: str) -> str | None:
+    """Return the one fingerprint in ``fingerprints``, ``None`` if empty, else raise.
+
+    Raises:
+        ValueError: If more than one is present. Reachable through a group written
+            by two producers, which nothing in the write path rules out.
+
+    """
+    if not fingerprints:
+        return None
+    if len(fingerprints) > 1:
+        msg = (
+            f"{source} reference more than one action PCA basis ({sorted(fingerprints)}); vectors projected "
+            "onto different bases are mutually incomparable, so neither is a safe automatic winner. Two "
+            "bases at one descriptor version means two runs each fit their own before either published, so "
+            f"run one embeddings leg at a time over the {ACTION_COLUMN_GROUP.name} group."
+        )
+        raise ValueError(msg)
+    return fingerprints[0]
+
+
+def _load_bound_basis(store: PcaArtifactStore, fingerprint: str) -> PcaArtifact:
+    """Load the bound basis from the artifact store, logging what it was fit on.
+
+    Raises:
+        ValueError: If the referenced basis is missing or incompatible (via
+            ``store.load``).
+
+    """
+    pca = store.load(fingerprint)
+    logger.info(f"loaded action PCA basis {fingerprint[:12]} (fit on {pca.n_fit_rows} rows)")
     return pca
 
 

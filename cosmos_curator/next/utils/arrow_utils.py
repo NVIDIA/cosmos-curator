@@ -277,3 +277,48 @@ def filesystem_path(location: str) -> str:
         # worse, a different directory that happens to exist.
         return unquote(urlsplit(location).path)
     return location
+
+
+def normalize_location_root(location: str) -> str:
+    """Return ``location`` in the one spelling that segments may be appended to.
+
+    Surrounding whitespace and redundant trailing separators are removed, so two
+    spellings of one directory join to one URI. Callers that derive a durable
+    identity from the joined path need that: without it a configured
+    ``"/staging/"`` and ``"/staging"`` name two different places, and work meant
+    for one lands in both.
+
+    A filesystem ROOT keeps its final slash, because there the slash is not
+    redundant - it is what makes the path absolute. Stripping it would turn
+    ``"/"`` into ``""`` (which resolves against the process working directory,
+    and a Ray worker's is not the driver's) and ``"file:///"`` into
+    ``"file://"`` (an authority, not a path).
+
+    Lives beside :func:`filesystem_path` rather than with its callers because
+    the two must agree on what a ``file://`` URI's path is; a private copy could
+    be "simplified" to a bare ``rstrip`` and silently disagree.
+
+    Returns:
+        The normalized location, unvalidated - an unsupported scheme is
+        :func:`filesystem_path`'s or :func:`arrow_filesystem`'s to reject, and a
+        blank result is the caller's, since only the caller knows whether a
+        location was required.
+
+    """
+    normalized = location.strip()
+    if normalized == "/":
+        return normalized
+    try:
+        scheme = _validated_filesystem_scheme(normalized)
+    except ValueError:
+        return normalized.rstrip("/")
+    if scheme == "file":
+        path = filesystem_path(normalized)
+        if path == "/":
+            return "file:///"
+        canonical = f"file://{path}"
+        return canonical.rstrip("/")
+    if scheme == "s3":
+        _, _, rest = normalized.partition("://")
+        return f"s3://{rest}".rstrip("/")
+    return normalized.rstrip("/")

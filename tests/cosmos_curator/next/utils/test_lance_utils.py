@@ -50,6 +50,8 @@ _PRODUCERS_INSPECTED = 2
 
 _IDENTITY_COLUMN = "producer"
 
+_KEEPER_COLUMN = "keeper"
+
 # Rows per data file, so every multi-row table below spans several fragments and a
 # read that stopped at the first one would be visibly wrong.
 _ROWS_PER_FILE = 3
@@ -60,6 +62,25 @@ def _write_identities(path: pathlib.Path, values: Sequence[str | None]) -> lance
     uri = str(path)
     lance.write_dataset(
         pa.table({_IDENTITY_COLUMN: pa.array(list(values), type=pa.string())}),
+        uri,
+        max_rows_per_file=_ROWS_PER_FILE,
+        data_storage_version=lance_utils.LANCE_DATA_STORAGE_VERSION,
+    )
+    return lance.dataset(uri)
+
+
+def _write_restricted_identities(
+    path: pathlib.Path, values: Sequence[str | None], keepers: Sequence[str | None]
+) -> lance.LanceDataset:
+    """Write producer identities alongside a second column a ``where`` clause can restrict on."""
+    uri = str(path)
+    lance.write_dataset(
+        pa.table(
+            {
+                _IDENTITY_COLUMN: pa.array(list(values), type=pa.string()),
+                _KEEPER_COLUMN: pa.array(list(keepers), type=pa.string()),
+            }
+        ),
         uri,
         max_rows_per_file=_ROWS_PER_FILE,
         data_storage_version=lance_utils.LANCE_DATA_STORAGE_VERSION,
@@ -221,6 +242,47 @@ def test_distinct_non_null_values_refuses_a_bound_that_reads_nothing(tmp_path: p
     dataset = _write_identities(tmp_path / "zero-bound.lance", ["fp-abc"])
     with pytest.raises(ValueError, match="must be at least 1"):
         distinct_non_null_values(dataset, _IDENTITY_COLUMN, max_values=0)
+
+
+def test_a_where_clause_narrows_which_rows_contribute_an_identity(tmp_path: pathlib.Path) -> None:
+    """Only rows satisfying ``where`` are considered, so an excluded producer is not reported.
+
+    What makes the read usable for a caller asking "which identities does THIS
+    subset carry" - reading the whole column instead would report a producer that
+    wrote rows the caller is not asking about.
+    """
+    dataset = _write_restricted_identities(
+        tmp_path / "restricted.lance",
+        ["fp-kept", "fp-dropped", "fp-kept", "fp-dropped"],
+        ["yes", "no", "yes", "no"],
+    )
+    values = distinct_non_null_values(
+        dataset, _IDENTITY_COLUMN, max_values=_PRODUCERS_INSPECTED, where=f"{_KEEPER_COLUMN} = 'yes'"
+    )
+    assert values == ("fp-kept",)
+
+
+def test_a_double_quoted_name_in_where_is_an_identifier_not_a_literal(tmp_path: pathlib.Path) -> None:
+    """A double-quoted name resolves the column here, the inverse of a Lance scanner filter.
+
+    The two SQL surfaces Lance exposes disagree, and both accept the other's
+    spelling silently. On a scanner filter (``count_rows(filter=...)``) a
+    double-quoted name is a STRING LITERAL, so ``"keeper" IS NOT NULL`` is a
+    constant that matches every row. Here the same text resolves the column, and a
+    caller who ports a predicate between the two gets a wrong answer rather than
+    an error. The fixture is what tells the two readings apart: were the name
+    treated as a literal, the clause would be trivially true and the excluded
+    producer would come back too.
+    """
+    dataset = _write_restricted_identities(
+        tmp_path / "quoted-identifier.lance",
+        ["fp-kept", "fp-dropped", "fp-kept", "fp-dropped"],
+        ["present", None, "present", None],
+    )
+    values = distinct_non_null_values(
+        dataset, _IDENTITY_COLUMN, max_values=_PRODUCERS_INSPECTED, where=f'"{_KEEPER_COLUMN}" IS NOT NULL'
+    )
+    assert values == ("fp-kept",)
 
 
 def test_lance_sink_and_utils_share_one_storage_version() -> None:

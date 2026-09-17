@@ -35,13 +35,13 @@ composition root imports this module at CLI startup, and the embedding runtime
 reaches torch, transformers, sentence_transformers, lance, and ray, so a
 module-level import here would put all of them on the startup path.
 
-The adapter catches nothing. That is what lets the generic runtime tell a config
-fault from a run fault by where it arose: the former surfaces from
-``prepare_run``, the latter from the returned closure. It does raise one thing of
-its own, ``IncompleteRunError``, when a run committed its survivors but skipped
-fragments, so a run that may still owe work is not reported as finished. How a
-raise is labelled and what it exits with belongs to ``pipeline_runtime`` - see
-that module rather than a paraphrase here.
+The adapter catches nothing and raises nothing of its own. That is what lets the
+generic runtime tell a config fault from a run fault by where it arose: the
+former surfaces from ``prepare_run``, the latter from the returned closure. It
+also needs no partial-success channel, because every way a modality can fail to
+publish raises before its own commit, so a returned result always describes work
+that is canonical. How a raise is labelled and what it exits with belongs to
+``pipeline_runtime`` - see that module rather than a paraphrase here.
 """
 
 from collections.abc import Sequence
@@ -52,20 +52,6 @@ from cosmos_curator.next.core.pipeline_kind import PipelineKind, PipelinePreset,
 
 if TYPE_CHECKING:
     from cosmos_curator.next.recipes.embeddings.embed import EmbeddingRunResult
-
-
-class IncompleteRunError(RuntimeError):
-    """A run published its survivors but skipped fragments, so it cannot be called finished.
-
-    Raised rather than returned so the process exits non-zero: a caller that
-    decides completion from the exit status would otherwise record the attempt as
-    finished and never run again. The message is the run's summary line, and no
-    structured payload accompanies it.
-
-    A ``RuntimeError`` rather than a ``ValueError``, which keeps it outside the
-    ``except FillContractError`` family: every one of those is raised before its
-    own group committed, whereas this one only ever after.
-    """
 
 
 def _template_yaml() -> str:
@@ -90,6 +76,12 @@ model_weights_path: s3://example-bucket/model_weights/
 # Remove a modality to skip it. Action applies only to clips carrying an
 # action_data_uri (Mecka ACT2); with none present it is skipped, not failed.
 modalities: [text, image, action]
+
+# Where a crashed run's staged rows and checkpoints live, so a rerun resumes
+# instead of recomputing. Leave it out unless the staged rows belong on different
+# storage from the table: the default is a sibling directory of clips_lance_uri
+# suffixed __embedding_staging, which needs no configuration to work.
+# staging_root_uri: s3://example-bucket/robot_clips/embedding_staging
 """
 
 
@@ -139,15 +131,6 @@ def _list_presets() -> list[PipelinePreset]:
     return []
 
 
-def _total_skipped_fragments(result: "EmbeddingRunResult") -> int:
-    """Return the run's skipped-fragment count summed across modalities.
-
-    Shared by the message's skip suffix and the run's decision to refuse, so what
-    the line reports and what the exit status says cannot disagree.
-    """
-    return sum(modality.skipped_fragments for modality in result.modalities)
-
-
 def _run_payload(result: "EmbeddingRunResult", *, clips_lance_uri: str) -> dict[str, object]:
     """Project one run's summary onto the machine-readable ``--json`` payload.
 
@@ -155,8 +138,9 @@ def _run_payload(result: "EmbeddingRunResult", *, clips_lance_uri: str) -> dict[
     the CLI surface that promises it, and the recipe keeps returning its own
     verification summary unchanged.
 
-    Every per-modality ``skipped_fragments`` here is zero: a run that skipped one
-    raises instead of reporting, so this payload asserts completeness.
+    ``result_identity`` is reported because it is the only fact here that answers
+    "did my model change take effect": a rebuilt group and an untouched one
+    differ in the identity their rows now carry, not in the counts.
 
     A non-null ``ending_version`` with every ``committed_version`` null is the
     schema widening: the columns were added and no fill followed them.
@@ -170,8 +154,8 @@ def _run_payload(result: "EmbeddingRunResult", *, clips_lance_uri: str) -> dict[
                 "selected": modality.selected,
                 "filled": modality.filled,
                 "failed": modality.failed,
-                "skipped_fragments": modality.skipped_fragments,
                 "committed_version": modality.committed_version,
+                "result_identity": modality.result_identity,
             }
             for modality in result.modalities
         ],
@@ -198,20 +182,17 @@ def _version_phrase(result: "EmbeddingRunResult") -> str:
 
 
 def _run_message(result: "EmbeddingRunResult") -> str:
-    """Summarize one run in a single line: filled/selected per modality, the table version, then any skips.
+    """Summarize one run in a single line: filled/selected per modality, then the table version.
 
-    A skipped fragment's rows are counted in neither ``selected`` nor ``filled``,
-    so a run that lost fragments but committed the survivors reaches
-    ``filled == selected`` and would otherwise read as complete. The skip count is
-    therefore part of the verdict, not a detail: it is the only thing on this line
-    that says another run is owed.
+    The counts describe only what this run published, never how much of the group
+    is complete: a top-up that embedded four new clips onto a million filled rows
+    reads ``4/4``. Completeness is not claimed here because nothing claims it -
+    the owed-work predicate is re-evaluated every run.
     """
     per_modality = ", ".join(
         f"{modality.modality.value} {modality.filled}/{modality.selected}" for modality in result.modalities
     )
-    skipped = _total_skipped_fragments(result)
-    suffix = f"; {skipped} fragment(s) SKIPPED, re-run to fill the rows they owed" if skipped else ""
-    return f"embeddings: {per_modality}; {_version_phrase(result)}{suffix}"
+    return f"embeddings: {per_modality}; {_version_phrase(result)}"
 
 
 def _prepare_run(
@@ -229,17 +210,14 @@ def _prepare_run(
         from cosmos_curator.next.recipes.embeddings.embed import run_embedding_pipeline  # noqa: PLC0415
 
         result = run_embedding_pipeline(resolved)
-        message = _run_message(result)
-        # A skipped fragment was never written, and whether it owed rows is not
-        # knowable from here (see the outage guard in fill.py), so the run refuses
-        # rather than claim completion it cannot prove; the fill is idempotent, so
-        # a needless re-run is cheap. A row counted in ``failed`` WAS attempted and
-        # left NULL, which no re-run changes, so it deliberately does not raise.
-        if _total_skipped_fragments(result) > 0:
-            raise IncompleteRunError(message)
+        # Returned unconditionally: a modality either published its owed rows or
+        # raised, so there is no partial outcome for this adapter to turn into an
+        # exit status. A row counted in ``failed`` WAS attempted and left NULL,
+        # which the next run's own predicate re-selects, so it is reported rather
+        # than refused.
         return PipelineRunOutput(
             json_payload=_run_payload(result, clips_lance_uri=resolved.clips_lance_uri),
-            message=message,
+            message=_run_message(result),
         )
 
     return run

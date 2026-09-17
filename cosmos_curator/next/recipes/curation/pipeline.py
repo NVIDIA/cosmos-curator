@@ -1104,8 +1104,9 @@ def _require_recorded_producer(
     msg = (
         f"embedding group {group.name!r} on {dataset.uri} has {filled_rows} row(s) with a vector this "
         f"run reads ({list(consumed)}) but no producer identity in {unrecorded}; vectors without a "
-        f"recorded producer cannot be curated in one metric. Re-run the embeddings leg with "
-        f"--reset-group {group.name} to refill the group, then curate again"
+        f"recorded producer cannot be curated in one metric. Re-run the embeddings leg to refill "
+        f"the group - an ordinary run recomputes any row whose recorded identity is missing or "
+        f"names another computation - then curate again"
     )
     raise ValueError(msg)
 
@@ -1154,9 +1155,10 @@ def _require_single_producer(dataset: lance.LanceDataset, weights: Mapping[str, 
                 msg = (
                     f"embedding group {group.name!r} on {dataset.uri} was filled by more than one "
                     f"producer: {column!r} holds {list(producers)}. This run would compare those rows "
-                    f"in one cosine space, where vectors from two producers share no geometry; re-run "
-                    f"the embeddings leg with --reset-group {group.name} to refill it from one "
-                    f"producer, then curate again"
+                    f"in one cosine space, where vectors from two producers share no geometry. Two "
+                    f"producers is what a group looks like PART-WAY through a rebuild, so finish the "
+                    f"embeddings leg - an ordinary re-run recomputes every row still naming the older "
+                    f"computation - then curate again"
                 )
                 raise ValueError(msg)
             if producers:

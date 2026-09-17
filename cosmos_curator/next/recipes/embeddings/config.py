@@ -16,10 +16,11 @@
 """Typed config for the embedding recipe (pydantic; no business logic).
 
 Embedding-specific knobs only: which modalities run, per-modality resources, the
-shared ``clips.lance`` table (both the read source and the write target), and the
-dev fragment cap. There is no output-table, side-table, or PCA-artifact
-URI: the recipe updates ``clips.lance`` in place and derives the action-PCA
-artifact directory from it. Validation is strict (unknown keys rejected, no silent
+shared ``clips.lance`` table (both the read source and the write target), the
+recovery staging settings, and the dev fragment cap. There is no output-table or
+side-table URI: the recipe updates ``clips.lance`` in place, and both the
+action-PCA artifact directory and the recovery staging root default to locations
+derived from the table. Validation is strict (unknown keys rejected, no silent
 coercion) so a malformed config fails at assembly on the driver rather than deep
 inside a Ray Data actor.
 
@@ -216,9 +217,11 @@ class EmbeddingPipelineConfig(BaseModel):
     Beyond the version gate and the discriminator, only ``clips_lance_uri`` is
     required; everything else defaults. Which modalities run is decided by
     ``modalities``, so a single modality can be embedded on its own. There is
-    deliberately no output-table, side-table, or PCA-artifact URI: the recipe
-    updates ``clips.lance`` in place and always derives the action-PCA artifact
-    directory from it.
+    deliberately no output-table or side-table URI: the recipe updates
+    ``clips.lance`` in place. The action-PCA artifact directory and the recovery
+    staging root are both DERIVED from the table by default, so a run recovers
+    from a crash without being configured to; ``staging_root_uri`` exists only to
+    put the transient staged rows on different storage from the table.
     """
 
     model_config = _MODEL_CONFIG
@@ -251,6 +254,20 @@ class EmbeddingPipelineConfig(BaseModel):
         default=MODEL_WEIGHTS_PREFIX,
         description="Weights base passed to download_models; the default is a placeholder bucket that must be "
         "overridden for a run against pre-staged weights.",
+    )
+    staging_root_uri: NonBlankStr | None = Field(
+        default=None,
+        description="Root for the transient checkpoint and staged-row directories a crashed run resumes from. "
+        "Defaults to a sibling of clips_lance_uri suffixed __embedding_staging, so recovery needs no configuration; "
+        "set it to put the staged rows on different storage from the table.",
+    )
+    parquet_rows_per_file: int = Field(
+        default=4_096,
+        ge=1,
+        description="Rows per staged Parquet file, requested of Ray's sink as a hint rather than a guarantee. One "
+        "file is one write bundle, so with the modality's batch_size it sets the recovery granularity: what a crash "
+        "re-computes is bounded by the LARGER of the two, and raising a batch_size above this value makes this knob "
+        "the smaller one and so no longer the bound.",
     )
     max_fragments: int | None = Field(
         default=None,

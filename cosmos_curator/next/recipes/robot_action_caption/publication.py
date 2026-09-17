@@ -599,9 +599,13 @@ def _prepare_fragments(  # noqa: PLR0913 - mirrors the phase boundary it fans ou
 
     """
     items = [{FRAGMENT_ID_COLUMN: fragment_id} for fragment_id in fragment_ids]
-    # Ray accepts fn_kwargs for a keyword-only batch UDF; its public stub does not
-    # model that callable shape.
-    results = ray.data.from_items(items).map_batches(
+    # One block per fragment, stated rather than autodetected. Task count follows
+    # BLOCK count, and ``from_items`` autodetects
+    # ``min(len(items), max(200, 2 * avail_cpus))``, so a batch_size of one
+    # fragment alone buys that many tasks each walking its block's fragments in
+    # series. The override cannot over-split: the autodetected value is itself
+    # clamped to ``len(items)``.
+    results = ray.data.from_items(items, override_num_blocks=len(items)).map_batches(
         _prepare_batch,  # type: ignore[arg-type]
         batch_format="pyarrow",
         batch_size=_FRAGMENTS_PER_TASK,
@@ -827,8 +831,12 @@ def _committed_version_after(  # noqa: PLR0913 - every input independently verif
         if fragment is None:
             absent.append(fragment_id)
             continue
-        # O(fragments) filtered counts on one column, never O(rows) on the
-        # driver: the same per-fragment count planning already uses.
+        # One filtered count per wave fragment, projecting one column. A
+        # filtered count is a READ of that column's pages, not a metadata
+        # lookup (only the unfiltered form answers from the manifest), so the
+        # bound worth stating is the wave rather than the corpus - and this
+        # sits on the error path, where a slow check delays a run already in
+        # trouble.
         owed_counts.append(int(fragment.count_rows(filter=row_filter)))
     if absent:
         # An absent fragment is UNVERIFIABLE, not benign, so it must not be

@@ -18,11 +18,12 @@ table (clips.lance)     +--> modality . --> + embedding_._* columns --+    one r
 — the schema-evolution and column-write machinery is modality-agnostic, and a
 modality is *data* (group, source columns, embedder, actor shape) rather than a
 subclass. Its embedder must be **key-blind** and **cardinality- and
-order-preserving**: the batch it is handed carries `clip_id` (the fill joins on it)
-but the embedder must not read it, and it returns exactly one row per input row, so
-a clip it cannot embed becomes an all-NULL row rather than a dropped one. The recipe attaches the key positionally, so a batch whose row count changes
-raises `FillContractError`, as does one whose columns do not cast to the stored
-schema — the contract in full is
+order-preserving**: the batch it is handed carries `clip_id` (publication joins on
+it) but the embedder must not read it, and it returns exactly one row per input row,
+so a clip it cannot embed becomes an all-NULL row rather than a dropped one. The
+recipe attaches the key positionally, so a batch whose row count changes fails the
+attempt, as does one whose columns do not cast to the stored schema — the contract
+in full is
 [design doc](../../../docs/curator/design/curator-next-embeddings.md) §4.1, §4.2,
 §7, §11.3.
 
@@ -149,11 +150,11 @@ video, no LeRobot `data/*.parquet`, no `meta/`. It reads one row per
 ### The source row (one `(span, view)` clip)
 
 Each modality reads only its own source columns. `clip_id` is both the row's
-identity and the key each fill joins on:
+identity and the key publication joins on:
 
 | Field | Where it came from (set by `robot_action_split`) | Feeds |
 |---|---|---|
-| `clip_id` | SHA-256 of `(media_contract_version, span_group_id, video_bitrate[, view_name])` | the write join key (no embedder reads it) |
+| `clip_id` | SHA-256 of `(media_contract_version, span_group_id, video_bitrate[, view_name])` | the publication join key (no embedder reads it) |
 | `task_name` | `meta/tasks.parquet` label, materialized into the row | text |
 | `subtask_name` | `meta/subtasks.parquet` label, materialized into the row | text |
 | `clip_uri` | `.../video/<view>/<clip_id>.mp4` — the **generated clip**, not the raw recording | image |
@@ -202,41 +203,54 @@ NULL.
 
 | Group | Columns | Scale |
 |---|---|---|
-| text | `embedding_text_subtask` (fsl<f32,384>), `embedding_text_task` (fsl<f32,384>), `embedding_text_model_id` (string) | unit-norm |
-| image | `embedding_image` (fsl<f32,384>), `embedding_image_model_id` (string) | unit-norm |
+| text | `embedding_text_subtask` (fsl<f32,384>), `embedding_text_task` (fsl<f32,384>), `embedding_text_model_id` (string — a **result-identity** digest, not a model name) | unit-norm |
+| image | `embedding_image` (fsl<f32,384>), `embedding_image_model_id` (string — a **result-identity** digest) | unit-norm |
 | action | `embedding_action` (fsl<f32,97>), `embedding_action_descriptor_version` (string), `embedding_action_pca_fingerprint` (string) | raw PCA |
 | action PCA | `clips.lance__action_pca/<sha256-fingerprint>.npz` (immutable, content-addressed basis) | — |
 
-**Direct-column persistence — the fragment is the unit of work.** A modality adds
-its group in one metadata `add_columns` commit, then fills it: the driver pins a
-version and lists the **fragment ids** (a metadata read — no row is scanned or
-counted), hands those ids to an actor pool, and each worker re-opens the table at
-that version, scans its own fragment's pending rows, embeds them, and writes the
-group's columns with `LanceFragment.update_columns` joined on `clip_id`. Only
-fragment metadata (never a vector) reaches the driver, which commits every touched
-fragment in **one** atomic `LanceOperation.Update`.
+**Direct-column persistence — two phases with a durable boundary.** A modality adds
+its group in one metadata `add_columns` commit, then runs:
 
-Neither step creates a **tombstone**: `add_columns` on an all-nullable schema is
-metadata-only, and `update_columns` rebinds field ids to a new column file without
-replacing any row, so Lance writes no deletion vector. A fragment with nothing
-pending is not rewritten at all, so a re-run over a filled table commits nothing.
+```text
+plan   one filtered count_rows per fragment, on the driver
+         |                         (owed = missing OR stale result identity)
+         v
+stage  read owed rows --> embed --> staged Parquet + Ray row checkpoint
+         |                          (nothing touches clips.lance yet)
+         v
+publish per-fragment update_columns joined on clip_id, all committed as
+         |                          ONE LanceOperation.Update
+         v
+drop the staging workspace
+```
 
-**A failed fragment is skipped, not fatal.** The worker warns, the run commits
-every fragment that did succeed, and the skipped rows keep their NULL group values
-— so the ordinary pending predicate re-selects them and the next run refills them
-with no operator action. The one exception is `FillContractError`, whose contract
-is "a failure the run must stop for rather than skip past": a violated invariant of
-the fill (a broken embedder — wrong row count, or a schema that does not cast — or
-a fragment absent at the pinned version), and a total outage (nothing written while
-at least one fragment failed). Which of the two occurred, and so whether to re-run
-or to fix an input, is in the message. See design doc §7.
+Only fragment metadata (never a vector) reaches the driver. The staged rows plus
+Ray's job-level row checkpoint are the whole of the recovery state — there is no
+marker or manifest file — so a crashed run is resumed by **re-running the same
+config**: it recomputes only the rows that were not yet staged, and it publishes
+nothing until the whole modality is staged.
+
+Neither write step creates a **tombstone**: `add_columns` on an all-nullable schema
+is metadata-only, and `update_columns` rebinds field ids to a new column file
+without replacing any row, so Lance writes no deletion vector. A fragment owing
+nothing is never planned, so a re-run over a filled table commits nothing.
+
+**A worker fault is fatal to the attempt, and that is what the checkpoint pays
+for.** Publishing around a lost subset would produce a group that reads as complete
+while an unknown set of rows holds nothing, so nothing is published unless every
+owed row was staged. A **per-row** failure is different: that row's group is
+published all-NULL — including over a vector it previously held — so it stays owed
+and the next run retries it. Every other refusal (an unusable staged partition, a
+prepared set that differs from the plan, a fragment whose staged rows do not tally
+with its planned owed count, a width mismatch, a failed commit) happens **before**
+the commit, leaving the previous version current. See design doc §7.
 
 ## Reuse the action components on their own
 
 The extractor, projector and fused embedder are plain callables over Arrow batches,
 so they run without Ray or Lance; `PcaArtifactStore` owns the immutable basis and
 its storage. What none of them do is write `clips.lance` — the column write and its
-commit belong to the recipe's `fill.py`.
+commit belong to the recipe's `fill.py` and `publication.py`.
 
 ```python
 import pyarrow as pa
@@ -277,13 +291,19 @@ themselves (the PCA fit does exactly that).
 - **Why one image frame / why PCA / why 97-d?** Cheap correlated-frame proxy;
   reduce a redundant 600-d motion descriptor — design doc §4.2, §5.
 - **Can I regenerate one modality / re-run safely?** Yes — `modalities` selects
-  which run; a re-run fills only still-NULL rows (which is also how a skipped
-  fragment retries), and `--reset-group` replaces a whole group — design doc §7,
-  §11.
+  which run, and a run selects only the rows that are missing or whose recorded
+  result identity names another computation. A model swap, a re-pin, or a
+  `result_version` bump therefore replaces that group through an ordinary re-run;
+  there is no reset command and no rebuild mode — design doc §7, §11.
+- **A run crashed. Do I lose the GPU time?** No — re-run the same config. The
+  staged rows and the row checkpoint under the staging root are reused, so only
+  what was not staged is recomputed, and the table never held a partial group —
+  design doc §7.
 - **Why are some clips NULL / missing in a modality?** A modality leaves the row's
   group all-NULL when it cannot embed it or the row is inapplicable; a modality
   that never ran has no such column at all — design doc §3, §8.
 - **What if I delete a PCA `.npz`?** Bases are immutable and content-addressed —
   deleting one that live rows reference makes the next action run fail with a clear
-  missing-basis error. `--reset-group action` followed by a run fits a fresh basis
-  and recomputes the group with it — design doc §5, §11.
+  missing-basis error, and it can only be restored, not regenerated. A refit is a
+  descriptor change: bump `DESCRIPTOR_VERSION` and the rows become stale, so the
+  next run fits a fresh basis and recomputes them — design doc §5, §11.

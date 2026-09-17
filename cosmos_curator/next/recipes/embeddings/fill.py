@@ -13,557 +13,429 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Distributed per-fragment fill of one embedding column group, plus its single commit.
+"""Stage one embedding column group's computed vectors as checkpointed Parquet.
 
-The unit of work is a LANCE FRAGMENT. Each Ray actor is handed fragment ids, and for
-each one it re-opens the table at the run's pinned version, scans just that
-fragment's pending rows, computes, and writes the group's columns back in place::
+Computation and publication are separate phases. This module owns the first: it
+turns owed rows into staged rows and records which rows are done. Nothing here
+writes to the clips table, and no worker holds the capability to - publication is
+one driver-side commit in ``publication.py``.
 
-    from_items(fragment_ids).map_batches(_FragmentWorker, batch_size=1)
-        |   per fragment, inside one actor:
-        |     READ       dataset(uri, version).get_fragment(id)
-        |                fragment.scanner(columns=[clip_id, *inputs], filter=row_filter)
-        |                nothing pending -> emit zero rows, fragment left untouched
-        |     TRANSFORM  embedder(batch) -> ONLY the group's columns, same rows,
-        |                in the same order
-        |     WRITE      attach clip_id positionally, cast to the stored types
-        |                fragment.update_columns(tbl, left_on=clip_id, right_on=clip_id)
-        |                emit one JSON string row
-        |     ON FAILURE log a WARNING and emit an ERROR payload instead; the
-        |                fragment is skipped, not fatal (see below). A violated
-        |                fill contract emits a FATAL payload instead of an ERROR one
+::
+
+    read_datasource(EmbeddingScanDatasource)   owed rows, each carrying its
+        |                                      fragment id and checkpoint id
+        |   override_num_blocks = owed fragments
         v
-    driver: collect O(touched fragments) results, raise on a FATAL payload,
-            otherwise partition written from skipped; nothing written while
-            something was skipped is an outage and also raises
+    repartition(target_num_rows_per_block)     split a large fragment without
+        |   strict=False                       mixing adjacent ones
         v
-    Transaction(Update(written_fragments, fields_modified))   one commit per modality
+    map_batches(EmbeddingBatchWorker)          embedder built once per actor;
+        |   ActorPoolStrategy(1, placeable)    compute only, no Lance handle
+        v
+    write_parquet(results_uri, APPEND)         Ray commits the checkpoint ids of
+            partition_cols=[fragment_id]       each completed write bundle
 
-Why this shape:
+The whole chain runs inside one ``installed_checkpoint`` block, and the shape
+above is a CORRECTNESS requirement of it rather than a preference. Ray plans job
+checkpointing only for a DAG that starts at a read and ends at a write: the read
+is where the skip filter is inserted, and the write is the only moment at which a
+row is provably finished. A ``materialize()`` terminal would disable the whole
+mechanism with nothing but a Python warning.
 
-- **No shuffle.** The scan is fragment-local, so compute and write are fused inside
-  one actor. There is no ``groupby`` barrier forcing all compute to finish before any
-  write can start, and no intermediate vector is ever materialized in Ray's object
-  store.
-- **Driver state is O(fragments), not O(rows).** ``_RESULT_SCHEMA`` is the enforced
-  guarantee: a worker returns one JSON string per touched fragment, and a single
-  string column STRUCTURALLY cannot carry column data back to the driver.
-- **No row is ever replaced, so no tombstone is created.** ``update_columns`` writes a
-  NEW file holding only the group's columns for the fragment's existing rows, in their
-  existing offset order, and returns updated ``FragmentMetadata`` plus the field ids it
-  rebound. ``LanceOperation.Update`` then re-points those field ids at the new file for
-  the touched fragments only. Row addresses, row count, and every other column's file
-  are untouched, so no deletion vector is written. The superseded column file stays on
-  disk referenced only by older versions.
-- **A fragment with nothing pending is not rewritten at all.** The worker probes the
-  scanner for a first batch before calling ``update_columns``; with no pending row it
-  emits zero result rows, so an unchanged rerun of a fully embedded table commits
-  nothing.
-- **A fragment that fails is skipped, not fatal.** One flaky fragment must not
-  discard the hours of GPU time every other fragment already spent, so the worker
-  catches the failure, warns, and reports it; the run commits everything that did
-  succeed. No retry machinery is needed because a skipped fragment was never
-  written: any rows it still owed stay pending, so the ordinary pending predicate
-  re-selects them on the next run. The exception is ``FillContractError``, which
-  stops the run instead; see its docstring for the two things it covers.
-- **Unless NOTHING was written, which is not a partial loss.** The skip trades one
-  fragment's work for the rest of the run's, and stops being a trade when there is
-  no rest: the group is untouched and every count is zero, exactly as for a run
-  that owed no work. ``FillContractError`` is that boundary too, and the skip count
-  is what distinguishes the two - hence it is carried on the result, not only logged.
-- **The inputs every fragment shares are checked once, on the driver.** The
-  projection and the row filter do not vary by fragment, so a broken one is not a
-  fragment fault at all: it would fail identically on every fragment, and a run
-  that skipped them all would report success over an untouched group.
-  ``_check_fill_preconditions`` resolves the scan plan before any worker starts,
-  which is what leaves the per-fragment handler free to be broad - by the time it
-  runs, the faults still reachable are genuinely local ones.
-- **A contract violation travels as a payload, not as an exception.** Ray Data
-  replaces whatever a UDF raises with a ``UserCodeException`` wrapper and does not
-  carry the original object across the task boundary, so an exception raised in a
-  worker reaches the driver as a ``RayTaskError`` that is no longer an instance of
-  its own cause. The worker therefore emits a FATAL payload and the DRIVER raises
-  ``FillContractError`` - on the first such payload it sees, so the remaining
-  fragments are abandoned rather than run for a result that would be discarded.
+The checkpoint id must therefore survive untouched from the read to the sink. It
+is projected by the datasource, carried through the worker by
+:class:`EmbeddingBatchWorker`, and written into the staged file, because Ray reads
+it back off the sink to mark a row complete. A plan that dropped it anywhere in
+between would record no progress while appearing to work.
 
-``update_columns`` joins on the ordinary persisted ``clip_id`` column with left-outer
-semantics: a fragment row absent from the update table keeps its previous group value,
-which is what makes writing only the pending subset of a fragment safe.
+What a crash costs is one write bundle per actor, not the phase: rows in bundles
+that already committed are filtered out at the read on the next attempt, so their
+GPU time is never paid twice.
 
-The producer does not guarantee ``clip_id`` uniqueness, and Lance resolves a duplicate
-key by taking one matching row's value, so this path ASSUMES rows sharing a ``clip_id``
-agree: same source columns, and therefore the same computed group value and the same
-applicability. Under that assumption every duplicate ends up with the value it would
-have computed for itself. Rows that share a key but disagree on their source columns
-are malformed input, not a case this path reconciles - it neither detects nor
-de-duplicates them, because doing so would cost a shuffle on every run to guard
-against data the producer is not supposed to emit.
-
-The table is assumed COMPLETE AND QUIESCENT for the duration of a run: no producer
-append, no second embedding writer. Under that contract the pinned version is not a
-concurrency mechanism - it is there because every worker must scan one schema, and
-because Lance needs a base version to build a valid ``Update``.
-
-A commit that loses a race is nonetheless REBASED onto the newer manifest, up to
-``LanceDataset.commit``'s own default retry count, and that is desirable here rather
-than merely tolerated: this transaction names specific fragments and specific field
-ids, so a producer append of NEW fragments cannot conflict with it. The replayed
-``Update`` still lands, the appended rows keep their NULL group values, and the next
-run fills them through the ordinary pending path. Only a genuine conflict - a second
-embedding writer on the same group, which the quiescence contract forbids - exhausts
-the rebases, and that surfaces as a ``ValueError`` rather than a merged result.
+A worker fault is FATAL to the attempt: nothing here tolerates a lost partition
+of rows. The checkpoint is what makes that affordable - a re-run resumes rather
+than restarting - and it is what a tolerated loss cannot offer, since publishing
+around a failed subset produces a group that reads as complete while an unknown
+set of rows holds nothing.
 """
 
-import json
-from collections.abc import Iterator
-from typing import Any
+import math
+from typing import Any, Final
 
-import attrs
 import lance
 import pyarrow as pa
 import ray
-from lance.fragment import FragmentMetadata, LanceFragment
 from loguru import logger
-from ray.data import ActorPoolStrategy
+from ray.data import ActorPoolStrategy, SaveMode
 
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
+from cosmos_curator.next.core.ray_runtime import installed_checkpoint
 from cosmos_curator.next.embeddings.schemas import KEY_COLUMN, EmbeddingColumnGroup
 from cosmos_curator.next.recipes.embeddings.columns import pending_filter
-from cosmos_curator.next.recipes.embeddings.modalities import ModalityFill, ModalityResult
+from cosmos_curator.next.recipes.embeddings.datasource import (
+    EmbeddingScanDatasource,
+    EmbeddingScanPlan,
+    PinnedScan,
+)
+from cosmos_curator.next.recipes.embeddings.modalities import ModalityFill, WorkerResources
+from cosmos_curator.next.recipes.embeddings.staged import (
+    CHECKPOINT_ID_COLUMN,
+    FRAGMENT_ID_COLUMN,
+    staged_schema,
+)
+from cosmos_curator.next.recipes.embeddings.workspace import EmbeddingWorkspace
 
-# The single column a worker is allowed to send the driver: one JSON payload per
-# touched fragment, carrying its identity, its serialized updated metadata, the
-# rebound field ids and two counters. A lone string column is the mechanism that
-# keeps driver memory O(touched fragments) rather than O(rows) - it cannot be
-# widened into a full-corpus vector gather without changing its type.
-_RESULT_COLUMN = "result_json"
-_RESULT_SCHEMA: pa.Schema = pa.schema([pa.field(_RESULT_COLUMN, pa.large_string())])
+# Written as a PAIR because Ray couples them: ``_apply_default_remote_args`` forces
+# ``max_task_retries=-1`` whenever ``max_restarts`` is non-zero, so bounding the
+# restarts alone would leave tasks retrying forever. Both are bounded rather than
+# zero: an actor that dies on a transient fault should be replaced, but an actor
+# dying on a permanent one - unreadable media, a model that cannot load - must
+# stop the attempt instead of looping on it for the run's lifetime.
+ACTOR_RESTART_BOUNDS: Final = {"max_restarts": 5, "max_task_retries": 5}
 
-# Keys that DISCRIMINATE the two FAILURE payload shapes a worker can emit; a
-# fragment that was written carries the metadata keys instead. They are separate
-# keys rather than one flag because the driver must react to them in opposite ways:
-# ``_ERROR_KEY`` marks a fragment that was skipped and the run carries on without
-# it (``_collect`` partitions on its presence), while ``_FATAL_KEY`` marks a
-# violated fill contract that stops the run (``_run_workers`` raises on it).
-_ERROR_KEY = "error"
-_FATAL_KEY = "fatal"
+# The identity columns a staged row carries out of the worker, in staged-schema
+# order. Taken from the INPUT batch rather than from the embedder, which never
+# sees them.
+_IDENTITY_COLUMNS: Final = (KEY_COLUMN, FRAGMENT_ID_COLUMN, CHECKPOINT_ID_COLUMN)
 
-# The column ``from_items`` carries into the worker: one fragment id per work item.
-_FRAGMENT_ID_COLUMN = "fragment_id"
+# Ray's own key for the heap reservation, both in the ``memory=`` request and in
+# ``available_resources()``. Named once because the same string has to index the
+# cluster snapshot AND select the byte rendering below: as two literals they could
+# drift, and the divisor would then silently stop dividing by memory at all.
+_MEMORY_RESOURCE: Final = "memory"
 
-# Ray Data work-item batch size. Pinned to one fragment per ``__call__`` so a worker's
-# memory is bounded by one fragment's in-flight batch. Distinct from
-# ``WorkerResources.scan_batch_size``, which is how many ROWS of that fragment reach
-# the embedder at a time. It does NOT set the run's concurrency: that ceiling belongs
-# to the block count below.
-_FRAGMENTS_PER_TASK = 1
-
-# Ray Data's own block ceiling for ``from_items``, and therefore this fill's
-# concurrency ceiling: ``min(len(fragment_ids), _MAX_FROM_ITEMS_BLOCKS)``. Above it one
-# block carries about ceil(N / 200) fragment ids that a single batch stream walks
-# serially, so a one-fragment table runs on one worker however large the actor pool is.
-# Measured on ray 2.55.1 and NOT re-verified on the pinned 2.56.0 - it is a Ray Data
-# autodetect default, so Ray is precisely the axis that could move it. Every run logs
-# the ceiling it derived; the lever that lifts it, and why this recipe declines to pull
-# it, are in ``docs/curator/design/curator-next-embeddings.md`` section 7.
-_MAX_FROM_ITEMS_BLOCKS = 200
+_BYTES_PER_GIB: Final = 1024**3
 
 
-class FillContractError(ValueError):
-    """A failure the run must stop for, rather than skip past. Two kinds qualify.
+class EmbeddingBatchWorker:
+    """Ray Data callable class computing one modality's vectors for a batch of owed rows.
 
-    Scoped to what the FILL detects, so the two are a violated invariant - a wrong
-    row count or schema from the embedder, a fragment absent at the pinned version,
-    none of which a retry fixes - and a total outage: nothing written while at least
-    one fragment failed. Their responses are opposite, re-run the outage versus fix
-    the inputs behind the violation, and that guidance lives in each raise's
-    MESSAGE, not in the type (``docs/curator/design/curator-next-embeddings.md``
-    section 7).
-
-    A ``ValueError`` subclass so it joins the recipe's other pre-commit refusals as
-    one thing a caller handles: the run stopped before anything was published. It
-    always reaches the CALLER from the driver - a worker raises it internally, but
-    as a signal its own handler turns into a FATAL payload, because the raise would
-    otherwise arrive at the driver as a Ray wrapper of another type.
+    Constructed once per actor from picklable arguments only, so the model weights
+    load once per actor rather than once per batch. It opens no Lance dataset and
+    holds no storage client: this actor pool is the only place in the leg that
+    holds a GPU, and giving it write capability is what the staged-then-publish
+    split exists to avoid.
     """
 
-
-@attrs.define
-class _FillCounters:
-    """Mutable row/fill tallies accumulated while a fragment's update stream is consumed.
-
-    ``update_columns`` pulls the update batches itself, so the counts are only final
-    once it returns; a small mutable holder lets the generator that produces those
-    batches report what it saw without buffering the batches to count them first.
-
-    Attributes:
-        rows: Pending rows the fragment scan yielded (this fragment's ``selected``).
-        filled: Of those, the rows whose primary vector came out non-NULL.
-        contract_error: Message of a fill-contract violation the generator raised,
-            recorded because the raise itself does not survive the reader boundary.
-
-    """
-
-    rows: int = 0
-    filled: int = 0
-    contract_error: str | None = None
-
-
-class _FragmentWorker:
-    """Ray Data callable class filling one fragment's column group per invocation.
-
-    Constructed once per actor from picklable arguments only (no dataset handle, no
-    loaded model): it builds the embedder in ``__init__`` so the weights load once per
-    actor rather than once per fragment, and opens the pinned dataset lazily on first
-    use so nothing live crosses the pickle boundary.
-
-    Every fragment it touches is read at the run's pinned ``read_version``, so every
-    worker sees one schema and one row set for the whole run.
-    """
-
-    def __init__(  # noqa: PLR0913 -- every argument is required worker state; grouping them would just hide the same set
+    def __init__(
         self,
         *,
-        uri: str,
         group: EmbeddingColumnGroup,
-        read_version: int,
-        storage_options: dict[str, str] | None,
-        source_columns: tuple[str, ...],
-        row_filter: str | None,
-        scan_batch_size: int,
+        staged: pa.Schema,
         embedder_cls: type,
         embedder_kwargs: dict[str, Any],
     ) -> None:
-        """Store the fill parameters and build this actor's embedder once."""
-        self._uri = uri
+        """Store the staged contract and build this actor's embedder once.
+
+        Args:
+            group: The modality's column group, named in failure messages.
+            staged: The schema every returned batch is cast to.
+            embedder_cls: Callable class taking an Arrow batch of the modality's
+                source columns and returning exactly the group's columns.
+            embedder_kwargs: Keyword arguments ``embedder_cls`` is built from.
+
+        """
         self._group = group
-        self._read_version = read_version
-        self._storage_options = storage_options
-        self._source_columns = source_columns
-        self._row_filter = row_filter
-        self._scan_batch_size = scan_batch_size
+        self._staged = staged
         self._embedder = embedder_cls(**embedder_kwargs)
-        self._dataset: lance.LanceDataset | None = None
-        self._update_schema: pa.Schema | None = None
 
     def __call__(self, batch: pa.Table) -> pa.Table:
-        """Fill every fragment named in ``batch``, returning one result row per touched fragment.
-
-        A fragment with no pending rows contributes no result row, so the driver's
-        collector sees only fragments that were either written or skipped, and needs
-        no sentinel filtering.
-        """
-        payloads = [self._fill_fragment(int(fragment_id)) for fragment_id in batch.column(_FRAGMENT_ID_COLUMN)]
-        touched = [payload for payload in payloads if payload is not None]
-        return pa.table({_RESULT_COLUMN: pa.array(touched, type=pa.large_string())}, schema=_RESULT_SCHEMA)
-
-    def _fill_fragment(self, fragment_id: int) -> str | None:
-        """Fill one fragment, reporting a failure as a payload; ``None`` if nothing was pending.
-
-        Two failure shapes, because the driver must react to them in opposite ways.
-        An ordinary fault becomes a SKIP, which is safe rather than lossy because a
-        failed fragment was never written: any rows it still owed stay pending, so
-        the ordinary pending predicate re-selects them on the next run, and one flaky
-        fragment no longer discards every other fragment's completed work. A violated
-        fill contract becomes a FATAL payload the driver raises on, because no retry
-        can fix it.
-
-        Neither leaves the worker as an exception, so the two must be distinguishable
-        by payload: Ray Data does not carry the original object across the task
-        boundary, so a raise here would reach the driver as an untyped wrapper. Ray
-        also sees no task failure, so its own retry never fires - an intra-run retry
-        becomes an inter-run one.
-        """
-        try:
-            return self._write_fragment(fragment_id)
-        except FillContractError as e:
-            logger.error(
-                f"embedding group {self._group.name!r}: fragment {fragment_id} of {self._uri} violated a fill "
-                f"contract ({e}); the run stops without committing"
-            )
-            return json.dumps({"fragment_id": fragment_id, _FATAL_KEY: str(e)})
-        except Exception as e:  # noqa: BLE001 - any fault must cost one fragment, not the modality
-            logger.warning(
-                f"embedding group {self._group.name!r}: fragment {fragment_id} of {self._uri} failed and is "
-                f"SKIPPED ({e!r}); it was not written, so any rows it still owed stay pending and the next "
-                f"run's pending filter re-selects them"
-            )
-            return json.dumps({"fragment_id": fragment_id, _ERROR_KEY: repr(e)})
-
-    def _write_fragment(self, fragment_id: int) -> str | None:
-        """Compute and write one fragment's group, or return ``None`` if nothing was pending.
-
-        The scanner is probed for a first batch BEFORE ``update_columns`` is called:
-        with no pending row the fragment must be left byte-for-byte untouched, but
-        ``update_columns`` would already have written an (empty) column file by the
-        time an exhausted reader revealed there was no work.
+        """Return one staged row per input row, in input order.
 
         Raises:
-            FillContractError: If the fragment id is absent at the pinned version, so
-                the fragment list the run derived and the table disagree, or if the
-                update stream reported a violated fill contract.
+            ValueError: If the embedder returned a different row count, or columns
+                that do not cast to the staged schema. Both messages are
+                self-contained because Ray replaces whatever a UDF raises with a
+                wrapper carrying neither the type nor the cause.
 
         """
-        dataset = self._open()
-        fragment = dataset.get_fragment(fragment_id)
-        if fragment is None:
-            msg = f"fragment {fragment_id} is not present in {self._uri} at version {self._read_version}"
-            raise FillContractError(msg)
-        counters = _FillCounters()
-        batches = self._update_batches(fragment, counters)
-        first = next(batches, None)
-        if first is None:
-            return None
-        schema = self._stored_update_schema()
-
-        def remaining() -> Iterator[pa.RecordBatch]:
-            yield first
-            yield from batches
-
-        reader = pa.RecordBatchReader.from_batches(schema, remaining())
-        try:
-            metadata, modified_field_ids = fragment.update_columns(reader, left_on=KEY_COLUMN, right_on=KEY_COLUMN)
-        except Exception as e:
-            # Only the first batch is embedded on this stack; Lance pulls the rest
-            # through the Arrow C data interface, which carries an error MESSAGE but
-            # not the Python exception object - a contract violation raised there
-            # re-emerges as a bare RuntimeError. Re-raising it from the recorded
-            # message is what keeps the fatal-vs-skip decision a property of the
-            # violation rather than of which batch it happened on.
-            if counters.contract_error is not None:
-                raise FillContractError(counters.contract_error) from e
-            raise
-        # The worker-to-driver SUCCESS payload (the skip path emits the error shape
-        # instead). Its keys ARE the collector's contract, so a change here has to
-        # land in ``_collect`` in the same edit. The metadata is
-        # embedded as the exact string ``FragmentMetadata.from_json`` expects, rather
-        # than as a nested object, so the round-trip cannot lose a field to re-encoding.
-        return json.dumps(
-            {
-                "fragment_id": fragment_id,
-                "metadata_json": json.dumps(metadata.to_json()),
-                "modified_field_ids": [int(field_id) for field_id in modified_field_ids],
-                "rows": counters.rows,
-                "filled": counters.filled,
-            }
-        )
-
-    def _update_batches(self, fragment: LanceFragment, counters: _FillCounters) -> Iterator[pa.RecordBatch]:
-        """Yield ``clip_id`` + group batches for one fragment's pending rows, tallying as it goes.
-
-        Streams rather than buffering: each scanned batch is embedded and handed
-        straight to ``update_columns``, so peak memory is one batch of vectors, not one
-        fragment's worth.
-
-        A contract violation is recorded on ``counters`` on its way out, because every
-        batch but the first is pulled from beneath a reader boundary that keeps the
-        message and discards the type; the caller re-raises it from there.
-        """
-        scanner = fragment.scanner(
-            columns=list(self._source_columns),
-            filter=self._row_filter,
-            batch_size=self._scan_batch_size,
-        )
-        schema = self._stored_update_schema()
-        for record_batch in scanner.to_batches():
-            if not record_batch.num_rows:
-                continue
-            source = pa.Table.from_batches([record_batch])
-            try:
-                update = self._embed(source, schema)
-            except FillContractError as e:
-                counters.contract_error = str(e)
-                raise
-            counters.rows += source.num_rows
-            counters.filled += update.num_rows - update.column(self._group.primary_vector).null_count
-            yield from update.to_batches()
-
-    def _embed(self, source: pa.Table, schema: pa.Schema) -> pa.Table:
-        """Embed one scanned batch and attach ``clip_id``, casting to the stored types.
-
-        The key is attached POSITIONALLY, which is sound only because the embedder is
-        cardinality- and order-preserving; the row-count check makes a violation of
-        that contract fail loudly here instead of silently pairing vectors with the
-        wrong clips.
-
-        Raises:
-            FillContractError: If the embedder did not return exactly one row per
-                input row, or returned columns that do not cast to the stored
-                schema. Deliberately NOT failures a fragment is skipped for: both
-                mean the embedder is broken, so every fragment would fail the same
-                way and the run would report an empty group as a success.
-
-        """
-        computed = self._embedder(source)
-        if computed.num_rows != source.num_rows:
+        computed = self._embedder(batch)
+        if computed.num_rows != batch.num_rows:
             msg = (
                 f"embedder for group {self._group.name!r} returned {computed.num_rows} row(s) for a "
-                f"{source.num_rows}-row batch; the contract is one output row per input row, in input order"
+                f"{batch.num_rows}-row batch; the contract is one output row per input row, in input order"
             )
-            raise FillContractError(msg)
-        keyed = computed.add_column(0, KEY_COLUMN, source.column(KEY_COLUMN))
+            raise ValueError(msg)
+        # Attached POSITIONALLY, which is sound only because the embedder is
+        # cardinality- and order-preserving - exactly what the check above
+        # enforces. Without it a violation would silently pair vectors with the
+        # wrong clips, and the checkpoint id with the wrong vector.
+        staged = computed
+        for index, name in enumerate(_IDENTITY_COLUMNS):
+            staged = staged.add_column(index, name, batch.column(name))
         try:
-            return keyed.cast(schema)
+            # Cast without a preceding ``select``: the cast is what rejects a
+            # missing, renamed, extra or reordered column, and selecting first
+            # would silently drop an extra one instead.
+            return staged.cast(self._staged)
         except (ValueError, pa.ArrowTypeError, pa.ArrowNotImplementedError) as e:
-            # All three arms were measured on pyarrow 24: a missing, renamed, extra
-            # or REORDERED column raises a plain ValueError, an uncastable dtype
-            # raises ArrowNotImplementedError, and a wrong vector width raises
-            # ArrowTypeError. The common base pa.ArrowException would be shorter but
-            # also catches ArrowMemoryError, and an allocation failure is transient -
-            # promoting it here would discard every other fragment's work.
+            # Measured at pyarrow 25.0.1: a missing, renamed, extra or REORDERED
+            # column raises a plain ValueError; an uncastable dtype raises
+            # ArrowNotImplementedError; a wrong vector width raises ArrowInvalid,
+            # which is caught by the ValueError arm it subclasses rather than by
+            # the ArrowTypeError one. So do NOT trim ValueError as redundant with
+            # the Arrow arms - it is what carries the width fault. The common base
+            # pa.ArrowException would be shorter but also catches ArrowMemoryError,
+            # and an allocation failure is transient, so promoting it here would
+            # fail an attempt a retry would have completed.
             msg = (
-                f"embedder for group {self._group.name!r} returned columns that do not match the stored "
-                f"schema: {e}. Expected {schema.to_string(show_field_metadata=False)}, "
-                f"got {keyed.schema.to_string(show_field_metadata=False)}"
+                f"embedder for group {self._group.name!r} returned columns that do not match the staged "
+                f"schema: {e}. Expected {self._staged.to_string(show_field_metadata=False)}, "
+                f"got {staged.schema.to_string(show_field_metadata=False)}"
             )
-            raise FillContractError(msg) from e
-
-    def _stored_update_schema(self) -> pa.Schema:
-        """Return ``clip_id`` + the group's fields, typed exactly as the table stores them.
-
-        Taken from the dataset schema rather than rebuilt, so the update table is cast
-        to the stored types (``clip_id`` may be ``large_string``) and ``update_columns``
-        never has to coerce.
-        """
-        if self._update_schema is None:
-            schema = self._open().schema
-            self._update_schema = pa.schema([schema.field(name) for name in (KEY_COLUMN, *self._group.field_names)])
-        return self._update_schema
-
-    def _open(self) -> lance.LanceDataset:
-        """Open (once per actor) the table pinned at the run's read version."""
-        if self._dataset is None:
-            self._dataset = lance.dataset(
-                self._uri,
-                version=self._read_version,
-                storage_options=self._storage_options,
-            )
-        return self._dataset
+            raise ValueError(msg) from e
 
 
-def fill_embedding_group(
+def stage_embedding_group(  # noqa: PLR0913 - each argument is an independent input to one phase
     dataset: lance.LanceDataset,
     fill: ModalityFill,
     *,
+    workspace: EmbeddingWorkspace,
+    plan: EmbeddingScanPlan,
+    rows_per_file: int,
     storage_options: dict[str, str] | None,
-    max_fragments: int | None = None,
-) -> ModalityResult:
-    """Fill one modality's pending rows fragment by fragment and publish them in one commit.
+) -> None:
+    """Compute one modality's owed rows and stage them, recording each completed row.
 
-    A fragment that fails is SKIPPED rather than failing the modality: it is left
-    unwritten, so any rows it still owed stay pending and the next run's pending
-    predicate re-selects them. The skip count reaches the caller on the result, and
-    a run that skipped a fragment without writing ANY of them is refused outright,
-    because its counts are indistinguishable from an honestly empty run's.
+    Returns nothing because the staged rows ARE the output: they live in
+    ``workspace.results_uri`` until publication reads them back. A count returned
+    here would be this attempt's alone, while publication needs the total across
+    every attempt that staged into this workspace.
 
     Args:
-        dataset: The clips table, open at the version the fill reads and commits against.
+        dataset: The clips table, open at the version ``plan`` was built against.
         fill: The modality's embedder, source columns, group and actor shape.
-        storage_options: Lance credentials for the workers and for the commit.
-        max_fragments: Visit at most this many fragments (``None`` visits all of them).
-
-    Returns:
-        The run's accounting over the fragments that were written;
-        ``committed_version`` is ``None`` when nothing was committed.
+        workspace: Namespace the staged rows and the checkpoint are written into.
+        plan: The owed fragments. Must be non-empty; a modality owing nothing is
+            skipped by the caller rather than executed with an empty plan.
+        rows_per_file: Rows per staged Parquet file. With the modality's batch
+            size it bounds what one checkpoint makes durable, and a crash costs
+            the LARGER of the two - lowering this alone below the batch size
+            buys no finer recovery.
+        storage_options: Lance credentials each read task re-opens the table with.
 
     Raises:
-        FillContractError: If the run's shared scan inputs do not resolve against
-            the table, a worker reported a violated fill invariant, or no fragment
-            was written while at least one failed.
-        ValueError: If two workers report the same fragment, or the commit fails.
+        ValueError: If ``plan`` is empty, if the shared scan inputs do not resolve
+            against the table, or if a worker violated the embedder contract.
 
     """
-    version = int(dataset.version)
-    # Listing fragments is a manifest read, not a scan. Slicing by ``max_fragments``
-    # bounds a first run against a large table; ``[:None]`` is the identity slice.
-    fragment_ids = [fragment.fragment_id for fragment in dataset.get_fragments()][:max_fragments]
-    row_filter = pending_filter(fill.group, fill.applicability_filter)
-    _check_fill_preconditions(dataset, fill, row_filter=row_filter)
-    if not fragment_ids:
-        logger.info(f"embedding group {fill.group.name!r}: table has no fragments to fill")
-        return ModalityResult.nothing_to_do(fill.modality)
-
-    # The number that actually caps this run, reported rather than inferred: a
-    # fragment-poor table starves an actor pool of any size, and nothing else in the
-    # log distinguishes that from a cluster too small to place the actors.
-    logger.info(
-        f"embedding group {fill.group.name!r}: visiting {len(fragment_ids)} fragment(s) of {dataset.uri} at "
-        f"v{version}; at most {min(len(fragment_ids), _MAX_FROM_ITEMS_BLOCKS)} run concurrently, whatever the "
-        f"cluster offers"
-    )
-    payloads = _run_workers(
-        dataset, fill, fragment_ids=fragment_ids, row_filter=row_filter, storage_options=storage_options
-    )
-    collected = _collect(payloads, fill.group)
-    # Total outage (design doc section 7). Checked before the log lines below so a
-    # refused run is reported once, as the refusal, rather than as a reassuring
-    # warning followed by a failure. The message claims no lost rows deliberately:
-    # a fragment can fault before its scan could report whether it held any.
-    if not collected.fragments and collected.skipped_fragments:
+    if not plan.fragments:
         msg = (
-            f"embedding group {fill.group.name!r}: no fragment was written while {collected.skipped_fragments} "
-            f"of the {len(fragment_ids)} fragment(s) visited failed, so nothing was committed and the group is "
-            f"untouched. Whether those fragments held pending rows is not knowable from here. Re-run first - a "
-            f"transient storage fault fails fragments alike and there are no in-run retries - then read the "
-            f"per-fragment WARNING lines if it persists."
+            f"embedding group {fill.group.name!r}: refusing to execute an empty scan plan. A modality that "
+            f"owes no work must be skipped before staging, or the run reports a phase it never ran"
         )
-        raise FillContractError(msg)
-    if not collected.fragments:
-        logger.info(
-            f"embedding group {fill.group.name!r}: nothing to commit across {len(fragment_ids)} fragment(s); "
-            f"none of them had a pending row"
-        )
-        return ModalityResult.nothing_to_do(fill.modality)
-    if collected.skipped_fragments:
-        logger.warning(
-            f"embedding group {fill.group.name!r}: {collected.skipped_fragments} of {len(fragment_ids)} "
-            f"fragment(s) failed and were SKIPPED (see the per-fragment warnings for the causes); they were "
-            f"not written, so any rows they still owed stay pending and the next run re-selects them"
-        )
-
-    committed_version = _commit(
-        dataset, fill.group, list(collected.fragments.values()), collected.field_ids, storage_options=storage_options
+        raise ValueError(msg)
+    # Re-derived rather than passed in: the predicate is a pure function of the
+    # fill, so recomputing it cannot disagree with the one the caller planned
+    # with, and threading it through the signature would invite a caller to pass
+    # a different one than the plan was built from.
+    row_filter = pending_filter(fill.group, fill.applicability_filter, fill.result_identity)
+    _check_fill_preconditions(dataset, fill, row_filter=row_filter)
+    resources = fill.resources
+    staged = staged_schema(fill.group)
+    source = EmbeddingScanDatasource(
+        PinnedScan.for_dataset(
+            dataset,
+            storage_options=storage_options,
+            source_columns=fill.source_columns,
+            row_filter=row_filter,
+            batch_size=resources.scan_batch_size,
+        ),
+        plan.fragments,
     )
+    max_actors = _placeable_actors(resources, owed_fragments=len(plan.fragments), group_name=fill.group.name)
+    # The filesystem comes off the workspace so the checkpoint and the sink below
+    # are reached through ONE credential set. Two independently resolved
+    # filesystems let the sink write where the checkpoint cannot read, which
+    # surfaces as a resume that silently redoes everything rather than as an
+    # access error.
+    with installed_checkpoint(
+        id_column=CHECKPOINT_ID_COLUMN,
+        checkpoint_path=workspace.checkpoints_uri,
+        filesystem=workspace.filesystem,
+    ):
+        owed = ray.data.read_datasource(
+            source,
+            override_num_blocks=len(plan.fragments),
+            ray_remote_args={"runtime_env": ray_data_gpu_runtime_env(resources.env_name)},
+        ).repartition(
+            target_num_rows_per_block=resources.scan_batch_size,
+            # Non-strict processes each source block independently: it splits a
+            # large fragment without coalescing or mixing adjacent fragments, so
+            # one block still belongs to one fragment and the Hive partition the
+            # sink writes stays a property of the read rather than of a shuffle.
+            strict=False,
+        )
+        computed = owed.map_batches(
+            EmbeddingBatchWorker,
+            fn_constructor_kwargs={
+                "group": fill.group,
+                "staged": staged,
+                "embedder_cls": fill.embedder_cls,
+                "embedder_kwargs": fill.embedder_kwargs,
+            },
+            batch_format="pyarrow",
+            batch_size=resources.scan_batch_size,
+            compute=ActorPoolStrategy(min_size=1, max_size=max_actors),
+            # Pinned for every modality, GPU and CPU alike: the worker needs the
+            # interpreter that holds the model stack, and an unpinned worker would
+            # silently inherit whichever env Ray happened to start.
+            runtime_env=ray_data_gpu_runtime_env(resources.env_name),
+            # Packs fractional-GPU actors rather than spreading them.
+            scheduling_strategy="DEFAULT",
+            # Ray declares all three as optional and treats an explicit ``None``
+            # exactly as an omitted kwarg, so an unset resource passes through.
+            num_gpus=resources.num_gpus,
+            num_cpus=resources.num_cpus,
+            memory=resources.memory_bytes,
+            # Spread whole because the two keys are one decision; see
+            # ``ACTOR_RESTART_BOUNDS``.
+            **ACTOR_RESTART_BOUNDS,
+        )
+        computed.write_parquet(
+            workspace.results_uri,
+            filesystem=workspace.filesystem,
+            partition_cols=[FRAGMENT_ID_COLUMN],
+            # Append, so a resume adds to what an earlier attempt staged instead of
+            # replacing it. The checkpoint guarantees those two sets are disjoint.
+            # Passed explicitly even though it is Ray's current default: were that
+            # default ever to become OVERWRITE, a resume would delete the very
+            # vectors it exists to preserve.
+            mode=SaveMode.APPEND,
+            # Both bounds are HINTS in Ray's sink rather than guarantees, and are
+            # set to one value only to keep a staged file small enough that a crash
+            # mid-phase leaves usable partial work. No repartition is added to
+            # enforce them: paying a shuffle to hit an exact file size would cost
+            # more than the uneven files it avoids.
+            min_rows_per_file=rows_per_file,
+            max_rows_per_file=rows_per_file,
+            ray_remote_args={"runtime_env": ray_data_gpu_runtime_env(resources.env_name)},
+        )
     logger.info(
-        f"embedding group {fill.group.name!r}: filled {collected.filled}/{collected.selected} row(s) across "
-        f"{len(collected.fragments)} fragment(s), {collected.skipped_fragments} skipped; "
-        f"v{version} -> v{committed_version}"
+        f"embedding group {fill.group.name!r}: staged {plan.num_rows} owed row(s) across "
+        f"{len(plan.fragments)} fragment(s) under {workspace.results_uri}"
     )
-    return ModalityResult(
-        modality=fill.modality,
-        selected=collected.selected,
-        filled=collected.filled,
-        skipped_fragments=collected.skipped_fragments,
-        committed_version=committed_version,
+
+
+def _format_resource(name: str, amount: float) -> str:
+    """Render one resource amount in the unit its name implies.
+
+    ``memory`` is a byte count while GPU and CPU are device counts, so one format
+    for all three renders the memory bound as an unlabelled ``1.9e+11`` - a figure
+    an operator cannot weigh against a node spec or against the ``memory_gb`` they
+    set, in the one line whose whole purpose is to name the bound they can act on.
+    """
+    if name == _MEMORY_RESOURCE:
+        return f"{amount / _BYTES_PER_GIB:g} GiB"
+    return f"{amount:g}"
+
+
+def _placeable_actors(resources: WorkerResources, *, owed_fragments: int, group_name: str) -> int:
+    """Return the actor ceiling this run's cluster snapshot and work can justify.
+
+    Two independent bounds, whichever is smaller. The RESOURCE bound is what the
+    live nodes can actually place: an unbounded pool autoscales against queue
+    pressure, and an actor Ray cannot place still counts in the pool's own
+    occupancy, so a saturated stage would report slack it does not have. The WORK
+    bound is the owed fragment count, because a fragment-poor table starves a pool
+    of any size.
+
+    The resource bound divides by EVERY resource the modality reserves and keeps
+    the tightest quotient. A modality holding a GPU, also reserving CPUs for
+    host-side decode, and also reserving a heap for the clips in flight is
+    placeable only where all three fit, so dividing by the GPU alone would
+    reproduce on a CPU-poor or memory-poor node exactly the over-count this
+    bound exists to prevent.
+
+    Args:
+        resources: The modality's per-actor request.
+        owed_fragments: Fragments this attempt owes work in.
+        group_name: Column group, for the log line.
+
+    Returns:
+        At least 1, so a cluster momentarily reporting nothing free still runs.
+
+    """
+    requested = {
+        name: value
+        for name, value in (
+            ("GPU", resources.num_gpus),
+            ("CPU", resources.num_cpus),
+            # Divided by on the same footing as the other two: this is the figure
+            # ``stage_embedding_group`` passes as ``memory=``, and Ray decrements
+            # the node's advertised ``memory`` by it at admission - measured, an
+            # actor requesting 64 MiB moved ``available_resources()["memory"]`` by
+            # exactly 64 MiB. That Ray does not ENFORCE the figure against real
+            # RSS is a separate fact and no reason to leave it out of the
+            # division: an actor whose reservation does not fit stays pending
+            # while still counting in the pool's occupancy, which is precisely
+            # the over-count this bound exists to prevent.
+            (_MEMORY_RESOURCE, resources.memory_bytes),
+        )
+        if value
+    }
+    if requested:
+        # One snapshot for every resource: two calls could report capacities from
+        # different moments, and the minimum of those is a cluster that never was.
+        snapshot = ray.available_resources()  # type: ignore[no-untyped-call]
+        # Compare the RAW quotients and clamp only the winner. Clamping first
+        # floors every exhausted resource at 1, so the basis would be decided by
+        # dict order rather than by scarcity - and the basis is the whole point
+        # of the log line, which exists to name the bound the operator can act on.
+        quotients = {name: math.floor(float(snapshot.get(name, 0.0)) / value) for name, value in requested.items()}
+        basis = min(quotients, key=lambda name: quotients[name])
+        placeable = max(1, quotients[basis])
+        # The capacity says "registered so far" because it counts whichever nodes
+        # had joined by the time this ran, not the nodes the job was allocated.
+        # Stated on the number itself rather than left to a cluster snapshot
+        # logged elsewhere, which is far enough away that a reader quoting this
+        # one line loses the caveat.
+        resource_clause = (
+            f"the nodes registered so far advertise {_format_resource(basis, float(snapshot.get(basis, 0.0)))} free "
+            f"{basis} against {_format_resource(basis, float(requested[basis]))} per actor, the tightest of the "
+            f"{'/'.join(sorted(requested))} it reserves ({placeable} placeable)"
+        )
+    else:
+        # A modality reserving no GPU, CPU or memory accepts Ray's own default
+        # request, which this function cannot divide by. The work bound still
+        # applies, so the pool is bounded either way.
+        placeable = owed_fragments
+        resource_clause = "it reserves no GPU, CPU or memory to divide, so no resource bound was measured"
+    ceiling = min(placeable, owed_fragments)
+    logger.info(
+        f"embedding group {group_name!r}: capping the actor pool at {ceiling}. For this modality {resource_clause}, "
+        f"and {owed_fragments} fragment(s) are owed"
     )
+    return ceiling
 
 
 def _check_fill_preconditions(dataset: lance.LanceDataset, fill: ModalityFill, *, row_filter: str) -> None:
-    """Verify the scan inputs every fragment shares, before any worker is started.
+    """Verify the scan inputs every read task shares, before any worker is started.
 
     The projection and the row filter are properties of the RUN, not of a
-    fragment, so a broken one fails on every fragment alike. Left to the workers
-    it arrives as a fault per fragment, and because a faulting fragment is
-    skipped, the modality would report a successful run that embedded nothing.
+    fragment, so a broken one fails on every read task alike. Checked here so the
+    fault arrives once, on the driver, with the inputs named - rather than as an
+    opaque Ray wrapper after an actor pool has already been built and the model
+    weights loaded onto a GPU.
 
     ``explain_plan`` is what makes checking this affordable: it resolves and
     optimizes the scan - which is where an unknown column or an unparsable
-    predicate is rejected - without reading a row. A re-run with nothing pending
-    therefore still reads nothing, whereas probing for a first matching row would
-    scan the whole table to discover the table is already complete.
+    predicate is rejected - without reading a row. Probing for a first matching
+    row would instead scan until one appeared, which on a table whose owed rows
+    sit at the end is most of the table.
 
     Raises:
-        FillContractError: If ``clip_id`` is absent from the projection, or the
+        ValueError: If ``clip_id`` is absent from the projection, or the
             projection and filter do not resolve against the table.
 
     """
     if KEY_COLUMN not in fill.source_columns:
         msg = (
             f"embedding group {fill.group.name!r}: source columns {list(fill.source_columns)} omit "
-            f"{KEY_COLUMN!r}; the embedder never reads it, but the fill attaches it positionally and "
-            f"update_columns joins on it, so it must be projected"
+            f"{KEY_COLUMN!r}; the embedder never reads it, but every staged row carries it and publication "
+            f"joins on it, so it must be projected"
         )
-        raise FillContractError(msg)
+        raise ValueError(msg)
     try:
         dataset.scanner(columns=list(fill.source_columns), filter=row_filter).explain_plan()
     except ValueError as e:
@@ -577,173 +449,4 @@ def _check_fill_preconditions(dataset: lance.LanceDataset, fill: ModalityFill, *
             f"{dataset.uri} at v{int(dataset.version)} (columns={list(fill.source_columns)}, "
             f"filter={row_filter!r}): {e}"
         )
-        raise FillContractError(msg) from e
-
-
-def _run_workers(
-    dataset: lance.LanceDataset,
-    fill: ModalityFill,
-    *,
-    fragment_ids: list[int],
-    row_filter: str,
-    storage_options: dict[str, str] | None,
-) -> list[dict[str, Any]]:
-    """Run the actor pool over the given fragment ids and return the decoded payloads.
-
-    The pool floors at one actor and pins no maximum, so it is bounded by two things
-    it does not measure: the free resource slices Ray can place an actor on, and the
-    work-item count (see ``_MAX_FROM_ITEMS_BLOCKS``).
-    ``scheduling_strategy="DEFAULT"`` packs fractional-GPU actors rather than
-    spreading them.
-
-    Raises:
-        FillContractError: If a worker reported a violated fill invariant. Raised on
-            the driver because a worker cannot: Ray Data replaces whatever a UDF
-            raises with a wrapper that is no longer an instance of its own cause.
-            Raised while the results are still streaming in, so the fragments not yet
-            started are abandoned instead of computing a result nothing will commit.
-
-    """
-    resources = fill.resources
-    items = [{_FRAGMENT_ID_COLUMN: fragment_id} for fragment_id in fragment_ids]
-    results = ray.data.from_items(items).map_batches(
-        _FragmentWorker,
-        fn_constructor_kwargs={
-            # Picklable values only: the worker re-opens the table at the pinned
-            # version itself rather than receiving this driver-side handle.
-            "uri": dataset.uri,
-            "group": fill.group,
-            "read_version": int(dataset.version),
-            "storage_options": storage_options,
-            "source_columns": fill.source_columns,
-            "row_filter": row_filter,
-            "scan_batch_size": resources.scan_batch_size,
-            "embedder_cls": fill.embedder_cls,
-            "embedder_kwargs": fill.embedder_kwargs,
-        },
-        batch_format="pyarrow",
-        batch_size=_FRAGMENTS_PER_TASK,
-        compute=ActorPoolStrategy(min_size=1),
-        # Pinned for every modality, GPU and CPU alike: the worker needs the
-        # interpreter that holds both the model stack and pylance, and an unpinned
-        # worker would silently inherit whichever env Ray happened to start.
-        runtime_env=ray_data_gpu_runtime_env(resources.env_name),
-        scheduling_strategy="DEFAULT",
-        # Ray declares all three as optional and treats an explicit ``None`` exactly
-        # as an omitted kwarg, so an unset resource is passed straight through.
-        num_gpus=resources.num_gpus,
-        num_cpus=resources.num_cpus,
-        memory=resources.memory_bytes,
-    )
-    payloads: list[dict[str, Any]] = []
-    for row in results.iter_rows():
-        payload = json.loads(str(row[_RESULT_COLUMN]))
-        detail = payload.get(_FATAL_KEY)
-        if detail is not None:
-            msg = (
-                f"embedding group {fill.group.name!r}: fragment {payload['fragment_id']} violated a fill "
-                f"contract, so the run stops without committing: {detail}"
-            )
-            raise FillContractError(msg)
-        payloads.append(payload)
-    return payloads
-
-
-@attrs.frozen
-class _CollectedFill:
-    """The worker payloads reduced to what the commit and the summary need.
-
-    Attributes:
-        fragments: Updated metadata of every WRITTEN fragment, keyed by fragment id.
-        field_ids: Union of the field ids those writes rebound.
-        selected: Pending rows the written fragments scanned.
-        filled: Of those, the rows whose primary vector came out non-NULL.
-        skipped_fragments: Fragments that failed and were left unwritten. Their rows
-            are not counted in ``selected``: nothing was written for them, so from
-            the table's point of view the run never visited them.
-
-    """
-
-    fragments: dict[int, FragmentMetadata]
-    field_ids: list[int]
-    selected: int
-    filled: int
-    skipped_fragments: int
-
-
-def _collect(payloads: list[dict[str, Any]], group: EmbeddingColumnGroup) -> _CollectedFill:
-    """Partition the worker payloads into the commit inputs, the counters, and the skips.
-
-    Sees only the written and skipped shapes: a FATAL payload never reaches here,
-    because ``_run_workers`` raises on it rather than returning it.
-
-    Raises:
-        ValueError: If two written payloads claim the same fragment. Each fragment is
-            a single work item, so a duplicate means a retried task's write was also
-            counted; committing two metadata versions of one fragment would make the
-            commit's outcome depend on ordering.
-
-    """
-    written = [payload for payload in payloads if _ERROR_KEY not in payload]
-    fragments = {
-        int(payload["fragment_id"]): FragmentMetadata.from_json(str(payload["metadata_json"])) for payload in written
-    }
-    if len(fragments) != len(written):
-        msg = (
-            f"embedding group {group.name!r}: {len(written)} fill result(s) named only {len(fragments)} distinct "
-            f"fragment(s); refusing to commit two metadata versions of one fragment"
-        )
-        raise ValueError(msg)
-    field_ids = {int(field_id) for payload in written for field_id in payload["modified_field_ids"]}
-    return _CollectedFill(
-        fragments=fragments,
-        field_ids=sorted(field_ids),
-        selected=sum(int(payload["rows"]) for payload in written),
-        filled=sum(int(payload["filled"]) for payload in written),
-        skipped_fragments=len(payloads) - len(written),
-    )
-
-
-def _commit(
-    dataset: lance.LanceDataset,
-    group: EmbeddingColumnGroup,
-    fragments: list[FragmentMetadata],
-    field_ids: list[int],
-    *,
-    storage_options: dict[str, str] | None,
-) -> int:
-    """Commit the touched fragments' rebound field ids as one ``Update`` transaction.
-
-    ``LanceOperation.Update`` accepts a PARTIAL fragment list, so only the fragments
-    that actually changed are named and every other fragment keeps its existing
-    metadata. ``fields_modified`` scopes the rebinding to this group's field ids, so
-    every column outside the group stays bound to the file it already had.
-    ``transaction_properties`` tags the commit so it is attributable in the table's
-    version history.
-
-    Raises:
-        ValueError: If the commit fails, so the CLI's ``except ValueError`` handler
-            reports a cause instead of a traceback.
-
-    """
-    read_version = int(dataset.version)
-    transaction = lance.Transaction(
-        read_version=read_version,
-        operation=lance.LanceOperation.Update(
-            updated_fragments=fragments,
-            fields_modified=field_ids,
-        ),
-        transaction_properties={
-            "kind": "curator-next-embedding",
-            "group": group.name,
-        },
-    )
-    try:
-        committed = lance.LanceDataset.commit(dataset.uri, transaction, storage_options=storage_options)
-    except (OSError, RuntimeError) as e:
-        # Lance routes only IO faults to OSError; its commit-conflict and
-        # write-contention variants all fall through to RuntimeError, so both must be
-        # caught to name a cause rather than surface a bare traceback.
-        msg = f"embedding group {group.name!r}: commit against v{read_version} of {dataset.uri} failed ({e})"
         raise ValueError(msg) from e
-    return int(committed.version)

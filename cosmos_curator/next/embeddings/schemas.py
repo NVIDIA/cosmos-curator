@@ -148,18 +148,21 @@ class EmbeddingColumnGroup:
         schema: The group's Arrow columns (vectors + provenance), each nullable.
             Excluded from equality/hash so the frozen group stays hashable
             (``pa.Schema`` is unhashable) and ``name`` is identity.
-        primary_vector: The vector whose NULL state marks a row pending. The
-            incremental selection filter is "applicable AND primary_vector IS
-            NULL". Completeness, by contrast, spans ALL fields (see below), so a
-            companion vector such as ``embedding_text_task`` is still required
-            for a row to count as complete even though it is not the primary.
-        provenance_columns: The producer-identity columns used for the single-
-            producer / staleness check (model id for text and image; descriptor
-            version + PCA fingerprint for action). These are the columns whose
-            distinct non-null values must number at most one, and against which
-            ``expected_provenance`` is compared. Companion vectors are NOT
-            provenance identity; they are covered by the all-fields completeness
-            rule instead.
+        primary_vector: The vector whose NULL state marks a row unfilled. Owed
+            work is "applicable AND (this vector IS NULL OR the provenance
+            columns name another computation)", so an unfilled row is one of the
+            two ways a row can be owed rather than the definition of it.
+            Completeness, by contrast, spans ALL fields, so a companion vector
+            such as ``embedding_text_task`` is still required for a row to count
+            as complete even though it is not the primary.
+        provenance_columns: The columns naming the computation that produced a
+            row (model result fingerprint for text and image; descriptor version
+            + PCA fingerprint for action). They carry the row's RESULT IDENTITY, which
+            is what makes a row stale when it names a computation other than the
+            one a run performs, and what lets a reader establish that a whole
+            group was produced by one computation. Companion vectors are not
+            identity; they are covered by the all-fields completeness rule
+            instead.
 
     """
 
@@ -389,10 +392,11 @@ def _masked_float32_list_array(matrix: npt.NDArray[np.float32], valid: npt.NDArr
 def _provenance_string_array(value: str, valid: npt.NDArray[np.bool_] | None, rows: int) -> pa.Array:
     """Build a ``string`` provenance column: ``value`` on valid rows, NULL on invalid ones.
 
-    The provenance identity (model id, descriptor version, PCA fingerprint) is the
-    same for every successful row of a run, so it is a scalar broadcast to the valid
-    rows and NULL elsewhere - a failed row's whole group (vector + provenance) stays
-    NULL together. ``valid is None`` broadcasts ``value`` to all ``rows``.
+    The provenance identity (model result fingerprint, descriptor version, PCA
+    fingerprint) is the same for every successful row of a run, so it is a scalar
+    broadcast to the valid rows and NULL elsewhere - a failed row's whole group
+    (vector + provenance) stays NULL together. ``valid is None`` broadcasts
+    ``value`` to all ``rows``.
     """
     if valid is None:
         return pa.array([value] * rows, type=pa.string())
@@ -403,9 +407,9 @@ def text_columns_batch(
     rows: int,
     subtask_vectors: npt.NDArray[np.floating],
     task_vectors: npt.NDArray[np.floating],
-    model_id: str,
+    result_fingerprint: str,
 ) -> pa.Table:
-    """Build the text group batch: both vectors + the model id, one row per input row.
+    """Build the text group batch: both vectors + the result fingerprint, one row per input row.
 
     Carries no key: the storage layer attaches ``clip_id`` positionally, so the
     output must stay in input order and hold exactly ``rows`` rows. The text leg
@@ -414,6 +418,18 @@ def text_columns_batch(
     complete and there is no validity mask. Both matrices are ``(rows, TEXT_DIM)``.
     The columns are exactly ``TEXT_COLUMN_GROUP``'s fields, so the storage layer's
     schema cast accepts the batch unchanged.
+
+    Args:
+        rows: Input row count the output must match.
+        subtask_vectors: ``(rows, TEXT_DIM)`` subtask embeddings.
+        task_vectors: ``(rows, TEXT_DIM)`` task embeddings.
+        result_fingerprint: Identity of the computation that produced these
+            vectors, stored in ``embedding_text_model_id``. It identifies the whole
+            computation, not merely the checkpoint, so two runs differing only in
+            how the text was formatted store different values.
+
+    Returns:
+        A table of exactly ``TEXT_COLUMN_GROUP``'s fields.
 
     Raises:
         ValueError: If either matrix is not ``(rows, TEXT_DIM)``.
@@ -425,7 +441,7 @@ def text_columns_batch(
         {
             "embedding_text_subtask": _masked_fixed_size_list_array(subtask, None),
             "embedding_text_task": _masked_fixed_size_list_array(task, None),
-            "embedding_text_model_id": _provenance_string_array(model_id, None, rows),
+            "embedding_text_model_id": _provenance_string_array(result_fingerprint, None, rows),
         }
     )
 
@@ -433,18 +449,31 @@ def text_columns_batch(
 def image_columns_batch(
     rows: int,
     vectors: npt.NDArray[np.floating],
-    model_id: str,
+    result_fingerprint: str,
     valid: npt.NDArray[np.bool_],
 ) -> pa.Table:
-    """Build the image group batch: one vector + the model id, per-row nullable.
+    """Build the image group batch: one vector + the result fingerprint, per-row nullable.
 
     Carries no key: the storage layer attaches ``clip_id`` positionally, so the
     output holds exactly ``rows`` rows in input order. ``valid[i]`` is False for a
-    clip whose media was missing or undecodable; that row's vector and model id are
-    both NULL, so its group stays pending / retryable and the batch still carries
-    exactly one row per input row. ``vectors`` is the full ``(rows, IMAGE_DIM)``
-    matrix aligned to ``valid`` (failed rows may hold placeholder zeros; they are
-    masked out). The columns are exactly ``IMAGE_COLUMN_GROUP``'s fields.
+    clip whose media was missing or undecodable; that row's vector and fingerprint
+    are both NULL, so its group stays pending / retryable and the batch still
+    carries exactly one row per input row. ``vectors`` is the full
+    ``(rows, IMAGE_DIM)`` matrix aligned to ``valid`` (failed rows may hold
+    placeholder zeros; they are masked out). The columns are exactly
+    ``IMAGE_COLUMN_GROUP``'s fields.
+
+    Args:
+        rows: Input row count the output must match.
+        vectors: ``(rows, IMAGE_DIM)`` embeddings aligned to ``valid``.
+        result_fingerprint: Identity of the computation that produced these
+            vectors, stored in ``embedding_image_model_id``. It identifies the
+            whole computation, not merely the checkpoint, so two runs differing
+            only in pooling store different values.
+        valid: Per-row validity mask; False yields an all-NULL group row.
+
+    Returns:
+        A table of exactly ``IMAGE_COLUMN_GROUP``'s fields.
 
     Raises:
         ValueError: If ``vectors`` is not ``(rows, IMAGE_DIM)`` or ``valid`` is not
@@ -455,7 +484,7 @@ def image_columns_batch(
     return pa.table(
         {
             "embedding_image": _masked_fixed_size_list_array(matrix, valid),
-            "embedding_image_model_id": _provenance_string_array(model_id, valid, rows),
+            "embedding_image_model_id": _provenance_string_array(result_fingerprint, valid, rows),
         }
     )
 

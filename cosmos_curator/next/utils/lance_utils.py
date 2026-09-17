@@ -17,8 +17,10 @@
 
 Deliberately small: the things every Curator Next recipe needs from Lance before
 it can decide anything - "does this table exist yet, how many rows does it hold,
-and how is it laid out" - plus one bounded column read and the one constant every
-sink that writes its own fragments must agree on. Absence is answerable either way:
+and how is it laid out" - plus one bounded column read and the constants every
+recipe must agree on because they describe the FORMAT rather than any one table:
+the storage version each sink writes at, and Lance's row-address layout. Absence
+is answerable either way:
 ``open_dataset`` returns ``None`` for a caller that treats a missing table as a
 valid state, and ``open_dataset_or_raise`` raises for one that cannot proceed
 without it. Everything table-shaped (schemas, key columns, what a vector means)
@@ -70,6 +72,20 @@ from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_op
 # deliberately.
 LANCE_DATA_STORAGE_VERSION: Literal["2.2"] = "2.2"
 
+# Lance's own row-address layout, shared for the same reason as the storage
+# version above: it is a property of the FORMAT, not of any one recipe's table, so
+# a second definition elsewhere could disagree with the format rather than merely
+# with its neighbour. A scan opts into the pseudo-column with
+# ``with_row_address=True``; Lance then packs each address as
+# ``(fragment_id << 32) | offset_within_fragment``.
+#
+# Exported as the two raw facts rather than as a decode helper: callers split an
+# address in materially different ways - columnar via ``pc.shift_right``, per row
+# via a Python shift, and one that also needs the offset - and a helper shaped for
+# any one of them would be bypassed by the others.
+ROW_ADDRESS_COLUMN: Literal["_rowaddr"] = "_rowaddr"
+ROW_ADDRESS_FRAGMENT_SHIFT: Literal[32] = 32
+
 
 def open_dataset(uri: str, *, storage_options: dict[str, str] | None = None) -> lance.LanceDataset | None:
     """Open a Lance dataset, returning ``None`` when it does not exist.
@@ -111,7 +127,9 @@ def open_dataset_or_raise(uri: str, *, storage_options: dict[str, str] | None = 
     return dataset
 
 
-def distinct_non_null_values(dataset: lance.LanceDataset, column: str, *, max_values: int) -> tuple[str, ...]:
+def distinct_non_null_values(
+    dataset: lance.LanceDataset, column: str, *, max_values: int, where: str | None = None
+) -> tuple[str, ...]:
     """Return an arbitrary bounded subset of a string column's distinct non-null values, sorted.
 
     Bounded so a caller can tell "one distinct value" from "more than one" by
@@ -123,6 +141,23 @@ def distinct_non_null_values(dataset: lance.LanceDataset, column: str, *, max_va
     every non-null value to prove only one is present - no fragment or dataset
     statistic it exposes answers that, and these columns carry no index. That
     pass is a projected scan of one encoded column.
+
+    Args:
+        dataset: The table to read.
+        column: The string column whose distinct values are wanted.
+        max_values: Upper bound on values returned; at least 1.
+        where: Optional extra restriction, ANDed with the non-null condition.
+
+            This is **DataFusion** SQL, not Lance's scanner-filter dialect: here
+            double quotes are IDENTIFIERS and single quotes are LITERALS. That is
+            the exact INVERSE of the scanner-filter surface
+            (``count_rows(filter=...)``, ``scanner(filter=...)``), where a
+            double-quoted name parses as a string literal and silently matches
+            every row. A predicate written for one surface is wrong on the other,
+            so do not pass a filter built for the scanner here.
+
+    Returns:
+        Up to ``max_values`` distinct non-null values, sorted.
 
     Raises:
         ValueError: If ``column`` is absent, not a string column, or
@@ -148,7 +183,8 @@ def distinct_non_null_values(dataset: lance.LanceDataset, column: str, *, max_va
     # double-quoted name is read as a string literal and silently matches every
     # row: this statement goes through DataFusion, where double quotes are
     # identifiers and it is SINGLE quotes that would produce a literal.
-    statement = f"SELECT DISTINCT {column} FROM dataset WHERE {column} IS NOT NULL LIMIT {max_values}"  # noqa: S608
+    restriction = f"{column} IS NOT NULL" if where is None else f"{column} IS NOT NULL AND ({where})"
+    statement = f"SELECT DISTINCT {column} FROM dataset WHERE {restriction} LIMIT {max_values}"  # noqa: S608
     batches = dataset.sql(statement).build().to_batch_records()
     return tuple(sorted(value for batch in batches for value in batch.column(0).to_pylist()))
 

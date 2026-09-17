@@ -32,7 +32,10 @@ against the installed Lance rather than trusting API names:
    over a concurrent base-row ``Append``;
 5. ``drop_columns`` is all-or-nothing over the names it is given, and a dropped
    group can be re-added and refilled by the ordinary write path - the two facts
-   the ``--reset-group`` maintenance operation rests on.
+   a WIDTH migration rests on. A model whose vector width changes cannot be
+   overwritten in place (``ensure_embedding_columns`` rejects a present group
+   whose type differs), so the group is dropped and re-added at the new width and
+   an ordinary run refills it.
 
 These assertions are deliberately narrower than the storage engine's behaviour:
 they cover only what the pipeline depends on, keyed the way the pipeline keys it.
@@ -301,9 +304,9 @@ def test_fixed_size_list_vector_and_provenance_publish_together(make_clips_table
 def test_dropping_one_absent_name_drops_none_of_the_present_ones(make_clips_table: ClipsTableFactory) -> None:
     """``drop_columns`` is all-or-nothing: one unknown name aborts the whole drop.
 
-    This is why a group reset narrows to the fields the schema really carries. A
-    half-installed group passed whole would raise on its missing field and leave
-    the present one behind, so the corrupt group could never be reset.
+    This is why a width migration narrows to the fields the schema really carries.
+    A half-installed group passed whole would raise on its missing field and leave
+    the present one behind, so the corrupt group could never be dropped at all.
     """
     uri = make_clips_table(rows=2, rows_per_file=2)
     add_group_columns(uri, _IMAGE_GROUP)
@@ -321,11 +324,12 @@ def test_dropping_one_absent_name_drops_none_of_the_present_ones(make_clips_tabl
 def test_a_dropped_group_can_be_re_added_and_refilled_by_the_ordinary_write_path(
     make_clips_table: ClipsTableFactory,
 ) -> None:
-    """Reset then refill: a re-added group takes new values through the same per-fragment update.
+    """Drop then refill: a re-added group takes new values through the same per-fragment update.
 
     The drop detaches the group's data file from every fragment, so this proves the
     refill writes a fresh one rather than needing the fragments to be rewritten -
-    which is what makes ``--reset-group`` a metadata operation plus an ordinary run.
+    which is what keeps a width migration to two metadata commits plus an ordinary
+    run, instead of a table rewrite.
     """
     uri = make_clips_table(rows=4, rows_per_file=2)
     add_group_columns(uri, _IMAGE_GROUP)

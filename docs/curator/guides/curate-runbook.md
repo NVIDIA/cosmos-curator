@@ -195,14 +195,14 @@ will give them to you.
   text model, one image model, one action descriptor version and PCA fingerprint.
   A table filled by two producers is refused, because the run would compare both
   in one cosine space where their vectors share no geometry while every distance
-  it yields still looks plausible. If a group was filled twice, reset it with the
-  embeddings leg's `--reset-group <name>` and re-embed it before curating, then
-  confirm the refill covered every row you expect to curate. The resolved
-  identities appear in the preflight log and in the centroids artifact. Read the
-  check for what it is: for text and image the identity is a model id, so a
-  re-embed that changed pooling or prompt formatting under the same checkpoint
-  passes this gate — only the action PCA fingerprint is derived from the basis
-  content itself. The requirement is per **column** and is read against the
+  it yields still looks plausible. Two identities in one group normally means an
+  embeddings rebuild is still in flight: re-run the embeddings leg to completion —
+  an ordinary run recomputes every row whose recorded identity names another
+  computation — then confirm the group reports one identity before curating. The
+  resolved identities appear in the preflight log and in the centroids artifact.
+  The identity is a digest of the whole computation, so a re-pin or a pooling
+  change is visible to this gate rather than passing it silently. The requirement
+  is per **column** and is read against the
   vectors this run actually consumes, so the action group must record both its
   descriptor version and its PCA fingerprint, and the text group is judged on
   `embedding_text_task` always plus `embedding_text_subtask` only when that block
@@ -211,8 +211,9 @@ will give them to you.
   and is **not** refused here — the eligible-row count is what reports it — while
   a group that holds vectors this run reads but leaves a provenance column NULL
   **is** refused, naming that column and the number of rows affected. The remedy
-  for the second is the same as for a double fill: `--reset-group <name>` and
-  re-embed, so the vectors and their attribution are written together.
+  for the second is the same as for a double fill: re-run the embeddings leg, which
+  selects any row whose provenance is NULL and rewrites the vector and its
+  attribution together.
 - **Environment: `cuml`.** The fit and the per-cluster dedup are the only GPU
   steps and run cuML/cuPy; everything else is CPU Ray Data. Both GPU stages name
   the `cuml` pixi environment through their runtime environment, and the driver
@@ -999,7 +1000,7 @@ version, but finding the one you want still means walking its history.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
-| Driver exits immediately with a named error before any Ray work | Preflight rejected the input: a missing vector column, a `clip_id` / `task_name` type mismatch, a consumed embedding group filled by more than one producer, a consumed group holding vectors whose provenance column records nothing, or no row satisfying the eligibility predicate raises `ValueError`; an entirely absent table raises `FileNotFoundError`. Preflight runs inside the run, so both are reported as `runtime` under `--json`, and without it as a traceback whose last line is the message. | Read the last log line; fix the table or the config. For either producer-identity failure the message names the group and the column, and the remedy is the embeddings leg's `--reset-group <name>` followed by a re-embed, so one producer fills the vectors and their attribution together. Preflight is deliberately eager so bad inputs never reach a Ray actor, and it precedes the verdict commit — so no verdict is published. On a first run the schema widening may already have committed; see *Re-runs and recovery*. |
+| Driver exits immediately with a named error before any Ray work | Preflight rejected the input: a missing vector column, a `clip_id` / `task_name` type mismatch, a consumed embedding group filled by more than one producer, a consumed group holding vectors whose provenance column records nothing, or no row satisfying the eligibility predicate raises `ValueError`; an entirely absent table raises `FileNotFoundError`. Preflight runs inside the run, so both are reported as `runtime` under `--json`, and without it as a traceback whose last line is the message. | Read the last log line; fix the table or the config. For either producer-identity failure the message names the group and the column, and the remedy is to re-run the embeddings leg to completion, which recomputes every row whose recorded identity is missing or names another computation, so one producer fills the vectors and their attribution together. Preflight is deliberately eager so bad inputs never reach a Ray actor, and it precedes the verdict commit — so no verdict is published. On a first run the schema widening may already have committed; see *Re-runs and recovery*. |
 | Parse-time error naming a key you did not expect to be wrong | A pre-rewrite config or launch script | The key is gone rather than renamed-and-tolerated; see the *Config fields* table for the current surface. |
 | Run dies after the whole dedup pass with a message about rows carrying no reason, or not accounting for every eligible row | A stage dropped or duplicated rows | Nothing was committed — the check runs before the write. Report it: this is an internal invariant, not an input problem. |
 | Run dies with a message that no row survived to be selected, or that every eligible row already carries a reason | Every eligible row is a duplicate, has an invalid embedding, or already carries a verdict from a prior run | Raise `dedup_eps` scrutiny first (a very large `eps` collapses everything), then check `invalid_embedding` volume in the previous run. At `dedup_eps: null` no row can be a duplicate, so the whole eligible set was `invalid_embedding` and the vector columns are the only place to look. Nothing was committed. |

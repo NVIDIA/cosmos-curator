@@ -22,9 +22,9 @@ Three layers:
 - Dispatch tests that stub ``run_embedding_pipeline``, pinning the payload and
   message the adapter assembles and proving the config is resolved exactly once.
 - Two wiring smokes against a real local ``clips.lance``: one without Ray (the
-  schema-widening commit and the skip path) and one ``ray_local`` fill through a
-  stub embedder, which is the only place a config file drives real vectors into
-  the table.
+  schema-widening commit and the no-action-data skip) and one ``ray_local`` fill
+  through a stub embedder, which is the only place a config file drives real
+  vectors into the table.
 
 The Ray fill runs in the integration suite; the remaining tests run in the CPU job.
 """
@@ -55,7 +55,7 @@ from cosmos_curator.next.recipes.embeddings.modalities import (
     ModalityResult,
     WorkerResources,
 )
-from cosmos_curator.next.recipes.embeddings.pipeline_kind import EMBEDDINGS_KIND, IncompleteRunError
+from cosmos_curator.next.recipes.embeddings.pipeline_kind import EMBEDDINGS_KIND
 
 from .conftest import DEFAULT_CLIPS_URI, ClipsTableFactory
 
@@ -94,13 +94,13 @@ def _modality_result(
     selected: int,
     filled: int,
     version: int | None,
-    skipped_fragments: int = 0,
+    result_identity: dict[str, str] | None = None,
 ) -> ModalityResult:
     return ModalityResult(
         modality=modality,
+        result_identity=result_identity if result_identity is not None else {},
         selected=selected,
         filled=filled,
-        skipped_fragments=skipped_fragments,
         committed_version=version,
     )
 
@@ -149,7 +149,7 @@ def _stub_image_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
         group=IMAGE_COLUMN_GROUP,
         source_columns=("clip_id", "clip_uri"),
         applicability_filter=_IMAGE_APPLICABILITY_FILTER,
-        expected_provenance=None,
+        result_identity={"embedding_image_model_id": _STUB_MODEL_ID},
         embedder_cls=_ConstantImageEmbedder,
         embedder_kwargs={},
         resources=WorkerResources(scan_batch_size=config.image.batch_size, num_cpus=1),
@@ -267,8 +267,20 @@ def test_a_run_reports_the_recipe_summary_as_json_and_one_message(
     seen = _stub_run(
         monkeypatch,
         _result(
-            _modality_result(Modality.TEXT, selected=4, filled=4, version=6),
-            _modality_result(Modality.IMAGE, selected=4, filled=3, version=7),
+            _modality_result(
+                Modality.TEXT,
+                selected=4,
+                filled=4,
+                version=6,
+                result_identity={"embedding_text_model_id": "text-model"},
+            ),
+            _modality_result(
+                Modality.IMAGE,
+                selected=4,
+                filled=3,
+                version=7,
+                result_identity={"embedding_image_model_id": "image-model"},
+            ),
             action=action,
         ),
     )
@@ -286,16 +298,19 @@ def test_a_run_reports_the_recipe_summary_as_json_and_one_message(
                 "selected": 4,
                 "filled": 4,
                 "failed": 0,
-                "skipped_fragments": 0,
                 "committed_version": 6,
+                "result_identity": {"embedding_text_model_id": "text-model"},
             },
             {
                 "modality": "image",
                 "selected": 4,
                 "filled": 3,
                 "failed": 1,
-                "skipped_fragments": 0,
                 "committed_version": 7,
+                # Reported per modality rather than once per run: the two name
+                # different computations, so a single run-level identity could not
+                # say which group a model change took effect in.
+                "result_identity": {"embedding_image_model_id": "image-model"},
             },
         ],
         "action_pca": {"fingerprint": action.fingerprint, "samples_used": None},
@@ -371,75 +386,16 @@ def test_a_widening_run_where_one_modality_filled_reports_the_fill_not_the_colum
     assert output.message == "embeddings: text 4/4, action 0/0; clips.lance at v5"
 
 
-def test_a_run_that_lost_fragments_refuses_even_though_its_row_counts_balance(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A partially-failed run must not be reported to its caller as finished.
+def test_a_failed_row_is_reported_rather_than_raised(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row left NULL by a per-row failure is a returned count, not an exit status.
 
-    A skipped fragment's rows land in neither ``selected`` nor ``filled``, so the
-    survivors alone reach ``filled == selected`` and every count balances. Were
-    that returned, the caller would see an ordinary success and a scheduled job
-    would record the attempt as complete.
-
-    A single skip is used deliberately: one flaky fragment is the likeliest shape
-    of this failure, and it is the only case that pins the threshold at zero
-    rather than merely somewhere below the count under test.
+    The next run's own owed-work predicate re-selects that row, so the remedy is
+    a re-run rather than a red exit -- and a red exit would make a corpus holding
+    one permanently broken clip fail forever with nothing an operator could do.
+    Structural failures are the opposite: every one of them raises before its own
+    commit, so nothing partial reaches this adapter to classify.
     """
-    _stub_run(
-        monkeypatch,
-        _result(_modality_result(Modality.TEXT, selected=470, filled=470, version=12, skipped_fragments=1)),
-    )
-    path = _write_config(tmp_path, modalities=["text"])
-
-    run = EMBEDDINGS_KIND.prepare_run(path, set_overrides=[])
-
-    with pytest.raises(IncompleteRunError) as exc_info:
-        run()
-
-    # Asserted whole: the raise costs the payload, so on the CLI's output surface
-    # this line is the only record of the version the run did commit.
-    assert str(exc_info.value) == (
-        "embeddings: text 470/470; clips.lance at v12; 1 fragment(s) SKIPPED, re-run to fill the rows they owed"
-    )
-
-
-def test_the_refusal_counts_skipped_fragments_across_every_modality(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The count reported is the run's total, not any single leg's.
-
-    Split across two modalities because a count taken from one of them would
-    under-report how much is pending to whoever decides what the re-run must
-    cover.
-    """
-    _stub_run(
-        monkeypatch,
-        _result(
-            _modality_result(Modality.TEXT, selected=470, filled=470, version=12, skipped_fragments=30),
-            _modality_result(Modality.IMAGE, selected=470, filled=470, version=13, skipped_fragments=4),
-        ),
-    )
-    path = _write_config(tmp_path, modalities=["text", "image"])
-
-    run = EMBEDDINGS_KIND.prepare_run(path, set_overrides=[])
-
-    with pytest.raises(IncompleteRunError, match=r"34 fragment\(s\) SKIPPED"):
-        run()
-
-
-def test_a_failed_row_alone_does_not_make_the_run_incomplete(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Only unattempted work is owed a further run.
-
-    A row counted in ``failed`` was attempted and left NULL, so re-running cannot
-    change it -- refusing would make every such run red forever with no remedy.
-    A skipped fragment is the opposite: never attempted, so a re-run can fill it.
-    """
-    _stub_run(
-        monkeypatch,
-        _result(_modality_result(Modality.IMAGE, selected=4, filled=3, version=7, skipped_fragments=0)),
-    )
+    _stub_run(monkeypatch, _result(_modality_result(Modality.IMAGE, selected=4, filled=3, version=7)))
     path = _write_config(tmp_path, modalities=["image"])
 
     output = EMBEDDINGS_KIND.prepare_run(path, set_overrides=[])()
@@ -447,7 +403,14 @@ def test_a_failed_row_alone_does_not_make_the_run_incomplete(
     # Asserted so a fixture edit cannot make the test vacuous by removing the
     # failed row it exists to tolerate.
     assert output.json_payload["modalities"] == [
-        {"modality": "image", "selected": 4, "filled": 3, "failed": 1, "skipped_fragments": 0, "committed_version": 7}
+        {
+            "modality": "image",
+            "selected": 4,
+            "filled": 3,
+            "failed": 1,
+            "committed_version": 7,
+            "result_identity": {},
+        }
     ]
     assert output.message == "embeddings: image 3/4; clips.lance at v7"
 
@@ -585,7 +548,9 @@ def test_a_config_driven_run_fills_the_enabled_modality(
             "selected": 4,
             "filled": 4,
             "failed": 0,
-            "skipped_fragments": 0,
             "committed_version": lance.dataset(clips_uri).version,
+            # The stub's own model id, reached through the whole chain: this is
+            # the identity the published rows now carry.
+            "result_identity": {"embedding_image_model_id": _STUB_MODEL_ID},
         }
     ]

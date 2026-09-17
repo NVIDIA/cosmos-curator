@@ -80,6 +80,39 @@ def test_max_fragments_below_one_is_rejected(make_embeddings_config: EmbeddingsC
         make_embeddings_config(max_fragments=0)
 
 
+def test_recovery_needs_no_configuration(make_embeddings_config: EmbeddingsConfigFactory) -> None:
+    """A crashed run must be resumable by an operator who configured nothing for it.
+
+    ``None`` is what selects the sibling-of-the-table default, so a value here
+    would mean recovery only works where someone opted into it.
+    """
+    assert make_embeddings_config().staging_root_uri is None
+
+
+def test_a_staging_root_may_put_staged_rows_on_different_storage(
+    make_embeddings_config: EmbeddingsConfigFactory,
+) -> None:
+    """The staged rows are transient bulk, so they need not live beside the table."""
+    cfg = make_embeddings_config(staging_root_uri="s3://scratch-bucket/embedding_staging")
+    assert cfg.staging_root_uri == "s3://scratch-bucket/embedding_staging"
+
+
+def test_blank_staging_root_uri_rejected(make_embeddings_config: EmbeddingsConfigFactory) -> None:
+    """A whitespace-only root is rejected here rather than at resolution.
+
+    ``resolve_workspace`` refuses one too, but that is a Ray-side failure partway
+    into a run; this is the same fault caught at assembly.
+    """
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        make_embeddings_config(staging_root_uri="   ")
+
+
+def test_parquet_rows_per_file_below_one_is_rejected(make_embeddings_config: EmbeddingsConfigFactory) -> None:
+    """Zero rows per file would stage no recoverable unit, so a crash would re-compute everything."""
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        make_embeddings_config(parquet_rows_per_file=0)
+
+
 def test_pca_sample_floor_is_derived_from_action_dim() -> None:
     """The sample floor tracks the action width so the two cannot drift."""
     assert _MIN_PCA_SAMPLE_SIZE == ACTION_DIM + 1
