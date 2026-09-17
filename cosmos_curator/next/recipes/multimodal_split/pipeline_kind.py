@@ -51,6 +51,7 @@ def _template_payload() -> dict[str, Any]:
                 "example": {
                     "front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"},
                     "ego": {"sensor_type": "egotrajectory", "uri_pattern": "*/egotrajectory.mcap"},
+                    "imu": {"sensor_type": "imu", "uri_pattern": "*/imu.mcap"},
                     "gps": {
                         "sensor_type": "gps",
                         "uri_pattern": "*/gps.mcap",

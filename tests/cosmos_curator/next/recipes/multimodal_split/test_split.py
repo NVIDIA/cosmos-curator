@@ -1256,6 +1256,42 @@ def test_an_mcap_clip_is_written_per_span_and_catalogued(
     assert all(outcome["observations_location"] is None for outcome in outcomes)
 
 
+def test_an_imu_clip_is_written_per_span_and_catalogued(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_imu_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """IMU goes through the exact same copy path as egotrajectory -- COPIED_SENSOR_TYPES, not a new writer.
+
+    One targeted check that the dispatch actually routes ``sensor_type="imu"``
+    through correctly (right filename, right catalogued type, no grid
+    artifacts), not a full duplicate of egotrajectory's suite: the mechanism
+    underneath ``_ego_clips``/``split_mcap_session`` is identical either way.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_imu_mcap(session)
+    config = make_config(root, tmp_path / "media", imu_sensors={"imu": "imu/imu.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success"] * 3
+    assert all(outcome["sensor_type"] == "imu" for outcome in outcomes)
+    for outcome in outcomes:
+        media = Path(str(outcome["media_location"]))
+        assert media.name == "imu.mcap"
+        assert media.parent.name == outcome["split_clip_id"]
+        written = media.read_bytes()
+        assert outcome["media_size_bytes"] == len(written)
+        assert outcome["media_sha256"] == hashlib.sha256(written).hexdigest()
+        with media.open("rb") as stream:
+            decoded = list(mcap_make_reader(stream).iter_messages())
+        assert decoded
+    assert all(outcome["timeline_location"] is None for outcome in outcomes)
+    assert all(outcome["observations_location"] is None for outcome in outcomes)
+
+
 def test_an_interior_mcap_clip_carries_a_pose_at_or_before_its_start(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -1369,6 +1405,35 @@ def test_a_clip_spanning_a_trajectory_gap_is_refused_with_its_reason(
     assert "no messages between" in report["failures"][0]["message"]
 
 
+def test_an_imu_clip_spanning_a_gap_is_refused_with_its_reason(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_imu_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """The same refusal as egotrajectory's gap case, proven for imu's own fixture and config wiring.
+
+    Exercises make_imu_mcap's gap parameter and the imu_sensors config path
+    together -- unlike egotrajectory's version, this was previously untested
+    for imu even though the underlying _write_mcap_clip check is shared.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    # Index range scaled for imu's 125 Hz (8ms period) rather than ego's 100 Hz:
+    # indices 125-249 cover times 1000-1992ms, the same second clip span (1s-2s)
+    # ego's gap=(100, 200) covers at 10ms period.
+    make_imu_mcap(session, gap=(125, 250))
+    config = make_config(root, tmp_path / "media", imu_sensors={"imu": "imu/imu.mcap"})
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success", "failure", "success"]
+    report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "imu")).read_bytes())
+    assert len(report["failures"]) == 1
+    assert report["failures"][0]["stage"] == "cut_mcap"
+    assert "no messages between" in report["failures"][0]["message"]
+
+
 def test_the_bracket_is_the_nearest_earlier_pose_on_an_unchunked_recording(
     tmp_path: Path,
     make_session: Callable[..., Path],
@@ -1442,6 +1507,26 @@ def test_a_named_topic_is_cut_from_a_multi_topic_mcap(
     with Path(str(outcomes[0]["media_location"])).open("rb") as stream:
         topics = {channel.topic for _s, channel, _m in mcap_make_reader(stream).iter_messages()}
     assert topics == {"/egotrajectory"}
+
+
+def test_a_named_imu_topic_is_cut_from_a_multi_topic_mcap(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_imu_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Exercises make_config's imu_topic parameter, previously dead from a coverage standpoint."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    make_imu_mcap(session, extra_topic="/other")
+    config = make_config(root, tmp_path / "media", imu_sensors={"imu": "imu/imu.mcap"}, imu_topic="/imu")
+
+    outcomes = _ego_clips(session, config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success"] * 3
+    with Path(str(outcomes[0]["media_location"])).open("rb") as stream:
+        topics = {channel.topic for _s, channel, _m in mcap_make_reader(stream).iter_messages()}
+    assert topics == {"/imu"}
 
 
 def test_a_cut_clip_carries_the_bytes_and_schema_it_arrived_with(

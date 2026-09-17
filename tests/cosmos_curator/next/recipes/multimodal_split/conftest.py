@@ -93,23 +93,70 @@ def make_session() -> Callable[..., Path]:
 
 
 EGO_TOPIC = "/egotrajectory"
+IMU_TOPIC = "/imu"
 
 
-@pytest.fixture
-def make_ego_mcap() -> Callable[..., Path]:
-    """Return a builder for a session's egotrajectory MCAP.
+def _write_copied_sensor_mcap(
+    session: Path,
+    *,
+    schema_name: str,
+    first_ns: int,
+    count: int,
+    rate_hz: int,
+    uri_pattern: str,
+    topic: str,
+    gap: tuple[int, int] | None,
+    chunked: bool,
+    extra_topic: str | None,
+) -> Path:
+    """Write one COPIED_SENSOR_TYPES sensor's MCAP -- the shared mechanics behind make_ego_mcap/make_imu_mcap.
 
     Written with the upstream MCAP writer rather than the recipe's own, because
     this stands in for what a recorder produced: the recipe reads these files and
     does not write them, and the options that matter here -- chunking, a second
     topic -- are properties of the recorder, not of the cut.
 
-    The payloads are opaque bytes rather than encoded poses. Nothing in this
+    The payloads are opaque bytes rather than encoded messages. Nothing in this
     recipe decodes them: planning reads the topic's first and last ``log_time``
     from the index, and the cut copies records through unexamined. A fixture that
-    encoded real poses would assert the recipe understands a schema it is
+    encoded real payloads would assert the recipe understands a schema it is
     deliberately built not to.
+
+    ``gap`` is a dropout, as a half-open window of indices. A recorder that
+    loses the sensor for a while still writes an MCAP whose bounds span the
+    whole session, which is why planning cannot see the hole.
     """
+    period_ns = _NS_PER_SECOND // rate_hz
+    skipped = range(*gap) if gap is not None else range(0)
+    path = session / uri_pattern
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        writer = McapWriter(handle, chunk_size=10_000, use_chunking=chunked)
+        writer.start(library="test recorder")
+        schema_id = writer.register_schema(name=schema_name, encoding="test-schema", data=b"schema-bytes")
+        channels = {
+            name: writer.register_channel(schema_id=schema_id, topic=name, message_encoding="test-bytes")
+            for name in ([topic] if extra_topic is None else [topic, extra_topic])
+        }
+        for index in range(count):
+            if index in skipped:
+                continue
+            log_time = first_ns + index * period_ns
+            for name, channel_id in channels.items():
+                writer.add_message(
+                    channel_id=channel_id,
+                    log_time=log_time,
+                    data=f"{name}-{index}".encode(),
+                    publish_time=log_time,
+                    sequence=index,
+                )
+        writer.finish()
+    return path
+
+
+@pytest.fixture
+def make_ego_mcap() -> Callable[..., Path]:
+    """Return a builder for a session's egotrajectory MCAP -- see _write_copied_sensor_mcap for the mechanics."""
 
     def build(
         session: Path,
@@ -128,35 +175,60 @@ def make_ego_mcap() -> Callable[..., Path]:
         chunked: bool = True,
         extra_topic: str | None = None,
     ) -> Path:
-        period_ns = _NS_PER_SECOND // rate_hz
-        # A dropout, as a half-open window of indices. A recorder that loses the
-        # trajectory for a while still writes an MCAP whose bounds span the whole
-        # session, which is why planning cannot see the hole.
-        skipped = range(*gap) if gap is not None else range(0)
-        path = session / uri_pattern
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as handle:
-            writer = McapWriter(handle, chunk_size=10_000, use_chunking=chunked)
-            writer.start(library="test recorder")
-            schema_id = writer.register_schema(name="test.Pose", encoding="test-schema", data=b"schema-bytes")
-            channels = {
-                name: writer.register_channel(schema_id=schema_id, topic=name, message_encoding="test-bytes")
-                for name in ([topic] if extra_topic is None else [topic, extra_topic])
-            }
-            for index in range(count):
-                if index in skipped:
-                    continue
-                log_time = first_ns + index * period_ns
-                for name, channel_id in channels.items():
-                    writer.add_message(
-                        channel_id=channel_id,
-                        log_time=log_time,
-                        data=f"{name}-{index}".encode(),
-                        publish_time=log_time,
-                        sequence=index,
-                    )
-            writer.finish()
-        return path
+        return _write_copied_sensor_mcap(
+            session,
+            schema_name="test.Pose",
+            first_ns=first_ns,
+            count=count,
+            rate_hz=rate_hz,
+            uri_pattern=uri_pattern,
+            topic=topic,
+            gap=gap,
+            chunked=chunked,
+            extra_topic=extra_topic,
+        )
+
+    return build
+
+
+@pytest.fixture
+def make_imu_mcap() -> Callable[..., Path]:
+    """Return a builder for a session's IMU MCAP -- see _write_copied_sensor_mcap for the mechanics.
+
+    Same shape as ``make_ego_mcap`` and for the same reason: IMU is a copied
+    sensor too (see config.py's ``COPIED_SENSOR_TYPES`` docstring -- nearest
+    neighbor/interpolate would each discard nearly every sample of a ~100-200 Hz
+    inertial stream, and what a consumer actually wants is a pose delta
+    integrated over the interval, not a point sample of one; that integration is
+    deferred, not done here).
+    """
+
+    def build(
+        session: Path,
+        *,
+        first_ns: int = DEVICE_ORIGIN_NS,
+        # 376 at 125 Hz places the last message at exactly 3.000s, the same
+        # camera-session coverage make_ego_mcap's 301-at-100-Hz default gives.
+        count: int = 376,
+        rate_hz: int = 125,
+        uri_pattern: str = "imu/imu.mcap",
+        topic: str = IMU_TOPIC,
+        gap: tuple[int, int] | None = None,
+        chunked: bool = True,
+        extra_topic: str | None = None,
+    ) -> Path:
+        return _write_copied_sensor_mcap(
+            session,
+            schema_name="test.ImuSample",
+            first_ns=first_ns,
+            count=count,
+            rate_hz=rate_hz,
+            uri_pattern=uri_pattern,
+            topic=topic,
+            gap=gap,
+            chunked=chunked,
+            extra_topic=extra_topic,
+        )
 
     return build
 
@@ -374,6 +446,8 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         mcap_sensors: dict[str, str] | None = None,
         optional_sensors: frozenset[str] = frozenset(),
         topic: str | None = None,
+        imu_sensors: dict[str, str] | None = None,
+        imu_topic: str | None = None,
         gps_sensors: dict[str, str] | None = None,
         # No default, because the config has none: a test that forgets to say
         # how its GPS is sampled should fail the way a config would.
@@ -424,6 +498,15 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                             "topic": topic,
                         }
                         for key, pattern in (mcap_sensors or {}).items()
+                    },
+                    **{
+                        key: {
+                            "sensor_type": "imu",
+                            "uri_pattern": pattern,
+                            "required": key not in optional_sensors,
+                            "topic": imu_topic,
+                        }
+                        for key, pattern in (imu_sensors or {}).items()
                     },
                 },
                 "output": {"path": str(media_root)},

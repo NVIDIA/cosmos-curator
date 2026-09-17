@@ -62,7 +62,7 @@ MultimodalSplitVideoEncoder = Literal["libopenh264"]
 
 # Widened as each kind lands. A config naming a kind the recipe cannot process
 # yet is refused at load, rather than discovering it after a listing pass.
-MultimodalSplitSensorType = Literal["camera", "egotrajectory", "gps"]
+MultimodalSplitSensorType = Literal["camera", "egotrajectory", "gps", "imu"]
 
 #: How a sensor's samples are placed on the clip's grid.
 #:
@@ -80,7 +80,7 @@ SENSOR_TYPE_CAMERA = "camera"
 
 #: Kinds whose source artifact is an MCAP, so planning takes their bounds from a
 #: topic rather than from a timeline sidecar. Says nothing about how they are cut.
-MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "gps"})
+MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "gps", "imu"})
 
 #: Kinds cut by copying records at the rate they were recorded. With
 #: ``ALIGNED_SENSOR_TYPES`` this partitions ``MCAP_SENSOR_TYPES``, and the
@@ -92,7 +92,16 @@ MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "gps"})
 #: before any consumer saw it, so the clip carries what the sensor recorded and
 #: ``core.sensors.alignment.ego_trajectory`` derives poses from that when a
 #: consumer wants them on a grid.
-COPIED_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory"})
+#:
+#: IMU is here for a sharper version of the same reason: at ~100-200 Hz,
+#: nearest/interpolate (``ALIGNED_SENSOR_TYPES``'s two policies) would each
+#: throw away all but one or two samples per grid interval, and neither
+#: recovers what a consumer actually wants from an inertial stream -- a pose
+#: delta integrated over the interval, not a point sample of one. That
+#: integration is ``core.sensors.sensors.preintegrated_imu_sensor``'s job,
+#: deliberately deferred to whenever a consumer needs it against whatever grid
+#: it needs it on, rather than frozen into this clip against this one.
+COPIED_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "imu"})
 
 #: Kinds cut by placing samples on the clip's grid, the same grid the cameras
 #: are resampled onto.
@@ -148,12 +157,16 @@ class MultimodalSplitInputConfig(BaseModel):
 class MultimodalSplitClipConfig(BaseModel):
     """The episode timeline: how long a clip is, and at what rate it is sampled.
 
-    Both belong to the clip because both are what every sensor obeys. The design
-    document is explicit that one configured rate defines the episode timeline
-    and every modality is sampled or derived against it -- a camera selects the
-    nearest frame to each grid timestamp, an IMU preintegrates over adjacent
-    ones, a GPS interpolates onto them. So the rate is not a camera setting that
-    the video happens to inherit; it is the grid, and the video inherits it.
+    Both belong to the clip because both are what every sensor obeys once it is
+    placed on the grid at all -- a camera selects the nearest frame to each grid
+    timestamp, a GPS interpolates onto them. So the rate is not a camera setting
+    that the video happens to inherit; it is the grid, and the video inherits it.
+
+    Not every sensor is placed on it. A copied sensor (``COPIED_SENSOR_TYPES``,
+    e.g. egotrajectory, imu) is cut at the rate it was recorded and carries no
+    relationship to this grid at all -- deriving a value against it, an IMU's
+    preintegrated pose delta included, is deferred to whatever consumer needs
+    that later, against whatever grid it needs it on.
 
     ``sampling_fps`` names what it is. The grid is built with it as
     ``sample_rate_hz``, and a clip plays at that rate as a consequence of having

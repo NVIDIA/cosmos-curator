@@ -574,7 +574,7 @@ def test_a_sensor_must_say_what_kind_it_is() -> None:
 def test_a_sensor_kind_the_recipe_cannot_process_is_refused_at_load() -> None:
     """Refused here rather than after a discovery pass has already listed every session."""
     with pytest.raises(ValidationError, match="camera"):
-        _resolved(sensors={"imu": {"sensor_type": "imu", "uri_pattern": "*/imu.mcap"}})
+        _resolved(sensors={"lidar": {"sensor_type": "lidar", "uri_pattern": "*/lidar_gt_top_p128.bin"}})
 
 
 def test_several_cameras_are_accepted() -> None:
@@ -717,6 +717,25 @@ def test_a_topic_on_an_mcap_sensor_is_accepted() -> None:
     assert config.sensors["front"].topic is None
 
 
+def test_an_imu_sensor_is_copied_like_egotrajectory() -> None:
+    """IMU joins egotrajectory in COPIED_SENSOR_TYPES -- both are mcap_sensors, neither takes sampling.
+
+    Not ALIGNED_SENSOR_TYPES: nearest/interpolate would each discard nearly
+    every sample of a ~100-200 Hz inertial stream, and what a consumer wants
+    is a pose delta integrated over the interval, not a point sample of one --
+    see config.py's own note on COPIED_SENSOR_TYPES.
+    """
+    config = _resolved(
+        sensors={
+            "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
+            "imu": {"sensor_type": "imu", "uri_pattern": "imu.mcap", "topic": "/imu"},
+        }
+    )
+
+    assert config.sensors["imu"].topic == "/imu"
+    assert list(config.mcap_sensors) == ["imu"]
+
+
 def test_an_aligned_sensor_must_say_how_it_is_sampled() -> None:
     """There is no defensible default, so the config has to choose.
 
@@ -735,7 +754,7 @@ def test_an_aligned_sensor_must_say_how_it_is_sampled() -> None:
         )
 
 
-@pytest.mark.parametrize("sensor_type", ["camera", "egotrajectory"])
+@pytest.mark.parametrize("sensor_type", ["camera", "egotrajectory", "imu"])
 def test_sampling_on_a_sensor_that_is_not_aligned_is_refused(sensor_type: str) -> None:
     """A copied sensor is never placed on the grid, so naming a policy describes work that will not happen."""
     sensors: dict[str, dict[str, object]] = {"front": {"sensor_type": "camera", "uri_pattern": "front.mp4"}}

@@ -310,6 +310,41 @@ def test_an_mcap_sensor_is_planned_without_its_messages(
     ]
 
 
+def test_an_imu_sensor_plans_alongside_egotrajectory(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_ego_mcap: Callable[..., Path],
+    make_imu_mcap: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Two copied MCAP sensors plan independently, each correctly typed.
+
+    IMU shares egotrajectory's whole code path (COPIED_SENSOR_TYPES, generic
+    open_mcap_sensors) -- what's worth a dedicated check is that a session
+    naming both at once tags each plan row with its own sensor_type rather
+    than one clobbering the other.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    ego = make_ego_mcap(session)
+    imu = make_imu_mcap(session)
+    config = make_config(
+        root,
+        tmp_path / "media",
+        mcap_sensors={"ego": "ego/egotrajectory.mcap"},
+        imu_sensors={"imu": "imu/imu.mcap"},
+    )
+
+    results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
+
+    mcap_plans = {row["sensor_key"]: row for row in results if row["result_kind"] == MCAP_PLAN}
+    assert set(mcap_plans) == {"ego", "imu"}
+    assert mcap_plans["ego"]["sensor_type"] == "egotrajectory"
+    assert mcap_plans["ego"]["sensor_uri"] == str(ego)
+    assert mcap_plans["imu"]["sensor_type"] == "imu"
+    assert mcap_plans["imu"]["sensor_uri"] == str(imu)
+
+
 def test_a_missing_required_mcap_sensor_refuses_the_session(
     tmp_path: Path,
     make_session: Callable[..., Path],
