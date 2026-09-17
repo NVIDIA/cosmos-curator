@@ -22,6 +22,7 @@ from cosmos_curator.next.recipes.video_caption.lance_state import (
     leaf_field_ids,
     validate_caption_input,
 )
+from cosmos_curator.next.recipes.video_transcode.contracts import completed_publication
 
 
 def _registered(
@@ -288,3 +289,23 @@ def test_input_validation_rejects_duplicate_clip_ids(
 
     with pytest.raises(ValueError, match="not globally unique"):
         validate_caption_input(dataset, uri=uri)
+
+
+@pytest.mark.parametrize("mutation", ["append", "delete"])
+def test_input_validation_rejects_stale_transcode_publication(
+    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    clip_row_factory: Callable[..., dict[str, object]],
+    mutation: str,
+) -> None:
+    """Later row changes invalidate a completion record even with valid clip fields."""
+    uri, dataset = clip_dataset_factory()
+    record = completed_publication(dataset)
+    if mutation == "append":
+        lance.write_dataset(pa.Table.from_pylist([clip_row_factory(2)], schema=dataset.schema), uri, mode="append")
+    else:
+        dataset.delete("clip_id = 'clip-0'")
+    latest = lance.dataset(uri)
+    assert completed_publication(latest) == record
+
+    with pytest.raises(ValueError, match="changed after video-transcode publication"):
+        validate_caption_input(latest, uri=uri)

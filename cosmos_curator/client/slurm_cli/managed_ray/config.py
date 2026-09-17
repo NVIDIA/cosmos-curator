@@ -397,7 +397,10 @@ class SlurmRayRayConfig(BaseModel):
     io_slots_per_node: int = Field(
         default=environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE,
         ge=1,
-        description="Logical source-IO capacity advertised by each elastic worker node.",
+        description=(
+            "Per-worker curator_io slots limiting concurrent large-source downloads. "
+            "Each download task must reserve one slot."
+        ),
     )
 
     @field_validator("temp_dir")

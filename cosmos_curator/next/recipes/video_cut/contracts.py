@@ -59,11 +59,11 @@ def make_span_id(source_id: str, start_ns: int, end_ns: int) -> str:
     return canonical_digest({"source_id": source_id, "stream_index": 0, "start_ns": start_ns, "end_ns": end_ns})
 
 
-def span_schema(split: FixedStrideConfig, input_snapshot_id: str) -> pa.Schema:
-    """Bind the canonical table to its cutting contract and frozen source set."""
+def span_schema(split: FixedStrideConfig, input_snapshot_id: str | None = None) -> pa.Schema:
+    """Bind the append-only table to its cutting contract, independently of each run's inputs."""
+    del input_snapshot_id  # Legacy callers may supply a run snapshot; it is no longer table metadata.
     return SPAN_SCHEMA.with_metadata(
         {
             "video_cut.contract": json.dumps(split.cutting_contract, sort_keys=True),
-            "video_cut.input_snapshot": input_snapshot_id,
         }
     )

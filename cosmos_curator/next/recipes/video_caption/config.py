@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
-from cosmos_curator.next.recipes.video_split.uris import join_s3_uri, normalize_s3_uri
+from cosmos_curator.next.utils.uris import normalize_location
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -31,7 +31,7 @@ def _normalize_location(location: str, *, label: str) -> str:
         raise ValueError(msg)
     parsed = urlsplit(location)
     if parsed.scheme.lower() == "s3":
-        return normalize_s3_uri(location, strip_trailing_slash=True)
+        return normalize_location(location)
     if parsed.scheme.lower() == "file":
         if parsed.netloc.lower() not in {"", "localhost"} or not parsed.path:
             msg = f"Unsupported local file URI for {label}: {location!r}"
@@ -45,16 +45,16 @@ def _normalize_location(location: str, *, label: str) -> str:
 
 def _join_location(root: str, *parts: str) -> str:
     if root.lower().startswith("s3://"):
-        return join_s3_uri(root, *parts)
+        return "/".join((root.rstrip("/"), *parts))
     return str(Path(root).joinpath(*parts))
 
 
 class VideoCaptionInputConfig(BaseModel):
-    """The canonical clip table produced by ``video-split``."""
+    """The canonical clip table produced by ``video-transcode``."""
 
     model_config = _MODEL_CONFIG
 
-    media_root: str = Field(min_length=1, examples=["s3://example-bucket/curated/video-split"])
+    media_root: str = Field(min_length=1, examples=["s3://example-bucket/curated/video-transcode"])
     clips_lance_uri: str = Field(default="", description="Defaults to <media_root>/lance.")
 
     @field_validator("media_root")
@@ -189,7 +189,7 @@ class ResolvedVideoCaptionConfig(BaseModel):
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
     "kind": "video-caption",
-    "input": {"media_root": "s3://example-bucket/curated/video-split"},
+    "input": {"media_root": "s3://example-bucket/curated/video-transcode"},
     "model": {"variant": "qwen3_8_27b_fp8"},
     "output": {},
     "execution": {"storage_profile": "default"},
@@ -265,11 +265,11 @@ def config_template_payload() -> dict[str, Any]:
     """Return structured template metadata for agents."""
     return {
         "kind": "video-caption",
-        "description": "Caption complete video-split clips and atomically enrich their canonical Lance rows.",
+        "description": "Caption complete video-transcode clips and atomically enrich their canonical Lance rows.",
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "video-caption"},
-            {"path": "input.media_root", "example": "s3://example-bucket/curated/video-split"},
+            {"path": "input.media_root", "example": "s3://example-bucket/curated/video-transcode"},
             {"path": "model.variant", "example": "qwen3_8_27b_fp8"},
         ],
         "config": config_template(),

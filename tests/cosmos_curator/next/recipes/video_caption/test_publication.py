@@ -24,8 +24,8 @@ from cosmos_curator.next.recipes.video_caption.publication import (
     publish_staged_results,
 )
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
-from cosmos_curator.next.recipes.video_split.lance_sink import append_clip_fragment, write_clip_fragment
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
+from tests.cosmos_curator.next.recipes.video_caption.helpers import append_clip_fragment, write_clip_fragment
 
 _DISTRIBUTED_PUBLICATION_DATASET = publication._prepared_publication_dataset
 
@@ -550,7 +550,7 @@ def test_split_owned_physical_change_is_rejected(
     caption_digest: str,
     caption_bindings: CaptionRunBindings,
 ) -> None:
-    """A rewrite of video-split-owned physical data is never rebound."""
+    """A rewrite of video-transcode-owned physical data is never rebound."""
     uri, attempt, workspace, _ = _setup_attempt(
         tmp_path, clip_dataset_factory, caption_spec, caption_digest, caption_bindings
     )
@@ -576,7 +576,7 @@ def test_split_owned_physical_change_is_rejected(
     )
     lance.LanceDataset.commit(uri, transaction, max_retries=0)
 
-    with pytest.raises(PublicationError, match="video-split-owned physical binding"):
+    with pytest.raises(PublicationError, match="video-transcode-owned physical binding"):
         publish_staged_results(
             uri,
             attempt,

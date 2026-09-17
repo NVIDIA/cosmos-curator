@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Atomic snapshot publication, ambiguous responses, and source outcome validation."""
+"""Atomic append publication, ambiguous responses, and incremental source selection."""
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,14 @@ import pytest
 from cosmos_curator.next.media.ffmpeg import VideoMetadata
 from cosmos_curator.next.recipes.video_cut import pipeline, publication
 from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_cut.contracts import SOURCE_SCHEMA, SPAN_FIELDS, SPAN_SCHEMA, span_schema
+from cosmos_curator.next.recipes.video_cut.contracts import (
+    SOURCE_SCHEMA,
+    SPAN_FIELDS,
+    SPAN_SCHEMA,
+    make_source_id,
+    span_schema,
+)
 from cosmos_curator.next.recipes.video_cut.processing import source_result
-from cosmos_curator.next.utils import lance_fragment_recovery
 from cosmos_curator.next.utils.identity import canonical_digest
 
 
@@ -29,7 +35,12 @@ def _stage(config: ResolvedVideoCutConfig, *, duration: int = 5_000_000_000) -> 
     outcomes = pa.Table.from_pylist([row, empty], schema=SOURCE_SCHEMA)
     Path(workspace.results).mkdir(parents=True)
     pq.write_table(outcomes, Path(workspace.results) / "source.parquet")
-    record = {"source_results": 2, "errors": 0, "errors_uri": None}
+    record = {
+        "source_results": 2,
+        "errors": 0,
+        "errors_uri": None,
+        "source_ids": [make_source_id(uri) for uri in config.input.uris],
+    }
     return outcomes, record
 
 
@@ -119,45 +130,13 @@ def test_workspace_schema_changes_isolate_recovery(
     assert Path(existing[0]).is_file()
 
 
-@pytest.mark.parametrize("legacy_rows", [0, 2])
-def test_all_fragments_publish_atomically_and_replay_is_noop(
-    config: ResolvedVideoCutConfig, legacy_rows: int, snapshot_id: str
-) -> None:
-    """A complete snapshot replaces empty or old partial output in exactly one commit."""
+def test_all_fragments_publish_atomically_and_replay_is_noop(config: ResolvedVideoCutConfig, snapshot_id: str) -> None:
+    """All new sources append in exactly one commit; the receipt makes replay a no-op."""
     outcomes, record = _stage(config)
-    if legacy_rows:
-        rows = pa.concat_tables(
-            list(
-                publication.expand_sources(
-                    outcomes,
-                    contract_id=config.split.contract_id,
-                    spans_per_fragment=config.execution.spans_per_fragment,
-                )
-            )
-        ).slice(0, legacy_rows)
-        candidate = lance_fragment_recovery.write_row_fragment(
-            rows.cast(span_schema(config.split, snapshot_id)),
-            uri=config.output.spans_lance_uri,
-            storage_profile="default",
-            schema=span_schema(config.split, snapshot_id),
-            id_column="span_id",
-            data_storage_version="2.2",
-        )
-        lance_fragment_recovery.append_row_fragment(
-            candidate,
-            uri=config.output.spans_lance_uri,
-            storage_profile="default",
-            schema=span_schema(config.split, snapshot_id),
-            id_column="span_id",
-            kind="video-cut",
-            operation="append-spans",
-            data_storage_version="2.2",
-            attempts=1,
-        )
     before = publication.open_span_table(config, snapshot_id)
     candidates = _candidates(outcomes, config)
     assert len(candidates) == 2
-    assert publication.open_span_table(config, snapshot_id).count_rows() == legacy_rows
+    assert publication.open_span_table(config, snapshot_id).count_rows() == 0
     dataset = publication.commit_fragments(
         candidates, config=config, input_snapshot_id=snapshot_id, publication=record, read_version=int(before.version)
     )
@@ -213,61 +192,167 @@ def test_zero_spans_keep_valid_empty_table(config: ResolvedVideoCutConfig, snaps
     assert publication.completed_publication(dataset)["source_results"] == 2
 
 
-@pytest.mark.parametrize("completed", [False, True])
 @pytest.mark.parametrize("sources", [["s3://test-bucket/long.mp4"], ["s3://test-bucket/new.mp4"]])
-def test_changed_source_snapshot_fails_before_execution(
+def test_changed_source_snapshot_selects_only_new_sources(
     config: ResolvedVideoCutConfig,
     monkeypatch: pytest.MonkeyPatch,
     sources: list[str],
     snapshot_id: str,
-    *,
-    completed: bool,
 ) -> None:
-    """Both incomplete and published outputs belong to one frozen source selection."""
+    """A different selection can reuse the table without probing completed sources."""
     outcomes, record = _stage(config)
-    if completed:
-        publication.commit_fragments(
-            _candidates(outcomes, config),
-            config=config,
-            input_snapshot_id=snapshot_id,
-            publication=record,
-            read_version=1,
-        )
+    publication.commit_fragments(
+        _candidates(outcomes, config),
+        config=config,
+        input_snapshot_id=snapshot_id,
+        publication=record,
+        read_version=1,
+    )
     raw = config.model_dump(mode="json")
     raw["input"] = {"uris": sources}
     changed = resolve_config_data(raw)
     monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **_: pytest.fail("unexpected Ray initialization"))
-    with pytest.raises(ValueError, match="input snapshot"):
-        pipeline.run_config(changed)
+    current = publication.open_span_table(changed, canonical_digest(changed.input.uris))
+    assert publication.pending_source_uris(current, changed.input.uris) == (
+        changed.input.uris if sources[0].endswith("new.mp4") else ()
+    )
+    if not sources[0].endswith("new.mp4"):
+        assert pipeline.run_config(changed)["source_results"] == 0
     assert Path(publication.resolve_workspace(config, snapshot_id).root).exists()
 
 
 def test_publication_preserves_concurrent_changes_and_additional_columns(
     config: ResolvedVideoCutConfig, snapshot_id: str
 ) -> None:
-    """An atomic replacement cannot erase another writer's version or enrichment fields."""
+    """An append preserves nullable schema extensions committed while staging."""
     outcomes, record = _stage(config)
     candidates = _candidates(outcomes, config)
-    schema = span_schema(config.split, snapshot_id).append(pa.field("annotation", pa.string()))
-    concurrent = lance.write_dataset(
-        pa.Table.from_pylist([], schema=schema),
+    concurrent = publication.open_span_table(config, snapshot_id)
+    concurrent.add_columns(pa.schema([pa.field("annotation", pa.string())]))
+    result = publication.commit_fragments(
+        candidates, config=config, input_snapshot_id=snapshot_id, publication=record, read_version=1
+    )
+    assert result.to_table(columns=["annotation"])["annotation"].null_count == 3
+
+
+def test_new_run_appends_without_changing_existing_enriched_fragments(
+    config: ResolvedVideoCutConfig,
+    snapshot_id: str,
+) -> None:
+    """An independently selected source set adds fragments and preserves all earlier files."""
+    outcomes, record = _stage(config)
+    first = publication.commit_fragments(
+        _candidates(outcomes, config),
+        config=config,
+        input_snapshot_id=snapshot_id,
+        publication=record,
+        read_version=1,
+    )
+    first.add_columns(pa.schema([pa.field("annotation", pa.string())]))
+    raw = config.model_dump(mode="json")
+    raw["input"] = {"uris": ["s3://test-bucket/new-long.mp4", "s3://test-bucket/new-short.mp4"]}
+    changed = resolve_config_data(raw)
+    new_snapshot = canonical_digest(changed.input.uris)
+    new_outcomes, new_record = _stage(changed)
+    candidates = _candidates(new_outcomes, changed)
+    # Populate an existing fragment after the cutter has staged its new ones.
+    read_version = int(first.version)
+    values = first.get_fragment(0).to_table(columns=["span_id"])
+    values = values.append_column("annotation", pa.array(["retained"] * values.num_rows))
+    fragment, fields = first.get_fragment(0).update_columns(values, left_on="span_id", right_on="span_id")
+    enriched = lance.LanceDataset.commit(
+        first.uri,
+        lance.LanceOperation.Update(updated_fragments=[fragment], fields_modified=fields),
+        read_version=first.version,
+    )
+    existing_files = [fragment.metadata.to_json() for fragment in enriched.get_fragments()]
+    published = publication.commit_fragments(
+        candidates,
+        config=changed,
+        input_snapshot_id=new_snapshot,
+        publication=new_record,
+        read_version=read_version,
+    )
+    assert published.count_rows() == 6
+    assert [fragment.metadata.to_json() for fragment in published.get_fragments()[:2]] == existing_files
+    assert published.get_fragment(0).to_table(columns=["annotation"])["annotation"].to_pylist() == ["retained"] * 2
+    assert published.get_fragment(2).to_table(columns=["annotation"])["annotation"].null_count == 2
+    assert publication.pending_source_uris(published, (*config.input.uris, *changed.input.uris)) == ()
+    # Replaying either receipt after unrelated versions does not append again.
+    again = publication.commit_fragments(
+        _candidates(outcomes, config),
+        config=config,
+        input_snapshot_id=snapshot_id,
+        publication=record,
+        read_version=1,
+    )
+    assert again.version == published.version
+
+
+def test_growing_selection_processes_only_new_sources(
+    config: ResolvedVideoCutConfig,
+    snapshot_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run path excludes both successful and zero-span sources before Ray starts."""
+    outcomes, record = _stage(config)
+    current = publication.commit_fragments(
+        _candidates(outcomes, config),
+        config=config,
+        input_snapshot_id=snapshot_id,
+        publication=record,
+        read_version=1,
+    )
+    raw = config.model_dump(mode="json")
+    new_uri = "s3://test-bucket/new.mp4"
+    raw["input"]["uris"].append(new_uri)
+    changed = resolve_config_data(raw)
+    observed = []
+
+    def run_pending(
+        cfg: ResolvedVideoCutConfig, pending: tuple[str, ...], selection: str
+    ) -> tuple[lance.LanceDataset, dict[str, Any], bool]:
+        assert cfg == changed
+        observed.append(pending)
+        assert selection == canonical_digest(changed.input.uris)
+        return current, {"source_results": 1, "errors": 0, "errors_uri": None}, True
+
+    monkeypatch.setattr(pipeline, "_run_pending", run_pending)
+    summary = pipeline.run_config(changed)
+    assert observed == [(new_uri,)]
+    assert summary["selected_sources"] == 3
+    assert summary["source_results"] == 1
+
+
+def test_legacy_completed_snapshot_can_be_reopened_and_extended(
+    config: ResolvedVideoCutConfig,
+    snapshot_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing v2 metadata remains readable while the input selection may grow."""
+    outcomes, _ = _stage(config)
+    spans = pa.concat_tables(
+        list(publication.expand_sources(outcomes, contract_id=config.split.contract_id, spans_per_fragment=2))
+    )
+    metadata = dict(span_schema(config.split).metadata or {})
+    metadata[b"video_cut.input_snapshot"] = snapshot_id.encode()
+    metadata[b"video_cut.publication"] = json.dumps(
+        {"publication_version": 2, "spans": 3, "source_results": 2, "errors": 0, "errors_uri": None}
+    ).encode()
+    lance.write_dataset(
+        spans.cast(span_schema(config.split).with_metadata(metadata)),
         config.output.spans_lance_uri,
         mode="overwrite",
         data_storage_version="2.2",
     )
-    with pytest.raises(RuntimeError, match="changed while"):
-        publication.commit_fragments(
-            candidates, config=config, input_snapshot_id=snapshot_id, publication=record, read_version=1
-        )
-    with pytest.raises(ValueError, match="additional or changed fields"):
-        publication.commit_fragments(
-            candidates,
-            config=config,
-            input_snapshot_id=snapshot_id,
-            publication=record,
-            read_version=int(concurrent.version),
-        )
-    assert publication.open_span_table(config, snapshot_id).schema.field("annotation").type == pa.string()
+    monkeypatch.setattr(
+        pipeline, "ensure_ray_initialized", lambda **_: pytest.fail("Legacy completion should skip Ray")
+    )
+    assert pipeline.run_config(config)["source_results"] == 2
+    current = publication.open_span_table(config, "different-selection")
+    assert publication.pending_source_uris(current, (config.input.uris[0], "s3://test-bucket/new.mp4")) == (
+        "s3://test-bucket/new.mp4",
+    )
 
 
 @pytest.mark.parametrize("legacy_record", [False, True])

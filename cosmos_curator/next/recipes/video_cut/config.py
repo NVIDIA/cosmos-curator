@@ -5,7 +5,6 @@
 
 import copy
 import json
-import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -17,25 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cosmos_curator.next.core.config import apply_dotted_overrides
 from cosmos_curator.next.media.spans import seconds_to_nanoseconds
 from cosmos_curator.next.utils.identity import canonical_digest
-
-# Match S3Prefix's bucket policy, including underscores for S3-compatible stores.
-_BUCKET = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
-
-
-def normalize_s3_uri(value: str) -> str:
-    """Preserve literal S3 keys, including percent escapes and repeated slashes."""
-    parsed = urlsplit(value)
-    if (
-        value != value.strip()
-        or any(character in value for character in "\r\n\t?#")
-        or parsed.scheme.lower() != "s3"
-        or not _BUCKET.fullmatch(parsed.netloc)
-        or parsed.query
-        or parsed.fragment
-    ):
-        msg = f"Expected an undecorated S3 URI, got {value!r}"
-        raise ValueError(msg)
-    return f"s3://{parsed.netloc}/{parsed.path.removeprefix('/')}"
+from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 
 class _Config(BaseModel):

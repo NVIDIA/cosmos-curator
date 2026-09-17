@@ -26,6 +26,7 @@ def test_registered_kind_names_are_derived_from_concrete_objects() -> None:
         "video-caption",
         "video-cut",
         "video-split",
+        "video-transcode",
         "video_split",
     )
     assert tuple(kind.name for kind in BUILTIN_PIPELINE_KINDS) == BUILTIN_PIPELINE_KINDS.names()

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ray Data source checkpoints followed by packed, atomic Lance span publication."""
+"""Ray Data source checkpoints followed by packed, append-only Lance publication."""
 
 import json
 from collections.abc import Iterator
@@ -35,7 +35,9 @@ from cosmos_curator.next.recipes.video_cut.publication import (
     completed_publication,
     expand_sources,
     open_span_table,
+    pending_source_uris,
     resolve_workspace,
+    select_source_results,
     source_result_files,
     stage_fragment,
 )
@@ -111,8 +113,7 @@ def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uri
             SourceDatasource(source_uris),
             override_num_blocks=min(len(source_uris), 256),
         )
-        source_tasks = sources.repartition(target_num_rows_per_block=1, strict=True)
-        planned = source_tasks.map_batches(
+        planned = sources.map_batches(
             cast("Any", plan_sources),
             batch_size=None,
             batch_format="pyarrow",
@@ -128,9 +129,9 @@ def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uri
         )
 
 
-def _write_error_report(outcomes: ray.data.Dataset, config: ResolvedVideoCutConfig) -> str:
+def _write_error_report(outcomes: ray.data.Dataset, config: ResolvedVideoCutConfig, input_snapshot_id: str) -> str:
     """Keep terminal diagnostics with the output before the commit makes them visible."""
-    uri = f"{config.output.spans_lance_uri}/video-cut/errors.jsonl"
+    uri = f"{config.output.spans_lance_uri}/video-cut/{input_snapshot_id}/errors.jsonl"
     fs = arrow_filesystem(uri, config.execution.storage_profile)
     path = filesystem_path(uri)
     fs.create_dir(path.rsplit("/", 1)[0], recursive=True)
@@ -144,20 +145,29 @@ def _write_error_report(outcomes: ray.data.Dataset, config: ResolvedVideoCutConf
 
 
 def publish_spans(
-    config: ResolvedVideoCutConfig, workspace: Workspace, *, input_snapshot_id: str, source_count: int
+    config: ResolvedVideoCutConfig, workspace: Workspace, *, input_snapshot_id: str, source_uris: tuple[str, ...]
 ) -> lance.LanceDataset:
-    """Pack the frozen source snapshot and publish it in one atomic commit."""
+    """Pack this run's new sources and append them in one atomic commit."""
     dataset = open_span_table(config, input_snapshot_id)
-    if completed_publication(dataset) is not None:
+    if completed_publication(dataset, input_snapshot_id) is not None:
         return dataset
     files = source_result_files(workspace, config)
     if not files:
         msg = "No source results are available for the frozen input snapshot"
         raise ValueError(msg)
+    expected = {make_source_id(uri) for uri in source_uris}
     outcomes = ray.data.read_parquet(
         files,
         filesystem=arrow_filesystem(workspace.results, config.execution.storage_profile),
+    ).map_batches(
+        cast("Any", select_source_results),
+        batch_format="pyarrow",
+        batch_size=None,
+        fn_kwargs={"source_ids": tuple(sorted(expected))},
+        num_cpus=0.25,
     )
+    # A previous attempt may have checkpointed sources that another, sequential
+    # cut invocation has since published. Reuse only this attempt's new sources.
     source_results = errors = 0
     counts = outcomes.select_columns(["status"]).groupby("status").aggregate(Count(alias_name="sources"))
     for outcome in counts.take_all():
@@ -167,10 +177,11 @@ def publish_spans(
         source_results += outcome["sources"]
         if outcome["status"] == "error":
             errors += outcome["sources"]
-    if source_results != source_count:
+    source_ids = [row["source_id"] for row in outcomes.select_columns(["source_id"]).iter_rows()]
+    if source_results != len(expected) or len(source_ids) != len(expected) or set(source_ids) != expected:
         msg = "Source results do not cover the frozen input snapshot"
         raise ValueError(msg)
-    errors_uri = _write_error_report(outcomes, config) if errors else None
+    errors_uri = _write_error_report(outcomes, config, input_snapshot_id) if errors else None
     expanded = outcomes.map_batches(
         cast("Any", expand_sources),
         batch_format="pyarrow",
@@ -200,36 +211,25 @@ def publish_spans(
             "source_results": source_results,
             "errors": errors,
             "errors_uri": errors_uri,
+            "source_ids": sorted(source_ids),
         },
         read_version=int(dataset.version),
     )
 
 
 def run_config(config: ResolvedVideoCutConfig) -> dict[str, Any]:
-    """Publish or reopen a frozen source snapshot, cleaning only the workspace used in this invocation."""
+    """Append new immutable sources, preserving all existing fragments and enrichment."""
     source_uris = resolve_input_uris(config.input, storage_profile=config.execution.storage_profile)
     input_snapshot_id = canonical_digest(source_uris)
     dataset = open_span_table(config, input_snapshot_id)
-    publication = completed_publication(dataset)
+    publication = completed_publication(dataset, input_snapshot_id)
     cleanup_complete: bool | None = None
     if publication is None:
-        workspace = resolve_workspace(config, input_snapshot_id)
-        ensure_ray_initialized()
-        configure_ray_data_progress(progress=config.execution.progress)
-        configure_ray_data_stability()
-        cut_sources(config, workspace, source_uris)
-        dataset = publish_spans(config, workspace, input_snapshot_id=input_snapshot_id, source_count=len(source_uris))
-        publication = completed_publication(dataset)
-        if publication is None:
-            msg = "Span publication completed without its completion record"
-            raise RuntimeError(msg)
-        try:
-            cleanup_workspace(workspace, config)
-        except Exception as exc:  # noqa: BLE001 -- cleanup cannot invalidate a successful publication
-            cleanup_complete = False
-            logger.warning("Spans are committed at Lance v{}, but workspace cleanup failed: {!r}", dataset.version, exc)
+        pending = pending_source_uris(dataset, source_uris)
+        if not pending:
+            publication = {"source_results": 0, "errors": 0, "errors_uri": None}
         else:
-            cleanup_complete = True
+            dataset, publication, cleanup_complete = _run_pending(config, pending, input_snapshot_id)
     summary = {
         "selected_sources": len(source_uris),
         "source_results": publication["source_results"],
@@ -247,3 +247,25 @@ def run_config(config: ResolvedVideoCutConfig) -> dict[str, Any]:
         summary["errors"],
     )
     return summary
+
+
+def _run_pending(
+    config: ResolvedVideoCutConfig, pending: tuple[str, ...], input_snapshot_id: str
+) -> tuple[lance.LanceDataset, dict[str, Any], bool]:
+    """Process one finite selection of new sources and clean only its own workspace."""
+    workspace = resolve_workspace(config, input_snapshot_id)
+    ensure_ray_initialized()
+    configure_ray_data_progress(progress=config.execution.progress)
+    configure_ray_data_stability()
+    cut_sources(config, workspace, pending)
+    dataset = publish_spans(config, workspace, input_snapshot_id=input_snapshot_id, source_uris=pending)
+    publication = completed_publication(dataset, input_snapshot_id)
+    if publication is None:
+        msg = "Span publication completed without its completion record"
+        raise RuntimeError(msg)
+    try:
+        cleanup_workspace(workspace, config)
+    except Exception as exc:  # noqa: BLE001 -- cleanup cannot invalidate a successful publication
+        logger.warning("Spans are committed at Lance v{}, but workspace cleanup failed: {!r}", dataset.version, exc)
+        return dataset, publication, False
+    return dataset, publication, True

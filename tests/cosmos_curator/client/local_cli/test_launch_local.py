@@ -35,8 +35,9 @@ from cosmos_curator.client.local_cli.launch_local import (  # type: ignore[impor
 runner = CliRunner()
 
 
-def test_launch_command() -> None:
-    """Test that docker run command forms."""
+@pytest.mark.parametrize(("stdout_tty", "stderr_tty"), [(True, True), (True, False), (False, True), (False, False)])
+def test_launch_command(*, stdout_tty: bool, stderr_tty: bool) -> None:
+    """Preserve terminal progress and redirected streams without exposing stdin."""
     args = [
         "local",
         "launch",
@@ -51,8 +52,13 @@ def test_launch_command() -> None:
         "-m",
         "cosmos_curator.pipelines.examples.hello_world_pipeline",
     ]
-    with patch("cosmos_curator.client.local_cli.launch_local.subprocess.call") as mock_call:
+    with (
+        patch("cosmos_curator.client.local_cli.launch_local.subprocess.call") as mock_call,
+        patch("cosmos_curator.client.local_cli.launch_local.sys") as mock_sys,
+    ):
         mock_call.return_value = 0
+        mock_sys.stdout.isatty.return_value = stdout_tty
+        mock_sys.stderr.isatty.return_value = stderr_tty
 
         result = runner.invoke(cosmos_curator, args)
 
@@ -66,13 +72,11 @@ def test_launch_command() -> None:
     assert "--network=host" not in called_args
     assert "--cap-add=SYS_ADMIN" not in called_args
     assert "COSMOS_CURATOR_RAY_IO_SLOTS_PER_NODE=16" in called_args
-    # A pseudo-TTY becomes the container's controlling terminal, and Ray (>=2.57) puts each worker
-    # in its own process group. Any worker child reading stdin from such a background group is
-    # stopped with SIGTTIN, which silently hangs ffmpeg mid-pipeline. PYTHONUNBUFFERED replaces the
-    # line buffering the TTY used to provide.
-    assert "-t" not in called_args
+    assert ("-t" in called_args) is (stdout_tty and stderr_tty)
+    assert "-i" not in called_args
     assert "-it" not in called_args
     assert "PYTHONUNBUFFERED=1" in called_args
+    assert called_args[-1].startswith("exec < /dev/null && ")
 
 
 def test_launch_command_forwards_local_ray_io_capacity() -> None:

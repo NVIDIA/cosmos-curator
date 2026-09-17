@@ -3,42 +3,32 @@
 
 """Shared fixtures for video-caption contract and Lance integration tests."""
 
+import json
 from collections.abc import Callable
-from functools import partial
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInputBindings,
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
-)
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.contracts import (
     CaptionModelSpec,
-    build_terminal_result_row,
     caption_contract_digest,
     resolve_model_spec,
-    validate_terminal_row,
-    validate_terminal_value,
 )
-from cosmos_curator.next.recipes.video_caption.inference import (
-    MAPPED_INPUT_SCHEMA,
-    decompose_row_addresses,
-    result_schema,
-)
-from cosmos_curator.next.recipes.video_split.lance_sink import validate_clip_table
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, PUBLICATION_KEY
+from tests.cosmos_curator.next.recipes.video_caption.helpers import caption_run_bindings
 
 
 def clip_row(index: int, *, clip_id: str | None = None) -> dict[str, object]:
-    """Return one valid canonical video-split row."""
+    """Return one valid canonical video-transcode row."""
     return {
         "record_schema_version": 1,
-        "media_contract_version": 1,
+        "cut_contract_id": "cut-contract",
+        "span_id": f"span-{index}",
+        "stream_index": 0,
+        "transcode_contract_id": "transcode-contract",
         "source_id": f"source-{index}",
         "source_uri": f"s3://input/source-{index}.mp4",
         "source_size_bytes": 1_000 + index,
@@ -77,43 +67,7 @@ def caption_digest(caption_spec: CaptionModelSpec) -> str:
 @pytest.fixture
 def caption_bindings(caption_spec: CaptionModelSpec, caption_digest: str) -> CaptionRunBindings:
     """Return the clip recipe's explicit private run bindings."""
-    return CaptionRunBindings(
-        input=CaptionInputBindings(
-            source_columns=("clip_id", "clip_uri", "clip_size_bytes"),
-            source_schema=pa.schema([CLIP_SCHEMA.field(name) for name in ("clip_id", "clip_uri", "clip_size_bytes")]),
-            mapped_schema=MAPPED_INPUT_SCHEMA,
-            project_batch=decompose_row_addresses,
-            row_id_column="clip_id",
-            media_uri_column="clip_uri",
-            media_size_column="clip_size_bytes",
-            media_sha256_column=None,
-            staged_binding_columns=("clip_id",),
-        ),
-        result=CaptionResultBindings(
-            caption_field_name=caption_spec.caption_field_name,
-            metadata_field_name=caption_spec.metadata_field_name,
-            fields=caption_spec.fields,
-            staged_schema=result_schema(caption_spec),
-            digest=caption_digest,
-            build_terminal_row=partial(build_terminal_result_row, spec=caption_spec, digest=caption_digest),
-            validate_terminal_value=partial(
-                validate_terminal_value,
-                spec=caption_spec,
-                digest=caption_digest,
-            ),
-            validate_staged_row=partial(
-                validate_terminal_row,
-                spec=caption_spec,
-                digest=caption_digest,
-            ),
-        ),
-        publication=CaptionPublicationBindings(
-            validate_base_schema=partial(validate_clip_table, uri="test-clips.lance"),
-            protected_field_names=tuple(CLIP_SCHEMA.names),
-            base_field_owner="video-split",
-            transaction_properties={"kind": "video-caption"},
-        ),
-    )
+    return caption_run_bindings(caption_spec, caption_digest)
 
 
 @pytest.fixture
@@ -145,7 +99,12 @@ def clip_dataset_factory(
         )
         uri = str(tmp_path / f"clips-{created}.lance")
         dataset = lance.write_dataset(
-            pa.Table.from_pylist(values, schema=CLIP_SCHEMA),
+            pa.Table.from_pylist(
+                values,
+                schema=CLIP_SCHEMA.with_metadata(
+                    {PUBLICATION_KEY: json.dumps({"publication_version": 1, "spans": len(values)}).encode()}
+                ),
+            ),
             uri,
             max_rows_per_file=rows_per_fragment,
             data_storage_version="2.2",

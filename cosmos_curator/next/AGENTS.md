@@ -149,6 +149,9 @@ period with no workers should stall rather than invalidate the logical run. Do n
 resource snapshot or keep required progress only in worker-local files, actor memory, or Ray objects. Initialize model
 and process state for every new worker or actor incarnation.
 
+For large-source download stages, follow the
+[`curator_io` concurrency guidance](../../docs/curator/design/ray-data.md#large-source-downloads-and-curator_io).
+
 ## Recovery Direction
 
 Recovery mechanisms remain provisional and recipe-specific; expect this guidance to evolve as more work shapes are

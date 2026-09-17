@@ -28,12 +28,12 @@ def _minimal(media_root: str) -> dict[str, object]:
 
 
 def test_defaults_derive_contract_paths_for_s3() -> None:
-    """S3 defaults remain under the normalized video-split media root."""
-    config = resolve_config_data(_minimal("s3://example-bucket/curated/video-split/"))
+    """S3 defaults remain under the normalized video-transcode media root."""
+    config = resolve_config_data(_minimal("s3://example-bucket/curated/video-transcode/"))
 
-    assert config.input.media_root == "s3://example-bucket/curated/video-split"
-    assert config.input.clips_lance_uri == "s3://example-bucket/curated/video-split/lance"
-    assert config.output.staging_root_uri == "s3://example-bucket/curated/video-split/staging/video-caption"
+    assert config.input.media_root == "s3://example-bucket/curated/video-transcode"
+    assert config.input.clips_lance_uri == "s3://example-bucket/curated/video-transcode/lance"
+    assert config.output.staging_root_uri == "s3://example-bucket/curated/video-transcode/staging/video-caption"
     assert config.execution.storage_profile == "default"
     assert config.execution.inference_concurrency == "auto"
     assert config.execution.media_concurrency == "auto"

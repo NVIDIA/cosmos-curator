@@ -215,7 +215,7 @@ def normalized_caption_contract(spec: CaptionModelSpec) -> dict[str, Any]:
 
 
 def caption_contract_digest(spec: CaptionModelSpec) -> str:
-    """Hash the normalized result contract with video-split's canonical JSON rules."""
+    """Hash the normalized caption result contract with canonical JSON rules."""
     return canonical_digest(normalized_caption_contract(spec))
 
 

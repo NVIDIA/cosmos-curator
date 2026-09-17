@@ -146,6 +146,21 @@ New Ray Data pipelines are built one at a time, starting with simple examples an
 For pipelines that already have a Xenna implementation, the Ray Data version can be validated against it. Where Ray
 Data proves to be the better fit, it may replace the Xenna version; where Xenna works better, it stays.
 
+### Large source downloads and `curator_io`
+
+Large downloads use little CPU but can hold substantial memory, so fractional CPU reservations can admit excessive
+concurrency. Reserve one `curator_io` slot per concurrent source download (default: 16 per node), including retries,
+and keep CPU/GPU processing in a separate stage. Ray's backpressure regulates queued payloads; bounded downstream
+uploads normally rely on production rate and backpressure without reserving download slots.
+
+Custom resources bound execution in Ray Core, but Ray 2.58's Data task-pool admission accounting only tracks built-in
+resources. An uncapped task pool can therefore consume its CPU/memory budget with submitted downloads waiting for IO
+slots. For this workload, [video-transcode](curator-next-video-transcode.md) uses an autoscaling actor pool: each actor
+owns an IO slot, accepts one in-flight task, and can be replaced when a worker disappears. Use a reachable actor scaling
+threshold (1.0 for one in-flight task and concurrency one), and do not derive a permanent pool maximum from a startup
+resource snapshot. Actors hold slots while idle or backpressured too; task admission and payload memory budgets remain
+separate concerns.
+
 ### S3-compatible object storage (GCS)
 
 An `s3://` location may resolve through a storage profile to Google Cloud

@@ -466,7 +466,7 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
         "NVCF_REQUEST_STATUS=false",
         "-e",
         f"{CURATOR_IO_SLOTS_PER_NODE_ENV_VAR}={opts.ray_io_slots_per_node}",
-        # Replaces the line buffering a pseudo-TTY used to give us; see the -t note below.
+        # Keep redirected output responsive too.
         "-e",
         "PYTHONUNBUFFERED=1",
     ]
@@ -489,10 +489,10 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     for vol in opts.extra_volumes:
         docker_command.extend(["-v", vol])
     docker_command.extend(_get_identity_mounts(scratch_home))
-    # Deliberately no "-t": a pseudo-TTY becomes the container's controlling terminal, and Ray
-    # (>=2.57) puts each worker in its own process group. Any child that reads stdin from such a
-    # background group is stopped with SIGTTIN, which silently hangs ffmpeg mid-pipeline. Without a
-    # TTY, job control signals cannot be raised at all.
+    # Ray's live progress display requires a TTY. Keep stdout/stderr separate
+    # when either is redirected; Docker combines them when a TTY is allocated.
+    if sys.stdout.isatty() and sys.stderr.isatty():
+        docker_command.append("-t")
     docker_command.extend(
         [
             f"{opts.image_label}",
@@ -505,7 +505,9 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     # in .pixi/envs/*/bin/ carry shebangs with the host's absolute path (e.g.
     # #!/home/user/project/.pixi/envs/default/bin/python3.13) which don't exist
     # inside the container.  Create a symlink so the kernel can resolve them.
-    preamble_parts: list[str] = []
+    # Ray workers run in background process groups. Disconnect stdin before
+    # starting them so inherited terminal reads cannot stop children with SIGTTIN.
+    preamble_parts: list[str] = ["exec < /dev/null"]
     if opts.pixi_path is not None:
         host_code_dir = Path(opts.pixi_path).resolve()
         if host_code_dir != CONTAINER_PATHS_CODE_DIR:

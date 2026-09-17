@@ -46,9 +46,9 @@ from cosmos_curator.next.recipes.video_caption.inference import (
 )
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace, phase_a_completion_covers
-from cosmos_curator.next.recipes.video_split.lance_sink import append_clip_fragment, write_clip_fragment
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
 from tests.cosmos_curator.next.conftest import CURATOR_IO_RESOURCE, CURATOR_IO_SLOTS
+from tests.cosmos_curator.next.recipes.video_caption.helpers import append_clip_fragment, write_clip_fragment
 
 
 class _FakeCaptionProcessor:

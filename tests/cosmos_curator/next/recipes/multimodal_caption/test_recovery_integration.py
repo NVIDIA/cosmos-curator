@@ -51,6 +51,7 @@ def _fake_inference(row: dict[str, Any]) -> dict[str, object]:
     }
 
 
+@pytest.mark.integration
 def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # noqa: PLR0915
     tmp_path: Path,
     camera_factory: Callable[..., dict[str, object]],

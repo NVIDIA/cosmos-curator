@@ -4,8 +4,9 @@
 """Resolve source selection before Ray execution or output creation."""
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
-from cosmos_curator.next.recipes.video_cut.config import InputConfig, normalize_s3_uri
+from cosmos_curator.next.recipes.video_cut.config import InputConfig
 from cosmos_curator.next.recipes.video_cut.storage import s3_client
+from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 
 def resolve_input_uris(config: InputConfig, *, storage_profile: str) -> tuple[str, ...]:

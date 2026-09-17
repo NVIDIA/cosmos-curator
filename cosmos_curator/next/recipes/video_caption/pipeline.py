@@ -63,8 +63,7 @@ from cosmos_curator.next.recipes.video_caption.workspace import (
     resolve_workspace,
     workspace_manifest_exists,
 )
-from cosmos_curator.next.recipes.video_split.lance_sink import validate_clip_table
-from cosmos_curator.next.recipes.video_split.records import CLIP_SCHEMA
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, validate_clip_table
 from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 
 
@@ -100,7 +99,7 @@ def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
         publication=CaptionPublicationBindings(
             validate_base_schema=partial(validate_clip_table, uri=uri),
             protected_field_names=tuple(CLIP_SCHEMA.names),
-            base_field_owner="video-split",
+            base_field_owner="video-transcode",
             transaction_properties={"kind": "video-caption"},
         ),
     )

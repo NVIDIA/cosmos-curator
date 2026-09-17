@@ -21,11 +21,10 @@ stops any background process that reads stdin by sending it SIGTTIN. A stopped f
 returns, so the owning stage sits at 0% CPU with zero completions and no error -- the
 failure mode this guard exists to prevent.
 
-Removing the pseudo-TTY from the local launcher is the root fix (see
-``test_launch_local.test_launch_command``), but library code also runs under launchers that
-do allocate a terminal, such as the interactive ``ssh -t`` and ``srun --pty`` paths in
-``slurm_shell``. So every spawn in library code must decide stdin explicitly rather than
-inherit it.
+The local launcher disconnects stdin before starting Ray, while retaining terminal output
+for progress bars (see ``test_launch_local.test_launch_command``). Library code also runs
+under interactive ``ssh -t`` and ``srun --pty`` paths in ``slurm_shell``, so every spawn must
+decide stdin explicitly rather than inherit it.
 
 This is a structural guard, not a behavioral test: regex sweeps of this codebase have twice
 missed a spawn helper (``check_call``), and a new unguarded call site arrived from ``main``

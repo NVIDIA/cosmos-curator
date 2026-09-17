@@ -45,8 +45,8 @@ from cosmos_curator.next.recipes.video_caption.workspace import (
     CaptionWorkspace,
     record_phase_a_completion,
 )
-from cosmos_curator.next.recipes.video_split.storage import download_bytes
 from cosmos_curator.next.utils.arrow_utils import filesystem_path
+from cosmos_curator.next.utils.storage import download_bytes
 
 _ROW_ADDRESS_FRAGMENT_SHIFT = 32
 _ROW_ADDRESS_OFFSET_MASK = (1 << _ROW_ADDRESS_FRAGMENT_SHIFT) - 1

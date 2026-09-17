@@ -255,6 +255,40 @@ def test_native_pending_write_is_replayed_within_frozen_snapshot(
 
 
 @pytest.mark.integration
+def test_resuming_after_an_overlapping_cut_run_filters_checkpointed_sources(
+    config: ResolvedVideoCutConfig, tmp_path: Path
+) -> None:
+    """A sequential cut run may publish some checkpointed sources before the original run resumes."""
+    raw = config.model_dump(mode="json")
+    raw["input"]["uris"].extend(["s3://test-bucket/long-2.mp4", "s3://test-bucket/long-3.mp4"])
+    config = resolve_config_data(
+        raw, overrides=["execution.sources_per_checkpoint=1", "execution.spans_per_fragment=4"]
+    )
+    first = _attempt(config, tmp_path, "interrupted", config.input.uris, interrupt=True)
+    assert first.returncode != 0
+    assert "injected driver loss before commit" in first.stderr, first.stdout + first.stderr
+
+    raw = config.model_dump(mode="json")
+    raw["input"] = {"uris": [config.input.uris[0]]}
+    subset = resolve_config_data(raw)
+    second = _attempt(subset, tmp_path, "subset", subset.input.uris)
+    assert second.returncode == 0, second.stdout + second.stderr
+    existing = [
+        fragment.metadata.to_json() for fragment in lance.dataset(config.output.spans_lance_uri).get_fragments()
+    ]
+
+    third = _attempt(config, tmp_path, "resumed-overlap", ())
+    assert third.returncode == 0, third.stdout + third.stderr
+    dataset = lance.dataset(config.output.spans_lance_uri)
+    assert dataset.count_rows() == 9
+    assert len(set(dataset.to_table(columns=["span_id"])["span_id"].to_pylist())) == 9
+    assert [fragment.metadata.to_json() for fragment in dataset.get_fragments()[: len(existing)]] == existing
+    summary = json.loads((tmp_path / "resumed-overlap.json.summary").read_text())
+    assert summary["source_results"] == 3
+    assert summary["selected_sources"] == 4
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("sources_per_checkpoint", [1, 2])
 def test_full_sized_fragments_pack_source_plans(
     config: ResolvedVideoCutConfig, tmp_path: Path, sources_per_checkpoint: int

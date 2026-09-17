@@ -23,14 +23,15 @@ a classified verdict on failure, is a stateful job that lives next door in
 
 Importing this module costs a cloud SDK (``botocore``, and ``azure.identity``
 transitively), which a client-only install does not have. Pure URI parsing
-therefore lives in :mod:`cosmos_curator.next.utils.local_uri` and is imported
-back below; a caller that only needs to resolve a path - a config model, a CLI
-render - must import that module directly rather than this one.
+therefore lives in :mod:`cosmos_curator.next.utils.local_uri`, with location
+normalization in :mod:`cosmos_curator.next.utils.uris`. Config and CLI callers
+must import those modules directly rather than this one.
 """
 
 import os
 import shutil
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,7 +39,7 @@ import tenacity
 from botocore.exceptions import ClientError
 from loguru import logger
 
-from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix, is_s3path
+from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix, get_s3_client_config, is_s3path
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_storage_client,
     is_missing_object_error,
@@ -74,6 +75,26 @@ def artifact_uri(location: str) -> str:
     if location.startswith("file://"):
         return local_path(location).resolve().as_uri()
     return Path(location).expanduser().resolve().as_uri()
+
+
+@lru_cache(maxsize=8)
+def _s3_client(profile: str, *, overwrite: bool = False) -> S3Client:
+    return S3Client(get_s3_client_config(profile, can_overwrite=overwrite))
+
+
+def download_bytes(source_uri: str, *, storage_profile: str) -> bytes:
+    """Read local or S3 object bytes with cached worker credentials."""
+    if source_uri.startswith("s3://"):
+        return _s3_client(storage_profile).download_object_as_bytes(S3Prefix(source_uri))
+    return local_media_path(source_uri).read_bytes()
+
+
+def upload_bytes(payload: bytes, destination_uri: str, *, storage_profile: str) -> None:
+    """Atomically replace a local or S3 destination on task replay."""
+    if destination_uri.startswith("s3://"):
+        _s3_client(storage_profile, overwrite=True).upload_bytes(S3Prefix(destination_uri), payload)
+    else:
+        write_media(destination_uri, payload, storage_profile=storage_profile)
 
 
 def write_media(location: str, data: bytes, *, storage_profile: str = "default") -> None:

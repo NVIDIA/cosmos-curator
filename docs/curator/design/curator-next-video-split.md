@@ -1,6 +1,6 @@
 # Curator Next: Video Split
 
-**Status:** Deprecated in favor of [`video-cut`](curator-next-video-cut.md) and the planned `video-transcode` recipe.
+**Status:** Deprecated in favor of [`video-cut`](curator-next-video-cut.md) and [`video-transcode`](curator-next-video-transcode.md).
 Retain the existing implementation until both replacements are available; migration and removal follow separately.
 
 ## Summary

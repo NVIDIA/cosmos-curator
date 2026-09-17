@@ -13,7 +13,7 @@ import pyarrow as pa
 from lance.fragment import FragmentMetadata, LanceFragment
 
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_split.lance_sink import validate_clip_table
+from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_table
 from cosmos_curator.next.utils.identity import canonical_digest
 
 _OWNED_FIELD_COUNT = 2

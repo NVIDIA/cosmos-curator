@@ -3,7 +3,7 @@
 ## Summary
 
 `video-caption` enriches the canonical clip table produced by Curator Next
-[`video-split`](curator-next-video-split.md). It reads complete clip MP4s, generates one caption per clip with Qwen3.8
+[`video-transcode`](curator-next-video-transcode.md). It reads complete clip MP4s, generates one caption per clip with Qwen3.8
 through Ray Data LLM and vLLM, and fills a versioned caption field set on the existing Lance rows.
 
 The design separates expensive inference from canonical publication:
@@ -20,20 +20,20 @@ corresponding fragments are verified in Lance.
 
 ## Context and Responsibilities
 
-`video-split` owns row creation, fragment creation, and clip media. Captioning owns only its selected caption and
-metadata fields. It does not discover sources, split videos, rewrite media, append rows, or change row order.
+`video-cut` owns span rows and fragment creation. `video-transcode` owns clip media and its metadata. Captioning owns
+only its selected caption and metadata fields. It does not discover sources, split videos, rewrite media, append rows, or change row order.
 
 The design relies on these properties of the upstream table:
 
 - `clip_id` is globally unique and immutable.
 - `clip_uri` and `clip_size_bytes` are non-null and immutable for an existing row.
 - Each clip is a standalone H.264 MP4 that was probed after transcoding.
-- Splitting is append-only; new fragments may appear while captioning is running.
-- Nullable enrichment fields may be added without changing the splitting-owned fields.
+- Transcoding publishes all clip metadata in one commit while preserving the cut fragment layout.
+- Nullable enrichment fields may be added without changing the upstream-owned fields.
 
-One logical writer owns a given caption field set. `video-split` and enrichment writers for disjoint field sets may run
-concurrently when they follow the fragment-reconciliation protocol described below. Multiple writers for the same
-field set are outside the consistency model.
+Captioning starts after transcode publication. One logical writer owns a given caption field set. Enrichment writers
+for disjoint field sets may run concurrently when they follow the fragment-reconciliation protocol described below.
+Multiple writers for the same field set are outside the consistency model.
 
 ## Design Invariants
 
@@ -118,7 +118,8 @@ state and validates any pre-existing workspace before cleanup.
 ### Field ownership and registration
 
 The recipe adds the caption and metadata fields together in one Lance schema transaction. Both top-level fields are
-nullable so existing rows and future split appends begin pending. Their Arrow metadata records the owner and field set:
+nullable so existing rows and any future producer appends begin pending. Their Arrow metadata records the owner and
+field set:
 
 ```text
 cosmos_curator.owner = video-caption
@@ -398,9 +399,10 @@ client response a reconciliation event rather than a reason to repeat inference.
 
 ## Concurrency and Consistency Model
 
-The pinned `V_attempt` separates selection from concurrent appends. A fragment appended by `video-split` after that
+The pinned `V_attempt` separates selection from concurrent appends. A fragment appended by a future producer after that
 snapshot is not part of the active attempt and remains pending for the next invocation. Earlier selected fragments can
-still be published while splitting appends other fragments.
+still be published while an independent producer appends other fragments. Transcode itself publishes a complete snapshot
+and does not append after completion.
 
 Disjoint enrichment writers can proceed concurrently when they preserve the fragment ID, row count, ordered
 `clip_id` values, and all split- and caption-owned physical bindings. A same-fragment race causes restaging from Parquet
@@ -424,7 +426,7 @@ These cases fail closed when detectable rather than risking a caption-to-media m
 | Phase A complete | Reuse Parquet and enter Phase B without model setup when the completion marker covers the attempt. |
 | Prepared update not known committed | Reopen latest and reconcile; restage from Parquet when the change is disjoint. |
 | Some fragments committed | Skip canonical fragments and publish only fragments that remain pending. |
-| `video-split` appended after `V_attempt` | Leave the new fragment pending until the next attempt. |
+| A producer appended after `V_attempt` | Leave the new fragment pending until the next attempt. |
 | Canonical verification succeeded but cleanup failed | Keep the Lance result; retry workspace cleanup later. |
 
 Deterministic per-clip media failures are terminal data and are not retried by an ordinary rerun. Shared failures stop
@@ -440,7 +442,7 @@ schema_version: 1
 kind: video-caption
 
 input:
-  media_root: s3://example-bucket/curated/video-split
+  media_root: s3://example-bucket/curated/video-transcode
 
 model:
   variant: qwen3_8_27b_fp8

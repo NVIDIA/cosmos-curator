@@ -242,7 +242,7 @@ def verify_selected_fragments(  # noqa: PLR0913 -- explicit canonical-verificati
     for fragment_id in attempt.selected_fragment_ids:
         fragment = _require_fragment(current, fragment_id)
         guard = resolved_guards[fragment_id]
-        _assert_split_identity(current, fragment, guard, bindings)
+        _assert_base_identity(current, fragment, guard, bindings)
         state = classify_fragment(fragment, bindings=bindings)
         if state is not FragmentCaptionState.COMPLETE:
             msg = f"Fragment {fragment_id} selected from attempt v{attempt.version} is still pending"
@@ -556,7 +556,7 @@ def prepare_fragment_publication(
     descriptor: PreparedFragmentUpdate | None = None
     state = classify_fragment(fragment, bindings=bindings)
     if state is FragmentCaptionState.COMPLETE:
-        _assert_split_identity(current, fragment, guard, bindings)
+        _assert_base_identity(current, fragment, guard, bindings)
         if _caption_values_fingerprint(fragment, bindings) != staged_values_fingerprint:
             msg = f"Fragment {fragment_id} has a terminal caption that differs from staged recovery data"
             raise PublicationError(msg)
@@ -1004,7 +1004,7 @@ def _assert_pending_identity(
     guard: AttemptFragmentGuard,
     bindings: CaptionRunBindings,
 ) -> None:
-    _assert_split_identity(dataset, fragment, guard, bindings)
+    _assert_base_identity(dataset, fragment, guard, bindings)
     pending_ids = leaf_field_ids(
         dataset,
         (
@@ -1019,7 +1019,7 @@ def _assert_pending_identity(
         raise PublicationError(msg)
 
 
-def _assert_split_identity(
+def _assert_base_identity(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
