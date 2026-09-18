@@ -131,7 +131,8 @@ def test_recipes_do_not_reach_into_the_deprecated_ray_data_package(repo_root: pa
     """``next`` must stay importable once ``pipelines.ray_data`` is deleted."""
     probe = (
         "import sys;"
-        "import cosmos_curator.next.recipes.video_split.pipeline;"
+        "import cosmos_curator.next.recipes.video_cut.pipeline;"
+        "import cosmos_curator.next.recipes.video_transcode.pipeline;"
         "print([m for m in sys.modules if m.startswith('cosmos_curator.pipelines')])"
     )
     result = subprocess.run(  # noqa: S603

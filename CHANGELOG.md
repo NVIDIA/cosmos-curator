@@ -2,6 +2,12 @@
 
 ## Latest
 
+### Breaking Changes
+
+- Remove the Curator Next `video-split` recipe. Use [video-cut](docs/curator/design/curator-next-video-cut.md), then
+  [video-transcode](docs/curator/design/curator-next-video-transcode.md), then `video-caption`;
+  existing split tables require a fresh output or an explicit migration.
+
 ## [2.6.0]
 
 ### Released

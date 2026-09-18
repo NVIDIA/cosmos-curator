@@ -1,8 +1,8 @@
 # Curator Next: Video Cut
 
 [`video_cut`](../../../cosmos_curator/next/recipes/video_cut/) plans fixed-stride video spans without creating clip media.
-[`video-transcode`](curator-next-video-transcode.md) encodes those spans. Together they replace the deprecated
-[`video-split`](curator-next-video-split.md), whose implementation remains pending removal.
+[`video-transcode`](curator-next-video-transcode.md) encodes those spans. Together they replace the removed
+`video-split` recipe.
 
 ## Decision and rationale
 

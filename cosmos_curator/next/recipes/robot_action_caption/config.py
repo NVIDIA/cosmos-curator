@@ -39,8 +39,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cosmos_curator.core.utils.config.pydantic_config import STRICT_CONFIG_MODEL_CONFIG
 from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.next.core.config import apply_dotted_overrides
-from cosmos_curator.next.recipes.video_split.uris import normalize_s3_uri
 from cosmos_curator.next.utils.local_uri import local_media_path
+from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 _YAML_SUFFIXES: Final = frozenset({".yaml", ".yml"})
 

@@ -2,8 +2,10 @@
 
 ## Status
 
-Incremental row growth and cross-run split recovery are implemented by `video-split`. Dynamic curation-column
-registration, fragment-scoped column backfill, and optional fine-grained checkpoints remain proposals.
+This design records the original `video-split` publication model and the proposed curation extensions. That recipe has
+been removed. Current row growth and source checkpoints belong to [video-cut](curator-next-video-cut.md); clip media,
+column enrichment, and span checkpoints belong to [video-transcode](curator-next-video-transcode.md). See those designs
+and [video-caption](curator-next-video-captioning.md) for the implemented publication and recovery boundaries.
 
 ## Summary
 
@@ -228,6 +230,7 @@ The implementation should demonstrate that:
 ## Related Design Notes
 
 - [Cosmos Curator Next](curator-next.md)
-- [Curator Next Video Split](curator-next-video-split.md)
+- [Curator Next Video Cut](curator-next-video-cut.md)
+- [Curator Next Video Transcode](curator-next-video-transcode.md)
 - [Ray Data Design](ray-data.md)
 - [Managed Ray Clusters for Curator Pipelines on Slurm](curator-next-slurm-ray.md)

@@ -45,7 +45,7 @@ Whether that is a problem, or whether they are too FEW, is a statement about the
 reader's width, so no helper here makes it and none recommends an operation.
 
 Write paths are NOT here on purpose. Each recipe owns its own commit semantics:
-``video_split`` and ``robot_action_split`` append fragments, the embeddings recipe
+``video_cut`` and ``robot_action_split`` append fragments, the embeddings recipe
 updates column groups in place. A shared "write a Lance table" helper would have
 to encode one of those choices for all of them.
 """

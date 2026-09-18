@@ -205,7 +205,7 @@ def test_validate_rejects_a_config_routed_to_this_kind_under_another_discriminat
     """The adapter enforces its own discriminator, not just the registry's dispatch."""
     path = tmp_path / "embeddings.yaml"
     path.write_text(
-        yaml.safe_dump({"schema_version": 1, "kind": "video-split", "clips_lance_uri": DEFAULT_CLIPS_URI}),
+        yaml.safe_dump({"schema_version": 1, "kind": "video-cut", "clips_lance_uri": DEFAULT_CLIPS_URI}),
         encoding="utf-8",
     )
 

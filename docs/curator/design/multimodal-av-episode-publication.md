@@ -68,8 +68,9 @@ camera_media                         large_list
 | Top-level camera columns | `front_left_uri`, `front_right_uri`, … | Duplicates field families and binds the table to one rig |
 | One row per camera | `(episode_id, camera_key)` per row | Every consumer must regroup rows and prove the camera set is complete |
 
-Existing clip-oriented recipes intentionally use different row units. `video-split` publishes one flat MP4 row per
-`clip_id`. `robot-action-split` publishes one independently appendable view row per `clip_id`; a consumer needing
+Existing clip-oriented recipes intentionally use different row units. `video-cut` publishes one row per `span_id`,
+which `video-transcode` enriches with one flat MP4 and `clip_id`. `robot-action-split` publishes one independently
+appendable view row per `clip_id`; a consumer needing
 synchronized views groups those rows by `span_group_id`. Here the synchronized camera set, rather than an individual
 camera clip, is the canonical row.
 

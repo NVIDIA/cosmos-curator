@@ -2,13 +2,17 @@
 
 ## Summary
 
-`robot-action-split` extends the Curator Next video-split recipe to support
+`robot-action-split` builds on the original Curator Next video-split design to support
 **semantically-bounded span extraction** from LeRobot/Mecka robot datasets. Where
 `video-split` produces fixed-stride clips from a flat MP4 inventory, this recipe
 reads parquet-backed episode metadata, identifies subtask boundaries, and cuts
 each span as a standalone MP4 together with its per-span robot action data (`.bin`
 file) and a JSON metadata sidecar. Multiple camera views of the same span are
 treated as a coherent group and share a stable `span_group_id`.
+
+The comparisons with `video-split` below describe the removed recipe's historical contract. Flat-video workflows now
+use [video-cut](curator-next-video-cut.md) and [video-transcode](curator-next-video-transcode.md). Robot-action splitting
+retains its own execution and publication contract and uses shared utilities without importing the removed recipe.
 
 The design reuses the Curator Next programming model (config system, Lance
 publication) and the `cut_plan` smart cut for GOP-aware stream copying, but
@@ -396,8 +400,7 @@ projects failed outcomes separately to a replaced-each-run `errors.json` report 
 Lance. Keeping failures out of the canonical table (rather than a mixed success/failure schema)
 is what makes the append-once-per-`clip_id` recovery invariant below hold: a retried failure never
 collides with an already-committed row, because a failed attempt never gets a canonical row to
-retry against in the first place. This mirrors `video-split`'s `CLIP_SCHEMA`/`errors.json` split
-exactly (`curator-next-video-split.md`, "Outputs" and "Cross-Run Recovery").
+retry against in the first place.
 
 `CLIP_SCHEMA`:
 
@@ -454,8 +457,7 @@ columns non-null, which the embed leg's read contract (`EMBED_SOURCE_ROW`) alrea
 
 ## Cross-Run Recovery
 
-The recovery protocol follows [Curator Next Incremental Curation](curator-next-incremental-curation.md) and
-mirrors `video-split`'s (`curator-next-video-split.md`, "Cross-Run Recovery") — a canonical Lance table that
+The recovery protocol follows [Curator Next Incremental Curation](curator-next-incremental-curation.md): a canonical Lance table that
 is both published output and cross-run checkpoint, deterministic identities, idempotent fragment-scoped
 commits, and driver-side reconciliation before any expensive work starts.
 
@@ -572,7 +574,7 @@ each call to `process_batch` reads one chunk file and one parquet shard. The
 
 ## Validation Criteria
 
-In addition to the `video-split` validation criteria, the first
+In addition to the shared recipe configuration, identity, publication, and recovery checks, the first
 `robot-action-split` implementation is complete when:
 
 - span provider emits the correct segments for a fixture LeRobot/Mecka shard,

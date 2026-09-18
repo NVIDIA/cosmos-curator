@@ -53,7 +53,6 @@ class RobotActionSplitInputConfig(BaseModel):
         ge=1,
         description=(
             "Cap on the number of distinct source chunk MP4s processed during discovery. "
-            "Matches video-split semantics where limit bounds the number of source videos. "
             "Each chunk may yield multiple spans. Use for smoke runs and local iteration."
         ),
     )

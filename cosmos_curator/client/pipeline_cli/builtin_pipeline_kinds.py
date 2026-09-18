@@ -31,7 +31,6 @@ from cosmos_curator.next.recipes.robot_action_caption.pipeline_kind import ROBOT
 from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND
 from cosmos_curator.next.recipes.video_caption.pipeline_kind import VIDEO_CAPTION_KIND
 from cosmos_curator.next.recipes.video_cut.pipeline_kind import VIDEO_CUT_KIND
-from cosmos_curator.next.recipes.video_split.pipeline_kind import VIDEO_SPLIT_KIND
 from cosmos_curator.next.recipes.video_transcode.pipeline_kind import VIDEO_TRANSCODE_KIND
 
 # Registering a kind also changes two restatements of the sorted name list in the
@@ -46,15 +45,13 @@ BUILTIN_PIPELINE_KINDS = PipelineKindRegistry(
         MULTIMODAL_SPLIT_KIND,
         VIDEO_CAPTION_KIND,
         VIDEO_CUT_KIND,
-        VIDEO_SPLIT_KIND,
         VIDEO_TRANSCODE_KIND,
         ROBOT_ACTION_SPLIT_KIND,
         ROBOT_ACTION_CAPTION_KIND,
         CURATE_KIND,
         EMBEDDINGS_KIND,
         # Deprecated alongside cosmos_curator.pipelines.ray_data; delete these
-        # two entries and legacy_kinds.py together with that tree. `video_split`
-        # and `video-split` deliberately select different recipe generations.
+        # two entries and legacy_kinds.py together with that tree.
         VIDEO_SPLIT_LEGACY_KIND,
         CAPTION_JUDGE_KIND,
     )

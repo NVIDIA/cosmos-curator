@@ -151,8 +151,8 @@ to get a `PipelineRunOutput` carrying a JSON payload and a one-line message.
 
 The `kind` string is matched exactly — `load_pipeline_kind_name` returns it verbatim and the
 registry looks it up unchanged — so hyphen and underscore are different kinds rather than two
-spellings of one. That is deliberate: `video-split` selects the Curator Next recipe while
-`video_split` selects the legacy one. Next recipes are hyphenated, so this one is
+spellings of one. For example, `robot-action-split` is registered and `robot_action_split`
+is rejected. The remaining `video_split` kind selects the legacy pipeline. This recipe is
 `data-integrity` everywhere: in `kind:`, as the CLI's kind argument, and as the registered
 name. `test_robot_action_split_underscore_spelling_is_not_supported` pins the rule.
 
@@ -175,22 +175,22 @@ subcommand, and `test_pipeline_run_is_not_host_cli_command` pins that.
 
 ### New Kind: `data-integrity`
 
-A distinct kind, structured like `next/recipes/video_split`: a Pydantic config module, a
+A distinct kind, structured like other Next recipes: a Pydantic config module, a
 `pipeline_kind.py` exposing the config and runtime surface, and a `pipeline.py` driver that
 owns the Ray Data work. Unlike the other Next recipes, there is no media output — the only
 output is store rows.
 
 The recipe lives beside the DI code it drives, under
-`cosmos_curator/next/recipes/data_integrity/`. `video_split` is the closest precedent and a
-complete one: it is a Ray Data pipeline under `next/`, its `pipeline_kind.py` defers every
-import so the CLI stays Ray-free, its `run_config(resolved) -> dict` is the shape
-`prepare_run` wraps, and it refuses an input selection that realizes nothing rather than
+`cosmos_curator/next/recipes/data_integrity/`. The original, now removed `video-split` provided
+the precedent: a Ray Data pipeline under `next/` whose `pipeline_kind.py` deferred every
+import so the CLI stayed Ray-free, with `run_config(resolved) -> dict` as the shape
+`prepare_run` wrapped. It refused an input selection that realized nothing rather than
 publishing an empty result — the same rule this recipe applies to an empty session
 expansion.
 
 The Ray conventions are already in `next/core/ray_runtime.py`: `ensure_ray_initialized`,
 `configure_ray_data_progress` and `configure_ray_data_stability`, called in that order at the
-top of `video_split`'s driver. This recipe imports the same three. The helpers that would
+top of the original splitter's driver. This recipe imports the same three. The helpers that would
 size the stage from the live cluster — `capped_slots_for_items` and `live_ray_node_count`,
 with `DEFAULT_IO_SLOTS_PER_NODE` — have no public home: they are private to
 `pipelines/ray_data/_runtime.py` and `pipelines/ray_data/constants.py:19`, which
@@ -469,7 +469,7 @@ pipeline.run(config)
 ```
 
 Items are wrapped into single-key dicts because `from_items` on bare strings names the
-column `item`; `next/recipes/video_split/pipeline.py:103` wraps the same way. Seeding from
+column `item`. Seeding from
 `from_items` also spreads the sessions across blocks on its own. Were this recipe to seed
 from `multimodal-split`'s discovery table instead, it would have to repartition first —
 `ray.data.from_arrow` maps one table to one block however the table is chunked, so the whole

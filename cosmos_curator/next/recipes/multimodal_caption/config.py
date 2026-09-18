@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
-from cosmos_curator.next.recipes.video_split.uris import join_s3_uri, normalize_s3_uri
+from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -46,7 +46,7 @@ def _normalize_location(location: str, *, label: str) -> str:
 def _default_staging_root(episodes_lance_uri: str) -> str:
     if episodes_lance_uri.lower().startswith("s3://"):
         parent = episodes_lance_uri.rsplit("/", 1)[0]
-        return join_s3_uri(parent, "staging", "multimodal-caption")
+        return f"{parent.rstrip('/')}/staging/multimodal-caption"
     return str(Path(episodes_lance_uri).parent / "staging" / "multimodal-caption")
 
 

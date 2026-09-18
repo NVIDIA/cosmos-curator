@@ -3,13 +3,16 @@
 
 """Download reuse, FFmpeg batching, and media durability before checkpointing."""
 
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import Mock
 
 import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.media.ffmpeg import TranscodeError, VideoMetadata
+from cosmos_curator.core.utils.misc import retry_utils
+from cosmos_curator.next.media.ffmpeg import ProbeError, TranscodeError, VideoMetadata
 from cosmos_curator.next.recipes.video_transcode import processing
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_FIELDS, PAYLOAD_SCHEMA, RESULT_SCHEMA
@@ -152,3 +155,57 @@ def test_failed_ffmpeg_batch_falls_back_to_individual_spans(
     assert set(output["span_id"].to_pylist()) == set(spans["span_id"].to_pylist())
     assert set(CLIP_FIELDS.names).issubset(output.column_names)
     assert output["clip_bytes"].to_pylist() == [b"clip"] * 4
+
+
+@pytest.mark.parametrize("ffmpeg_batch_size", [1, 2])
+@pytest.mark.parametrize("probe_recovers", [True, False])
+def test_clip_probe_retries_reuse_encoded_media(
+    config: ResolvedVideoTranscodeConfig,
+    dataset: lance.LanceDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    ffmpeg_batch_size: int,
+    *,
+    probe_recovers: bool,
+) -> None:
+    """Retry inspection without re-encoding; exhausted probes must not yield a clip."""
+    config = config.model_copy(
+        update={
+            "execution": config.execution.model_copy(
+                update={"ffmpeg_batch_size": ffmpeg_batch_size, "probe_attempts": 2}
+            )
+        }
+    )
+    spans = pa.concat_tables([table for task in SpanDatasource(dataset, config).get_read_tasks(2) for table in task()])
+    probed_paths: list[Path] = []
+    encoded_paths: list[Path] = []
+
+    def encode(_source: Path, outputs: tuple, _config: object) -> None:
+        for _, path in outputs:
+            encoded_paths.append(path)
+            path.write_bytes(b"clip")
+
+    def probe(path: Path, **_kwargs: object) -> VideoMetadata:
+        probed_paths.append(path)
+        assert path.read_bytes() == b"clip"
+        if len(probed_paths) == 1 or not probe_recovers:
+            message = "temporary probe failure"
+            raise ProbeError(message)
+        return VideoMetadata(1_000_000_000, 64, 64, 10.0, None, "h264")
+
+    monkeypatch.setattr(retry_utils.time, "sleep", lambda _: None)
+    monkeypatch.setattr(retry_utils, "logger", Mock())
+    monkeypatch.setattr(processing, "assert_video_encoder_available", lambda _: None)
+    monkeypatch.setattr(processing, "_encode", encode)
+    monkeypatch.setattr(processing, "probe_video_path", probe)
+    source = processing.download_source(processing.group_source_spans(spans).to_pylist()[0], config=config)
+    with closing(processing.transcode_source(source, config=config)) as clips:
+        if probe_recovers:
+            clip = next(clips)
+            assert clip["clip_bytes"] == b"clip"
+            assert clip["clip_frame_count"] is None
+        else:
+            with pytest.raises(ProbeError, match="temporary probe failure"):
+                next(clips)
+    assert len(encoded_paths) == ffmpeg_batch_size
+    assert probed_paths == [encoded_paths[0], encoded_paths[0]]
+    assert all(not path.exists() for path in encoded_paths)

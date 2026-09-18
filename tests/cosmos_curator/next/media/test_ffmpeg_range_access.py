@@ -11,7 +11,7 @@ import pytest
 
 from cosmos_curator.next.media import ffmpeg
 from cosmos_curator.next.media.spans import Span
-from cosmos_curator.next.recipes.video_split.config import TranscodeConfig
+from cosmos_curator.next.recipes.video_transcode.config import TranscodeConfig
 
 
 def test_http_transcode_uses_input_seek_before_signed_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

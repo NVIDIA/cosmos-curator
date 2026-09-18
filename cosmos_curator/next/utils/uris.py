@@ -3,29 +3,29 @@
 
 """Dependency-light location normalization for recipe configuration and discovery."""
 
-import re
 from urllib.parse import urlsplit
 
+from cosmos_curator.core.utils.storage.s3_validation import validate_s3_prefix
 from cosmos_curator.next.utils.local_uri import local_media_path, uri_scheme
 
-# Match S3Prefix's bucket policy, including underscores for S3-compatible stores.
-_BUCKET = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
 
-
-def normalize_s3_uri(value: str) -> str:
+def normalize_s3_uri(value: str, *, strip_trailing_slash: bool = False) -> str:
     """Preserve literal S3 keys, including percent escapes and repeated slashes."""
     parsed = urlsplit(value)
     if (
         value != value.strip()
         or any(character in value for character in "\r\n\t?#")
         or parsed.scheme.lower() != "s3"
-        or not _BUCKET.fullmatch(parsed.netloc)
+        or not parsed.netloc
         or parsed.query
         or parsed.fragment
     ):
         msg = f"Expected an undecorated S3 URI, got {value!r}"
         raise ValueError(msg)
-    return f"s3://{parsed.netloc}/{parsed.path.removeprefix('/')}"
+    key = parsed.path.removeprefix("/")
+    validate_s3_prefix(parsed.netloc, key)
+    normalized = f"s3://{parsed.netloc}/{key}"
+    return normalized.rstrip("/") if strip_trailing_slash and key else normalized
 
 
 def normalize_location(value: str) -> str:

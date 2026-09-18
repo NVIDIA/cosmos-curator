@@ -252,7 +252,7 @@ def test_the_wrong_kind_is_rejected(tmp_path: Path) -> None:
     """The discriminator must match, so a misrouted config fails loudly."""
     path = tmp_path / "config.yaml"
     path.write_text(
-        yaml.safe_dump({"schema_version": 1, "kind": "video-split", "clips_lance_uri": DEFAULT_CLIPS_URI}),
+        yaml.safe_dump({"schema_version": 1, "kind": "video-cut", "clips_lance_uri": DEFAULT_CLIPS_URI}),
         encoding="utf-8",
     )
 
