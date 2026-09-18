@@ -48,7 +48,7 @@ def _facts(episode_id: str) -> EpisodeFacts:
         exclusive_end_ns=1_000_000_000 if episode_id == "a" else 2_000_000_000,
         sampling_fps=30,
         row_count=30,
-        timestamp_source=TimestampSource.CAPTURE,
+        timestamp_source=TimestampSource.SENSOR,
         split_contract_digest="contract",
     )
 
@@ -62,8 +62,8 @@ def _record(episode_id: str) -> dict[str, object]:
         "media_sha256": episode_id * 64,
         "timeline_location": f"/output/{episode_id}/front.mp4.timestamps.npy",
         "timeline_sha256": "1" * 64,
-        "observations_location": f"/output/{episode_id}/front.mp4.observations.npy",
-        "observations_sha256": "2" * 64,
+        "sensor_timestamps_location": f"/output/{episode_id}/front.mp4.sensor_timestamps.npy",
+        "sensor_timestamps_sha256": "2" * 64,
     }
     return build_episode_record(_facts(episode_id), [camera])
 

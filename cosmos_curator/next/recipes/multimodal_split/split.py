@@ -65,8 +65,8 @@ from cosmos_curator.next.recipes.multimodal_split.storage import (
 from cosmos_curator.next.recipes.multimodal_split.uris import (
     clip_dir_uri,
     clip_media_uri,
-    observations_uri,
-    timeline_uri,
+    sensor_timestamps_uri,
+    timestamps_sidecar_uri,
 )
 from cosmos_curator.next.utils.storage import write_media
 
@@ -109,8 +109,8 @@ SENSOR_OUTCOME_SCHEMA = pa.schema(
         pa.field("media_sha256", pa.string()),
         pa.field("timeline_location", pa.large_string()),
         pa.field("timeline_sha256", pa.string()),
-        pa.field("observations_location", pa.large_string()),
-        pa.field("observations_sha256", pa.string()),
+        pa.field("sensor_timestamps_location", pa.large_string()),
+        pa.field("sensor_timestamps_sha256", pa.string()),
     ]
 )
 
@@ -132,15 +132,15 @@ def split_session(
     at a time would reopen a remote artifact per clip and decode from the start
     each time, which is the cost a single forward pass exists to avoid.
 
-    The timeline arrives on the row rather than being read again. Planning
-    already paid for it, and a second fetch per camera is a high-latency round
-    trip for bytes this run holds.
+    The source timeline arrives on the row rather than being read again. Planning
+    already paid for it, and a second fetch per camera is a high-latency round trip
+    for bytes this run holds.
     """
     session_id = str(item["source_session_id"])
     sensor_key = str(item["sensor_key"])
     sensor_type = str(item["sensor_type"])
     sensor_uri = str(item["sensor_uri"])
-    timeline = np.asarray(item["timeline_ns"], dtype=np.int64)
+    timeline_ns = np.asarray(item["timeline_ns"], dtype=np.int64)
     spans = tuple(
         Span(start_ns=int(entry["start_ns"]), end_ns=int(entry["exclusive_end_ns"])) for entry in item["spans"]
     )
@@ -155,7 +155,15 @@ def split_session(
             sensor_uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
         ) as source:
             clips, walk_failures = _stream_clips(
-                source, spans, clip_ids, timeline, session_id, sensor_key, sensor_type, config, storage_profile
+                source,
+                spans,
+                clip_ids,
+                timeline_ns,
+                session_id,
+                sensor_key,
+                sensor_type,
+                config,
+                storage_profile,
             )
             failures.extend(walk_failures)
     except Exception as error:  # noqa: BLE001 -- one unreadable view is one failed sensor
@@ -308,8 +316,8 @@ def _write_aligned_clip(  # noqa: PLR0913 -- every argument names a different pa
         # there is no separate timeline to record: the grid is the episode's.
         "timeline_location": None,
         "timeline_sha256": None,
-        "observations_location": None,
-        "observations_sha256": None,
+        "sensor_timestamps_location": None,
+        "sensor_timestamps_sha256": None,
     }, None
 
 
@@ -417,8 +425,8 @@ def _write_mcap_clip(  # noqa: PLR0913 -- every argument names a different part 
         # no per-row record of which sample served which row.
         "timeline_location": None,
         "timeline_sha256": None,
-        "observations_location": None,
-        "observations_sha256": None,
+        "sensor_timestamps_location": None,
+        "sensor_timestamps_sha256": None,
     }
     return clip, None
 
@@ -466,8 +474,8 @@ def _sensor_outcome(
             "media_sha256": None,
             "timeline_location": None,
             "timeline_sha256": None,
-            "observations_location": None,
-            "observations_sha256": None,
+            "sensor_timestamps_location": None,
+            "sensor_timestamps_sha256": None,
         }
     else:
         # The sidecars are a camera's. A trajectory is copied rather than
@@ -479,8 +487,8 @@ def _sensor_outcome(
             "media_sha256": str(clip["media_sha256"]),
             "timeline_location": _optional_str(clip["timeline_location"]),
             "timeline_sha256": _optional_str(clip["timeline_sha256"]),
-            "observations_location": _optional_str(clip["observations_location"]),
-            "observations_sha256": _optional_str(clip["observations_sha256"]),
+            "sensor_timestamps_location": _optional_str(clip["sensor_timestamps_location"]),
+            "sensor_timestamps_sha256": _optional_str(clip["sensor_timestamps_sha256"]),
         }
     return {
         "status": "success" if clip is not None else "failure",
@@ -523,14 +531,14 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
     whoever reads it to ask every row which kind it is.
     """
     destination = clip_media_uri(clip_dir_uri(config.output.path, session_id, clip_id), sensor_key)
-    selected: list[int] = []
+    sensor_timestamps_ns: list[int] = []
     try:
         timeline_ns = sampling_grid_ns(span, config)
         row_count = len(timeline_ns)
         with tempfile.TemporaryDirectory() as staging:
             local = Path(staging) / f"{clip_id}.mp4"
             written = encode_frames_to_path(
-                provide_frames(span, row_count, selected),
+                provide_frames(span, row_count, sensor_timestamps_ns),
                 local,
                 fps=config.clip.sampling_fps,
                 encoder=config.video.encoder.video_encoder,
@@ -543,15 +551,15 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
                 raise ValueError(msg)  # noqa: TRY301 -- reported as this clip's failure, like any other
             video = local.read_bytes()
             # Sidecars first, media last. A consumer walking the tree looks for
-            # the MP4, so publishing it before its timeline and observations
+            # the MP4, so publishing it before its timeline and sensor timestamps
             # would leave a window where a clip exists and cannot say when its
             # frames happened -- and a failure between the two writes would
             # leave that state permanently, under a stable clip id. Written this
             # way the MP4 is the commit point: sidecars without media are
             # invisible, media without sidecars cannot happen.
             timeline_location, timeline_sha256 = _write_clip_timeline(destination, timeline_ns, storage_profile)
-            observations_location, observations_sha256 = _write_clip_observations(
-                destination, selected, storage_profile
+            sensor_timestamps_location, sensor_timestamps_sha256 = _write_clip_sensor_timestamps(
+                destination, sensor_timestamps_ns, storage_profile
             )
             write_media(destination, video, storage_profile=storage_profile)
             clip_bytes = len(video)
@@ -581,13 +589,15 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
         "media_sha256": media_sha256,
         "timeline_location": timeline_location,
         "timeline_sha256": timeline_sha256,
-        "observations_location": observations_location,
-        "observations_sha256": observations_sha256,
+        "sensor_timestamps_location": sensor_timestamps_location,
+        "sensor_timestamps_sha256": sensor_timestamps_sha256,
     }
     return clip, None
 
 
-def _write_clip_observations(destination: str, selected: list[int], storage_profile: str) -> tuple[str, str]:
+def _write_clip_sensor_timestamps(
+    destination: str, sensor_timestamps_ns: list[int], storage_profile: str
+) -> tuple[str, str]:
     """Write, for each of the clip's frames, when the camera actually saw it.
 
     The timeline beside this says where the clip's frames sit: the grid it was
@@ -597,22 +607,22 @@ def _write_clip_observations(destination: str, selected: list[int], storage_prof
     to the instants a camera observed.
 
     Per camera, because twelve views of one moment are served by twelve
-    different observations. Non-decreasing rather than ascending, because one
-    observation serves several frames wherever the grid asks for more than the
-    camera captured, which is what a missed exposure looks like.
+    different sensor samples. Non-decreasing rather than ascending, because one
+    sensor sample serves several frames wherever the grid asks for more than the
+    sensor produced, which is what a missed exposure looks like.
     """
-    observations = np.asarray(selected, dtype=np.int64)
-    require_nondecreasing("observations", observations)
+    sensor_timestamps = np.asarray(sensor_timestamps_ns, dtype=np.int64)
+    require_nondecreasing("sensor_timestamps_ns", sensor_timestamps)
     buffer = io.BytesIO()
-    np.save(buffer, observations, allow_pickle=False)
-    location = observations_uri(destination)
+    np.save(buffer, sensor_timestamps, allow_pickle=False)
+    location = sensor_timestamps_uri(destination)
     payload = buffer.getvalue()
     write_media(location, payload, storage_profile=storage_profile)
     return location, hashlib.sha256(payload).hexdigest()
 
 
 def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], storage_profile: str) -> tuple[str, str]:
-    """Write the clip's own observation timeline beside its media.
+    """Write the clip's alignment timeline beside its media.
 
     A clip is read the same way a session is, and an MP4 starts at zero however it
     was cut, so without this a later stage cannot say when a clip's frames
@@ -628,7 +638,7 @@ def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], s
     """
     buffer = io.BytesIO()
     write_timestamps_ns(timeline_ns.astype(np.int64), buffer)
-    location = timeline_uri(destination)
+    location = timestamps_sidecar_uri(destination)
     payload = buffer.getvalue()
     write_media(location, payload, storage_profile=storage_profile)
     return location, hashlib.sha256(payload).hexdigest()
@@ -638,7 +648,7 @@ def _stream_clips(  # noqa: PLR0913 -- one argument per part of a session's iden
     source: io.BufferedIOBase,
     spans: tuple[Span, ...],
     clip_ids: list[str],
-    timestamps_ns: npt.NDArray[np.int64],
+    timeline_ns: npt.NDArray[np.int64],
     session_id: str,
     sensor_key: str,
     sensor_type: str,
@@ -653,14 +663,14 @@ def _stream_clips(  # noqa: PLR0913 -- one argument per part of a session's iden
     run without one.
 
     The feed running out is not how a session ends -- it is the media and its
-    timeline disagreeing. Planning tiles the timeline and drops the tail, so the
-    last planned span always ends inside it, and a container holding what the
-    timeline describes cannot run short. When it does, every span still to come
-    is unproducible for the same reason, and each is recorded: a clip that
+    source timeline disagreeing. Planning tiles that timeline and drops the tail,
+    so the last planned span always ends inside it, and a container with one frame
+    per timestamp cannot run short. When it does, every span still to
+    come is unproducible for the same reason, and each is recorded: a clip that
     quietly never appears is worse than one that failed, because nothing in the
     output says to go looking.
     """
-    feed = _open_frame_feed(source, spans, timestamps_ns, config)
+    feed = _open_frame_feed(source, spans, timeline_ns, config)
     provider = _feed_provider(feed)
 
     clips: list[dict[str, Any]] = []
@@ -712,7 +722,7 @@ def _unproducible(
     written are good and a reader needs to know exactly which moments are
     missing -- the same reason an encode failure names its own span.
     """
-    detail = str(error) or "its media holds fewer frames than its timeline describes"
+    detail = str(error) or "its media holds fewer frames than its sensor timestamps describe"
     reason = _StreamEndedError(f"the camera ran out of frames before this span: {detail}")
     return [failure(session_id, sensor_key, span, "stream_ended", reason, clip_id) for span, clip_id in remaining]
 
@@ -754,14 +764,14 @@ class _FrameFeed:
         self._frames = itertools.chain([first], frames)
         self.taken = 0
 
-    def take(self, count: int, selected: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
+    def take(self, count: int, sensor_timestamps_ns: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
         """Yield the next ``count`` frames, recording which source frame served each."""
         for _ in range(count):
             row = next(self._frames, None)
             if row is None:
                 raise _StreamEndedError
             _align_ns, pts_ns, frame = row
-            selected.append(int(pts_ns))
+            sensor_timestamps_ns.append(pts_ns)
             self.taken += 1
             yield frame
 
@@ -812,11 +822,11 @@ def _spec_for_spans(spans: tuple[Span, ...], config: ResolvedMultimodalSplitConf
 def _open_frame_feed(
     source: io.BufferedIOBase,
     spans: tuple[Span, ...],
-    timestamps_ns: npt.NDArray[np.int64],
+    timeline_ns: npt.NDArray[np.int64],
     config: ResolvedMultimodalSplitConfig,
 ) -> _FrameFeed:
     """Open one forward pass over a camera, serving the planned spans in order."""
-    sensor = StreamingCameraSensor(source, timestamps_ns=timestamps_ns)
+    sensor = StreamingCameraSensor(source, timestamps_ns=timeline_ns)
     policy = NearestTimestampPolicy(max_delta_ns=config.video.max_delta_ns)
     payloads = sensor.sample(_spec_for_spans(spans, config), policy=policy)
     return _FrameFeed(row for payload in payloads for row in payload.frames())
@@ -825,7 +835,7 @@ def _open_frame_feed(
 def _feed_provider(feed: _FrameFeed) -> FrameProvider:
     """Serve each clip from the next run of frames in one continuous pass."""
 
-    def provide(_span: Span, row_count: int, selected: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
-        return feed.take(row_count, selected)
+    def provide(_span: Span, row_count: int, sensor_timestamps_ns: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
+        return feed.take(row_count, sensor_timestamps_ns)
 
     return provide

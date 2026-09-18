@@ -36,7 +36,7 @@ _HEIGHT = 16
 
 # A recorder's clock when it started this session, taken from real footage: an
 # uptime counter, nowhere near zero and nowhere near a wall-clock epoch. Fixtures
-# default to it because a session that starts at zero cannot tell a capture
+# default to it because a session that starts at zero cannot tell a sensor
 # timeline apart from a presentation one, and that is the whole distinction the
 # recipe now turns on.
 DEVICE_ORIGIN_NS = 3_517_693_838_000
@@ -77,7 +77,7 @@ def make_session() -> Callable[..., Path]:
             for packet in stream.encode(None):
                 container.mux(packet)
 
-        # The observation-timeline artifact the recorder's converter writes beside
+        # The sensor-timestamp artifact the recorder's converter writes beside
         # every camera. Both paths take their bounds from this instead of from the
         # container, so a session without one is not processable. It carries the
         # recorder's clock, which is what makes a camera clip joinable with the

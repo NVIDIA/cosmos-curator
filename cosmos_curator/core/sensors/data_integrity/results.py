@@ -103,11 +103,11 @@ class SessionTimestampSource(enum.Enum):
 
     Variants:
 
-    * ``CAPTURE`` -- every contributing stream reported real capture times. The only
+    * ``SENSOR`` -- every contributing stream reported real sensor times. The only
       value on which a cross-sensor comparison means anything.
     * ``CONTAINER_PTS`` -- every contributing stream was measured on container PTS.
-    * ``MIXED`` -- the streams disagree. Not a lesser ``CAPTURE``: comparing a rig's
-      real capture times against another camera's synthesized grid produces a spread
+    * ``MIXED`` -- the streams disagree. Not a lesser ``SENSOR``: comparing a rig's
+      real sensor times against another camera's synthesized grid produces a spread
       that is an artifact of the mux, which is the same defect as ``CONTAINER_PTS``
       and is why both skip.
 
@@ -116,7 +116,7 @@ class SessionTimestampSource(enum.Enum):
     session-grain metrics at all.
     """
 
-    CAPTURE = "capture"
+    SENSOR = "sensor"
     CONTAINER_PTS = "container_pts"
     MIXED = "mixed"
 
@@ -144,8 +144,8 @@ def session_timestamp_source(sources: Iterable[TimestampSource]) -> SessionTimes
     distinct = set(sources)
     if not distinct:
         return None
-    if distinct == {TimestampSource.CAPTURE}:
-        return SessionTimestampSource.CAPTURE
+    if distinct == {TimestampSource.SENSOR}:
+        return SessionTimestampSource.SENSOR
     if distinct == {TimestampSource.CONTAINER_PTS}:
         return SessionTimestampSource.CONTAINER_PTS
     return SessionTimestampSource.MIXED

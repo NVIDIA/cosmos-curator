@@ -41,8 +41,8 @@ def _outcome(
 
     return {
         "status": status,
-        "record_schema_version": 1,
-        "media_contract_version": 2,
+        "record_schema_version": 2,
+        "media_contract_version": 3,
         "episode_id": "episode",
         "split_clip_id": "split",
         "source_id": "source",
@@ -52,7 +52,7 @@ def _outcome(
         "exclusive_end_ns": 1_000_000_000,
         "sampling_fps": 30,
         "expected_row_count": 30,
-        "timestamp_source": "capture",
+        "timestamp_source": "sensor",
         "split_contract_digest": "contract",
         "planned_camera_keys": ["front", "left"],
         "planned_sensor_keys": planned_sensor_keys or [],
@@ -66,8 +66,8 @@ def _outcome(
         # for, so its sidecar descriptors are null where a camera's are set.
         "timeline_location": sidecar(f"/output/{camera_key}.mp4.timestamps.npy"),
         "timeline_sha256": sidecar("a" * 64),
-        "observations_location": sidecar(f"/output/{camera_key}.mp4.observations.npy"),
-        "observations_sha256": sidecar("b" * 64),
+        "sensor_timestamps_location": sidecar(f"/output/{camera_key}.mp4.sensor_timestamps.npy"),
+        "sensor_timestamps_sha256": sidecar("b" * 64),
     }
 
 

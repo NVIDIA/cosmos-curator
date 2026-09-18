@@ -260,17 +260,17 @@ def test_what_the_session_tool_exited_on_is_what_reads_back(
     Every stream passes and the session does not, so before session verdicts were
     stored the store read back ``PASS`` for a run the CLI exited ``1`` on.
     """
-    # On capture times, because a session on container PTS never reaches a verdict at
+    # On sensor times, because a session on container PTS never reaches a verdict at
     # all -- and it is the verdict, not the skip, that this table exists to record.
     streams = [
-        make_stream(f"{SESSION}/front.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
-        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
+        make_stream(f"{SESSION}/front.mp4", perfect(), timestamp_source=TimestampSource.SENSOR),
+        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.SENSOR),
     ]
     stub_session(
         streams,
         run_session_metrics(
             [
-                SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.CAPTURE)
+                SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.SENSOR)
                 for start, end in ((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS))
             ],
             thresholds=NO_SKEW,

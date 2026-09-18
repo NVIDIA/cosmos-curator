@@ -214,11 +214,11 @@ def test_run_stream_batched_matches_one_shot() -> None:
 
 
 def _canned(
-    source: str, status: CheckStatus, *, timestamp_source: TimestampSource = TimestampSource.CAPTURE
+    source: str, status: CheckStatus, *, timestamp_source: TimestampSource = TimestampSource.SENSOR
 ) -> StreamResult:
-    """Build a finished per-stream result, on capture times unless a test says otherwise.
+    """Build a finished per-stream result, on sensor times unless a test says otherwise.
 
-    ``capture`` rather than the ``StreamResult`` default of ``None`` because these
+    ``sensor`` rather than the ``StreamResult`` default of ``None`` because these
     stand in for streams that *were* measured, and a stream reporting no clock at all
     contributes nothing to a session verdict -- which would leave the session tests
     below asserting a skip they did not mean to arrange.
@@ -284,18 +284,18 @@ def test_run_session_defaults_to_discovering_every_stream(monkeypatch: pytest.Mo
 def test_run_session_judges_the_session_as_well_as_its_streams(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
-    capture_timeline: Callable[..., pathlib.Path],
+    sensor_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """A session whose sensors stopped at different times fails on the session's own verdict.
 
     Real files rather than canned results: the bounds a session metric folds are read
-    off each decode, so a fake would be measuring the fake. Capture timelines beside
+    off each decode, so a fake would be measuring the fake. Sensor timelines beside
     them for the same reason -- without those the cameras are on container PTS, where
     a ragged session is unmeasurable rather than failing.
     """
     for name, frames in (("front.mp4", 30), ("rear.mp4", 15)):
         (tmp_path / name).write_bytes(h264_video(frames=frames))
-        capture_timeline(tmp_path / name, frames=frames)
+        sensor_timeline(tmp_path / name, frames=frames)
 
     report = run_session(str(tmp_path), expected_hz=30.0)
 
@@ -308,7 +308,7 @@ def test_run_session_judges_the_session_as_well_as_its_streams(
 def test_a_session_of_resampled_clips_is_not_graded_as_a_rig(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
-    capture_timeline: Callable[..., pathlib.Path],
+    sensor_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """The shape a ``multimodal_split`` clip directory has, end to end through the runner.
 
@@ -325,10 +325,10 @@ def test_a_session_of_resampled_clips_is_not_graded_as_a_rig(
     """
     for name in ("front.mp4", "rear.mp4"):
         (tmp_path / name).write_bytes(h264_video(frames=30))
-        capture_timeline(tmp_path / name, frames=30)
+        sensor_timeline(tmp_path / name, frames=30)
         # What multimodal_split writes beside a clip, and what the runner reads as
         # "the timeline next door is a grid" -- contents never opened.
-        with pathlib.Path(f"{tmp_path / name}.observations.npy").open("wb") as stream:
+        with pathlib.Path(f"{tmp_path / name}.sensor_timestamps.npy").open("wb") as stream:
             np.save(stream, np.arange(30, dtype=np.int64), allow_pickle=False)
 
     report = run_session(str(tmp_path), expected_hz=30.0)
@@ -392,7 +392,7 @@ def test_a_session_of_one_readable_stream_has_nothing_to_compare() -> None:
     assert {m.status for m in metrics} == {CheckStatus.SKIPPED}
 
 
-def test_a_session_without_capture_timelines_is_skipped_rather_than_passed(
+def test_a_session_without_sensor_timelines_is_skipped_rather_than_passed(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
 ) -> None:
@@ -415,15 +415,15 @@ def test_a_session_without_capture_timelines_is_skipped_rather_than_passed(
     assert report.status is OverallStatus.PASS, "a skipped session metric is not a finding"
 
 
-def test_a_session_where_only_some_cameras_have_capture_timelines_is_skipped_too(
+def test_a_session_where_only_some_cameras_have_sensor_timelines_is_skipped_too(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
-    capture_timeline: Callable[..., pathlib.Path],
+    sensor_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """Half a rig's real clock is not half an answer: the comparison needs one clock, not a better one."""
     for name in ("front.mp4", "rear.mp4"):
         (tmp_path / name).write_bytes(h264_video(frames=30))
-    capture_timeline(tmp_path / "front.mp4", frames=30)
+    sensor_timeline(tmp_path / "front.mp4", frames=30)
 
     report = run_session(str(tmp_path), expected_hz=30.0)
 

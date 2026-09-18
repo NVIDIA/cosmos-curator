@@ -211,20 +211,20 @@ def test_a_session_yields_the_rows_of_every_stream_it_holds(session: pathlib.Pat
 def test_a_failing_session_metric_is_counted_in_the_record(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
-    capture_timeline: Callable[..., pathlib.Path],
+    sensor_timeline: Callable[..., pathlib.Path],
 ) -> None:
     """The counter the driver sums into the run summary, which no store row states.
 
     Two sensors that stopped a second apart, under a policy allowing no non-overlap at
     all: every stream passes on its own, so the session's own verdict is the only thing
-    that fails, and ``failed_metrics`` beside it must not move. Capture timelines make
+    that fails, and ``failed_metrics`` beside it must not move. Sensor timelines make
     the session measurable in the first place.
     """
     ragged = tmp_path / "ragged"
     ragged.mkdir()
     for name, frames in (("front.mp4", 30), ("rear.mp4", 60)):
         (ragged / name).write_bytes(h264_video(frames=frames))
-        capture_timeline(ragged / name, frames=frames)
+        sensor_timeline(ragged / name, frames=frames)
 
     record = _check(ragged, thresholds={"max_non_overlap_percent": 0.0})
     verdicts = {

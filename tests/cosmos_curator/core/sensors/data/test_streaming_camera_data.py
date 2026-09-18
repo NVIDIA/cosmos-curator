@@ -37,7 +37,7 @@ def _payload() -> StreamingCameraData:
 
 
 def test_frames_yields_the_underlying_walk() -> None:
-    """``frames()`` is a generator of ``(align_timestamp_ns, pts_ns, frame)``."""
+    """``frames()`` yields ``(align_timestamp_ns, pts_ns, frame)``."""
     data = _payload()
 
     rows = [(align_ns, pts_ns, int(frame[0, 0, 0])) for align_ns, pts_ns, frame in data.frames()]

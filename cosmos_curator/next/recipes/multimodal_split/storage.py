@@ -41,7 +41,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
 )
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import read_bounds
 from cosmos_curator.next.recipes.multimodal_split.reports import errors_prefix
-from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed, timeline_uri
+from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed, timestamps_sidecar_uri
 
 
 @contextmanager
@@ -95,17 +95,17 @@ def open_sensor_source(
         yield cast("io.BufferedIOBase", stream)
 
 
-def load_timeline_ns(
+def load_sensor_timestamps_ns(
     sensor_uri: str, *, storage_profile: str = "default", read_buffer_bytes: int | None = None
 ) -> npt.NDArray[np.int64]:
-    """Load the camera's capture timestamps, in nanoseconds.
+    """Load the camera's sensor timestamps, in nanoseconds.
 
-    The camera's own timestamps, not a rate: real capture deltas on 30 fps
+    The camera's own timestamps, not a rate: real sensor-time deltas on 30 fps
     footage measure 33330 to 33361 microseconds, so a timeline derived from a
     nominal rate drifts against the camera it describes.
     """
     with open_sensor_source(
-        timeline_uri(sensor_uri), storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes
+        timestamps_sidecar_uri(sensor_uri), storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes
     ) as stream:
         # open_sensor_source is typed to DataSource's BufferedIOBase arm; np.load
         # wants the narrower BinaryIO, and every stream reachable here satisfies it.
@@ -117,9 +117,10 @@ def load_container_pts_ns(
 ) -> npt.NDArray[np.int64]:
     """Read a camera's presentation timestamps by indexing its own container.
 
-    The fallback for a camera with no capture timeline: indexing is the only way
-    to learn a container's PTS, which is the eager pass ``load_timeline_ns``
-    exists to avoid paying when a capture timeline is already on hand.
+    The fallback for a camera with no sensor timeline: indexing is the only way
+    to learn a container's PTS, which is the eager pass
+    ``load_sensor_timestamps_ns`` exists to avoid paying when a sensor timeline
+    is already on hand.
 
     Raises:
         ValueError: If the video stream has no displayable frames. Mirrors

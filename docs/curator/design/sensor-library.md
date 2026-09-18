@@ -140,7 +140,7 @@ not:
 `CameraSensor(origin_ns=...)` accepts a Python integer or NumPy integer scalar
 signed-nanosecond origin -- where the first displayed frame sits on the
 caller's clock -- or `None` to keep the container's own timeline. A recording
-that carries a capture timeline beside it knows when it started but not what
+that carries a sensor timeline beside it knows when it started but not what
 PTS the container gave that instant, so the sensor computes the offset itself
 rather than asking the caller to supply one directly: it anchors the first
 displayed frame to `origin_ns` and derives the shift from there. Boolean
@@ -165,14 +165,14 @@ The offset changes timestamp positions, not durations. In particular,
 `NearestTimestampPolicy.max_delta_ns` remains an unshifted tolerance in
 nanoseconds; no offset is added to it.
 
-### Camera capture timeline
+### Camera sensor timeline
 
 `origin_ns` shifts the container's timeline; it does not replace it. That is
 enough only when PTS spacing is itself trustworthy. A constant-frame-rate mux
 discards the real sample times and regenerates them on a fixed grid, so no
 single offset can recover them -- the intervals themselves are synthetic.
 
-`CameraSensor(capture_timestamps_ns=...)` takes the recording's own capture
+`CameraSensor(sensor_timestamps_ns=...)` takes the recording's own sensor
 times instead: one `int64` nanosecond entry per displayable frame, which must
 be 1-D, non-empty, strictly increasing, and exactly as long as the stream has
 displayable frames. A length that disagrees is rejected rather than padded or
@@ -191,7 +191,7 @@ so seeking and decode planning are unchanged; the container's numbers keep
 doing the job they are actually for.
 
 `CameraSensor.timestamp_source` reports which of the two is in effect
-(`TimestampSource.CAPTURE` or `TimestampSource.CONTAINER_PTS`). Consumers that
+(`TimestampSource.SENSOR` or `TimestampSource.CONTAINER_PTS`). Consumers that
 draw conclusions from timing need it: the two are indistinguishable from the
 timestamps alone, and one of them may be an artifact of the encoder. Reading
 the timeline out of a file is deliberately not the sensor's job -- the sensor
@@ -504,7 +504,7 @@ Under the half-open contract:
   ``window.timestamps_ns[i]``. For ``CameraData``, ``align_timestamps_ns``
   should match those active reference times.
 - **Sensor times** — ``sensor_timestamps_ns`` has shape ``(N,)``;
-  ``sensor_timestamps_ns[i]`` is the actual capture / message time chosen
+  ``sensor_timestamps_ns[i]`` is the actual sensor / message time chosen
   for row ``i`` (for example, the nearest neighbour to the active reference
   timestamp in the source stream).
 - **Payloads** — For cameras, ``frames`` has shape ``(N, H, W, 3)`` for RGB
@@ -768,7 +768,7 @@ problem.
 
 ### Why int64 nanoseconds
 
-MCAP and many capture pipelines use nanosecond resolution. Using int64 ns
+MCAP and many sensor pipelines use nanosecond resolution. Using int64 ns
 end-to-end matches `VideoIndex` presentation times derived from packet PTS and
 MCAP camera streams without truncating to microseconds.
 

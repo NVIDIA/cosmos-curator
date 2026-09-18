@@ -179,14 +179,14 @@ row i:
   frame_index = i
   episode_time_ns[i] = delivered grid offset defined by the canonical publication contract
   timestamp = episode_time_ns[i] / 1e9
-  row_count = length of the delivered capture-clock grid
+  row_count = length of the delivered sensor-clock grid
   target_source_time_ns[i] = source_interval_start_ns + episode_time_ns[i]
 ```
 
 `output_fps` is the normalized integer FPS for the episode timeline. Rows are
 emitted for `0 <= i < row_count`. The delivered camera-only grid construction
 and rounding rule are defined by
-[Canonical Multimodal AV Episode Publication](multimodal-av-episode-publication.md#capture-clock-grid).
+[Canonical Multimodal AV Episode Publication](multimodal-av-episode-publication.md#sensor-clock-grid).
 The grid construction makes row count a deterministic function of integer clip
 duration and output FPS without independently re-deriving it from a second
 formula. The episode timestamp grid is explicitly half-open:
@@ -826,7 +826,7 @@ can:
 - produce inspectable Lance episode, row, media-reference, provenance, and
   curation records;
 - write one logical episode per aligned multiview clip;
-- compute row count as the length of the delivered capture-clock grid;
+- compute row count as the length of the delivered sensor-clock grid;
 - emit episode rows only for the half-open interval
   `0 <= episode_time_ns[i] < duration_ns`;
 - preserve source timestamps and alignment provenance;

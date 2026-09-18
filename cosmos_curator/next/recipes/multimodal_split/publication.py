@@ -115,8 +115,8 @@ def assemble_episode_group(outcomes: pa.Table) -> pa.Table:  # noqa: C901 -- one
             (
                 "timeline_location",
                 "timeline_sha256",
-                "observations_location",
-                "observations_sha256",
+                "sensor_timestamps_location",
+                "sensor_timestamps_sha256",
             )
             if is_camera
             else ()

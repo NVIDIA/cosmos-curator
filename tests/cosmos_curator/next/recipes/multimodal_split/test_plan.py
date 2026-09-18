@@ -229,7 +229,7 @@ def test_a_camera_missing_its_timeline_is_refused_without_the_fallback_flag(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A recording with video and no capture timeline stays a broken camera by default."""
+    """A recording with video and no sensor timeline stays a broken camera by default."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000", write_timestamps=False)
     config = make_config(root, tmp_path / "media")
@@ -266,7 +266,7 @@ def test_a_camera_whose_container_pts_also_fails_is_an_open_sensor_failure(
     """``allow_pts_fallback`` is a fallback, not a second guarantee: a camera that fails both stays failed.
 
     The session's video is unreadable garbage rather than missing, so
-    ``load_timeline_ns`` fails for the usual reason (no sidecar) and the
+    ``load_sensor_timestamps_ns`` fails for the usual reason (no sidecar) and the
     fallback then fails too, for a different one (no parseable container).
     Both are camera-read faults, and the second must not escape as anything
     other than the same per-camera ``open_sensor`` failure the first is.
@@ -320,11 +320,11 @@ def test_a_mixed_session_marks_the_whole_episode_container_pts(
     """One camera falling back to container PTS taints the whole episode's timestamp_source.
 
     A clip is one moment across every view the rig promised, so a reader must
-    not be able to read ``timestamp_source`` as "capture" for an episode where
-    only one of two cameras actually has a capture timeline.
+    not be able to read ``timestamp_source`` as "sensor" for an episode where
+    only one of two cameras actually has a sensor timeline.
 
     ``load_container_pts_ns`` is faked to land on the same clock as ``left``'s
-    real capture timeline: a real container's own PTS restarts at 0 per file
+    real sensor timeline: a real container's own PTS restarts at 0 per file
     (see ``CameraSensor``'s docstring on why it's an inferior fallback), so two
     cameras on genuinely unrelated clocks would cover no common window at all --
     a real planning failure, but not the one this test is pinning.

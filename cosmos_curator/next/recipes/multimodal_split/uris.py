@@ -19,8 +19,8 @@ Where a session's artifacts live, expressed as string joins. Nothing here opens
 anything: a URI is a name, and resolving one to bytes is storage's job.
 """
 
-_TIMELINE_SUFFIX = ".timestamps.npy"
-_OBSERVATIONS_SUFFIX = ".observations.npy"
+_TIMESTAMPS_SIDECAR_SUFFIX = ".timestamps.npy"
+_SENSOR_TIMESTAMPS_SUFFIX = ".sensor_timestamps.npy"
 SESSIONS_PREFIX = "sessions"
 
 
@@ -34,9 +34,13 @@ def slashed(location: str) -> str:
     return location if location.endswith("/") else f"{location}/"
 
 
-def timeline_uri(sensor_uri: str) -> str:
-    """Return the observation-timeline artifact that sits beside a camera."""
-    return f"{sensor_uri}{_TIMELINE_SUFFIX}"
+def timestamps_sidecar_uri(media_uri: str) -> str:
+    """Return the ``.timestamps.npy`` sidecar beside *media_uri*.
+
+    The filename does not identify its clock: a source camera uses it for sensor
+    timestamps, while a clip produced by this recipe uses it for its alignment grid.
+    """
+    return f"{media_uri}{_TIMESTAMPS_SIDECAR_SUFFIX}"
 
 
 def resolve_sensor_uri(session_uri: str, uri_pattern: str) -> str:
@@ -57,9 +61,9 @@ def clip_media_uri(clip_dir: str, sensor_key: str, suffix: str = ".mp4") -> str:
     return f"{clip_dir}/{sensor_key}{suffix}"
 
 
-def observations_uri(clip_media_location: str) -> str:
-    """Return the which-frame-served-each-row artifact that sits beside a clip's media."""
-    return f"{clip_media_location}{_OBSERVATIONS_SUFFIX}"
+def sensor_timestamps_uri(clip_media_location: str) -> str:
+    """Return the selected sensor-timestamps artifact beside a clip's media."""
+    return f"{clip_media_location}{_SENSOR_TIMESTAMPS_SUFFIX}"
 
 
 def clip_dir_uri(output_path: str, session_id: str, clip_id: str) -> str:

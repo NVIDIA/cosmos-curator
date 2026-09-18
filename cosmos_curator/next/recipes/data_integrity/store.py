@@ -389,7 +389,7 @@ def session_measurement_row(  # noqa: PLR0913 -- a metric row is its identity pr
     The same "never ran" shape as :func:`measurement_row`, and for the same reason:
     ``is_defined = null`` with every metric column null says the metric was
     considered and could not run, which an absent row could not say. Both session
-    metrics reach it whenever their sensors were not all on capture times, and the
+    metrics reach it whenever their sensors were not all on sensor times, and the
     null columns are the point: a stored zero spread would be re-judged into a pass.
     ``session.lance``'s ``timestamp_source`` says which of the causes it was.
     """
@@ -493,7 +493,7 @@ def commit_run(  # noqa: PLR0913 -- a commit records the run it closes, which is
 
     Must therefore be the last write of a run.
     """
-    row = {
+    row: dict[str, object] = {
         "run_id": run_id,
         "created_at": created_at,
         "committed_at": _utc_now(),

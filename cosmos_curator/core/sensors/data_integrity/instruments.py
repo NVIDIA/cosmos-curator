@@ -178,8 +178,8 @@ class InstrumentSpec:
         requires_expected_hz: whether the metric can only be built when an expected
             rate is known. Rate, gap and jitter can't; without one they never run at
             all, which is the ``is_defined = None`` case in the store.
-        requires_capture_timestamps: whether the metric can only be built when every
-            contributing sensor reported real capture times. The two session-grain
+        requires_sensor_timestamps: whether the metric can only be built when every
+            contributing sensor reported real sensor times. The two session-grain
             metrics can't: a constant-frame-rate mux rewrites each camera onto one
             regenerated grid, so comparing those grids reports a flawless rig by
             construction. Same consequence as the flag above -- the metric never runs
@@ -201,7 +201,7 @@ class InstrumentSpec:
     measurement_cls: type
     fields: tuple[FieldSpec, ...]
     requires_expected_hz: bool
-    requires_capture_timestamps: bool
+    requires_sensor_timestamps: bool
     threshold: Callable[[Thresholds], Any]
     accessor: Callable[[Any], Any]
     reason: Callable[[Any, Any], str]
@@ -291,7 +291,7 @@ _ORDERING_SPEC = InstrumentSpec(
         FieldSpec("num_samples", FieldKind.INT),
     ),
     requires_expected_hz=False,
-    requires_capture_timestamps=False,
+    requires_sensor_timestamps=False,
     threshold=lambda t: t.max_strict_violations,
     accessor=lambda m: m.strict_violation_count,
     reason=lambda m, threshold: f"strict_violation_count={m.strict_violation_count} (threshold={threshold})",
@@ -313,7 +313,7 @@ _RATE_SPEC = InstrumentSpec(
         FieldSpec("num_filtered", FieldKind.INT),
     ),
     requires_expected_hz=True,
-    requires_capture_timestamps=False,
+    requires_sensor_timestamps=False,
     threshold=lambda t: t.max_rate_deviation_percent,
     accessor=lambda m: m.period_deviation_percent,
     reason=(
@@ -335,7 +335,7 @@ _GAP_SPEC = InstrumentSpec(
         FieldSpec("first_gap_index", FieldKind.INT, nullable=True),
     ),
     requires_expected_hz=True,
-    requires_capture_timestamps=False,
+    requires_sensor_timestamps=False,
     threshold=lambda t: t.max_gaps,
     accessor=lambda m: m.num_gaps,
     reason=lambda m, threshold: f"num_gaps={m.num_gaps} (threshold={threshold})",
@@ -354,7 +354,7 @@ _JITTER_SPEC = InstrumentSpec(
         FieldSpec("num_filtered", FieldKind.INT),
     ),
     requires_expected_hz=True,
-    requires_capture_timestamps=False,
+    requires_sensor_timestamps=False,
     threshold=lambda t: t.max_jitter_percent,
     accessor=lambda m: m.jitter_percent,
     reason=lambda m, threshold: f"jitter_percent={m.jitter_percent:.4f} (threshold={threshold:.4f}%)",
@@ -367,7 +367,7 @@ _REORDERING_SPEC = InstrumentSpec(
     measurement_cls=FrameReorderingPresentMeasurement,
     fields=(FieldSpec("has_reordering", FieldKind.BOOL, nullable=True),),
     requires_expected_hz=False,
-    requires_capture_timestamps=False,
+    requires_sensor_timestamps=False,
     # threshold 0 fails when a reordering flag is set; 1 permits it.
     threshold=lambda t: 1 if t.allow_frame_reordering else 0,
     accessor=lambda m: int(bool(m.has_reordering)),
@@ -385,7 +385,7 @@ _SENSOR_SPREAD_SPEC = InstrumentSpec(
         FieldSpec("num_sensors", FieldKind.INT),
     ),
     requires_expected_hz=False,
-    requires_capture_timestamps=True,
+    requires_sensor_timestamps=True,
     threshold=lambda t: t.max_sensor_spread_ns,
     # The worse end of the rig: a session is as badly aligned as its furthest-out
     # sensor, whether that sensor was late to start or late to stop.
@@ -406,7 +406,7 @@ _SENSOR_OVERLAP_SPEC = InstrumentSpec(
         FieldSpec("num_sensors", FieldKind.INT),
     ),
     requires_expected_hz=False,
-    requires_capture_timestamps=True,
+    requires_sensor_timestamps=True,
     threshold=lambda t: t.max_non_overlap_percent,
     # The complement, because :func:`below_threshold` is the only comparison a spec can
     # express and an overlap is the one quantity here that a session wants *more* of.

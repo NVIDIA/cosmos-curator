@@ -78,9 +78,9 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 # Reason attached to a rate-dependent check that has no usable expected rate.
 REASON_MISSING_HZ = "skipped: --expected-hz not provided and container header lacks a nominal frame rate"
 
-#: What a session was measured on, for the reason on a check that needed capture times.
+#: What a session was measured on, for the reason on a check that needed sensor times.
 #: ``None`` is its own phrase because "no sensor reported a clock" is not a clock.
-#: ``CAPTURE`` is absent because it is not a cause: a session on capture times runs the
+#: ``SENSOR`` is absent because it is not a cause: a session on sensor times runs the
 #: check rather than skipping it.
 _SESSION_SOURCE_PHRASES: dict[SessionTimestampSource | None, str] = {
     SessionTimestampSource.CONTAINER_PTS: "every sensor was measured on container PTS",
@@ -133,8 +133,8 @@ def resolve_expected_hz(user_hz: float | None, sensor: IntegritySensor) -> Resol
     Priority: explicit ``user_hz`` > container header ``avg_frame_rate`` > unavailable.
 
     An explicit ``user_hz`` is the authoritative baseline: it states independently
-    what the capture was supposed to be, which is the only way to judge whether it
-    was right.
+    what the sensor sampling rate was supposed to be, which is the only way to judge
+    whether it was right.
 
     The header value is best-effort and weaker than it looks. It comes from
     libav's ``AVStream.avg_frame_rate``, which is not guaranteed to preserve an
@@ -143,8 +143,8 @@ def resolve_expected_hz(user_hz: float | None, sensor: IntegritySensor) -> Resol
     timestamps come from. Judged against such a value, gap and jitter still bite,
     because they measure variation *between* samples: an irregular cadence shows
     up whatever the baseline. The rate check does not, and cannot be relied on to
-    catch a uniformly wrong capture rate, since a stream that ran entirely at the
-    wrong speed tends to declare a header rate that matches it. Pass
+    catch a uniformly wrong sensor sampling rate, since a stream that ran entirely
+    at the wrong speed tends to declare a header rate that matches it. Pass
     ``--expected-hz`` whenever that distinction matters.
 
     ``Fraction(0)`` -- the sentinel used in
@@ -185,8 +185,8 @@ def _skipped_missing_hz(name: str) -> CheckResult:
     )
 
 
-def reason_without_capture(session_source: SessionTimestampSource | None) -> str:
-    """Phrase why a session metric needing capture times could not run.
+def reason_without_sensor_timestamps(session_source: SessionTimestampSource | None) -> str:
+    """Phrase why a session metric needing sensor times could not run.
 
     Public because a re-judge has to say the same thing. Nothing about a stored
     never-ran row explains itself -- every column on it is null -- so
@@ -195,19 +195,19 @@ def reason_without_capture(session_source: SessionTimestampSource | None) -> str
     invocations describing one session the same way.
 
     The cause is named rather than elided because the fix differs by cause: a session
-    on container PTS needs its capture-timestamp sidecars, while a mixed one has some
+    on container PTS needs its sensor-timestamp sidecars, while a mixed one has some
     already and is missing the rest.
     """
     phrase = _SESSION_SOURCE_PHRASES.get(session_source, _UNEXPLAINED_SOURCE_PHRASE)
-    return f"skipped: comparing sensors needs capture timestamps, but {phrase}"
+    return f"skipped: comparing sensors needs sensor timestamps, but {phrase}"
 
 
-def _skipped_without_capture(name: str, session_source: SessionTimestampSource | None) -> CheckResult:
-    """Build a SKIPPED result for a session metric whose sensors lacked a shared capture clock."""
+def _skipped_without_sensor_timestamps(name: str, session_source: SessionTimestampSource | None) -> CheckResult:
+    """Build a SKIPPED result for a session metric whose sensors lacked a shared sensor clock."""
     return CheckResult(
         name=name,
         status=CheckStatus.SKIPPED,
-        reason=reason_without_capture(session_source),
+        reason=reason_without_sensor_timestamps(session_source),
         measurement=None,
         evaluation=None,
     )
@@ -321,10 +321,10 @@ def run_session_metrics(
     reports ``SKIPPED``, having nothing to compare.
 
     Comparing sensors is only meaningful when they share a clock, so a metric declaring
-    ``requires_capture_timestamps`` does not run at all unless every sensor here
-    reported real capture times -- see :func:`session_timestamp_source`. That check
+    ``requires_sensor_timestamps`` does not run at all unless every sensor here
+    reported real sensor times -- see :func:`session_timestamp_source`. That check
     comes *first*, ahead of the two-sensor minimum, and the two skips are deliberately
-    different: one lone camera measured on capture times is a session that was measured
+    different: one lone camera measured on sensor times is a session that was measured
     and found to have nothing to compare, while one measured on container PTS was never
     measurable in the first place.
 
@@ -343,7 +343,7 @@ def run_session_metrics(
     """
     sensors = list(bounds)
     session_source = session_timestamp_source(sensor.timestamp_source for sensor in sensors)
-    on_capture = session_source is SessionTimestampSource.CAPTURE
+    on_sensor_timestamps = session_source is SessionTimestampSource.SENSOR
 
     spread = MultiSensorSpreadMetric()
     overlap = MultiSensorOverlapMetric()
@@ -358,8 +358,8 @@ def run_session_metrics(
     # A gated metric's accumulator was fed above but is never read: its numbers are an
     # artifact of the mux, and a stored artifact is one a re-judge can turn into a pass.
     return [
-        _skipped_without_capture(spec.name, session_source)
-        if spec.requires_capture_timestamps and not on_capture
+        _skipped_without_sensor_timestamps(spec.name, session_source)
+        if spec.requires_sensor_timestamps and not on_sensor_timestamps
         else evaluate_metric(spec, built[spec.name].measurement(), thresholds)
         for spec in SESSION_INSTRUMENTS
     ]

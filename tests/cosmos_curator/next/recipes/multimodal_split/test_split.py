@@ -102,7 +102,7 @@ def test_the_last_clip_is_served_from_real_frames(
     last = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[-1]
 
     assert last["start_ns"] == DEVICE_ORIGIN_NS + 2 * _S
-    assert len(_observations(last)) == 30
+    assert len(_sensor_timestamps(last)) == 30
     assert len(_decoded_means(Path(last["clip_location"]))) == 30
 
 
@@ -140,14 +140,14 @@ def test_an_end_before_the_start_is_rejected() -> None:
         plan_clip_spans(start_ns=_EPOCH, end_ns=_EPOCH - _S, duration_ns=10 * _S)
 
 
-def _observations(clip: dict[str, Any]) -> list[int]:
-    """Read which source observation served each of a clip's frames.
+def _sensor_timestamps(clip: dict[str, Any]) -> list[int]:
+    """Read the source sensor timestamp that served each of a clip's frames.
 
     Beside the clip rather than on its row: the array is one entry per frame and
     every downstream block would carry it for no reader.
     """
     media = Path(str(clip["clip_location"]))
-    return [int(value) for value in np.load(media.with_name(f"{media.name}{'.observations.npy'}"))]
+    return [int(value) for value in np.load(media.with_name(f"{media.name}{'.sensor_timestamps.npy'}"))]
 
 
 def _errors(config: ResolvedMultimodalSplitConfig, session_id: str = "session-000") -> list[dict[str, Any]]:
@@ -194,7 +194,7 @@ def test_a_session_yields_one_playable_clip_per_full_span(
     assert len(clips) == 3
     assert not _errors(config)
     for clip in clips:
-        assert len(_observations(clip)) == 30
+        assert len(_sensor_timestamps(clip)) == 30
         assert len(_decoded_means(Path(clip["clip_location"]))) == 30
 
 
@@ -216,17 +216,17 @@ def test_one_source_frame_may_serve_several_grid_timestamps(
 
     clip = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[0]
 
-    selected = _observations(clip)
-    assert len(selected) == 30
-    assert len(set(selected)) < 30
+    sensor_timestamps = _sensor_timestamps(clip)
+    assert len(sensor_timestamps) == 30
+    assert len(set(sensor_timestamps)) < 30
     # Source frames sit 100 ms apart, so a one-second clip draws on about ten.
-    assert len(set(selected)) <= 11
+    assert len(set(sensor_timestamps)) <= 11
     # Every recorded time is a real source frame time, not a grid time. The
     # sensor is given the same origin the recipe used, because a source frame
     # time only means anything against the clock it was recorded on.
     camera_path = root / "session-000" / "camera" / "front.mp4"
     source_times = set(CameraSensor(camera_path, origin_ns=DEVICE_ORIGIN_NS).timestamps_ns.tolist())
-    assert set(selected) <= source_times
+    assert set(sensor_timestamps) <= source_times
 
 
 def test_a_missing_camera_artifact_is_reported_rather_than_raised(
@@ -269,7 +269,7 @@ def test_a_tolerance_no_frame_can_meet_fails_the_clip_and_writes_nothing(
     them rather than accepting a frame a third of a second away.
 
     Refused from the timeline rather than partway through decoding: which
-    observation serves a reference is decided by capture times, so a recording
+    observation serves a reference is decided by sensor times, so a recording
     that cannot meet the tolerance is known before a container is opened.
     """
     root = tmp_path / "recordings"
@@ -312,7 +312,7 @@ def test_a_descriptor_carries_what_publication_will_need(
     assert clip["sensor_key"] == "front"
     assert clip["exclusive_end_ns"] - clip["start_ns"] == 1_000_000_000
     # One observation per frame of the clip's own grid: a second of 30 fps.
-    assert len(_observations(clip)) == 30
+    assert len(_sensor_timestamps(clip)) == 30
     assert clip["clip_id"]
 
 
@@ -351,7 +351,7 @@ def test_the_configured_output_rate_reaches_the_written_clip(
 
     clip = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[0]
 
-    assert len(_observations(clip)) == 60
+    assert len(_sensor_timestamps(clip)) == 60
     path = Path(clip["clip_location"])
     assert len(_decoded_means(path)) == 60
     with av.open(str(path)) as container:
@@ -405,7 +405,7 @@ def test_a_fractional_duration_lands_on_exact_nanosecond_boundaries(
     assert [clip["start_ns"] for clip in clips] == [
         DEVICE_ORIGIN_NS + offset for offset in (0, 700_000_000, 1_400_000_000, 2_100_000_000)
     ]
-    assert all(len(_observations(clip)) == 21 for clip in clips)
+    assert all(len(_sensor_timestamps(clip)) == 21 for clip in clips)
 
 
 def test_a_short_encode_fails_the_clip_instead_of_publishing_it(
@@ -525,18 +525,18 @@ def test_splitting_builds_no_video_index(
     assert calls == []
 
 
-def test_a_clip_is_stamped_in_the_recorder_clock_not_the_container_clock(
+def test_a_clip_is_stamped_in_the_sensor_clock_not_the_container_clock(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A span is capture time, which is the only thing that joins a camera to the other sensors.
+    """A span is sensor time, which is the only thing that joins a camera to the other sensors.
 
     Every container's presentation timestamps start at zero, so spans taken from
     them describe a position within one file and nothing else: two sessions
     recorded a day apart claim the same instants, and none of them line up with
-    an imu or gps reading. The timeline artifact carries the recorder's own
-    clock, and that is what a clip is published under.
+    an imu or gps reading. The timeline artifact carries the shared sensor clock,
+    and that is what a clip is published under.
     """
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
@@ -573,7 +573,7 @@ def test_a_clip_is_written_with_a_timeline_beside_it(
         assert beside.exists()
         with beside.open("rb") as stream:
             timeline = read_timestamps_ns(stream)
-        assert len(timeline) == len(_observations(clip))
+        assert len(timeline) == len(_sensor_timestamps(clip))
         assert int(timeline[0]) == clip["start_ns"]
         assert int(timeline[-1]) < clip["exclusive_end_ns"]
 
@@ -723,7 +723,7 @@ def test_a_wildcard_matching_several_names_no_camera_at_all(
     assert "matches 2 artifacts" in errors[0]["message"]
 
 
-def test_a_clip_records_which_observation_served_each_frame(
+def test_a_clip_records_each_frames_sensor_timestamp(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
@@ -747,9 +747,9 @@ def test_a_clip_records_which_observation_served_each_frame(
 
     for clip in clips:
         media = Path(clip["clip_location"])
-        observed = np.load(media.with_name(f"{media.name}.observations.npy"))
+        observed = np.load(media.with_name(f"{media.name}.sensor_timestamps.npy"))
         assert observed.dtype == np.int64
-        assert len(observed) == len(_observations(clip))
+        assert len(observed) == len(_sensor_timestamps(clip))
         assert all(left <= right for left, right in itertools.pairwise(observed))
 
 
@@ -791,7 +791,7 @@ def test_a_rerun_over_the_same_output_rewrites_identical_bytes(
     Sidecars are written before the media, so a failure between them leaves a
     clip invisible rather than unreadable. Running again over a finished clip
     replaces the sidecars before the MP4, which would mix two generations if a
-    rerun could produce different bytes -- old media beside new observations,
+    rerun could produce different bytes -- old media beside new sensor timestamps,
     and no error, because the MP4 exists and the clip looks published.
 
     It cannot, because the same clip id means the same content by construction:
@@ -827,7 +827,7 @@ def test_a_clip_is_never_published_without_its_sidecars(
     """The media is written last, so a failure cannot leave a clip that cannot place itself.
 
     A consumer walking the output looks for the MP4. Publishing it before its
-    timeline and observations would leave a window where a clip exists and
+    timeline and sensor timestamps would leave a window where a clip exists and
     cannot say when its frames happened -- and a failure between the writes
     would leave that permanently, under an id a rerun addresses again.
     """
@@ -838,13 +838,13 @@ def test_a_clip_is_never_published_without_its_sidecars(
 
     real_write = split_module.write_media
 
-    def fail_on_observations(location: str, data: bytes, *, storage_profile: str) -> None:
-        if location.endswith(".observations.npy"):
+    def fail_on_sensor_timestamps(location: str, data: bytes, *, storage_profile: str) -> None:
+        if location.endswith(".sensor_timestamps.npy"):
             msg = "storage went away"
             raise OSError(msg)
         real_write(location, data, storage_profile=storage_profile)
 
-    monkeypatch.setattr(split_module, "write_media", fail_on_observations)
+    monkeypatch.setattr(split_module, "write_media", fail_on_sensor_timestamps)
 
     clips = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)
 
@@ -1040,7 +1040,7 @@ def test_a_failed_clip_does_not_shift_the_frames_of_the_clips_after_it(
     # have held had it never failed.
     assert [clip["clip_id"] for clip in written] == [clip["clip_id"] for clip in reference][1:]
     for clip, expected in zip(written, reference[1:], strict=True):
-        assert _observations(clip) == _observations(expected)
+        assert _sensor_timestamps(clip) == _sensor_timestamps(expected)
 
 
 def test_a_failure_that_ends_the_pass_early_reports_the_spans_after_it(
@@ -1156,9 +1156,9 @@ def test_realigning_past_the_end_of_the_stream_is_refused() -> None:
     """
     frames = ((index, index, np.zeros((2, 2, 3), dtype=np.uint8)) for index in range(15))
     feed = split_module._FrameFeed(frames)
-    selected: list[int] = []
+    sensor_timestamps_ns: list[int] = []
 
-    taking = feed.take(30, selected)
+    taking = feed.take(30, sensor_timestamps_ns)
     for index, _frame in enumerate(taking):
         if index == 9:
             break
@@ -1210,7 +1210,7 @@ def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
     written = split_all(item, config=config)
 
     assert [clip["clip_id"] for clip in written] == [reference[2]["clip_id"]]
-    assert _observations(written[0]) == _observations(reference[2])
+    assert _sensor_timestamps(written[0]) == _sensor_timestamps(reference[2])
     assert len(_errors(config)) == 2
 
 
@@ -1253,7 +1253,7 @@ def test_an_mcap_clip_is_written_per_span_and_catalogued(
     # Copied rather than resampled, so there is no grid and no per-row account of
     # which sample served which row -- the two artifacts a camera clip carries.
     assert all(outcome["timeline_location"] is None for outcome in outcomes)
-    assert all(outcome["observations_location"] is None for outcome in outcomes)
+    assert all(outcome["sensor_timestamps_location"] is None for outcome in outcomes)
 
 
 def test_an_imu_clip_is_written_per_span_and_catalogued(
@@ -1289,7 +1289,7 @@ def test_an_imu_clip_is_written_per_span_and_catalogued(
             decoded = list(mcap_make_reader(stream).iter_messages())
         assert decoded
     assert all(outcome["timeline_location"] is None for outcome in outcomes)
-    assert all(outcome["observations_location"] is None for outcome in outcomes)
+    assert all(outcome["sensor_timestamps_location"] is None for outcome in outcomes)
 
 
 def test_an_interior_mcap_clip_carries_a_pose_at_or_before_its_start(

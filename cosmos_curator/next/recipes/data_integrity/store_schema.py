@@ -75,6 +75,11 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #: needs a fresh root. Deliberate rather than mitigated -- migration machinery for a
 #: store whose only readers are the two CLIs and the rollup would cost more than
 #: re-measuring, and re-measuring is cheap because the sources are unchanged.
+#:
+#: Version 3 rows may contain historical ``timestamp_source="capture"`` or the
+#: canonical ``"sensor"`` value. Current enum readers normalize ``"capture"`` to
+#: ``"sensor"``, and writers emit only ``"sensor"``. This vocabulary migration
+#: does not change Arrow layout, so it deliberately does not bump this version.
 STORE_SCHEMA_VERSION = 3
 
 STREAM_DATASET = "stream.lance"
@@ -267,7 +272,7 @@ SESSION_SCHEMA: pa.Schema = pa.schema(
         pa.field("num_unreadable", pa.int64(), nullable=False),
         # Which clock this session's streams were measured on, rolled up by
         # :func:`~cosmos_curator.core.sensors.data_integrity.results.session_timestamp_source`:
-        # ``capture`` only when every contributing stream had one, else ``container_pts``
+        # ``sensor`` only when every contributing stream had one, else ``container_pts``
         # or ``mixed``. Null means no stream contributed bounds -- an unlisted or empty
         # session has no clock rather than a bad one. This is what makes a never-ran
         # session-grain measurement legible: the metric row says only that it did not

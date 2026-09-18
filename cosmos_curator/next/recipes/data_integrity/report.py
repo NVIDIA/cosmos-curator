@@ -150,7 +150,7 @@ def render_text(report: SessionReport) -> str:
     clock = _session_clock_value(report)
     if clock is not None:
         # Above the session metrics because it decides whether they ran at all: the two
-        # cross-sensor checks skip unless every contributing stream reported `capture`.
+        # cross-sensor checks skip unless every contributing stream reported `sensor`.
         lines.append(f"  timestamps: {clock}")
     # Under the session heading, in the same columns the per-stream metrics use, so the
     # two read alike -- what differs is only which line they sit beneath.

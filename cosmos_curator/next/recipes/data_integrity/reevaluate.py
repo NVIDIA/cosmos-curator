@@ -31,7 +31,7 @@ than measured.
 import datetime
 from typing import cast
 
-from cosmos_curator.core.sensors.data_integrity.engine import reason_without_capture
+from cosmos_curator.core.sensors.data_integrity.engine import reason_without_sensor_timestamps
 from cosmos_curator.core.sensors.data_integrity.instruments import (
     INSTRUMENTS,
     SESSION_INSTRUMENTS,
@@ -88,12 +88,13 @@ def _reevaluate_session_row(
     """Rebuild and re-judge one session-grain row, naming the clock when it never ran.
 
     Only the never-ran branch differs from :func:`_reevaluate_row`, and only for a
-    capture-gated metric: the rate-shaped default wording would be the wrong cause,
-    since no session metric needs an expected rate. A session that *was* measured is
-    never asked for the phrase at all -- there is no missing clock to describe.
+    sensor-timestamp-gated metric: the rate-shaped default wording would be the wrong
+    cause, since no session metric needs an expected rate. A session that *was*
+    measured is never asked for the phrase at all -- there is no missing clock to
+    describe.
     """
-    if row.get("is_defined") is None and spec.requires_capture_timestamps:
-        return _skipped_never_ran(spec, reason_without_capture(session_source))
+    if row.get("is_defined") is None and spec.requires_sensor_timestamps:
+        return _skipped_never_ran(spec, reason_without_sensor_timestamps(session_source))
     return _reevaluate_row(spec, row, thresholds)
 
 

@@ -33,7 +33,9 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # 2: the identity stopped covering settings and became geometry alone. The
 # digest inputs changed, so a version left at 1 would name two different
 # identity schemes -- ids from either would be version 1 and indistinguishable.
-MEDIA_CONTRACT_VERSION = 2
+# 3: the selected source sensor-timestamp sidecar was renamed from
+# ``.observations.npy`` to ``.sensor_timestamps.npy``.
+MEDIA_CONTRACT_VERSION = 3
 EPISODE_IDENTITY_VERSION = 1
 # 4: a camera's allow_pts_fallback joined the contract, because it decides
 # whether the camera can produce output at all and which clock its timeline
@@ -53,7 +55,8 @@ SPLIT_CONTRACT_DIGEST_VERSION = 4
 # 2: non-camera sensor artifacts joined the digest. An episode published under
 # version 1 was its cameras and nothing else, so it cannot be compared byte for
 # byte against one that also carries a trajectory.
-MATERIALIZATION_DIGEST_VERSION = 2
+# 3: camera artifact identity now uses the canonical sensor-timestamp field.
+MATERIALIZATION_DIGEST_VERSION = 3
 
 
 def make_source_id(session_uri: str) -> str:
@@ -205,7 +208,7 @@ def make_materialization_digest(  # noqa: PLR0913 -- every input is a normative 
                     "camera_key": str(camera["camera_key"]),
                     "media_sha256": str(camera["media_sha256"]),
                     "timeline_sha256": str(camera["timeline_sha256"]),
-                    "observations_sha256": str(camera["observations_sha256"]),
+                    "sensor_timestamps_sha256": str(camera["sensor_timestamps_sha256"]),
                 }
                 for camera in sorted(camera_media, key=lambda camera: str(camera["camera_key"]))
             ],

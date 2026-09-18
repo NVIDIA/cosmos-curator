@@ -338,7 +338,7 @@ def session_metrics(streams: list[StreamResult], thresholds: Thresholds = DEFAUL
     Which streams contribute is :func:`contributing_bounds`' call, shared with the
     store so the recorded clock describes the streams the metrics were computed over.
     With fewer than two contributors every session metric comes back ``SKIPPED``; so
-    does one whose contributors were not all on capture times, which is the engine's
+    does one whose contributors were not all on sensor times, which is the engine's
     call to make rather than this seam's.
     """
     return run_session_metrics(contributing_bounds(streams), thresholds=thresholds)

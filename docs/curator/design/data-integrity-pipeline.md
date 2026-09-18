@@ -101,7 +101,7 @@ The session layout is already settled, and already exercised against the target 
 directory (or cloud prefix) holding one video per camera", and its usage block gives
 `--session-path s3://<bucket>/clips/<uuid>/` as a worked example.
 
-One recording can span several capture computers: a car with multiple Orins writes a
+One recording can span several recorder computers: a car with multiple Orins writes a
 `recorder-<NN>/` directory per Orin under one session uuid, and their clocks are expected
 to be synchronized. So the session is the uuid, not the recorder — splitting it per
 recorder would ask `multi_sensor_spread` and `multi_sensor_overlap` whether each Orin
@@ -370,7 +370,7 @@ addition rather than a rewrite: each task now judges its session as well as its 
 emits the three tables in [data-integrity-store-schema.md][store-schema] section 5. Both
 tools reach that verdict through one function, `session_runner.session_metrics`, so a
 session the CLI fails is not one the pipeline records as passing — and a session the CLI
-skips for want of a shared capture clock is not one the pipeline records at all.
+skips for want of a shared sensor clock is not one the pipeline records at all.
 
 Within a session the kernel's requirement is unchanged: each stream is read once, through
 `run_checks`, which takes exactly one URI, and folded into every instrument.
@@ -604,7 +604,7 @@ them: it never raises, so an unprofiled `HEAD` records empty provenance instead 
 The session-grain half then added what it needed: three builders, `session_key`, three dataset
 names and a dedup key of their own, and `STORE_SCHEMA_VERSION` at 2 — all of it additive, so a
 version-1 store still reads (see [data-integrity-store-schema.md][store-schema] section 5).
-Capture timestamps then took it to 3 by adding `timestamp_source` to `stream.lance`, which is
+Sensor timestamps then took it to 3 by adding `timestamp_source` to `stream.lance`, which is
 *not* additive: an append has to match the dataset's schema, so a store written at 1 or 2 needs
 a fresh root rather than a migration.
 What did not change is the commit rule, or `write_run`'s one production call site,
@@ -715,22 +715,22 @@ the sidecar reader below, which has to tell the same three apart for the same re
 there rather than here because that is the module the `smart_open` wrapper comes from, and
 because one reading of an error shape is what keeps a denial from being anything else.
 
-**The capture timeline was not there, or was not usable.** `run_checks` looks for a
+**The sensor timeline was not there, or was not usable.** `run_checks` looks for a
 `<video>.mp4.timestamps.npy` sidecar beside each stream and hands it to the sensor, which then
-measures and reports capture times instead of container PTS (see
+measures and reports sensor times instead of container PTS (see
 [Timestamp provenance][metrics-provenance] for why that matters). The four outcomes are
 deliberately different. **Absent** is the ordinary case — most sources have no sidecar — so it
 is not a finding: the stream is measured on PTS and `timestamp_source` says so. **Present but
 unusable** — corrupt, or a length that disagrees with the video's frame count — fails the
 stream, because falling back silently would hide the one thing an operator can act on, and
-because a timeline matched to frames by position leaves *every* frame's capture time in doubt
+because a timeline matched to frames by position leaves *every* frame's sensor time in doubt
 when the count is wrong. **Unreachable** is neither, and is classified exactly as an
 unreachable video is: it is the same bucket and the same credentials, so a denial there says
 nothing about the recording. Telling those apart is what `error_chain` is for above — through
 `smart_open`'s wrapper, a missing sidecar and a denied one are the same exception type. The
 fourth is **present but disowned**, below.
 
-**This recipe grades sessions as recorded, not clips cut from them.** The distinction is not
+**This recipe grades source sessions, not split clips.** The distinction is not
 enforceable in general — a path is a path, and a clip directory holds an MP4 and a sidecar
 like any other — but it decides what the numbers mean. `multimodal-split` cuts a session by
 resampling every camera onto one evenly spaced grid at the configured output rate, and writes
@@ -739,9 +739,11 @@ way it read a session. Graded as a recording, such a session answers the session
 it is asked: every camera sits on the same lattice, so spread is zero and overlap total
 however ragged the rig behind the clips was, because the alignment is the splitter's and the
 original skew is already gone. The instants a camera observed are kept beside the grid as
-`<clip>.mp4.observations.npy`, and that file is the discriminator: nothing a recorder writes
-produces it, so `read_capture_timeline` treats its presence as the tree disowning the timeline
-next to it, logs which artifact it found, and measures container PTS instead. Existence is the
+`<clip>.mp4.sensor_timestamps.npy`, and that file is the discriminator: nothing a recorder writes
+produces it, so `read_sensor_timestamps` treats its presence as the tree disowning the timeline
+next to it, logs which artifact it found, and measures container PTS instead. For clips written
+before the rename, the reader recognizes `<clip>.mp4.observations.npy` as the same discriminator;
+new split runs write only `.sensor_timestamps.npy`. Existence is the
 whole signal — the marker holds one observation per output frame and repeats wherever a frame
 was dropped, so it is non-decreasing where a timeline must strictly ascend, and could not be
 read as one. Keyed per stream rather than per directory, since twelve cameras share a clip
@@ -750,9 +752,9 @@ not support for it: the honest answer for a derived clip is that rig sync is una
 that is the answer it now gives.
 
 Absence is not a finding *per stream*, but it does decide the session grain. `session_metrics`
-rolls the contributing streams' clocks into one value — `capture` only when every one of them
+rolls the contributing streams' clocks into one value — `sensor` only when every one of them
 reported it, else `container_pts` or `mixed` — and both session-grain metrics declare
-`requires_capture_timestamps`, so on anything but `capture` they never run. Their rows are
+`requires_sensor_timestamps`, so on anything but `sensor` they never run. Their rows are
 written all-null and their verdicts are `SKIPPED`, naming the clock that was measured instead.
 Storing the numbers would be worse than storing nothing: a mux puts every camera on one
 regenerated grid, so the zero spread it produces is the encoder's, and a stored zero is one
@@ -798,9 +800,9 @@ grades one.
 | Metric ran but was undefined on too little data | measurement row with `is_defined` false, plus a `SKIPPED` evaluation row | 0 |
 | Metric never ran, with no usable rate | measurement row with `is_defined` null, plus a `SKIPPED` evaluation row | 0 |
 | Session listed cleanly and held no streams | `session.lance` row with `num_streams` 0, no `error` and a null `timestamp_source` — nothing contributed a clock — plus a never-ran session measurement and a `SKIPPED` verdict per session metric; counted in the summary. Rolls up `ERROR`, matching a live report on an empty session | 0 |
-| No capture-timeline sidecar beside the video | stream row measured on `container_pts`, recorded in `timestamp_source` | 0 |
-| Session whose streams were not all on capture times | `session.lance` row with `timestamp_source` `container_pts` or `mixed`, plus a session measurement row with `is_defined` null and every metric column null, and a `SKIPPED` verdict naming the clock. Not counted as a failure, and a re-judge cannot turn it into a pass | 0 |
-| Session of one camera, that camera on capture times | session measurement row with `is_defined` false and `num_sensors` 1, plus a `SKIPPED` verdict — measured, with nothing to compare, which is a different finding from the row above | 0 |
+| No sensor-timeline sidecar beside the video | stream row measured on `container_pts`, recorded in `timestamp_source` | 0 |
+| Session whose streams were not all on sensor times | `session.lance` row with `timestamp_source` `container_pts` or `mixed`, plus a session measurement row with `is_defined` null and every metric column null, and a `SKIPPED` verdict naming the clock. Not counted as a failure, and a re-judge cannot turn it into a pass | 0 |
+| Session of one camera, that camera on sensor times | session measurement row with `is_defined` false and `num_sensors` 1, plus a `SKIPPED` verdict — measured, with nothing to compare, which is a different finding from the row above | 0 |
 | Sidecar present but unreadable, or of the wrong length | stream row with `error`, as for any unreadable input | 0 |
 | Sidecar unreachable: 403, 5xx, or a transport failure | no stream row — the same as an unreachable video, since it is the same denial | nonzero, after the commit |
 | Stream unreachable: expired token, 403, 5xx, or an exhausted transport budget | no stream row; counted, and reported by the failure. Its session's row still says how many streams were *found*, so the session rolls up `ERROR` rather than `PASS` | nonzero, after the commit |
@@ -1039,7 +1041,7 @@ The first implementation is complete when:
 - any change to the shared storage CLI helpers, or to `di-check` / `di-session` behavior
 - any *non-additive* change to the Lance schema: the session-grain tables were added at
   `STORE_SCHEMA_VERSION` 2, and no existing dataset, column or dedup key moved. (Scoped to
-  this recipe. Capture timestamps later took the store to version 3 non-additively, on its
+  this recipe. Sensor timestamps later took the store to version 3 non-additively, on their
   own terms — see [data-integrity-store-schema.md][store-schema] section 2.)
 
 [mr1104]: https://gitlab-master.nvidia.com/aidot/cosmos-curator-public/cosmos-curator/-/merge_requests/1104

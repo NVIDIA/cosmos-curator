@@ -667,7 +667,7 @@ def test_a_run_publishes_an_episode_carrying_a_gridded_sensor(
     """A placed sensor reaches the catalogue like a copied one, with null grid sidecars.
 
     A gridded sensor sits on the episode's own timeline, so it has no timeline or
-    observations artifact of its own. Its outcome row carries nulls where a
+    sensor-timestamps artifact of its own. Its outcome row carries nulls where a
     camera's carries those descriptors, and assembly refuses a successful outcome
     missing any descriptor that applies to its kind -- so this is where a sensor
     kind is published or silently dropped.
@@ -703,7 +703,12 @@ def test_a_run_publishes_an_episode_carrying_a_gridded_sensor(
             "media_size_bytes",
             "media_sha256",
         }
-        sidecars = {"timeline_location", "timeline_sha256", "observations_location", "observations_sha256"}
+        sidecars = {
+            "timeline_location",
+            "timeline_sha256",
+            "sensor_timestamps_location",
+            "sensor_timestamps_sha256",
+        }
         assert sidecars.isdisjoint(gps)
         assert sidecars <= set(episode["camera_media"][0])
         payload = Path(gps["media_location"]).read_bytes()

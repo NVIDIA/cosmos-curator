@@ -281,7 +281,7 @@ def test_camera_sensor_origin_pins_the_first_frame_and_carries_the_rest_with_it(
 
     This index starts at 100 ns rather than zero, which is what separates the two
     readings: adding ``origin_ns`` would report the first frame at
-    ``origin_ns + 100``. A caller holding a capture timeline knows when recording
+    ``origin_ns + 100``. A caller holding a sensor timeline knows when recording
     started, not what the container chose to call that instant, so the sensor
     subtracts its own first PTS. Stream-native PTS are untouched, because decode
     planning and seeking still speak the container's timeline.
@@ -379,8 +379,8 @@ def test_camera_sensor_rejects_an_invalid_origin_before_indexing(
         CameraSensor(b"not-used", origin_ns=origin_ns)  # type: ignore[arg-type]
 
 
-def _capture_timeline(count: int) -> npt.NDArray[np.int64]:
-    """Build a rig's own capture times: epoch nanoseconds near 30 Hz, never exactly on it.
+def _sensor_timeline(count: int) -> npt.NDArray[np.int64]:
+    """Build a rig's own sensor times: epoch nanoseconds near 30 Hz, never exactly on it.
 
     Deliberately unlike anything a container would report -- epoch-scale rather than
     starting at zero, and unevenly spaced -- so a test cannot pass by accident on a
@@ -391,10 +391,10 @@ def _capture_timeline(count: int) -> npt.NDArray[np.int64]:
     return base + np.arange(count, dtype=np.int64) * 33_333_333 + jitter[:count]
 
 
-def test_a_capture_timeline_replaces_the_container_timeline(
+def test_a_sensor_timeline_replaces_the_container_timeline(
     patch_camera_sensor_dependencies: Callable[..., None],
 ) -> None:
-    """Every timestamp the sensor reports comes from the capture timeline, and the index keeps its own.
+    """Every timestamp the sensor reports comes from the sensor timeline, and the index keeps its own.
 
     The split the feature rests on: what the sensor *reports* moves to the recording's
     clock, while the stream-native PTS the index holds stay exactly as they were,
@@ -415,22 +415,22 @@ def test_a_capture_timeline_replaces_the_container_timeline(
 
     patch_camera_sensor_dependencies(make_index_and_metadata_fn=fake_make_index_and_metadata)
 
-    capture_ns = _capture_timeline(3)
-    sensor = CameraSensor(b"not-used", capture_timestamps_ns=capture_ns)
+    sensor_ns = _sensor_timeline(3)
+    sensor = CameraSensor(b"not-used", sensor_timestamps_ns=sensor_ns)
 
-    assert sensor.timestamp_source is TimestampSource.CAPTURE
-    np.testing.assert_array_equal(sensor.timestamps_ns, capture_ns)
-    np.testing.assert_array_equal(next(sensor.stream_timestamps()), capture_ns)
-    np.testing.assert_array_equal(np.concatenate(list(sensor.stream_timestamps(batch_size=2))), capture_ns)
-    assert sensor.start_ns == int(capture_ns[0])
-    assert sensor.end_ns == int(capture_ns[-1])
+    assert sensor.timestamp_source is TimestampSource.SENSOR
+    np.testing.assert_array_equal(sensor.timestamps_ns, sensor_ns)
+    np.testing.assert_array_equal(next(sensor.stream_timestamps()), sensor_ns)
+    np.testing.assert_array_equal(np.concatenate(list(sensor.stream_timestamps(batch_size=2))), sensor_ns)
+    assert sensor.start_ns == int(sensor_ns[0])
+    assert sensor.end_ns == int(sensor_ns[-1])
     # Untouched, and no offset invented to reconcile the two clocks.
     np.testing.assert_array_equal(sensor.video_index.pts_ns, np.array([0, 33_333_333, 66_666_666], dtype=np.int64))
     np.testing.assert_array_equal(sensor.video_index.pts_stream, np.array([0, 3_000, 6_000], dtype=np.int64))
     assert sensor.timestamp_offset_ns == 0
 
 
-def test_the_container_timeline_is_reported_when_no_capture_timeline_is_given(
+def test_the_container_timeline_is_reported_when_no_sensor_timeline_is_given(
     synthetic_video: io.BytesIO,
 ) -> None:
     """The default is unchanged, and says so.
@@ -446,7 +446,7 @@ def test_the_container_timeline_is_reported_when_no_capture_timeline_is_given(
     np.testing.assert_array_equal(sensor.timestamps_ns, sensor.video_index.display_pts_ns)
 
 
-def test_a_capture_timeline_reaches_the_sampled_payload(synthetic_video: io.BytesIO) -> None:
+def test_a_sensor_timeline_reaches_the_sampled_payload(synthetic_video: io.BytesIO) -> None:
     """A sampled batch is timestamped on the same clock the sensor reports.
 
     Runs through real decode rather than a fake one, because the payload's timestamps
@@ -455,31 +455,31 @@ def test_a_capture_timeline_reaches_the_sampled_payload(synthetic_video: io.Byte
     epoch nanoseconds is not something a caller aligning two sensors could detect.
     """
     frame_count = len(CameraSensor(synthetic_video.getvalue()).timestamps_ns)
-    capture_ns = _capture_timeline(frame_count)
+    sensor_ns = _sensor_timeline(frame_count)
 
-    sensor = CameraSensor(synthetic_video.getvalue(), capture_timestamps_ns=capture_ns)
-    stride_ns = int(capture_ns[2] - capture_ns[0])
-    spec = SamplingSpec(grid=make_sampling_grid(capture_ns[:5], stride_ns=stride_ns, duration_ns=stride_ns))
+    sensor = CameraSensor(synthetic_video.getvalue(), sensor_timestamps_ns=sensor_ns)
+    stride_ns = int(sensor_ns[2] - sensor_ns[0])
+    spec = SamplingSpec(grid=make_sampling_grid(sensor_ns[:5], stride_ns=stride_ns, duration_ns=stride_ns))
 
     batches = list(sensor.sample(spec, policy=NearestTimestampPolicy()))
 
     served = np.concatenate([batch.sensor_timestamps_ns for batch in batches])
     assert served.size
     # Every served timestamp is one the rig recorded, not one the container invented.
-    assert set(served.tolist()) <= set(capture_ns.tolist())
+    assert set(served.tolist()) <= set(sensor_ns.tolist())
     np.testing.assert_array_equal(served, np.concatenate([batch.align_timestamps_ns for batch in batches]))
     # The frames themselves are still addressed by container PTS.
     pts_served = np.concatenate([batch.pts_stream for batch in batches])
     assert set(pts_served.tolist()) <= set(sensor.video_index.display_pts_stream.tolist())
 
 
-def test_a_capture_timeline_of_the_wrong_length_is_rejected(
+def test_a_sensor_timeline_of_the_wrong_length_is_rejected(
     patch_camera_sensor_dependencies: Callable[..., None],
 ) -> None:
     """A timeline that does not describe this recording is an error, not something to trim.
 
     The two are matched by position, so a count that disagrees leaves every frame's
-    capture time in doubt rather than just the missing ones'.
+    sensor time in doubt rather than just the missing ones'.
     """
     index, metadata = _make_video_index_and_metadata(
         pts_ns=[0, 100, 200],
@@ -496,10 +496,10 @@ def test_a_capture_timeline_of_the_wrong_length_is_rejected(
     patch_camera_sensor_dependencies(make_index_and_metadata_fn=fake_make_index_and_metadata)
 
     with pytest.raises(ValueError, match="2 observations but the stream has 3 displayable frames"):
-        CameraSensor(b"not-used", capture_timestamps_ns=_capture_timeline(2))
+        CameraSensor(b"not-used", sensor_timestamps_ns=_sensor_timeline(2))
 
 
-def test_a_capture_timeline_and_an_origin_cannot_be_combined(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_sensor_timeline_and_an_origin_cannot_be_combined(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two answers to the same question are refused before the source is indexed."""
 
     def fail_to_index(*_args: object, **_kwargs: object) -> tuple[VideoIndex, VideoMetadata]:
@@ -511,11 +511,11 @@ def test_a_capture_timeline_and_an_origin_cannot_be_combined(monkeypatch: pytest
     )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
-        CameraSensor(b"not-used", origin_ns=1_000, capture_timestamps_ns=_capture_timeline(3))
+        CameraSensor(b"not-used", origin_ns=1_000, sensor_timestamps_ns=_sensor_timeline(3))
 
 
 @pytest.mark.parametrize(
-    ("capture_timestamps_ns", "match"),
+    ("sensor_timestamps_ns", "match"),
     [
         (np.array([], dtype=np.int64), "at least one observation"),
         (np.array([100, 100], dtype=np.int64), "strictly sorted"),
@@ -524,8 +524,8 @@ def test_a_capture_timeline_and_an_origin_cannot_be_combined(monkeypatch: pytest
         (np.array([100.5, 200.5], dtype=np.float64), "dtype int64"),
     ],
 )
-def test_an_unusable_capture_timeline_is_rejected_before_indexing(
-    capture_timestamps_ns: npt.NDArray[np.int64],
+def test_an_unusable_sensor_timeline_is_rejected_before_indexing(
+    sensor_timestamps_ns: npt.NDArray[np.int64],
     match: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -536,7 +536,7 @@ def test_an_unusable_capture_timeline_is_rejected_before_indexing(
     """
 
     def fail_to_index(*_args: object, **_kwargs: object) -> tuple[VideoIndex, VideoMetadata]:
-        pytest.fail("CameraSensor must validate capture_timestamps_ns before indexing")
+        pytest.fail("CameraSensor must validate sensor_timestamps_ns before indexing")
 
     monkeypatch.setattr(
         "cosmos_curator.core.sensors.sensors.camera_sensor.make_index_and_metadata",
@@ -544,10 +544,10 @@ def test_an_unusable_capture_timeline_is_rejected_before_indexing(
     )
 
     with pytest.raises(ValueError, match=match):
-        CameraSensor(b"not-used", capture_timestamps_ns=capture_timestamps_ns)
+        CameraSensor(b"not-used", sensor_timestamps_ns=sensor_timestamps_ns)
 
 
-def test_a_reported_capture_timeline_cannot_be_written_through(
+def test_a_reported_sensor_timeline_cannot_be_written_through(
     patch_camera_sensor_dependencies: Callable[..., None],
 ) -> None:
     """The array the sensor hands back is a read-only view, as the index's own timeline is.
@@ -569,13 +569,13 @@ def test_a_reported_capture_timeline_cannot_be_written_through(
 
     patch_camera_sensor_dependencies(make_index_and_metadata_fn=fake_make_index_and_metadata)
 
-    capture_ns = _capture_timeline(3)
-    sensor = CameraSensor(b"not-used", capture_timestamps_ns=capture_ns)
+    sensor_ns = _sensor_timeline(3)
+    sensor = CameraSensor(b"not-used", sensor_timestamps_ns=sensor_ns)
 
     with pytest.raises(ValueError, match="read-only"):
         sensor.timestamps_ns[0] = 0
     # The caller's own array stays writable: taking a view must not confiscate it.
-    capture_ns[0] = 0
+    sensor_ns[0] = 0
 
 
 def test_sample_singleton_window_is_boundary_only() -> None:

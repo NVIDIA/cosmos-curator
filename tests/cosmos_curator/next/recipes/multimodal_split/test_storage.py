@@ -245,7 +245,7 @@ def _write_synthetic_video(path: Path, *, frames: int = 10, fps: int = 30) -> No
 
 
 def test_load_container_pts_ns_indexes_the_video_when_no_sidecar_exists() -> None:
-    """The fallback for a camera with no capture timeline: read PTS from the container itself."""
+    """The fallback for a camera with no sensor timeline: read PTS from the container itself."""
     with TemporaryDirectory() as directory:
         path = Path(directory) / "front.mp4"
         _write_synthetic_video(path, frames=10, fps=30)

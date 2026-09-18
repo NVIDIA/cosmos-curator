@@ -51,19 +51,19 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
 
-def _validate_capture_timeline(timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-    """Reject a capture timeline that cannot describe a recording.
+def _validate_sensor_timeline(timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+    """Reject a sensor timeline that cannot describe a recording.
 
     The same bounds :class:`StreamingCameraSensor` puts on its own timeline, checked
     here for the same reason: an array that is empty or out of order gives an answer no
     recording could have produced. Whether it describes *this* recording is a separate
     question, answered against the frame count once the container has been indexed.
     """
-    require_1d("capture_timestamps_ns", timestamps_ns, np.int64)
+    require_1d("sensor_timestamps_ns", timestamps_ns, np.int64)
     if timestamps_ns.size == 0:
-        msg = "capture_timestamps_ns must describe at least one observation"
+        msg = "sensor_timestamps_ns must describe at least one observation"
         raise ValueError(msg)
-    require_strictly_increasing("capture_timestamps_ns", timestamps_ns)
+    require_strictly_increasing("sensor_timestamps_ns", timestamps_ns)
     return timestamps_ns
 
 
@@ -93,7 +93,7 @@ class CameraSensor:
         intrinsics: CameraIntrinsics | None = None,
         extrinsics: SensorExtrinsics | None = None,
         origin_ns: int | None = None,
-        capture_timestamps_ns: npt.NDArray[np.int64] | None = None,
+        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None,
     ) -> None:
         """Initialize the camera sensor.
 
@@ -120,13 +120,13 @@ class CameraSensor:
                 to a caller-defined reference frame.
             origin_ns: Where the first displayed frame sits on the caller's
                 clock, in nanoseconds, or ``None`` to keep the container's own
-                timeline. A recording that carries a capture timeline beside it
+                timeline. A recording that carries a sensor timeline beside it
                 knows when it started but not what PTS the container gave that
                 instant, so the sensor subtracts its own first PTS rather than
                 asking the caller to. Stream-native PTS values remain unchanged
                 for decode planning and seeking. Cannot be combined with
-                *capture_timestamps_ns*, which carries its own origin.
-            capture_timestamps_ns: The recording's own capture times, one per
+                *sensor_timestamps_ns*, which carries its own origin.
+            sensor_timestamps_ns: The recording's own sensor times, one per
                 displayable frame, in ascending int64 nanoseconds, or ``None`` to
                 report the container's presentation timestamps. Supplied rather
                 than read, because the library never accepts URIs and so cannot
@@ -139,7 +139,7 @@ class CameraSensor:
                 encoder rather than the hardware.
 
         Raises:
-            ValueError: If *origin_ns* is out of range, if *capture_timestamps_ns*
+            ValueError: If *origin_ns* is out of range, if *sensor_timestamps_ns*
                 is not a non-empty ascending int64 array, if it holds a different
                 number of observations than the container has displayable frames,
                 if both it and *origin_ns* are given, or if the stream has no
@@ -148,18 +148,18 @@ class CameraSensor:
         """
         # Before indexing, so an unusable origin costs nothing to reject.
         if origin_ns is not None:
-            if capture_timestamps_ns is not None:
+            if sensor_timestamps_ns is not None:
                 # Both answer "where is this recording on the caller's clock", and a
-                # capture timeline answers it for every frame rather than just the
+                # sensor timeline answers it for every frame rather than just the
                 # first, so honouring one would have to mean ignoring the other.
                 msg = (
-                    "origin_ns and capture_timestamps_ns are mutually exclusive: "
-                    "a capture timeline carries its own origin"
+                    "origin_ns and sensor_timestamps_ns are mutually exclusive: "
+                    "a sensor timeline carries its own origin"
                 )
                 raise ValueError(msg)
             origin_ns = validate_timestamp_offset_ns(origin_ns, name="origin_ns")
-        if capture_timestamps_ns is not None:
-            capture_timestamps_ns = _validate_capture_timeline(capture_timestamps_ns)
+        if sensor_timestamps_ns is not None:
+            sensor_timestamps_ns = _validate_sensor_timeline(sensor_timestamps_ns)
         self._source = source
         self._stream_idx = stream_idx
         self._decode_config = decode_config
@@ -180,31 +180,31 @@ class CameraSensor:
         # keeps its stream-native PTS regardless: those address frames in the file, and
         # seeking and decode planning still go through them.
         self._timeline_ns: npt.NDArray[np.int64]
-        if capture_timestamps_ns is None:
+        if sensor_timestamps_ns is None:
             self._timeline_ns = self._video_index.display_pts_ns
             self._timestamp_source = TimestampSource.CONTAINER_PTS
         else:
-            self._timeline_ns = as_readonly_view(self._require_matching_length(capture_timestamps_ns))
-            self._timestamp_source = TimestampSource.CAPTURE
+            self._timeline_ns = as_readonly_view(self._require_matching_length(sensor_timestamps_ns))
+            self._timestamp_source = TimestampSource.SENSOR
         self._empty_camera_data: CameraData | None = None
 
-    def _require_matching_length(self, capture_timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-        """Raise unless the capture timeline has one entry per displayable frame.
+    def _require_matching_length(self, sensor_timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+        """Raise unless the sensor timeline has one entry per displayable frame.
 
         Rejected rather than trimmed or padded to fit. The two are matched by position
-        -- frame *i* was captured at entry *i* -- so a count that disagrees means the
+        -- frame *i* has sensor time entry *i* -- so a count that disagrees means the
         alignment is unknown, not that the overlap is usable: whether the missing
         entries are at the front, the back, or scattered changes which frame every
         entry belongs to, and nothing here can tell those apart.
         """
         frames = len(self._video_index.display_pts_ns)
-        if len(capture_timestamps_ns) != frames:
+        if len(sensor_timestamps_ns) != frames:
             msg = (
-                f"capture_timestamps_ns describes {len(capture_timestamps_ns)} observations "
+                f"sensor_timestamps_ns describes {len(sensor_timestamps_ns)} observations "
                 f"but the stream has {frames} displayable frames"
             )
             raise ValueError(msg)
-        return capture_timestamps_ns
+        return sensor_timestamps_ns
 
     @property
     def video_index(self) -> VideoIndex:
@@ -249,7 +249,7 @@ class CameraSensor:
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
         """Get the timestamps in nanoseconds.
 
-        The capture timeline when one was supplied, and the container's presentation
+        The sensor timeline when one was supplied, and the container's presentation
         timestamps otherwise; :attr:`timestamp_source` says which, and the two do not
         mean the same thing.
 
@@ -262,7 +262,7 @@ class CameraSensor:
     def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
         """Stream the camera's timeline in nanoseconds.
 
-        Reads the timeline already resolved in the constructor -- the supplied capture
+        Reads the timeline already resolved in the constructor -- the supplied sensor
         times, or the ``VideoIndex``'s ``display_pts_ns`` -- so no frames are decoded
         and the batches are strictly increasing either way. With
         ``VideoIndexCreationMethod.AUTO`` — the default — B-frame streams are
@@ -345,13 +345,13 @@ class CameraSensor:
     ) -> npt.NDArray[np.int64]:
         """Timestamp each served frame on the clock this sensor reports.
 
-        A capture timeline is positional, so a served frame's capture time is simply the
+        A sensor timeline is positional, so a served frame's sensor time is simply the
         entry at the index that selected it. Without one, the frame's own PTS is
         converted from the decoder's time base rather than read back out of the index:
         that is the value the decoder returned for the frame it actually served, and
         keeping it is what leaves every existing caller's payloads bit-for-bit unchanged.
         """
-        if self._timestamp_source is TimestampSource.CAPTURE:
+        if self._timestamp_source is TimestampSource.SENSOR:
             return np.repeat(self._timeline_ns[indices], counts)
         return pts_to_ns(pts_stream_expanded, time_base) + self._video_index.timestamp_offset_ns
 

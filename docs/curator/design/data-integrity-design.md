@@ -223,12 +223,12 @@ per-stream ones instead of widening them. See
 [data-integrity-store-schema.md](data-integrity-store-schema.md) section 5.
 
 Arity also turned out to decide what a metric needs of its input. Both multi-sensor
-metrics declare `requires_capture_timestamps` and do not run unless every contributing
-sensor was measured on real capture times — a spec-level flag, in the same shape as
+metrics declare `requires_sensor_timestamps` and do not run unless every contributing
+sensor was measured on real sensor times — a spec-level flag, in the same shape as
 `requires_expected_hz`, rather than special-casing in the engine. Comparing sensors is
 the one thing container presentation timestamps cannot support at all, since a mux puts
 every camera on one regenerated grid; see
-[The session grain skips without a shared capture clock](data-integrity-metrics.md#the-session-grain-skips-without-a-shared-capture-clock).
+[The session grain skips without a shared sensor clock](data-integrity-metrics.md#the-session-grain-skips-without-a-shared-sensor-clock).
 
 ## Streaming and Windows
 

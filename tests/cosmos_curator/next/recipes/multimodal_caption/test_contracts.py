@@ -99,21 +99,21 @@ def test_every_accepted_config_variant_has_one_complete_contract() -> None:
     [
         (
             "qwen3_8_27b_fp8",
-            "0fa3f137b0b415ea49b338bd1eafa6af293566ead73340f985fdd82f0dbef2d4",
+            "47695580ced9e53912ea32cacc6e3a06aef0e7b7948f28d1d37d6bc2ea14b415",
             2,
             None,
             False,
         ),
         (
             "qwen3_8_27b",
-            "e4c306c234aa8b7cc255b0c99da02a559936ca9ca5eed49995ee7267c94b1c43",
+            "13777c993e5afb7a9de00a2e1fd71441f7469c6dbc0bbef87d60a13cc7546dd7",
             2,
             None,
             False,
         ),
         (
             "cosmos3_nano",
-            "deab31e64c03b92ba427b4df5b1b4377d9201e472f318e59649cd83d5042ac23",
+            "b7facaf7ff995f17766d9ea5da637dfa250a197dc4cb1bcca0c847005e52f480",
             4,
             {},
             None,

@@ -12,7 +12,7 @@ different views of the same interval from receiving inconsistent episode-level e
 
 ## Background and use cases
 
-A session's cameras observe a common capture-clock interval but may be stored under different recorder paths.
+A session's cameras observe a common sensor-clock interval but may be stored under different recorder paths.
 `multimodal-split` emits one terminal outcome per configured camera and planned span.
 
 Camera outcomes do not append base rows independently. Publication groups them by `split_clip_id` and writes one
@@ -38,7 +38,7 @@ episode_id = one synchronized source interval
     ├── front_left
     │   └── MP4 location + size/hash
     │       timeline location + hash
-    │       observations location + hash
+    │       sensor timestamps location + hash
     ├── front_right
     │   └── MP4 and timing-artifact bindings
     └── front_wide
@@ -128,7 +128,7 @@ The output root has one fixed layout:
     clip.json
     <camera_key>.mp4
     <camera_key>.mp4.timestamps.npy
-    <camera_key>.mp4.observations.npy
+    <camera_key>.mp4.sensor_timestamps.npy
     <sensor_key>.mcap
   errors/
 ```
@@ -154,11 +154,11 @@ The ordered producer-owned Arrow schema is:
 | `source_id` | `string not null` | Digest of the normalized source-session location |
 | `source_session_id` | `large_string not null` | Human-visible source-session child name |
 | `source_session_location` | `large_string not null` | Resolved source-session location |
-| `start_ns` | `int64 not null` | Inclusive capture-clock start |
-| `exclusive_end_ns` | `int64 not null` | Exclusive capture-clock end |
+| `start_ns` | `int64 not null` | Inclusive sensor-clock start |
+| `exclusive_end_ns` | `int64 not null` | Exclusive sensor-clock end |
 | `sampling_fps` | `int32 not null` | Shared regular-grid rate |
 | `row_count` | `int64 not null` | Grid points and encoded frames per camera |
-| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; `capture`, or `container_pts` when a camera's `allow_pts_fallback` fires |
+| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; `sensor`, or `container_pts` when a camera's `allow_pts_fallback` fires |
 | `split_contract_digest` | `string not null` | Result-defining split configuration identity |
 | `materialization_digest` | `string not null` | Exact sorted camera-artifact-set identity |
 | `camera_media` | `large_list<struct<...>> not null` | Complete camera descriptors, sorted by `camera_key` |
@@ -175,13 +175,13 @@ Every list item and every child of the `camera_media` struct is non-nullable:
 | `media_sha256` | `string not null` | SHA-256 of MP4 bytes |
 | `timeline_location` | `large_string not null` | Regular-grid timestamp sidecar |
 | `timeline_sha256` | `string not null` | SHA-256 of grid-sidecar bytes |
-| `observations_location` | `large_string not null` | Selected-source-observation sidecar |
-| `observations_sha256` | `string not null` | SHA-256 of observation-sidecar bytes |
+| `sensor_timestamps_location` | `large_string not null` | Selected source sensor-timestamp sidecar |
+| `sensor_timestamps_sha256` | `string not null` | SHA-256 of sensor-timestamp sidecar bytes |
 
 Every list item and every child of the `sensor_media` struct is likewise non-nullable. It carries no grid or
-observation sidecars, whichever way its clip was produced. A copied sensor was never put on the episode's grid, so
-there is no grid to record. An aligned one sits on the episode's own grid rather than a timeline of its own, and
-records per-row provenance inside the rows, so there is nothing to write beside them.
+sensor-timestamp sidecars, whichever way its clip was produced. A copied sensor was never put on the episode's grid, so
+there is no grid to record. An aligned one sits on the episode's own grid rather than a timeline of its own and records
+per-row provenance inside the rows, so there is nothing to write beside them.
 
 | Child | Arrow type | Meaning |
 |---|---|---|
@@ -276,7 +276,7 @@ resolved `source_media_location` remains explicit in the row and in pre-write co
 ```text
 {
   "kind": "multimodal-av-episode-materialization",
-  "materialization_digest_version": 2,
+  "materialization_digest_version": 3,
   "episode_id": <episode_id>,
   "split_clip_id": <split_clip_id>,
   "split_contract_digest": <split contract digest>,
@@ -287,7 +287,7 @@ resolved `source_media_location` remains explicit in the row and in pre-write co
       "camera_key": <key>,
       "media_sha256": <MP4 hash>,
       "timeline_sha256": <grid-sidecar hash>,
-      "observations_sha256": <observation-sidecar hash>
+      "sensor_timestamps_sha256": <sensor-timestamp-sidecar hash>
     },
     ... sorted by camera_key
   ]
@@ -301,19 +301,26 @@ The per-artifact hashes and the composite digest serve different scopes. Each `*
 artifact, allowing a consumer to validate only the files it reads. `materialization_digest` is a derived manifest
 fingerprint over those stored hashes and the episode, split, and grid facts above; it is not an additional checksum of
 the bytes. It gives a result consuming one or many camera views one compact input binding, and changes whenever any
-published MP4, timeline, or observation sidecar changes.
+published MP4, timeline, or sensor-timestamp sidecar changes.
 
 Canonical row presence alone does not prove that external objects remain intact. Byte verification requires reading
 the selected artifacts and comparing their stored hashes. Publication and reconciliation do not reread or rehash
 already-canonical media, so this contract enables detection, not automatic repair: a normal retry will not repair a
 damaged already-canonical artifact. Repair requires an explicit verification-and-repair workflow.
 
-### Capture-clock grid
+### Sensor-clock grid
 
-Version 1 publishes half-open intervals `[start_ns, exclusive_end_ns)` on the capture clock. `timestamp_source` is
-`"capture"` unless a camera's `allow_pts_fallback` config fired because its capture-timeline sidecar was missing, in
-which case the episode is `"container_pts"` instead: one camera reading its timeline from the container taints the
-whole episode, since a clip is one moment across every view the rig promised.
+Record schema version 2 publishes half-open intervals `[start_ns, exclusive_end_ns)` with
+`timestamp_source="sensor"` unless a camera's `allow_pts_fallback` config fired because its
+sensor-timestamp sidecar was missing. In that case the episode uses `"container_pts"`: one
+camera reading its timeline from the container sets the provenance for the whole episode,
+since a clip is one moment across every view the rig promised. Media contract version 3
+names the selected-source sidecar `<camera>.mp4.sensor_timestamps.npy`.
+
+There is no in-place migration from the previous record or media contract. An existing
+`episodes.lance` table written under record schema version 1 and media contract version 2 fails
+schema validation, and surviving rows also conflict during reconciliation because their contract
+versions and timestamp-source value differ. Run this version against a fresh output root.
 
 ```text
 step_ns = 1_000_000_000.0 / sampling_fps
@@ -325,7 +332,7 @@ row_count = len(grid)
 
 The delivered `make_ts_grid` half-open grid is authoritative for row count. Offsets are independently rounded from the
 origin; they are neither floored nor built by accumulating a rounded period. The regular grid is stored in each
-camera's timeline sidecar, while the corresponding selected capture observations are stored in its observation sidecar.
+camera's timeline sidecar, while the corresponding selected sensor timestamps are stored in its sensor-timestamp sidecar.
 
 Together, `source_id` and `timestamp_source` identify the session-local clock domain. A later non-camera enrichment
 must prove its timestamps are in that domain or record the mapping used to transform them.
@@ -344,7 +351,7 @@ For each planned logical episode:
    touches no artifact path.
 3. An incompatible match fails before a manifest, sidecar, or MP4 is rewritten.
 
-Reconciliation assumes source media and capture-timestamp sidecars are immutable at their recorded locations. Replacing
+Reconciliation assumes source media and sensor-timestamp sidecars are immutable at their recorded locations. Replacing
 either in place can reuse an existing canonical episode because reconciliation does not rehash source inputs. Corrected
 inputs must use a new session location, and therefore a new source identity.
 
@@ -386,7 +393,7 @@ episode. It does not govern the split producer, which owns every column it write
 Compact singular results may use producer-owned nullable episode fields. Dense, repeated, or independently versioned
 data belongs in typed tables or immutable sidecars keyed by `episode_id`. A visual result records the applicable
 `materialization_digest` in its own contract. A downstream non-camera modality does not become an entry in
-`camera_media` or `sensor_media`; the episode identity and capture-clock interval/grid are its join seam.
+`camera_media` or `sensor_media`; the episode identity and sensor-clock interval/grid are its join seam.
 
 A modality the splitter itself cuts is not downstream work. It is base data the producer owns, catalogued in
 `sensor_media` alongside `camera_media` and committed in the same fragment, so one clip is one row rather than a join
@@ -416,10 +423,10 @@ The Lance URI is always `<output.path>/episodes.lance`; there is no location ove
 The invocation succeeds only after canonical publication succeeds. Camera artifacts committed before a publication
 failure remain available for retry and diagnosis.
 
-The contract does not provide migration for an incompatible base schema or pre-v2 artifacts, coordinate concurrent
-base publishers, proactively detect out-of-band artifact replacement without a reader verifying the stored hashes, or
-define general output-root cleanup. Cleanup must preserve `episodes.lance` and every artifact referenced by a canonical
-row.
+The contract does not migrate incompatible base schemas or artifacts from earlier record or media contracts, coordinate
+concurrent base publishers, proactively detect out-of-band artifact replacement without a reader verifying the stored
+hashes, or define general output-root cleanup. Cleanup must preserve `episodes.lance` and every artifact referenced by a
+canonical row.
 
 ## Implementation ownership
 

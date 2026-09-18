@@ -46,13 +46,13 @@ type DataSource = Path | bytes | io.BufferedIOBase
 class TimestampSource(enum.Enum):
     """Which clock a sensor's reported timeline came from.
 
-    ``CAPTURE`` -- the recording's own capture times, supplied by the caller from
+    ``SENSOR`` -- the recording's own sensor times, supplied by the caller from
     whatever the recorder wrote beside the media. These are what every timing question
     is actually about.
 
-    ``CONTAINER_PTS`` -- the container's presentation timestamps, which reflect capture
+    ``CONTAINER_PTS`` -- the container's presentation timestamps, which reflect sensor time
     only when the file was muxed at a variable frame rate. A constant-frame-rate mux
-    discards the capture times and regenerates them on a fixed grid restarting at ``0``
+    discards the sensor times and regenerates them on a fixed grid restarting at ``0``
     per file, so a timeline from this source can be a metronome that says nothing about
     what the hardware did.
 
@@ -60,7 +60,7 @@ class TimestampSource(enum.Enum):
     mean the same thing and nothing in the numbers themselves gives it away.
     """
 
-    CAPTURE = "capture"
+    SENSOR = "sensor"
     CONTAINER_PTS = "container_pts"
 
 

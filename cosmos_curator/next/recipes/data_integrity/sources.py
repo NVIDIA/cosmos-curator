@@ -93,38 +93,38 @@ def open_source(
             yield stream_wrapper(local_stream) if stream_wrapper is not None else local_stream
 
 
-#: What a recorder's capture timeline is called, relative to the media it describes.
+#: What a recorder's sensor-timestamps artifact is called, relative to the media it describes.
 #: Spelled the same way ``multimodal_split`` spells it (see that recipe's ``uris.py``),
 #: because that is the artifact this reads on the way *in*; not imported from there,
 #: since one recipe reaching into another's naming would couple them over a constant.
 #: What that recipe writes on the way *out* wears the same name and is not the same
-#: thing -- see :data:`_DERIVED_TIMELINE_MARKER_SUFFIX`.
-CAPTURE_TIMELINE_SUFFIX = ".timestamps.npy"
+#: thing -- see :data:`_RESAMPLED_CLIP_MARKER_SUFFIXES`.
+SOURCE_SENSOR_TIMESTAMPS_SUFFIX = ".timestamps.npy"
 
 #: The artifact whose presence means the timeline beside it is a resampling grid rather
 #: than a recording's own clock.
 #:
 #: ``multimodal_split`` cuts a session into clips by resampling every camera onto one
 #: evenly spaced grid at the configured output rate, and writes *that grid* to
-#: :data:`CAPTURE_TIMELINE_SUFFIX` -- deliberately, so a later stage reads a clip the
-#: way it read a session. The instants a camera actually observed go beside it under
-#: this name instead. Read as a capture timeline, the grid answers the session grain's
-#: question before it is asked: every camera is on the same lattice, so spread is zero
-#: and overlap total, however far out of sync the rig behind the clips was. So a clip
-#: is measured on its container's PTS and reported as such, which is the outcome for
-#: any other source that cannot say when its frames happened.
+#: :data:`SOURCE_SENSOR_TIMESTAMPS_SUFFIX` -- deliberately, so a later stage reads a
+#: clip the way it read a session. The instants a camera actually observed go beside
+#: it under this name instead. Read as a sensor timeline, the grid answers the session
+#: grain's question before it is asked: every camera is on the same lattice, so spread
+#: is zero and overlap total, however far out of sync the rig behind the clips was. So
+#: a clip is measured on its container's PTS and reported as such, which is the outcome
+#: for any other source that cannot say when its frames happened.
 #:
 #: Absence of a marker is not proof of a recorder, only of nothing claiming otherwise.
 #: This recipe is meant for sessions as recorded, and a derived tree is out of contract
 #: rather than supported by this; the check is here because being wrong quietly is
-#: worse than the one request it costs.
-_DERIVED_TIMELINE_MARKER_SUFFIX = ".observations.npy"
+#: worse than paying for one current-marker probe and, when absent, one legacy probe.
+_RESAMPLED_CLIP_MARKER_SUFFIXES = (".sensor_timestamps.npy", ".observations.npy")
 
 #: S3 / Azure error codes that mean the object is not there. Distinct from
 #: :data:`~.session_runner._INFRASTRUCTURE_S3_CODES`, which answers the opposite
 #: question -- whether the request failed for reasons of our own access -- and never
 #: needed to name the 404 family because a missing *video* is a fact about the dataset
-#: rather than an absence to be tolerated. A missing capture timeline is the common
+#: rather than an absence to be tolerated. A missing sensor timeline is the common
 #: case, so this path has to recognise it precisely enough not to swallow a 403.
 _NOT_FOUND_CODES = frozenset(
     {"404", "NoSuchKey", "NoSuchBucket", "BlobNotFound", "ContainerNotFound", "ResourceNotFound"}
@@ -132,14 +132,14 @@ _NOT_FOUND_CODES = frozenset(
 _NOT_FOUND_STATUS = 404
 
 
-def capture_timeline_uri(source: str) -> str:
-    """Return where a stream's capture timeline would sit, whether or not one does."""
-    return f"{source}{CAPTURE_TIMELINE_SUFFIX}"
+def source_sensor_timestamps_uri(source: str) -> str:
+    """Return where a stream's sensor timestamps would sit, whether or not they do."""
+    return f"{source}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}"
 
 
-def derived_timeline_marker_uri(source: str) -> str:
-    """Return where the marker disowning a stream's timeline would sit, if one does."""
-    return f"{source}{_DERIVED_TIMELINE_MARKER_SUFFIX}"
+def _resampled_clip_marker_uris(source: str) -> tuple[str, ...]:
+    """Return current and legacy marker locations in probe order."""
+    return tuple(f"{source}{suffix}" for suffix in _RESAMPLED_CLIP_MARKER_SUFFIXES)
 
 
 def error_chain(exc: BaseException) -> Generator[BaseException]:
@@ -221,7 +221,7 @@ def http_status(exc: BaseException) -> int | None:
 def _is_not_found(exc: BaseException) -> bool:
     """Report whether ``exc`` says the object is absent, rather than unreachable.
 
-    Only absence may be treated as "this stream has no capture timeline". Anything
+    Only absence may be treated as "this stream has no sensor timeline". Anything
     else -- a denial, a 5xx, an expired token -- has to keep travelling, because
     reading it as absence would quietly measure a whole rig against the container's
     metronome and record that as the recording's own timeline. Which is why the code
@@ -234,19 +234,19 @@ def _is_not_found(exc: BaseException) -> bool:
     return error_code(exc) in _NOT_FOUND_CODES or http_status(exc) == _NOT_FOUND_STATUS
 
 
-def _timeline_is_disowned(
+def _timeline_is_derived(
     source: str,
     *,
     s3_profile_name: str | None,
     azure_profile_name: str,
     endpoint_url: str | None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None,
-) -> bool:
-    """Report whether a marker sits beside ``source`` disowning its timeline.
+) -> str | None:
+    """Return the marker beside ``source`` that disowns its timeline, if any.
 
     Existence is the whole signal; the contents are never read, and could not be used
     if they were. The marker holds one observation per output frame, which repeats
-    wherever the grid asked for more frames than the camera captured -- a dropped
+    wherever the grid asked for more frames than the sensor produced -- a dropped
     exposure -- so it is non-decreasing where a timeline must strictly ascend, and
     :class:`~cosmos_curator.core.sensors.sensors.camera_sensor.CameraSensor` would
     reject it. What it says instead is that something upstream distinguished the two
@@ -256,23 +256,25 @@ def _timeline_is_disowned(
     every backend, and a probe that cannot tell absence from a lazy handle would
     disown every timeline it met.
     """
-    try:
-        with open_source(
-            derived_timeline_marker_uri(source),
-            s3_profile_name=s3_profile_name,
-            azure_profile_name=azure_profile_name,
-            endpoint_url=endpoint_url,
-            stream_wrapper=stream_wrapper,
-        ) as stream:
-            stream.read(1)
-    except OSError as exc:
-        if _is_not_found(exc):
-            return False
-        raise
-    return True
+    for marker_uri in _resampled_clip_marker_uris(source):
+        try:
+            with open_source(
+                marker_uri,
+                s3_profile_name=s3_profile_name,
+                azure_profile_name=azure_profile_name,
+                endpoint_url=endpoint_url,
+                stream_wrapper=stream_wrapper,
+            ) as stream:
+                stream.read(1)
+        except OSError as exc:
+            if _is_not_found(exc):
+                continue
+            raise
+        return marker_uri
+    return None
 
 
-def read_capture_timeline(
+def read_sensor_timestamps(
     source: str,
     *,
     s3_profile_name: str | None = None,
@@ -280,9 +282,9 @@ def read_capture_timeline(
     endpoint_url: str | None = None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
 ) -> npt.NDArray[np.int64] | None:
-    """Read the capture timeline recorded beside ``source``, or ``None`` if there is none.
+    """Read the sensor timestamps recorded beside ``source``, or ``None`` if there are none.
 
-    The recipe half of preferring capture times over container PTS: the sensor library
+    The recipe half of preferring sensor times over container PTS: the sensor library
     accepts a timeline but never a URI, so finding the artifact is this layer's job (see
     :class:`~cosmos_curator.core.sensors.sensors.camera_sensor.CameraSensor`).
 
@@ -292,7 +294,7 @@ def read_capture_timeline(
       case for any source whose recorder wrote no timeline.
     * present but disowned -- ``None`` as well, and logged. A timeline the tree itself
       says is a resampling grid is worth less than no timeline at all, because it
-      would be believed; see :data:`_DERIVED_TIMELINE_MARKER_SUFFIX`.
+      would be believed; see :data:`_RESAMPLED_CLIP_MARKER_SUFFIXES`.
     * present but not a timeline -- ``ValueError`` from
       :func:`~cosmos_curator.core.sensors.utils.timestamps.read_timestamps_ns`, which
       the session runner records as that stream's error. An artifact that fails its
@@ -303,7 +305,7 @@ def read_capture_timeline(
 
     Args:
         source: the stream's local path or cloud URI. The timeline is looked for beside
-            it, under the same name plus :data:`CAPTURE_TIMELINE_SUFFIX`.
+            it, under the same name plus :data:`SOURCE_SENSOR_TIMESTAMPS_SUFFIX`.
         s3_profile_name: AWS profile forwarded to ``open_storage_source``.
         azure_profile_name: Azure profile forwarded to ``open_storage_source``.
         endpoint_url: optional S3 endpoint override.
@@ -317,7 +319,7 @@ def read_capture_timeline(
             ``.npy`` timeline.
 
     """
-    uri = capture_timeline_uri(source)
+    uri = source_sensor_timestamps_uri(source)
     try:
         with open_source(
             uri,
@@ -326,7 +328,7 @@ def read_capture_timeline(
             endpoint_url=endpoint_url,
             stream_wrapper=stream_wrapper,
         ) as stream:
-            timeline_ns = read_timestamps_ns(stream)
+            sensor_timestamps_ns = read_timestamps_ns(stream)
     except OSError as exc:
         # Narrower than it looks: read_timestamps_ns raises ValueError for a bad
         # artifact and documents OSError as meaning the bytes were never seen, so
@@ -336,24 +338,25 @@ def read_capture_timeline(
         raise
     # Only once a timeline is in hand, so the ordinary source -- no sidecar at all --
     # pays nothing for a question that was already answered.
-    if _timeline_is_disowned(
+    marker_uri = _timeline_is_derived(
         source,
         s3_profile_name=s3_profile_name,
         azure_profile_name=azure_profile_name,
         endpoint_url=endpoint_url,
         stream_wrapper=stream_wrapper,
-    ):
+    )
+    if marker_uri is not None:
         # Logged rather than recorded as the stream's error: nothing here is broken,
         # and the stored row says what it always says -- which clock this was measured
         # on. The line is what tells an operator why a tree full of timelines reports
         # container PTS anyway.
         logger.warning(
             f"{uri} is a resampling grid, not a recording's clock "
-            f"({derived_timeline_marker_uri(source)} sits beside it); "
+            f"({marker_uri} sits beside it); "
             f"measuring container PTS instead"
         )
         return None
-    return timeline_ns
+    return sensor_timestamps_ns
 
 
 def run_checks(  # noqa: PLR0913
@@ -377,8 +380,8 @@ def run_checks(  # noqa: PLR0913
     to classify (the single-video CLI maps it to exit code 2; the session tool records
     a per-stream ERROR).
 
-    Also where a capture timeline is preferred over the container's PTS, when the source
-    has one beside it (:func:`read_capture_timeline`). Done here rather than at either
+    Also where a sensor timeline is preferred over the container's PTS, when the source
+    has one beside it (:func:`read_sensor_timestamps`). Done here rather than at either
     entry point so both inherit it, and unconditionally rather than behind a flag: a
     recorder's own timestamps are the better answer wherever they exist, and which clock
     a stream was measured on is reported rather than chosen. The two exceptions are both
@@ -390,7 +393,7 @@ def run_checks(  # noqa: PLR0913
         expected_hz: expected sample rate for the rate-dependent metrics.
         thresholds: pass/fail policy (see :class:`Thresholds`).
         stream_idx: which video stream to open (default 0). Only 0 may be paired with
-            a capture timeline, since the sidecar names the file rather than a stream.
+            a sensor timeline, since the sidecar names the file rather than a stream.
         batch_size: timestamps per metric update; 0 feeds the whole array at once.
         s3_profile_name: optional AWS profile forwarded to ``open_storage_source``.
         azure_profile_name: Azure profile forwarded to ``open_storage_source``.
@@ -398,36 +401,36 @@ def run_checks(  # noqa: PLR0913
         stats: optional out-parameter; ``sensor_init_ms`` is recorded here in
             addition to the ``stream_ms`` / ``evaluate_ms`` from ``run_metrics``.
         stream_wrapper: optional wrapper applied to every stream this opens -- the
-            capture timeline as well as the video (e.g. a byte-counting reader for
+            sensor timeline as well as the video (e.g. a byte-counting reader for
             progress), for local paths as well as cloud URIs.
 
     Returns:
         The tuple returned by ``run_metrics``.
 
     Raises:
-        ValueError: If ``stream_idx`` is not 0 and a capture timeline sits beside
-            ``source``; see :func:`read_capture_timeline` for why it cannot be
+        ValueError: If ``stream_idx`` is not 0 and a sensor timeline sits beside
+            ``source``; see :func:`read_sensor_timestamps` for why it cannot be
             attributed to a particular stream.
 
     """
     # Before the video is opened, so a source whose timeline is unreachable fails
     # without paying to decode it -- and so a corrupt timeline is reported as the
     # stream's error rather than being overtaken by whatever the video says.
-    capture_timestamps_ns = read_capture_timeline(
+    sensor_timestamps_ns = read_sensor_timestamps(
         source,
         s3_profile_name=s3_profile_name,
         azure_profile_name=azure_profile_name,
         endpoint_url=endpoint_url,
         stream_wrapper=stream_wrapper,
     )
-    if stream_idx != 0 and capture_timestamps_ns is not None:
+    if stream_idx != 0 and sensor_timestamps_ns is not None:
         # The artifact is named for the file, not for a stream within it, so which
         # stream it describes is simply not recorded. Refused rather than guessed:
         # applying it to another stream would either silently put that stream on a
         # clock measured elsewhere, or fail on a frame count that says nothing about
         # the recording. A stream with no timeline beside it is unaffected.
         msg = (
-            f"{capture_timeline_uri(source)} does not record which video stream it describes, "
+            f"{source_sensor_timestamps_uri(source)} does not record which video stream it describes, "
             f"so it cannot be applied to stream_idx {stream_idx}; only stream 0 is defined"
         )
         raise ValueError(msg)
@@ -442,7 +445,7 @@ def run_checks(  # noqa: PLR0913
         sensor = CameraSensor(
             _as_data_source(src),
             stream_idx=stream_idx,
-            capture_timestamps_ns=capture_timestamps_ns,
+            sensor_timestamps_ns=sensor_timestamps_ns,
         )
         if stats is not None:
             stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000

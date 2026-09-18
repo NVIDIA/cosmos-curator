@@ -271,9 +271,9 @@ def test_errored_stream_omits_the_timestamp_source_line() -> None:
 @pytest.mark.parametrize(
     ("sources", "expected"),
     [
-        ([TimestampSource.CAPTURE, TimestampSource.CAPTURE], "capture"),
+        ([TimestampSource.SENSOR, TimestampSource.SENSOR], "sensor"),
         ([TimestampSource.CONTAINER_PTS, TimestampSource.CONTAINER_PTS], "container_pts"),
-        ([TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS], "mixed"),
+        ([TimestampSource.SENSOR, TimestampSource.CONTAINER_PTS], "mixed"),
     ],
 )
 def test_render_text_reports_the_clock_the_session_as_a_whole_was_measured_on(
@@ -306,10 +306,10 @@ def test_report_to_dict_exposes_the_timestamp_source() -> None:
     """The JSON payload carries provenance under the same name the store column uses."""
     report = SessionReport(
         session_path="s",
-        streams=[_stream("a", statuses=[CheckStatus.PASS], timestamp_source=TimestampSource.CAPTURE)],
+        streams=[_stream("a", statuses=[CheckStatus.PASS], timestamp_source=TimestampSource.SENSOR)],
     )
     stream = cast("list[dict[str, object]]", report_to_dict(report)["streams"])[0]
-    assert stream["timestamp_source"] == "capture"
+    assert stream["timestamp_source"] == "sensor"
 
 
 def test_errored_stream_omits_expected_hz_line() -> None:

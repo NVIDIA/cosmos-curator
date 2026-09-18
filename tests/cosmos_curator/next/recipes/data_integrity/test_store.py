@@ -98,7 +98,7 @@ def _metrics_for(
     bounds: list[tuple[int, int]],
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     *,
-    source: TimestampSource = TimestampSource.CAPTURE,
+    source: TimestampSource = TimestampSource.SENSOR,
 ) -> list[CheckResult]:
     """Judge one session from its sensors' recording bounds, through the real kernel.
 
@@ -106,8 +106,8 @@ def _metrics_for(
     both because the store sits below it and because bounds stated outright are how a
     test says which session shape it is about.
 
-    ``source`` defaults to ``CAPTURE`` because a store test wants rows with numbers in
-    them, and only a session measured on capture times produces any: the two session
+    ``source`` defaults to ``SENSOR`` because a store test wants rows with numbers in
+    them, and only a session measured on sensor times produces any: the two session
     metrics do not run at all on container PTS. Tests of *that* pass it explicitly.
     """
     return run_session_metrics(
@@ -566,9 +566,9 @@ def test_a_session_run_records_the_session_itself(
 @pytest.mark.parametrize(
     ("sources", "expected"),
     [
-        ([TimestampSource.CAPTURE, TimestampSource.CAPTURE], "capture"),
+        ([TimestampSource.SENSOR, TimestampSource.SENSOR], "sensor"),
         ([TimestampSource.CONTAINER_PTS, TimestampSource.CONTAINER_PTS], "container_pts"),
-        ([TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS], "mixed"),
+        ([TimestampSource.SENSOR, TimestampSource.CONTAINER_PTS], "mixed"),
     ],
 )
 def test_a_session_records_which_clock_its_streams_shared(
@@ -675,7 +675,7 @@ def test_a_row_from_a_newer_schema_is_refused_rather_than_half_written(store_roo
     store.append_rows([settled], uri, legacy, None)
 
     with pytest.raises(OSError, match="Append with different schema"):
-        store.append_rows([_run(SessionTimestampSource.CAPTURE)], uri, store_schema.SESSION_SCHEMA, None)
+        store.append_rows([_run(SessionTimestampSource.SENSOR)], uri, store_schema.SESSION_SCHEMA, None)
 
     history = store.read_sessions(store_root, latest=False, include_incomplete=True)
     assert [row["run_id"] for row in history] == [settled["run_id"]], "the refused row reached the dataset anyway"

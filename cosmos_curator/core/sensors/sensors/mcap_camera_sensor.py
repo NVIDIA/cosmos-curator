@@ -298,10 +298,12 @@ class McapCameraSensor:
 
     The sensor reads the configured camera topic in MCAP ``log_time`` order and
     feeds compressed H.264/H.265 access units to a single forward PyAV decoder.
-    MCAP ``message.log_time`` is the canonical timestamp exposed by this sensor:
-    it is used for sampling, alignment, ``timestamps_ns``, and ``pts_stream``.
-    The Foxglove ``CompressedVideo.timestamp`` payload field may also be present,
-    but it is not used as this sensor's sampling timeline.
+    It intentionally uses recorder ``message.log_time`` for sampling, alignment,
+    and ``timestamps_ns``; the emitted ``CameraData.sensor_timestamps_ns`` and
+    ``pts_stream`` currently carry that same recorder time. This sensor does not
+    yet expose acquisition-time provenance. The Foxglove
+    ``CompressedVideo.timestamp`` payload field may be present, but it is not
+    used as the sampling timeline.
     """
 
     def __init__(self, source: DataSource, topic: str = "/camera/rgb") -> None:
@@ -355,7 +357,7 @@ class McapCameraSensor:
 
     @property
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
-        """Canonical sensor timestamps in nanoseconds (raw MCAP ``message.log_time``)."""
+        """Canonical sampling timestamps in nanoseconds (raw MCAP ``message.log_time``)."""
         return self._mcap.timestamps_ns
 
     def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:

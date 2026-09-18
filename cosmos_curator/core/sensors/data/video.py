@@ -393,11 +393,11 @@ class VideoMetadata:
             (e.g., ``'mp4'``, ``'matroska,webm'``).
         height: frame height in pixels.
         width: frame width in pixels.
-        avg_frame_rate: average frame rate as a ``Fraction``
+        avg_frame_rate: nominal container frame rate as a ``Fraction``
             (e.g., ``Fraction(30, 1)`` for 30 fps,
             ``Fraction(30000, 1001)`` for 29.97 fps).  Derived from the
-            container header; use this to understand the source capture rate
-            relative to your sampling rate.
+            container header; use this to understand the encoded stream rate
+            relative to your sampling rate, not the sensor's acquisition cadence.
         pix_fmt: pixel format string as reported by libavcodec
             (e.g., ``'yuv420p'``, ``'yuv420p10le'``, ``'yuvj420p'``).
             Indicates chroma subsampling and bit depth; relevant when callers

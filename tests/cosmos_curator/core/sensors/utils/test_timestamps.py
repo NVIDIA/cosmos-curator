@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the observation-timeline ``.npy`` reader and writer."""
+"""Unit tests for the timestamp-timeline ``.npy`` reader and writer."""
 
 import io
 from typing import Any
@@ -23,7 +23,7 @@ import pytest
 
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, write_timestamps_ns
 
-# Three consecutive observations of real 30 fps recorder output, in nanoseconds.
+# Three consecutive sensor timestamps from real 30 fps recorder output.
 _SAMPLE_NS = np.array([10459540803000, 10459574136000, 10459607470000], dtype=np.int64)
 
 
@@ -54,7 +54,7 @@ def test_read_rejects_a_non_int64_array() -> None:
 
 
 def test_read_rejects_a_multidimensional_array() -> None:
-    """An observation timeline is 1-D; anything else is a different file."""
+    """A timestamp timeline is 1-D; anything else is a different file."""
     with pytest.raises(ValueError, match="1-D"):
         read_timestamps_ns(_npy_bytes(_SAMPLE_NS.reshape(1, 3)))
 

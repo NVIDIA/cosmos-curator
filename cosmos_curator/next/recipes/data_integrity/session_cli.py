@@ -117,7 +117,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=(
             "Authoritative expected sample rate for the rate, gap, and jitter checks, applied to every "
             "stream. Defaults to each stream's declared rate, which is best-effort and will not catch a "
-            "uniformly wrong capture rate; SKIPs those checks where neither is available."
+            "uniformly wrong sensor sampling rate; SKIPs those checks where neither is available."
         ),
     )
     parser.add_argument(

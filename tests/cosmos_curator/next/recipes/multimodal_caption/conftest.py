@@ -31,8 +31,8 @@ def camera(
         "media_sha256": marker * 64 if media_sha256 is None else media_sha256,
         "timeline_location": f"/output/{key}.mp4.timestamps.npy",
         "timeline_sha256": "a" * 64,
-        "observations_location": f"/output/{key}.mp4.observations.npy",
-        "observations_sha256": "b" * 64,
+        "sensor_timestamps_location": f"/output/{key}.mp4.sensor_timestamps.npy",
+        "sensor_timestamps_sha256": "b" * 64,
     }
 
 
@@ -53,7 +53,7 @@ def episode(
         exclusive_end_ns=1_000_000_000,
         sampling_fps=30,
         row_count=30,
-        timestamp_source=TimestampSource.CAPTURE,
+        timestamp_source=TimestampSource.SENSOR,
         split_contract_digest="split-contract",
     )
     if camera_media is None:

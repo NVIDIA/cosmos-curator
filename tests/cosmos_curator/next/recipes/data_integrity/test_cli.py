@@ -90,11 +90,11 @@ def test_the_json_report_carries_the_clock_it_measured_on(
     perfect: Callable[..., list[int]],
 ) -> None:
     """Under ``video``, so the field name matches the session report and the store column."""
-    _stub_engine(monkeypatch, run_engine, perfect, timestamp_source=TimestampSource.CAPTURE)
+    _stub_engine(monkeypatch, run_engine, perfect, timestamp_source=TimestampSource.SENSOR)
 
     assert cli.main(["--source", "clip.mp4", "--json"]) == PASS_EXIT_CODE
     payload = json.loads(capsys.readouterr().out)
-    assert payload["video"]["timestamp_source"] == "capture"
+    assert payload["video"]["timestamp_source"] == "sensor"
 
 
 @pytest.mark.parametrize(

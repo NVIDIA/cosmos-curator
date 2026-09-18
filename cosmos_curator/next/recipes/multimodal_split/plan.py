@@ -21,9 +21,9 @@ while producing one is a single camera's work. Separating them means a session
 that cannot be covered never occupies a splitting slot, and the unit of split
 work becomes one camera rather than a whole rig.
 
-A camera's timeline and resolved URI travel on the row. Both were paid for here,
-and reading them again in the next stage would be a second high-latency round
-trip per camera for bytes this stage already holds.
+A camera's source timeline and resolved URI travel on the row. Both were paid for
+here, and reading them again in the next stage would be a second high-latency
+round trip per camera for bytes this stage already holds.
 """
 
 from typing import Any
@@ -62,10 +62,10 @@ from cosmos_curator.next.recipes.multimodal_split.storage import (
     list_session_paths,
     load_container_pts_ns,
     load_mcap_bounds,
-    load_timeline_ns,
+    load_sensor_timestamps_ns,
     resolve_sensor_pattern,
 )
-from cosmos_curator.next.recipes.multimodal_split.uris import timeline_uri
+from cosmos_curator.next.recipes.multimodal_split.uris import timestamps_sidecar_uri
 
 CAMERA_PLAN = "camera_plan"
 MCAP_PLAN = "mcap_plan"
@@ -163,13 +163,13 @@ def open_cameras(
     immutable session could plan different episode sets, and the second would
     then fail reconciliation against the first.
 
-    A camera missing its capture timeline is still a fault unless its config sets
+    A camera missing its sensor timeline is still a fault unless its config sets
     ``allow_pts_fallback``, in which case its timeline is read from the
     container's own presentation timestamps instead -- returned in the third
     element, the keys whose timeline came from that fallback rather than from a
-    capture sidecar. "Missing" is decided the same way a camera's own absence
-    is: against the listing, not from whatever ``load_timeline_ns`` raises. A
-    sidecar the listing does carry is read, and if that read fails -- a
+    sensor-timestamp sidecar. "Missing" is decided the same way a camera's own
+    absence is: against the listing, not from whatever
+    ``load_sensor_timestamps_ns`` raises. A sidecar the listing does carry is read, and if that read fails -- a
     truncated write, a wrong dtype, a non-ascending timeline -- it is a fault,
     the same as a broken video would be, and never falls back: the fallback
     exists for a sidecar that was never written, not for one that was written
@@ -201,9 +201,9 @@ def open_cameras(
         # session_uri because session_paths is: resolve_sensor_uri's own join,
         # reversed.
         relative_match = uri.removeprefix(f"{session_uri.rstrip('/')}/")
-        if timeline_uri(relative_match) not in session_paths:
+        if timestamps_sidecar_uri(relative_match) not in session_paths:
             if not camera.allow_pts_fallback:
-                missing_timeline = FileNotFoundError(f"no capture timeline sidecar for {uri}")
+                missing_timeline = FileNotFoundError(f"no sensor-timestamp sidecar for {uri}")
                 failures.append(failure(session_id, key, None, "open_sensor", missing_timeline))
                 continue
             try:
@@ -216,7 +216,7 @@ def open_cameras(
             pts_fallback_keys.add(key)
         else:
             try:
-                timelines[key] = load_timeline_ns(
+                timelines[key] = load_sensor_timestamps_ns(
                     uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
                 )
             except Exception as timeline_error:  # noqa: BLE001 -- a listed-but-broken sidecar is one failed sensor
@@ -351,12 +351,10 @@ def span_planner(
     sensor_sources = {key: mcap_uris[key] for key in mcap_keys}
     split_contract_digest = make_split_contract_digest(config)
     # A clip is one moment across everything the rig promised, so one camera
-    # reading its timeline from container PTS instead of a capture sidecar marks
+    # reading its timeline from container PTS instead of a sensor sidecar marks
     # the whole episode CONTAINER_PTS -- there is no per-camera timestamp_source
     # on the row for a mixed episode to carry.
-    timestamp_source = (
-        TimestampSource.CONTAINER_PTS if pts_fallback_keys & set(camera_keys) else TimestampSource.CAPTURE
-    )
+    timestamp_source = TimestampSource.CONTAINER_PTS if pts_fallback_keys & set(camera_keys) else TimestampSource.SENSOR
     planned: list[dict[str, Any]] = []
     already_canonical: list[dict[str, Any]] = []
     existing_by_episode_id = (reconciliation or {}).get(source_id, {})
@@ -493,8 +491,8 @@ def plan_common_spans(
     applies per row while the clip is cut, not here -- this decides which spans
     exist, and that one decides which of them a sensor can actually serve.
     """
-    starts = [int(timeline[0]) for timeline in timelines.values()]
-    ends = [timeline_end_ns(timeline) for timeline in timelines.values()]
+    starts = [int(timestamps[0]) for timestamps in timelines.values()]
+    ends = [timeline_end_ns(timestamps) for timestamps in timelines.values()]
     for first_ns, last_ns in (bounds or {}).values():
         starts.append(first_ns)
         # Exclusive, like a timeline's end: the last message is an instant, and a
@@ -535,7 +533,7 @@ def partition_by_coverage(
         key, worst_ns = missing
         error = AlignmentError(
             AlignmentFailureReason.TOLERANCE_EXCEEDED,
-            f"camera {key!r} cannot serve this moment: its nearest observation is {worst_ns} ns from a "
+            f"camera {key!r} cannot serve this moment: its nearest source frame is {worst_ns} ns from a "
             f"reference, further than the {config.video.max_delta_ns} ns the rig was given",
             sensor_id=key,
             align_timestamps_ns=references,
@@ -550,8 +548,8 @@ def first_uncovered(
     max_delta_ns: int,
 ) -> tuple[str, int] | None:
     """Return the first camera that cannot reach every reference, and by how far."""
-    for key, timeline in timelines.items():
-        serving = timeline[find_closest_indices(timeline, references_ns)]
+    for key, timestamps in timelines.items():
+        serving = timestamps[find_closest_indices(timestamps, references_ns)]
         worst_ns = max(int(abs(int(left) - int(right))) for left, right in zip(serving, references_ns, strict=True))
         if worst_ns > max_delta_ns:
             return key, worst_ns

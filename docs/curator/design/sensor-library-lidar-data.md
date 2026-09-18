@@ -120,7 +120,7 @@ This supports providing a fixed set of named per-point arrays on
 `LidarData` rather than a self-describing offset/datatype table: the
 sensor library is consumed by Python ML pipelines that benefit more from
 predictable typed access than from arbitrary-schema flexibility. It also
-supports carrying a per-point capture-time array
+supports carrying a per-point sensor-timestamp array
 (`points_timestamps_ns: (P_total,) int64`) alongside the row-level
 `align_timestamps_ns` / `sensor_timestamps_ns`, rather than relying on
 a single sweep-level timestamp.
@@ -382,7 +382,7 @@ align_timestamps_ns:  npt.NDArray[np.int64]     # (N,) strictly increasing
                                                  #   reference instants
 sensor_timestamps_ns: npt.NDArray[np.int64]     # (N,) non-decreasing — per-row source-reported time
 points_xyz:           npt.NDArray[np.float32]   # (P_total, 3)
-points_timestamps_ns: npt.NDArray[np.int64]     # (P_total,) non-decreasing — per-point capture time
+points_timestamps_ns: npt.NDArray[np.int64]     # (P_total,) non-decreasing — per-point sensor timestamp
 ```
 
 Same `(N,)` shape as Option C, but the semantic of `align_timestamps_ns`
@@ -523,7 +523,7 @@ pose representation. `as_homogeneous_matrices()` provides row-major
 ### D3. Motion-compensation contract
 
 When `LidarData` is constructed, are the `xyz` coordinates expected to be in
-the sensor frame at the per-point capture time (raw), or already transformed
+the sensor frame at the per-point sensor timestamp (raw), or already transformed
 into a single reference frame for the sweep (motion-compensated)?
 
 **Option A — `LidarData` is agnostic; producer declares**
@@ -744,7 +744,7 @@ class LidarData:
 
     # Required per-point payload (length P_total; independent of N).
     points_xyz:           npt.NDArray[np.float32]              # (P_total, 3)
-    points_timestamps_ns: npt.NDArray[np.int64]                # (P_total,) non-decreasing — per-point capture time
+    points_timestamps_ns: npt.NDArray[np.int64]                # (P_total,) non-decreasing — per-point sensor timestamp
 
     metadata: LidarMetadata                                    # carries extrinsics + frame + comp state
 
@@ -798,7 +798,7 @@ Notes:
 | `align_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Strictly increasing. When `motion_compensated=True`, each entry is also the reference instant that all points nearest to it (by `points_timestamps_ns`) have been warped to. |
 | `sensor_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Per-row source-reported reference time. Non-decreasing; may repeat under supersampling. |
 | `points_xyz` | `np.float32` | `(P_total, 3)` | m | yes | Point coordinates in the frame declared by `LidarMetadata.reference_frame`. |
-| `points_timestamps_ns` | `np.int64` | `(P_total,)` | ns | yes | Per-point capture time. Non-decreasing globally across the batch. |
+| `points_timestamps_ns` | `np.int64` | `(P_total,)` | ns | yes | Per-point sensor timestamp. Non-decreasing globally across the batch. |
 | `metadata` | `LidarMetadata` | — | — | yes | Carries `motion_compensated`, `reference_frame` (frame of `points_xyz`), `extrinsics` (static sensor-to-rig calibration), and `sensor_model`. |
 
 ### Optional Fields (`LidarData`)
@@ -840,7 +840,7 @@ Notes:
 - **`sensor_timestamps_ns: (N,)`** — per-row source-reported reference
   time. Non-decreasing. Typically the sweep start / midpoint / query
   instant, producer's choice; parsers document the convention.
-- **`points_timestamps_ns: (P_total,)`** — per-point capture time.
+- **`points_timestamps_ns: (P_total,)`** — per-point sensor timestamp.
   Non-decreasing globally across the batch. This is what makes
   per-point-time-window queries and motion-comp math possible.
 
@@ -912,7 +912,7 @@ lossless re-seek would otherwise be impossible.
 
 If a source provides only a sweep-level timestamp and no per-point timing,
 the parser should synthesize `points_timestamps_ns` (uniform interpolation
-across an estimated capture duration is acceptable) and document the
+across an estimated sensor acquisition duration is acceptable) and document the
 synthesis.
 
 ## Coordinate Frames
@@ -922,7 +922,7 @@ synthesis.
 `LidarMetadata.reference_frame`. The metadata flag `motion_compensated`
 declares whether all points in the batch share a single instantaneous
 reference frame (`True`) or whether each point is in the sensor frame at
-its own capture time (`False`). The flag applies to every point in the
+its own sensor timestamp (`False`). The flag applies to every point in the
 batch; mixing motion-compensated and raw points in a single `LidarData` is
 not supported.
 
@@ -939,9 +939,9 @@ The valid combinations of `motion_compensated` and `reference_frame` are:
 
 | `motion_compensated` | `reference_frame` | Meaning |
 | --- | --- | --- |
-| `False` | `"sensor"` | Raw — each point in the sensor frame at its own capture time. No ego trajectory required. Cloud is time-sheared by ego motion. |
-| `False` | `"rig"` | Each point in the rig frame at its own capture time, obtained from sensor-frame coordinates via the static `extrinsics`. Cloud is time-sheared because the rig frame itself moves with the car. No ego trajectory required. |
-| `False` | `"world"` / `"map"` | **Invalid** — rejected by validators. Reaching a fixed global frame requires per-point `T_world_rig(t_capture)` lookup, which is mathematically equivalent to motion compensation; producers should declare `True` and record the chosen anchor instant. |
+| `False` | `"sensor"` | Raw — each point in the sensor frame at its own sensor timestamp. No ego trajectory required. Cloud is time-sheared by ego motion. |
+| `False` | `"rig"` | Each point in the rig frame at its own sensor timestamp, obtained from sensor-frame coordinates via the static `extrinsics`. Cloud is time-sheared because the rig frame itself moves with the car. No ego trajectory required. |
+| `False` | `"world"` / `"map"` | **Invalid** — rejected by validators. Reaching a fixed global frame requires per-point `T_world_rig(t_sensor)` lookup, which is mathematically equivalent to motion compensation; producers should declare `True` and record the chosen anchor instant. |
 | `True` | `"sensor"` | **Invalid** — rejected by validators. A single-instant snapshot of a moving frame is ill-defined; producers should target `"rig"` or a global frame instead. |
 | `True` | `"rig"` | Points motion-compensated into the rig frame. When `N == 1`, `align_timestamps_ns[0]` is the single reference instant. When `N > 1`, different points are compensated to different instants — point `j` was warped to whichever `align_timestamps_ns[i]` its per-point time is nearest to. |
 | `True` | `"world"` / `"map"` | Same as above, but the target frame is a fixed global frame. Per-row reference instants live in `align_timestamps_ns`. |
@@ -1058,7 +1058,7 @@ future work as described below.
   reader (KITTI, nuScenes, Waymo)? The choice affects which timestamp
   conventions and which optional fields are exercised first.
 - When per-point timestamps must be synthesized from a sweep-level
-  timestamp, is uniform interpolation across an estimated capture duration
+  timestamp, is uniform interpolation across an estimated sensor acquisition duration
   acceptable to downstream consumers, or do they require
   sensor-model-specific timing tables?
 - Should `LidarData` carry a per-batch `frame_id` string (`"lidar_top"`,

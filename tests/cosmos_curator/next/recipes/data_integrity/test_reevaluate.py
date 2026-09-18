@@ -50,14 +50,14 @@ _ONE_MINUTE_NS = 60_000_000_000
 _SKEW_NS = 1_000_000
 
 
-def _capture_bounds(*pairs: tuple[int, int]) -> list[SensorBounds]:
-    """Build bounds on the rigs' own capture clocks, which is what makes them measurable.
+def _sensor_bounds(*pairs: tuple[int, int]) -> list[SensorBounds]:
+    """Build bounds on the rigs' own sensor clocks, which is what makes them measurable.
 
     Every test here is about re-judging *stored numbers*, and a session measured on
-    container PTS stores none: its metrics never run. So these say ``capture``, and the
+    container PTS stores none: its metrics never run. So these say ``sensor``, and the
     streams whose rows sit beside them say the same.
     """
-    return [SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.CAPTURE) for start, end in pairs]
+    return [SensorBounds(start_ns=start, end_ns=end, timestamp_source=TimestampSource.SENSOR) for start, end in pairs]
 
 
 def _rate_verdicts(root: str) -> dict[str, dict[str, object]]:
@@ -92,8 +92,8 @@ def session_measured(
 ) -> tuple[str, str]:
     """Build a store holding two slightly-skewed sensors, with session metrics measured and judged."""
     streams = [
-        make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CAPTURE),
-        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.CAPTURE),
+        make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.SENSOR),
+        make_stream(f"{SESSION}/rear.mp4", perfect(), timestamp_source=TimestampSource.SENSOR),
     ]
     run_id = store.write_run(
         store_root,
@@ -102,7 +102,7 @@ def session_measured(
         thresholds=DEFAULT_THRESHOLDS,
         tool="di-session",
         session_metrics=run_session_metrics(
-            _capture_bounds((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)),
+            _sensor_bounds((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)),
             thresholds=DEFAULT_THRESHOLDS,
         ),
     )
@@ -326,16 +326,16 @@ def test_an_undefined_session_measurement_stays_skipped(
     simply undefined, so the re-judge has to leave the verdict ``SKIPPED`` with nothing
     to compare rather than invent a threshold and a margin for a measurement that has
     no value. Distinct from the "never ran" shape below it -- ``is_defined`` null --
-    which the same metric reaches when its sensors were not on capture times; see
+    which the same metric reaches when its sensors were not on sensor times; see
     :func:`test_a_session_metric_that_never_ran_names_the_clock_instead`.
     """
     store.write_run(
         store_root,
-        [make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.CAPTURE)],
+        [make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.SENSOR)],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
         tool="di-session",
-        session_metrics=run_session_metrics(_capture_bounds((0, _ONE_MINUTE_NS)), thresholds=DEFAULT_THRESHOLDS),
+        session_metrics=run_session_metrics(_sensor_bounds((0, _ONE_MINUTE_NS)), thresholds=DEFAULT_THRESHOLDS),
     )
     reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
 

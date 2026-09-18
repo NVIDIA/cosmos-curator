@@ -46,8 +46,8 @@ def _camera(key: str, marker: str) -> dict[str, object]:
         "media_sha256": marker * 64,
         "timeline_location": f"/output/{key}.mp4.timestamps.npy",
         "timeline_sha256": "a" * 64,
-        "observations_location": f"/output/{key}.mp4.observations.npy",
-        "observations_sha256": "b" * 64,
+        "sensor_timestamps_location": f"/output/{key}.mp4.sensor_timestamps.npy",
+        "sensor_timestamps_sha256": "b" * 64,
     }
 
 
@@ -62,7 +62,7 @@ def _facts() -> EpisodeFacts:
         exclusive_end_ns=1_000_000_000,
         sampling_fps=30,
         row_count=30,
-        timestamp_source=TimestampSource.CAPTURE,
+        timestamp_source=TimestampSource.SENSOR,
         split_contract_digest="contract",
     )
 
@@ -114,15 +114,15 @@ def test_record_builder_sorts_cameras_and_camera_resolution_is_exact() -> None:
         resolve_camera_media(record, "rear")
 
 
-def test_record_builder_accepts_capture_or_container_pts_clock() -> None:
+def test_record_builder_accepts_sensor_or_container_pts_clock() -> None:
     """Both clocks a camera can legally report reach canonical output.
 
     ``CONTAINER_PTS`` is the ``allow_pts_fallback`` result, and is accepted on
-    the same terms as ``CAPTURE``: canonical output just needs a well-formed
+    the same terms as ``SENSOR``: canonical output just needs a well-formed
     grid, not a specific source for the timeline.
     """
     facts = _facts()
-    for source in (TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS):
+    for source in (TimestampSource.SENSOR, TimestampSource.CONTAINER_PTS):
         record = build_episode_record(replace(facts, timestamp_source=source), [_camera("front", "1")])
         assert record["timestamp_source"] == source.value
 

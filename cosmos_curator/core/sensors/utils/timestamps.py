@@ -12,14 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A sensor's observation timeline: a 1-D ``int64`` nanosecond ``.npy``.
+"""A timestamp timeline: a 1-D ``int64`` nanosecond ``.npy``.
 
-When a sensor observed each of its samples is what every later alignment step
-keys off, whatever the sensor is -- camera frames, IMU samples, GPS fixes, lidar
-sweeps all reduce to one ascending sequence of instants. So the timeline is
-stored in the one form that needs no interpretation: nanoseconds on the
-recording device's clock, one entry per observation, strictly ascending, in a
-plain ``.npy``.
+Both sensor timestamps and generated alignment timestamps reduce to an ascending
+sequence of instants. This module owns only their shared representation: one
+strictly ascending nanosecond value per row in a plain ``.npy``. The caller owns
+the timeline's semantics and clock provenance.
 
 Integer nanoseconds because a ``float64`` carries only 53 bits of mantissa. At
 epoch-nanosecond magnitudes consecutive ``float64`` values are 256 ns apart, so
@@ -91,7 +89,7 @@ def _load_single_array(stream: BinaryIO) -> npt.NDArray[Any]:
 
 
 def read_timestamps_ns(stream: BinaryIO) -> npt.NDArray[np.int64]:
-    """Read an observation timeline from an open binary *stream*.
+    """Read a timestamp timeline from an open binary *stream*.
 
     Takes an already-open stream rather than a path or a URI: callers own their
     transport, so a local file, an object pulled from a bucket through
@@ -131,7 +129,7 @@ def read_timestamps_ns(stream: BinaryIO) -> npt.NDArray[np.int64]:
 
 
 def write_timestamps_ns(timestamps_ns: npt.NDArray[np.int64], stream: BinaryIO) -> None:
-    """Write an observation timeline to an open binary *stream*.
+    """Write a timestamp timeline to an open binary *stream*.
 
     Validated before writing rather than only on read: an artifact that fails
     its own reader is worse than no artifact, because it is discovered by

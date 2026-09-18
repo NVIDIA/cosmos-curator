@@ -48,7 +48,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
-from cosmos_curator.next.recipes.data_integrity.sources import CAPTURE_TIMELINE_SUFFIX
+from cosmos_curator.next.recipes.data_integrity.sources import SOURCE_SENSOR_TIMESTAMPS_SUFFIX
 
 HZ_100_PERIOD_NS = 10_000_000  # one sample every 10 ms at 100 Hz
 
@@ -86,7 +86,7 @@ class FakeSensor:
         """Which clock the synthetic timeline stands for.
 
         Defaults to the container's, which is what a bare list of integers honestly
-        is: a timeline given no provenance. A test about capture timestamps says so.
+        is: a timeline given no provenance. A test about sensor timestamps says so.
         """
         return self._timestamp_source
 
@@ -252,17 +252,17 @@ def h264_video() -> Callable[..., bytes]:
     return _make
 
 
-#: Epoch-scale, so a capture timeline cannot be mistaken for a container's own: PTS is
+#: Epoch-scale, so a sensor timeline cannot be mistaken for a container's own: PTS is
 #: counted from the start of one file and starts at or near zero.
-_CAPTURE_EPOCH_NS = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z
+_SENSOR_EPOCH_NS = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z
 
 #: One frame at 30 fps, matching what :func:`h264_video` encodes.
 _FRAME_PERIOD_NS = 33_333_333
 
 
 @pytest.fixture
-def capture_timeline() -> Callable[..., pathlib.Path]:
-    """Return a factory writing a capture timeline beside a video.
+def sensor_timeline() -> Callable[..., pathlib.Path]:
+    """Return a factory writing a sensor timeline beside a video.
 
     The sidecar is what makes a session-grain metric run at all: without it every
     camera is measured on container PTS, the mux has already put them on one
@@ -278,10 +278,10 @@ def capture_timeline() -> Callable[..., pathlib.Path]:
         video: pathlib.Path,
         *,
         frames: int,
-        start_ns: int = _CAPTURE_EPOCH_NS,
+        start_ns: int = _SENSOR_EPOCH_NS,
         period_ns: int = _FRAME_PERIOD_NS,
     ) -> pathlib.Path:
-        sidecar = pathlib.Path(f"{video}{CAPTURE_TIMELINE_SUFFIX}")
+        sidecar = pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")
         with sidecar.open("wb") as stream:
             write_timestamps_ns(start_ns + np.arange(frames, dtype=np.int64) * period_ns, stream)
         return sidecar

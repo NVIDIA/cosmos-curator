@@ -26,12 +26,12 @@ from cosmos_curator.next.recipes.multimodal_split.recovery import read_reconcili
 def test_duplicate_canonical_episode_ids_fail_closed() -> None:
     """A duplicate identity must not silently overwrite the first canonical row."""
     row = {
-        "record_schema_version": 1,
-        "media_contract_version": 2,
+        "record_schema_version": 2,
+        "media_contract_version": 3,
         "episode_id": "episode",
         "source_id": "source",
         "sampling_fps": 30,
-        "timestamp_source": "capture",
+        "timestamp_source": "sensor",
         "split_contract_digest": "contract",
         "camera_media": [{"camera_key": "front", "source_media_location": "/input/front.mp4"}],
     }

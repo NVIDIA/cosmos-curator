@@ -27,7 +27,7 @@ from cosmos_curator.next.recipes.multimodal_split.identities import (
     make_materialization_digest,
 )
 
-RECORD_SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 2
 
 CAMERA_MEDIA_STRUCT = pa.struct(
     [
@@ -38,8 +38,8 @@ CAMERA_MEDIA_STRUCT = pa.struct(
         pa.field("media_sha256", pa.string(), nullable=False),
         pa.field("timeline_location", pa.large_string(), nullable=False),
         pa.field("timeline_sha256", pa.string(), nullable=False),
-        pa.field("observations_location", pa.large_string(), nullable=False),
-        pa.field("observations_sha256", pa.string(), nullable=False),
+        pa.field("sensor_timestamps_location", pa.large_string(), nullable=False),
+        pa.field("sensor_timestamps_sha256", pa.string(), nullable=False),
     ]
 )
 
@@ -118,10 +118,10 @@ def build_episode_record(
     camera_media: list[dict[str, Any]],
     sensor_media: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build one canonical row, enforcing the capture-grid and camera contracts."""
-    if facts.timestamp_source not in (TimestampSource.CAPTURE, TimestampSource.CONTAINER_PTS):
+    """Build one canonical row, enforcing the timestamp grid and camera contracts."""
+    if facts.timestamp_source not in (TimestampSource.SENSOR, TimestampSource.CONTAINER_PTS):
         msg = (
-            f"Canonical multimodal episodes require capture or container-PTS timestamps, "
+            f"Canonical multimodal episodes require sensor or container-PTS timestamps, "
             f"got {facts.timestamp_source.value!r}"
         )
         raise ValueError(msg)
