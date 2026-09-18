@@ -36,4 +36,31 @@ persistence:
   size: 800Gi
   retentionPolicy:
     whenDeleted: Delete
-    whenScaled: Retain  
+    whenScaled: Retain
+
+# networkPolicy:
+#   # Enabled by default for standalone clusters.
+#   # Set false for NVCF deployments (NVCF rejects NetworkPolicy resources).
+#   enabled: true
+#
+#   # Peers allowed to reach the HTTP invocation endpoint (curator.port).
+#   # Empty = fail-closed. Add an API gateway entry here to open it:
+#   # allowInvocationFrom:
+#   #   - namespaceSelector:
+#   #       matchLabels:
+#   #         kubernetes.io/metadata.name: api-gateway
+#   allowInvocationFrom: []
+#
+#   # This values file enables metrics.serviceMonitor (Prometheus Operator
+#   # scraping pod-0 via the ClusterIP service) and disables the bundled
+#   # collector. With networkPolicy.enabled=true that cross-namespace scrape
+#   # is blocked by default — add an extraIngress rule for it:
+#   # extraIngress:
+#   #   - ports:
+#   #       - port: 9002
+#   #         protocol: TCP
+#   #     from:
+#   #       - namespaceSelector:
+#   #           matchLabels:
+#   #             kubernetes.io/metadata.name: monitoring
+#   extraIngress: []

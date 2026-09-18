@@ -85,6 +85,26 @@ _RAY_DASHBOARD = f"http://127.0.0.1:{os.getenv('RAY_DASHBOARD_PORT', '8265')}"
 _METRICS_PORT = 9002
 _RAY_JOB_ENTRYPOINT_FAILURE_MESSAGE = "Ray job entrypoint failed"
 
+
+def _ray_dashboard_headers() -> dict[str, str]:
+    """Build the Authorization header for Ray dashboard API calls when token auth is enabled.
+
+    Plain requests calls do not pick up RAY_AUTH_TOKEN_PATH (only Ray's own CLI/SDK
+    do). Mirrors Ray's lookup precedence: the RAY_AUTH_TOKEN_PATH file first, then
+    the RAY_AUTH_TOKEN env var. Returns an empty dict when no token is configured.
+    """
+    token = ""
+    token_path = os.getenv("RAY_AUTH_TOKEN_PATH", "")
+    if token_path:
+        try:
+            token = pathlib.Path(token_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning(f"RAY_AUTH_TOKEN_PATH is set but unreadable: {token_path}")
+    if not token:
+        token = os.getenv("RAY_AUTH_TOKEN", "")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 # This is evaluated at startup and used to decide if the logs/progress can be sent
 # using get-request-status
 using_nvcf_status: dict[str, bool] = {"get_req_sts": False}
@@ -403,7 +423,7 @@ def _list_all_jobs() -> dict[str, tuple[str, str, str]]:
     jlist: dict[str, tuple[str, str, str]] = {}
     tout: int = 600
     try:
-        resp = requests.get(f"{_RAY_DASHBOARD}/api/jobs/", timeout=tout)
+        resp = requests.get(f"{_RAY_DASHBOARD}/api/jobs/", timeout=tout, headers=_ray_dashboard_headers())
         jobs = resp.json()
         id_: str = ""
         type_: str = ""
@@ -480,7 +500,7 @@ def _wait_for_stop(job_id: str) -> bool:
     tout: int = 600
     http_ok: int = 200
     while count < retry_cnt:
-        resp = requests.get(f"{_RAY_DASHBOARD}/api/jobs/{job_id}", timeout=tout)
+        resp = requests.get(f"{_RAY_DASHBOARD}/api/jobs/{job_id}", timeout=tout, headers=_ray_dashboard_headers())
         if resp.status_code == http_ok:
             status = resp.json()
             logger.debug(f"{job_id} : stop status : {resp.text}")
@@ -506,7 +526,7 @@ def _stop_ray_job(job_id: str) -> tuple[bool, str]:
     tout: int = 600
     http_ok: int = 200
     while count < retry_cnt:
-        resp = requests.post(f"{_RAY_DASHBOARD}/api/jobs/{job_id}/stop", timeout=tout)
+        resp = requests.post(f"{_RAY_DASHBOARD}/api/jobs/{job_id}/stop", timeout=tout, headers=_ray_dashboard_headers())
         if resp.status_code == http_ok:
             # ideal resp : {"stopped": true}, this is async
             # hence we need to wait for status to change to STOPPED
@@ -576,7 +596,9 @@ def _terminate_last_job(request_id: str) -> tuple[bool, str]:
                 logger.debug(f"{request_id} : {k} Stopped : {m}")
                 if state:
                     # then delete
-                    resp = requests.delete(f"{_RAY_DASHBOARD}/api/jobs/{k}", timeout=tout)
+                    resp = requests.delete(
+                        f"{_RAY_DASHBOARD}/api/jobs/{k}", timeout=tout, headers=_ray_dashboard_headers()
+                    )
                     # ideal resp : {"deleted": true}, this is async
                     logger.debug(f"{request_id} : {k} Deleted : {resp.text}")
                     if resp.status_code != http_ok:

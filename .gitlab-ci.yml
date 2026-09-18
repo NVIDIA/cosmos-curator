@@ -185,7 +185,7 @@ variables:
     value: "cosmos-curator"
   CICD_HELM_CHART_VERSION:
     description: "Helm chart version for the CICD pipeline"
-    value: "2.4.1"
+    value: "2.5.0"
   XENNA_REF:
     # No default value: when unset, build_xenna_wheel.sh builds the
     # cosmos-xenna submodule's currently-checked-out commit (i.e. the SHA

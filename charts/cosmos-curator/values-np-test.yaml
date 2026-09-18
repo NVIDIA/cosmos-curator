@@ -1,0 +1,39 @@
+# NetworkPolicy live-test overrides.
+# Layer on top of values.yaml + values-standalone.yaml:
+#
+#   helm upgrade cosmos-curator \
+#     --namespace cosmos-curator --create-namespace --install \
+#     charts/cosmos-curator \
+#     -f charts/cosmos-curator/values.yaml \
+#     -f charts/cosmos-curator/values-standalone.yaml \
+#     -f charts/cosmos-curator/values-np-test.yaml \
+#     --set imagePullSecret.dockerConfigJson.password=${API_KEY} \
+#     --set ngcCatalog.secret.key=${MODEL_KEY} \
+#     --set image.repository=<your-registry>/cosmos-curator \
+#     --set image.tag=<your-tag>
+
+networkPolicy:
+  enabled: true
+  # Leave allowInvocationFrom empty to verify port 8000 is blocked by default.
+  # To test the allowInvocationFrom path, add a peer here, e.g.:
+  #   allowInvocationFrom:
+  #     - podSelector:
+  #         matchLabels:
+  #           app.kubernetes.io/name: my-test-client
+  allowInvocationFrom: []
+  # Example: allow in-cluster Prometheus to scrape metrics.port from the monitoring namespace.
+  extraIngress:
+    - ports:
+        - port: 9002
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring  # adjust to match your Prometheus namespace
+
+# Enable metrics without the NVCF secret-extractor init container.
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  extractNVCFSecrets: false

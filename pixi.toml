@@ -150,6 +150,8 @@ types-tqdm = "*"
 [feature.dev.tasks]
 mypy = "mypy"
 pytest = "pytest"
+# memory-bound suite; 4 workers measured optimal in CI — don't crank on a busy workstation
+pytest-fast = "pytest -n 4 --dist loadfile"
 
 [feature.runtime]
 channels = ["conda-forge", "nvidia"]

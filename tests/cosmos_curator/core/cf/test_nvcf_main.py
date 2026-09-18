@@ -1515,3 +1515,49 @@ def test_setup_pipeline_middleware() -> None:
 
             # Verify middleware was added (checking middleware stack)
             assert len(app.user_middleware) > 0
+
+
+class TestRayDashboardHeaders:
+    """Token-auth header construction for direct Ray dashboard HTTP calls."""
+
+    def test_prefers_token_path_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RAY_AUTH_TOKEN_PATH file wins over the env var, matching Ray's precedence."""
+        token_file = tmp_path / "token"
+        token_file.write_text("file-token\n", encoding="utf-8")
+        monkeypatch.setenv("RAY_AUTH_TOKEN_PATH", str(token_file))
+        monkeypatch.setenv("RAY_AUTH_TOKEN", "env-token")
+        assert nvcf_main._ray_dashboard_headers() == {"Authorization": "Bearer file-token"}
+
+    def test_env_var_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Fall back to RAY_AUTH_TOKEN when no token path is set."""
+        monkeypatch.delenv("RAY_AUTH_TOKEN_PATH", raising=False)
+        monkeypatch.setenv("RAY_AUTH_TOKEN", "env-token")
+        assert nvcf_main._ray_dashboard_headers() == {"Authorization": "Bearer env-token"}
+
+    def test_empty_when_unconfigured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No header when neither token source is configured."""
+        monkeypatch.delenv("RAY_AUTH_TOKEN_PATH", raising=False)
+        monkeypatch.delenv("RAY_AUTH_TOKEN", raising=False)
+        assert nvcf_main._ray_dashboard_headers() == {}
+
+    def test_unreadable_path_falls_back_to_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unreadable token file logs a warning and falls back to the env var."""
+        monkeypatch.setenv("RAY_AUTH_TOKEN_PATH", str(tmp_path / "does-not-exist"))
+        monkeypatch.setenv("RAY_AUTH_TOKEN", "env-token")
+        assert nvcf_main._ray_dashboard_headers() == {"Authorization": "Bearer env-token"}
+
+    def test_list_all_jobs_sends_auth_header(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_list_all_jobs passes the Authorization header through to requests.get.
+
+        Caller-path assertion complementing the helper tests: removing
+        headers=_ray_dashboard_headers() from the call site fails this test.
+        """
+        token_file = tmp_path / "token"
+        token_file.write_text("file-token\n", encoding="utf-8")
+        monkeypatch.setenv("RAY_AUTH_TOKEN_PATH", str(token_file))
+        monkeypatch.delenv("RAY_AUTH_TOKEN", raising=False)
+        with patch("requests.get") as mock_get:
+            mock_get.return_value.json.return_value = []
+            nvcf_main._list_all_jobs()
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["headers"] == {"Authorization": "Bearer file-token"}

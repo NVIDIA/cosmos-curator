@@ -32,9 +32,9 @@ helm repo update
 ```
 
 ### Set Chart Version
-The latest version is `2.4.0`. Set this as an environment variable:
+The latest version is `2.5.0`. Set this as an environment variable:
 ```bash
-export CHART_VERSION=2.4.0
+export CHART_VERSION=2.5.0
 ```
 
 ## Deployment
@@ -127,8 +127,10 @@ kubectl get pods -l app=cosmos-curator
 # View logs
 kubectl logs -l app=cosmos-curator --tail=100
 
-# Check Ray dashboard
+# Check Ray dashboard (rayAuth is on by default — retrieve the token first)
+kubectl -n cosmos-curator get secret ray-auth-token -o jsonpath='{.data.token}' | base64 -d
 kubectl port-forward svc/cosmos-curator 8265:8265
+# Then open http://localhost:8265 and enter the token when prompted
 ```
 
 #### Uninstalling
@@ -371,3 +373,94 @@ metrics:
 ```
 
 The ServiceMonitor automatically converts these OTEL-style configs (snake_case) to Prometheus Operator format (camelCase).
+
+## Network Exposure
+
+Without NetworkPolicy, any pod in the cluster can reach the ports the curator StatefulSet defines. Namespace boundaries do not restrict pod-to-pod traffic in vanilla Kubernetes — only a NetworkPolicy (or a CNI-level default-deny) enforces that.
+
+| Port | Value | Name | Risk if unprotected |
+|------|-------|------|---------------------|
+| `curator.port` | 8000 | Invocation (HTTP) | Unauthenticated inference triggering from any in-cluster caller |
+| `health.port` | 52365 | Health / readiness | Low — read-only probe endpoint |
+| `rayPorts.gcsServerPort` | 6379 | Ray GCS | Arbitrary task submission or cluster state manipulation |
+| `rayPorts.dashboardPort` | 8265 | Ray dashboard | Job submission via Jobs API (arbitrary code execution), full log and data access |
+| `rayPorts.objectManagerPort` | 8076 | Ray object manager | Object-store data exfiltration or injection |
+| `rayPorts.nodeManagerPort` | 8077 | Ray node manager | Ray node eviction or resource starvation |
+| `metrics.port` | 9002 | Prometheus metrics | Low — metric scraping |
+
+Egress is deliberately unrestricted — the NetworkPolicy applies `policyTypes: [Ingress]` only.
+
+### What NetworkPolicy does not protect against
+
+NetworkPolicy governs pod-to-pod traffic only. Node-originated traffic — kubelet liveness/readiness probes, `kubectl port-forward` connections, and node-mode load balancer health checks — is exempt from NetworkPolicy on mainstream CNIs (Calico, Cilium, AWS VPC CNI, the managed GKE/EKS/AKS integrations), so the workflows documented in this README keep working. This is implementation-defined by the k8s spec, not guaranteed — if your CNI applies policy to node traffic, or you use container-native load balancing where health checks reach pod IPs directly (GCP NEGs, AWS NLB `target-type: ip`), add an `ipBlock` extraIngress rule for the node/LB CIDRs:
+
+```yaml
+networkPolicy:
+  enabled: true
+  extraIngress:
+    - ports:
+        - port: 52365  # health.port — kubelet probes
+          protocol: TCP
+      from:
+        - ipBlock:
+            cidr: 10.0.0.0/8  # replace with your node/LB CIDR
+```
+
+### NVCF deployments
+
+NVCF enforces pod isolation at the platform level — function pods are already network-isolated by the NVCF runtime regardless of what the chart renders. This is not a security gap: NVCF provides equivalent protection through its own infrastructure. The practical constraint is that NVCF's Helm-functions allowlist does not include `NetworkPolicy`, so the chart deploy will be rejected if one is present. Set `networkPolicy.enabled: false` for all NVCF deployments.
+
+### Standalone / native Kubernetes deployments
+
+Enable the built-in policy:
+
+```yaml
+networkPolicy:
+  enabled: true
+```
+
+This allows all TCP traffic between the chart's own pods on every port **except** `curator.port` (blocked even to same-namespace pods), and blocks all ingress from other namespaces. The OTel metrics collector (`metrics.enabled=true`) is automatically allowed to scrape `metrics.port`.
+
+To allow a client in the **same namespace** to reach the invocation endpoint:
+
+```yaml
+networkPolicy:
+  enabled: true
+  allowInvocationFrom:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: my-client
+```
+
+To allow an **API gateway or authn/authz proxy in another namespace**:
+
+```yaml
+networkPolicy:
+  enabled: true
+  allowInvocationFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: api-gateway
+```
+
+To allow a **cluster-level Prometheus** in another namespace to scrape metrics:
+
+```yaml
+networkPolicy:
+  enabled: true
+  extraIngress:
+    - ports:
+        - port: 9002
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+```
+
+> **GitOps / ArgoCD / Flux note:** `rayAuth.enabled: true` (the default) auto-generates a 64-character token on every render via `randAlphaNum`. In a GitOps workflow this causes perpetual drift — pin the token explicitly to keep renders stable:
+> ```yaml
+> rayAuth:
+>   enabled: true
+>   token: "<your-stable-token>"
+> ```

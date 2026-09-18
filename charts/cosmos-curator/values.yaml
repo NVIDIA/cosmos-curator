@@ -225,9 +225,34 @@ rayMetrics:
   enableOpenTelemetry: false #Default to legacy opencensus implementation
 # Ray authentication token configuration
 rayAuth:
-  enabled: false
-  # Leave empty to auto-generate a 64-character hex token
+  enabled: true
+  # Leave empty to auto-generate a 64-character alphanumeric token on each render.
+  # GitOps users (ArgoCD/Flux): set an explicit token here to prevent perpetual
+  # drift and rolling restarts on every helm upgrade.
   token: ""
+
+networkPolicy:
+  # On by default for standalone clusters. NVCF deployments must set this
+  # false — NVCF's Helm-functions allowlist does not include NetworkPolicy.
+  enabled: true
+  # Peers allowed to reach curator.port (the HTTP invocation/API endpoint).
+  # Empty by default — the invocation port is unreachable from any caller,
+  # including same-namespace pods. Add entries for an API gateway or
+  # authn/authz proxy that needs to forward to this endpoint:
+  #   allowInvocationFrom:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: api-gateway
+  allowInvocationFrom: []
+  # Raw NetworkPolicyIngressRule entries appended verbatim for anything else
+  # (e.g. cross-namespace Prometheus scraping metrics.port).
+  extraIngress: []
+  # Note: when metrics.enabled=true, the policy automatically allows the
+  # bundled OTel collector to scrape metrics.port. This rule hardcodes
+  # the collector's pod labels for mode=deployment (the default). If
+  # opentelemetry-collector.mode is changed, the collector's pod labels
+  # change and the scrape allowance silently stops working.
+  # Use extraIngress to add a manual rule if running a non-default mode.
 
 readiness:
   initialDelaySeconds: 5  # With the startup probe, no need to delay significantly
@@ -374,6 +399,9 @@ tracing:
     # sampling: 1.0
 
 opentelemetry-collector:
+  # Restates the subchart's default explicitly so operators know the knob exists.
+  networkPolicy:
+    enabled: false
   mode: deployment
   podSecurityContext:
     runAsNonRoot: true

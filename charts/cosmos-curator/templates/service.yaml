@@ -13,9 +13,6 @@ spec:
     - name: health
       port: {{ .Values.health.port }}
       targetPort: {{ .Values.health.port }}
-    - name: vllm
-      port: {{ .Values.curator.port }}
-      targetPort: 8001
     - name: ray-gcs
       port: {{ .Values.rayPorts.gcsServerPort }}
       targetPort: {{ .Values.rayPorts.gcsServerPort }}

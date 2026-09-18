@@ -54,6 +54,9 @@
             "includeMetricsExternalLabels": true
           }
         },
+        "networkPolicy": {
+          "enabled": false
+        },
         "#commentScratch": "path to additional node storage on host",
         "#scratchDir": "/scratch"
     },

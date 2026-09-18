@@ -7,6 +7,23 @@
 - Remove the Curator Next `video-split` recipe. Use [video-cut](docs/curator/design/curator-next-video-cut.md), then
   [video-transcode](docs/curator/design/curator-next-video-transcode.md), then `video-caption`;
   existing split tables require a fresh output or an explicit migration.
+- Enable Ray cluster authentication by default (`rayAuth.enabled: true`). Upgrading from a prior
+  chart version may rotate the auth token and trigger a rolling restart. GitOps users (ArgoCD/Flux)
+  can pin `rayAuth.token` to a stable value to keep renders idempotent. To restore the previous
+  unauthenticated behaviour: `rayAuth.enabled: false`.
+- Enable `networkPolicy.enabled` by default. NVCF deployments must set it `false`.
+
+### Added
+
+- Add `networkPolicy.enabled` to the Helm chart: a NetworkPolicy that blocks all ingress to curator
+  pods except Ray inter-pod traffic, with explicit allow-lists for the invocation port
+  (`networkPolicy.allowInvocationFrom`) and the bundled OTel collector metrics scrape. Enabled by
+  default for standalone clusters; NVCF deployments set it `false`.
+
+### Fixed
+
+- Remove vestigial headless-service vllm port mapping to dead targetPort 8001 (headless services
+  do no NAT; the entry was unreachable and misleading).
 
 ## [2.6.0]
 
