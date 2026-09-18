@@ -724,7 +724,14 @@ unit_tests:
   script:
     - *setup_pixi_dev
     - *setup_curator
-    - pytest -s
+    # Parallelize across CPU cores: pytest-xdist is installed but was unused in
+    # this job; PYTEST_XDIST_WORKERS is the existing pipeline knob (default 4).
+    # --dist loadfile keeps each test file in one worker (module-scoped fixtures
+    # don't get duplicated).
+    # PYTHONFAULTHANDLER: a previous run segfaulted at interpreter shutdown
+    # (after writing results). Fluke or not, if it recurs the faulthandler stack
+    # lands in the job log; failures still fail the job as before.
+    - PYTHONFAULTHANDLER=1 pytest -s -n "${PYTEST_XDIST_WORKERS:-4}" --dist loadfile
     # Save the raw coverage data file
     - cp .coverage .coverage.unit_tests || true
   artifacts:
