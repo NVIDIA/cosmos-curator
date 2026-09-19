@@ -45,9 +45,9 @@ def align_ego_trajectory_nearest(
 
     ``source`` is the complete decoded trajectory for one already-split clip.
     Its mapper-produced ``align_timestamps_ns`` and ``requested_timestamps_ns``
-    must use the same alignment clock. MCAP ``log_time`` determines only which
-    records the splitter placed in the clip; it plays no part in selection,
-    tolerance checking, or output timestamps here.
+    must use the same alignment clock. This function does not inspect MCAP
+    metadata directly; a mapper may derive ``align_timestamps_ns`` from MCAP
+    ``log_time``.
 
     Source rows may be reused. Exact midpoint ties choose the earlier source
     row. A selected pose is copied unchanged: position, orientation, validity,

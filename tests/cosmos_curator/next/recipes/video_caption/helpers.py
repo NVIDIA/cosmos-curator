@@ -14,6 +14,7 @@ from cosmos_curator.next.recipes.video_caption.bindings import (
     CaptionRunBindings,
 )
 from cosmos_curator.next.recipes.video_caption.contracts import (
+    DEFAULT_PROMPT,
     CaptionModelSpec,
     build_terminal_result_row,
     validate_terminal_row,
@@ -58,6 +59,7 @@ def caption_run_bindings(spec: CaptionModelSpec, digest: str) -> CaptionRunBindi
             base_field_owner="video-transcode",
             transaction_properties={"kind": "video-caption"},
         ),
+        prompt_template=DEFAULT_PROMPT,
     )
 
 

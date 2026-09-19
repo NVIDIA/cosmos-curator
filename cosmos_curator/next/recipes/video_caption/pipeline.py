@@ -34,6 +34,7 @@ from cosmos_curator.next.recipes.video_caption.bindings import (
 from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config
 from cosmos_curator.next.recipes.video_caption.contracts import (
     CHECKPOINT_ADAPTER_VERSION,
+    DEFAULT_PROMPT,
     WORKSPACE_SCHEMA_VERSION,
     build_terminal_result_row,
     caption_contract_digest,
@@ -102,6 +103,7 @@ def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
             base_field_owner="video-transcode",
             transaction_properties={"kind": "video-caption"},
         ),
+        prompt_template=DEFAULT_PROMPT,
     )
     inference_config = CaptionExecutionConfig(
         storage_profile=config.execution.storage_profile,

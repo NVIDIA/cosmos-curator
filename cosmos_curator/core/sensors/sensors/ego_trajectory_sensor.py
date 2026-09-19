@@ -274,10 +274,9 @@ class EgoTrajectorySensor:
         so a selected source timestamp can lie before the clip's span. No pose
         after the span is carried, so a request near the end of a clip selects
         the nearest pose that clip holds even where the session had a nearer one
-        just beyond it. MCAP
-        ``log_time`` selects records while decoding the clip but does not
-        participate in nearest selection, tolerance checking, or output
-        timestamps. Those use mapper-produced ``align_timestamps_ns``.
+        just beyond it. Nearest selection and tolerance checking use
+        mapper-produced ``align_timestamps_ns``; depending on the mapping,
+        those timestamps may themselves originate from MCAP ``log_time``.
         """
         policy = require_nearest_timestamp_policy(policy, sensor_name=type(self).__name__)
         source = self.read_all()

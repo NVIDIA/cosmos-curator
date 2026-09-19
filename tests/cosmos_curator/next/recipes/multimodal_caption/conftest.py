@@ -10,6 +10,7 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.core.sensors.sampling.grid import make_ts_grid
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA, EpisodeFacts, build_episode_record
 
@@ -36,29 +37,57 @@ def camera(
     }
 
 
+def sensor(
+    key: str = "ego",
+    *,
+    location: str = "/output/ego.mcap",
+    size: int = 10,
+    media_sha256: str = "e" * 64,
+) -> dict[str, object]:
+    """Build one canonical EgoTrajectory descriptor."""
+    return {
+        "sensor_key": key,
+        "sensor_type": "egotrajectory",
+        "source_media_location": "/source/ego.mcap",
+        "media_location": location,
+        "media_size_bytes": size,
+        "media_sha256": media_sha256,
+    }
+
+
 def episode(
     index: int,
     *,
     episode_id: str | None = None,
     camera_media: list[dict[str, object]] | None = None,
+    sensor_media: list[dict[str, object]] | None = None,
+    start_ns: int = 0,
+    exclusive_end_ns: int = 1_000_000_000,
+    timestamp_source: TimestampSource = TimestampSource.SENSOR,
 ) -> dict[str, object]:
     """Build one canonical two-camera episode."""
+    sampling_fps = 30
+    _, _, timestamps_ns = make_ts_grid(
+        start_ns,
+        exclusive_end_ns=exclusive_end_ns,
+        sample_rate_hz=sampling_fps,
+    )
     facts = EpisodeFacts(
         episode_id=episode_id or f"episode-{index}",
         split_clip_id=f"split-{index}",
         source_id=f"source-{index}",
         source_session_id=f"session-{index}",
         source_session_location=f"/input/session-{index}",
-        start_ns=0,
-        exclusive_end_ns=1_000_000_000,
-        sampling_fps=30,
-        row_count=30,
-        timestamp_source=TimestampSource.SENSOR,
+        start_ns=start_ns,
+        exclusive_end_ns=exclusive_end_ns,
+        sampling_fps=sampling_fps,
+        row_count=len(timestamps_ns),
+        timestamp_source=timestamp_source,
         split_contract_digest="split-contract",
     )
     if camera_media is None:
         camera_media = [camera("front_left", "1"), camera("front_wide", "2")]
-    return build_episode_record(facts, camera_media)
+    return build_episode_record(facts, camera_media, sensor_media)
 
 
 @pytest.fixture
@@ -71,6 +100,12 @@ def camera_factory() -> Callable[..., dict[str, object]]:
 def episode_factory() -> Callable[..., dict[str, object]]:
     """Expose the canonical episode builder."""
     return episode
+
+
+@pytest.fixture
+def sensor_factory() -> Callable[..., dict[str, object]]:
+    """Expose the canonical sensor descriptor builder."""
+    return sensor
 
 
 @pytest.fixture

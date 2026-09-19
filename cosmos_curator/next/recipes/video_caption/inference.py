@@ -249,8 +249,8 @@ class SharedMediaError(RuntimeError):
     """A credentials or storage-availability failure that must stop Phase A."""
 
 
-class _ItemMediaError(RuntimeError):
-    """A deterministic failure scoped to one clip."""
+class ItemMediaError(RuntimeError):
+    """A deterministic failure scoped to one media item."""
 
 
 def result_schema(spec: CaptionModelSpec) -> pa.Schema:
@@ -317,16 +317,17 @@ def fetch_media_batch(
     )
     for row in batch.cast(input_bindings.mapped_schema).to_pylist():
         try:
-            payload = _read_clip_with_retries(
+            expected_sha256 = (
+                None if input_bindings.media_sha256_column is None else str(row[input_bindings.media_sha256_column])
+            )
+            payload = read_and_validate_media(
                 str(row[input_bindings.media_uri_column]),
                 storage_profile=storage_profile,
                 attempts=attempts,
+                expected_size=int(row[input_bindings.media_size_column]),
+                expected_sha256=expected_sha256,
             )
-            expected_size = int(row[input_bindings.media_size_column])
-            _validate_clip_size(payload, expected_size=expected_size)
-            if input_bindings.media_sha256_column is not None:
-                _validate_media_sha256(payload, expected_sha256=str(row[input_bindings.media_sha256_column]))
-        except _ItemMediaError as exc:
+        except ItemMediaError as exc:
             rows.append(
                 row
                 | {
@@ -352,6 +353,7 @@ def caption_llm_preprocess(
     row: dict[str, Any],
     *,
     assistant_prefill: str | None = None,
+    prompt_template: str = DEFAULT_PROMPT,
     request_mm_processor_kwargs: Mapping[str, Any],
     sampling_params: Mapping[str, float | int],
 ) -> dict[str, Any]:
@@ -360,6 +362,7 @@ def caption_llm_preprocess(
     # stages. Move the large data URL into the message instead of retaining a
     # second reference after multimodal preparation has replaced the message.
     video_data_url = row.pop("video_data_url", None)
+    rendered_prompt = row.pop("rendered_prompt", None)
     if row.get("download_error_type") is not None:
         return {
             "__inference_error__": f"{row['download_error_type']}: {row['download_error_message']}",
@@ -367,12 +370,16 @@ def caption_llm_preprocess(
     if not isinstance(video_data_url, str):
         msg = "Successful media fetch must provide a video_data_url string"
         raise TypeError(msg)
+    prompt = prompt_template if rendered_prompt is None else rendered_prompt
+    if not isinstance(prompt, str):
+        msg = "Rendered caption prompt must be a string or null"
+        raise TypeError(msg)
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
             "content": [
                 {"type": "video_url", "video_url": {"url": video_data_url}},
-                {"type": "text", "text": DEFAULT_PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -393,12 +400,14 @@ def caption_llm_postprocess(
     row: dict[str, Any],
     *,
     staged_binding_columns: tuple[str, ...],
+    carried_result_columns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Keep only small inference values and physical identity after success."""
     return {
         "fragment_id": row["fragment_id"],
         "row_offset": row["row_offset"],
         **{name: row[name] for name in staged_binding_columns},
+        **{name: row[name] for name in carried_result_columns},
         "caption_text": row["generated_text"],
         "prompt_token_count": row.get("num_input_tokens"),
         "generated_token_count": row.get("num_generated_tokens"),
@@ -578,6 +587,17 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             resources=_MEDIA_FETCH_RESOURCES,
             compute=media_compute,
         )
+        context_enriched = fetched
+        if bindings.context_stage is not None:
+            context_enriched = fetched.map_batches(
+                bindings.context_stage,  # type: ignore[arg-type]
+                batch_format="pyarrow",
+                batch_size=config.media_batch_size,
+                fn_kwargs={"storage_profile": config.storage_profile, "attempts": config.media_attempts},
+                num_cpus=config.media_cpus,
+                resources=_MEDIA_FETCH_RESOURCES,
+                compute=media_compute,
+            )
         inference_worker_ceiling = _resolve_inference_worker_ceiling(config, caption_source.num_rows)
         gpus_per_replica = config.tensor_parallel_size * config.pipeline_parallel_size
         available_gpus = float(ray.available_resources().get("GPU", 0.0))  # type: ignore[no-untyped-call]
@@ -601,10 +621,12 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             model_dir,
             bindings.input.staged_binding_columns,
             inference_bindings=bindings.inference,
+            prompt_template=bindings.prompt_template,
+            carried_result_columns=bindings.result.carried_result_columns,
             initial_inference_workers=initial_inference_workers,
             inference_worker_ceiling=inference_worker_ceiling,
         )
-        inferred = processor(fetched)
+        inferred = processor(context_enriched)
         terminal = inferred.map_batches(
             canonicalize_llm_batch,
             batch_format="pyarrow",
@@ -695,6 +717,8 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
     staged_binding_columns: tuple[str, ...],
     *,
     inference_bindings: CaptionInferenceBindings | None = None,
+    prompt_template: str = DEFAULT_PROMPT,
+    carried_result_columns: tuple[str, ...] = (),
     initial_inference_workers: int,
     inference_worker_ceiling: int,
 ) -> Any:  # noqa: ANN401
@@ -760,27 +784,54 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
     preprocess = partial(
         caption_llm_preprocess,
         assistant_prefill=bindings.assistant_prefill,
+        prompt_template=prompt_template,
         request_mm_processor_kwargs=bindings.request_mm_processor_kwargs,
         sampling_params=sampling_params,
     )
     processor = build_processor(
         processor_config,
         preprocess=preprocess,
-        postprocess=partial(caption_llm_postprocess, staged_binding_columns=staged_binding_columns),
+        postprocess=partial(
+            caption_llm_postprocess,
+            staged_binding_columns=staged_binding_columns,
+            carried_result_columns=carried_result_columns,
+        ),
     )
     return _ExactVLLMBatchProcessor(processor, batch_size=config.inference_batch_size)
 
 
-def _read_clip_with_retries(uri: str, *, storage_profile: str, attempts: int) -> bytes:
+def read_and_validate_media(  # noqa: PLR0913 -- explicit media contract inputs keep callers honest
+    uri: str,
+    *,
+    storage_profile: str,
+    attempts: int,
+    expected_size: int,
+    expected_sha256: str | None = None,
+    media_label: str = "MP4",
+) -> bytes:
+    """Read media with shared retry semantics and validate its descriptor."""
+    payload = _read_clip_with_retries(
+        uri,
+        storage_profile=storage_profile,
+        attempts=attempts,
+        media_label=media_label,
+    )
+    _validate_clip_size(payload, expected_size=expected_size, media_label=media_label)
+    if expected_sha256 is not None:
+        _validate_media_sha256(payload, expected_sha256=expected_sha256, media_label=media_label)
+    return payload
+
+
+def _read_clip_with_retries(uri: str, *, storage_profile: str, attempts: int, media_label: str = "Clip") -> bytes:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return _read_clip(uri, storage_profile=storage_profile)
+            return _read_clip(uri, storage_profile=storage_profile, media_label=media_label)
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in _ITEM_S3_ERROR_CODES:
-                msg = f"Clip object is unavailable ({code})"
-                raise _ItemMediaError(msg) from exc
+                msg = f"{media_label} object is unavailable ({code})"
+                raise ItemMediaError(msg) from exc
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             if code not in _RETRYABLE_S3_ERROR_CODES and status not in _RETRYABLE_S3_HTTP_STATUSES:
                 msg = f"Shared S3 request failed ({code or type(exc).__name__})"
@@ -796,7 +847,7 @@ def _read_clip_with_retries(uri: str, *, storage_profile: str, attempts: int) ->
     raise SharedMediaError(msg) from last_error
 
 
-def _read_clip(uri: str, *, storage_profile: str) -> bytes:
+def _read_clip(uri: str, *, storage_profile: str, media_label: str = "Clip") -> bytes:
     if uri.lower().startswith("s3://"):
         return download_bytes(uri, storage_profile=storage_profile)
     parsed = urlsplit(uri)
@@ -805,26 +856,26 @@ def _read_clip(uri: str, *, storage_profile: str) -> bytes:
     elif not parsed.scheme:
         path = Path(uri)
     else:
-        msg = f"Unsupported clip URI scheme: {parsed.scheme or '<none>'}"
-        raise _ItemMediaError(msg)
+        msg = f"Unsupported {media_label} URI scheme: {parsed.scheme or '<none>'}"
+        raise ItemMediaError(msg)
     try:
         return path.read_bytes()
     except (FileNotFoundError, IsADirectoryError) as exc:
-        msg = "Clip object is unavailable"
-        raise _ItemMediaError(msg) from exc
+        msg = f"{media_label} object is unavailable"
+        raise ItemMediaError(msg) from exc
 
 
-def _validate_clip_size(payload: bytes, *, expected_size: int) -> None:
+def _validate_clip_size(payload: bytes, *, expected_size: int, media_label: str = "MP4") -> None:
     if len(payload) != expected_size:
-        msg = f"Expected {expected_size} MP4 bytes but downloaded {len(payload)}"
-        raise _ItemMediaError(msg)
+        msg = f"Expected {expected_size} {media_label} bytes but downloaded {len(payload)}"
+        raise ItemMediaError(msg)
 
 
-def _validate_media_sha256(payload: bytes, *, expected_sha256: str) -> None:
+def _validate_media_sha256(payload: bytes, *, expected_sha256: str, media_label: str = "MP4") -> None:
     actual = sha256(payload).hexdigest()
     if actual != expected_sha256:
-        msg = f"Expected MP4 SHA-256 {expected_sha256} but downloaded {actual}"
-        raise _ItemMediaError(msg)
+        msg = f"Expected {media_label} SHA-256 {expected_sha256} but downloaded {actual}"
+        raise ItemMediaError(msg)
 
 
 def _optional_int(value: object) -> int | None:

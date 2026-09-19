@@ -5,7 +5,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import lance
 import pyarrow as pa
@@ -17,6 +17,20 @@ TerminalRowBuilder = Callable[..., dict[str, Any]]
 TerminalRowValidator = Callable[[dict[str, Any]], None]
 TerminalValueValidator = Callable[[str | None, dict[str, Any] | None], None]
 CompleteFragmentValidator = Callable[[LanceFragment], None]
+
+
+class ContextStage(Protocol):
+    """Post-fetch context enrichment used by the shared caption engine."""
+
+    def __call__(
+        self,
+        batch: pa.Table,
+        *,
+        storage_profile: str,
+        attempts: int,
+    ) -> pa.Table:
+        """Append transient prompt context and declared small result values."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -46,6 +60,7 @@ class CaptionResultBindings:
     build_terminal_row: TerminalRowBuilder
     validate_terminal_value: TerminalValueValidator
     validate_staged_row: TerminalRowValidator
+    carried_result_columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,4 +100,6 @@ class CaptionRunBindings:
     input: CaptionInputBindings
     result: CaptionResultBindings
     publication: CaptionPublicationBindings
+    prompt_template: str
     inference: CaptionInferenceBindings = field(default_factory=CaptionInferenceBindings)
+    context_stage: ContextStage | None = None

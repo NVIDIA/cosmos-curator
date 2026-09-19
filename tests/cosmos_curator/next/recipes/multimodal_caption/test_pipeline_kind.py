@@ -19,13 +19,18 @@ input:
 context:
   variant: video_only
   camera_key: front_wide
+inference:
+  prompt:
+    mode: default
+output:
+  result_key: default
 """,
         encoding="utf-8",
     )
 
     assert MULTIMODAL_CAPTION_KIND.validate(config, ()) == {"ok": True}
     assert '"kind": "multimodal-caption"' in MULTIMODAL_CAPTION_KIND.render(config, ())
-    assert MULTIMODAL_CAPTION_KIND.template_payload()["required_fields"][-1] == {
+    assert {
         "path": "context.camera_key",
         "example": "front_wide",
-    }
+    } in MULTIMODAL_CAPTION_KIND.template_payload()["required_fields"]

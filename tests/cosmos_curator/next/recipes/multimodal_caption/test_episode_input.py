@@ -13,24 +13,37 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_caption import episode_input
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
+    EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    EGO_REQUIRED_TIMESTAMP_SOURCE,
     build_terminal_result_row,
     caption_contract_digest,
+    resolve_context_definition,
+    resolve_ego_identity,
     resolve_model,
+    resolve_prompt_template,
     result_field_names,
     result_fields,
 )
 from cosmos_curator.next.recipes.multimodal_caption.episode_input import (
+    EGO_EPISODE_MAPPED_INPUT_SCHEMA,
+    EGO_EPISODE_SOURCE_COLUMNS,
+    EGO_EPISODE_SOURCE_SCHEMA,
+    EGO_EPISODE_STAGED_BINDING_COLUMNS,
     EPISODE_MAPPED_INPUT_SCHEMA,
     EPISODE_SOURCE_COLUMNS,
     EPISODE_SOURCE_SCHEMA,
     EPISODE_STAGED_BINDING_COLUMNS,
     project_episode_camera,
+    project_episode_camera_and_ego,
     validate_complete_fragment,
+    validate_ego_episode_input,
     validate_episode_input,
 )
-from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION
+from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION, make_episode_id
 from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionInputBindings
 from cosmos_curator.next.recipes.video_caption.inference import fetch_media_batch
@@ -45,6 +58,25 @@ def test_episode_input_accepts_canonical_unique_rows_and_resolves_exact_camera(
     assert validate_episode_input(dataset, uri=uri, camera_key="front_wide") is None
     with pytest.raises(ValueError, match="0 camera descriptors"):
         validate_episode_input(dataset, uri=uri, camera_key="missing")
+
+
+def test_video_only_accepts_container_pts_episode(
+    episode_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    episode_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Context-free captioning retains current-main container-PTS support."""
+    uri, dataset = episode_dataset_factory(rows=[episode_factory(0, timestamp_source=TimestampSource.CONTAINER_PTS)])
+
+    assert validate_episode_input(dataset, uri=uri, camera_key="front_wide") is None
+
+
+def test_episode_identity_commits_to_both_context_bounds() -> None:
+    """Caption recovery relies on the producer identity committing to both context bounds."""
+    source_id = "source-id"
+    baseline = make_episode_id(source_id, Span(start_ns=10, end_ns=20))
+
+    assert make_episode_id(source_id, Span(start_ns=11, end_ns=20)) != baseline
+    assert make_episode_id(source_id, Span(start_ns=10, end_ns=21)) != baseline
 
 
 def test_episode_input_rejects_duplicate_ids_and_ambiguous_camera(
@@ -169,8 +201,10 @@ def test_complete_fragment_rejects_incompatible_episode_binding(
     """Complete episode fragments remain bound to their selected camera source."""
     episode = episode_factory(0)
     model = resolve_model("qwen3_8_27b_fp8")
-    digest = caption_contract_digest(model, "front_wide")
-    caption_name, metadata_name = result_field_names(model.key)
+    definition = resolve_context_definition("video_only")
+    prompt = resolve_prompt_template(definition, mode="default", custom_template=None)
+    digest = caption_contract_digest(model, "front_wide", definition, None, prompt, "default")
+    caption_name, metadata_name = result_field_names(definition.variant, "default", model.key)
     selected = next(camera for camera in episode["camera_media"] if camera["camera_key"] == "front_wide")  # type: ignore[union-attr]
     staged = build_terminal_result_row(
         {
@@ -184,6 +218,10 @@ def test_complete_fragment_rejects_incompatible_episode_binding(
             "media_sha256": selected["media_sha256"],
         },
         model=model,
+        definition=definition,
+        ego=None,
+        prompt_template=prompt,
+        result_key="default",
         digest=digest,
         caption="caption",
         status="success",
@@ -201,7 +239,9 @@ def test_complete_fragment_rejects_incompatible_episode_binding(
         callback_camera_key = "front_left"
     else:
         selected["media_sha256"] = "f" * 64
-    metadata_field = result_fields(model.key).field(metadata_name)
+    metadata_field = result_fields(definition.variant, "default", model.key, ego=None, digest=digest).field(
+        metadata_name
+    )
     table = pa.Table.from_pylist(
         [{**episode, metadata_name: staged[metadata_name]}],
         schema=pa.schema([*EPISODE_SOURCE_SCHEMA, metadata_field]),
@@ -219,3 +259,268 @@ def test_complete_fragment_rejects_incompatible_episode_binding(
             metadata_field_name=metadata_name,
         )
     assert staged[caption_name] == "caption"
+
+
+def test_combined_ego_input_validation_resolves_camera_and_ego_once(
+    episode_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Ego startup validates both descriptor families and returns representatives in pinned order."""
+    episode = episode_factory(
+        0,
+        sensor_media=[sensor_factory(location="s3://bucket/ego.mcap")],
+        exclusive_end_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    )
+    cameras = list(episode["camera_media"])  # type: ignore[arg-type]
+    for camera in cameras:
+        if camera["camera_key"] == "front_wide":
+            camera["media_location"] = "s3://bucket/front-wide.mp4"
+    episode["camera_media"] = cameras
+    uri, dataset = episode_dataset_factory(rows=[episode])
+
+    assert validate_ego_episode_input(
+        dataset,
+        uri=uri,
+        camera_key="front_wide",
+        sensor_key="ego",
+        max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    ) == ("s3://bucket/front-wide.mp4", "s3://bucket/ego.mcap")
+
+    with pytest.raises(ValueError, match="0 camera descriptors"):
+        validate_ego_episode_input(
+            dataset,
+            uri=uri,
+            camera_key="missing",
+            sensor_key="ego",
+            max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+        )
+
+
+def test_ego_preflight_rejects_container_pts(
+    episode_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Every Ego row must use sensor timestamps before field registration."""
+    row = episode_factory(
+        0,
+        sensor_media=[sensor_factory()],
+        timestamp_source=TimestampSource.CONTAINER_PTS,
+    )
+    uri, dataset = episode_dataset_factory(rows=[row])
+    with pytest.raises(ValueError, match="Ego caption contexts require 'sensor'"):
+        validate_ego_episode_input(
+            dataset,
+            uri=uri,
+            camera_key="front_wide",
+            sensor_key="ego",
+            max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+        )
+
+
+def test_ego_projector_repeats_sensor_source_enforcement(
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Pinned-snapshot projection cannot stage a non-sensor Ego binding."""
+    row = episode_factory(
+        0,
+        sensor_media=[sensor_factory()],
+        timestamp_source=TimestampSource.CONTAINER_PTS,
+    )
+    source = pa.Table.from_pylist([row], schema=EGO_EPISODE_SOURCE_SCHEMA).append_column(
+        "_rowaddr", pa.array([0], type=pa.uint64())
+    )
+    with pytest.raises(ValueError, match="Ego caption contexts require 'sensor'"):
+        project_episode_camera_and_ego(
+            source,
+            camera_key="front_wide",
+            ego_sensor_key="ego",
+            max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+        )
+
+
+def test_ego_projector_has_exact_source_mapped_and_staged_boundaries(
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Ego projection carries bounds transiently and stages only source identity."""
+    episode = episode_factory(
+        0,
+        sensor_media=[sensor_factory()],
+        exclusive_end_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    )
+    source = pa.Table.from_pylist([episode], schema=EGO_EPISODE_SOURCE_SCHEMA).append_column(
+        "_rowaddr", pa.array([(7 << 32) | 3], type=pa.uint64())
+    )
+    projected = project_episode_camera_and_ego(
+        source,
+        camera_key="front_wide",
+        ego_sensor_key="ego",
+        max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    )
+
+    assert EGO_EPISODE_SOURCE_COLUMNS == (
+        "episode_id",
+        "materialization_digest",
+        "camera_media",
+        "timestamp_source",
+        "start_ns",
+        "exclusive_end_ns",
+        "sensor_media",
+    )
+    assert projected.schema == EGO_EPISODE_MAPPED_INPUT_SCHEMA
+    assert (
+        *EPISODE_STAGED_BINDING_COLUMNS,
+        "timestamp_source",
+        "ego_sensor_key",
+        "ego_sensor_type",
+        "ego_media_location",
+        "ego_media_size_bytes",
+        "ego_media_sha256",
+    ) == EGO_EPISODE_STAGED_BINDING_COLUMNS
+    assert "start_ns" not in EGO_EPISODE_STAGED_BINDING_COLUMNS
+    assert "exclusive_end_ns" not in EGO_EPISODE_STAGED_BINDING_COLUMNS
+    assert projected.to_pylist()[0]["ego_sensor_type"] == "egotrajectory"
+    assert projected.to_pylist()[0]["timestamp_source"] == EGO_REQUIRED_TIMESTAMP_SOURCE
+
+
+def test_ego_projector_accepts_ten_seconds_and_rejects_invalid_spans(
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """The fixed v1 duration predicate accepts equality and rejects invalid spans."""
+    accepted = episode_factory(
+        0,
+        sensor_media=[sensor_factory()],
+        exclusive_end_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    )
+    project_episode_camera_and_ego(
+        pa.Table.from_pylist([accepted], schema=EGO_EPISODE_SOURCE_SCHEMA).append_column(
+            "_rowaddr", pa.array([0], type=pa.uint64())
+        ),
+        camera_key="front_wide",
+        ego_sensor_key="ego",
+        max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+    )
+
+    rejected = dict(accepted)
+    rejected["exclusive_end_ns"] = EGO_CONTEXT_MAX_EPISODE_DURATION_NS + 1
+    with pytest.raises(ValueError, match=r"use multimodal-split clip\.duration_s <= 10\.0"):
+        project_episode_camera_and_ego(
+            pa.Table.from_pylist([rejected], schema=EGO_EPISODE_SOURCE_SCHEMA).append_column(
+                "_rowaddr", pa.array([0], type=pa.uint64())
+            ),
+            camera_key="front_wide",
+            ego_sensor_key="ego",
+            max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+        )
+
+    for invalid_end in (0, -1):
+        invalid = dict(accepted)
+        invalid["exclusive_end_ns"] = invalid_end
+        with pytest.raises(ValueError, match="must have a positive duration"):
+            project_episode_camera_and_ego(
+                pa.Table.from_pylist([invalid], schema=EGO_EPISODE_SOURCE_SCHEMA).append_column(
+                    "_rowaddr", pa.array([0], type=pa.uint64())
+                ),
+                camera_key="front_wide",
+                ego_sensor_key="ego",
+                max_episode_duration_ns=EGO_CONTEXT_MAX_EPISODE_DURATION_NS,
+            )
+
+
+def test_ego_terminal_binding_revalidates_sensor_identity(
+    episode_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+) -> None:
+    """Complete-fragment validation re-derives Ego identity without reading MCAP."""
+    definition = resolve_context_definition("ego_trajectory_absolute_poses")
+    ego = resolve_ego_identity(
+        definition,
+        sensor_key="ego",
+        topic="/ego",
+        frame="world",
+    )
+    assert ego is not None
+    prompt = resolve_prompt_template(definition, mode="default", custom_template=None)
+    episode = episode_factory(0, sensor_media=[sensor_factory()])
+    camera = next(item for item in episode["camera_media"] if item["camera_key"] == "front_wide")  # type: ignore[union-attr]
+    sensor = episode["sensor_media"][0]  # type: ignore[index]
+    model = resolve_model("qwen3_8_27b_fp8")
+    digest = caption_contract_digest(model, "front_wide", definition, ego, prompt, "default")
+    _, metadata_name = result_field_names(definition.variant, "default", model.key)
+    staged = build_terminal_result_row(
+        {
+            "fragment_id": 0,
+            "row_offset": 0,
+            "episode_id": episode["episode_id"],
+            "materialization_digest": episode["materialization_digest"],
+            "timestamp_source": episode["timestamp_source"],
+            "camera_key": camera["camera_key"],
+            "media_location": camera["media_location"],
+            "media_size_bytes": camera["media_size_bytes"],
+            "media_sha256": camera["media_sha256"],
+            "ego_sensor_key": sensor["sensor_key"],
+            "ego_sensor_type": sensor["sensor_type"],
+            "ego_media_location": sensor["media_location"],
+            "ego_media_size_bytes": sensor["media_size_bytes"],
+            "ego_media_sha256": sensor["media_sha256"],
+            "context_digest": "c" * 64,
+        },
+        model=model,
+        definition=definition,
+        ego=ego,
+        prompt_template=prompt,
+        result_key="default",
+        digest=digest,
+        caption="caption",
+        status="success",
+        prompt_token_count=4,
+        generated_token_count=8,
+        error_type=None,
+        error_message=None,
+    )
+    metadata_field = result_fields(definition.variant, "default", model.key, ego=ego, digest=digest).field(
+        metadata_name
+    )
+    table = pa.Table.from_pylist(
+        [{**episode, metadata_name: staged[metadata_name]}],
+        schema=pa.schema([*EGO_EPISODE_SOURCE_SCHEMA, metadata_field]),
+    )
+    fragment = SimpleNamespace(scanner=lambda **_kwargs: SimpleNamespace(to_batches=table.to_batches))
+    validate_complete_fragment(  # type: ignore[arg-type]
+        fragment,
+        camera_key="front_wide",
+        metadata_field_name=metadata_name,
+        ego_sensor_key="ego",
+    )
+
+    episode["sensor_media"][0]["media_sha256"] = "f" * 64  # type: ignore[index]
+    changed = pa.Table.from_pylist(
+        [{**episode, metadata_name: staged[metadata_name]}],
+        schema=pa.schema([*EGO_EPISODE_SOURCE_SCHEMA, metadata_field]),
+    )
+    fragment = SimpleNamespace(scanner=lambda **_kwargs: SimpleNamespace(to_batches=changed.to_batches))
+    with pytest.raises(ValueError, match="ego_media_sha256 does not match"):
+        validate_complete_fragment(  # type: ignore[arg-type]
+            fragment,
+            camera_key="front_wide",
+            metadata_field_name=metadata_name,
+            ego_sensor_key="ego",
+        )
+
+    episode["timestamp_source"] = "container_pts"
+    non_sensor = pa.Table.from_pylist(
+        [{**episode, metadata_name: staged[metadata_name]}],
+        schema=pa.schema([*EGO_EPISODE_SOURCE_SCHEMA, metadata_field]),
+    )
+    fragment = SimpleNamespace(scanner=lambda **_kwargs: SimpleNamespace(to_batches=non_sensor.to_batches))
+    with pytest.raises(ValueError, match="Ego caption contexts require 'sensor'"):
+        validate_complete_fragment(  # type: ignore[arg-type]
+            fragment,
+            camera_key="front_wide",
+            metadata_field_name=metadata_name,
+            ego_sensor_key="ego",
+        )

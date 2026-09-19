@@ -18,7 +18,9 @@ from cosmos_curator.next.recipes.multimodal_caption import pipeline
 from cosmos_curator.next.recipes.multimodal_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     caption_contract_digest,
+    resolve_context_definition,
     resolve_model,
+    resolve_prompt_template,
     result_field_names,
 )
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
@@ -102,6 +104,8 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
         "kind": "multimodal-caption",
         "input": {"episodes_lance_uri": episodes_uri},
         "context": {"variant": "video_only", "camera_key": "front_wide"},
+        "inference": {"prompt": {"mode": "default"}},
+        "output": {"result_key": "default"},
         "execution": {"media_batch_size": 1, "inference_batch_size": 2, "parquet_rows_per_file": 2},
     }
     config = resolve_config_data(config_data)
@@ -155,9 +159,12 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
     summary = pipeline.run_config(config)
 
     model = resolve_model("qwen3_8_27b_fp8")
-    caption_field, metadata_field = result_field_names(model.key)
+    definition = resolve_context_definition("video_only")
+    prompt = resolve_prompt_template(definition, mode="default", custom_template=None)
+    caption_field, metadata_field = result_field_names(definition.variant, "default", model.key)
     published = lance.dataset(episodes_uri).to_table(columns=["episode_id", caption_field, metadata_field]).to_pylist()
     assert summary["published_fragments"] == 1
+    assert summary["terminal_counts"] == {"success": 2, "truncated": 0, "error": 0}
     assert len(published) == 2
     assert [row[caption_field] for row in published] == ["caption for episode-0", "caption for episode-1"]
     assert [row[metadata_field]["camera_key"] for row in published] == ["front_wide", "front_wide"]
@@ -165,7 +172,7 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
     assert [row[metadata_field]["materialization_digest"] for row in published] == [
         row["materialization_digest"] for row in rows
     ]
-    expected_contract_digest = caption_contract_digest(model, "front_wide")
+    expected_contract_digest = caption_contract_digest(model, "front_wide", definition, None, prompt, "default")
     assert [row[metadata_field]["contract_digest"] for row in published] == [expected_contract_digest] * len(rows)
     assert not Path(interrupted_workspace.root_uri).exists()
 

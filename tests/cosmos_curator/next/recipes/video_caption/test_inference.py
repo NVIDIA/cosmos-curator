@@ -245,7 +245,7 @@ def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(
     [
         ("/does/not/exist.mp4", 10, "unavailable"),
         ("existing", 99, "Expected 99 MP4 bytes"),
-        ("https://example.com/clip.mp4", 10, "Unsupported clip URI scheme"),
+        ("https://example.com/clip.mp4", 10, "Unsupported MP4 URI scheme"),
     ],
 )
 def test_item_media_failures_become_rows(
@@ -288,8 +288,8 @@ def test_shared_media_failure_stops_the_batch(
     )
     attempts = 0
 
-    def unavailable(uri: str, *, storage_profile: str) -> bytes:
-        del uri, storage_profile
+    def unavailable(uri: str, *, storage_profile: str, media_label: str) -> bytes:
+        del uri, storage_profile, media_label
         nonlocal attempts
         attempts += 1
         msg = "shared mount unavailable"
@@ -320,8 +320,8 @@ def test_transient_s3_client_errors_use_the_retry_budget(
     """Transient service responses retry and can recover within the configured budget."""
     calls = 0
 
-    def flaky_read(uri: str, *, storage_profile: str) -> bytes:
-        del uri, storage_profile
+    def flaky_read(uri: str, *, storage_profile: str, media_label: str) -> bytes:
+        del uri, storage_profile, media_label
         nonlocal calls
         calls += 1
         if calls < 3:
@@ -341,8 +341,8 @@ def test_permanent_s3_client_error_fails_without_retry(monkeypatch: pytest.Monke
     """Authentication and other permanent shared failures stop the phase immediately."""
     calls = 0
 
-    def denied(uri: str, *, storage_profile: str) -> bytes:
-        del uri, storage_profile
+    def denied(uri: str, *, storage_profile: str, media_label: str) -> bytes:
+        del uri, storage_profile, media_label
         nonlocal calls
         calls += 1
         code = "AccessDenied"
@@ -397,6 +397,23 @@ def test_download_error_bypasses_llm() -> None:
     )
 
     assert output == {"__inference_error__": "ItemMediaError: missing"}
+
+
+def test_preprocess_prefers_exact_rendered_prompt_without_formatting() -> None:
+    """A context stage can supply one exact prompt while unrelated braces remain literal."""
+    rendered = "context {unrelated} bytes"
+    output = caption_llm_preprocess(
+        {
+            "video_data_url": "data:video/mp4;base64,AAAA",
+            "rendered_prompt": rendered,
+            "download_error_type": None,
+        },
+        prompt_template="fallback must not be used",
+        request_mm_processor_kwargs={},
+        sampling_params={"max_tokens": 1},
+    )
+
+    assert output["messages"][0]["content"][1] == {"type": "text", "text": rendered}
 
 
 def test_download_error_preserves_identity_through_terminal_adapter(
@@ -478,6 +495,7 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     assert preprocess.func is caption_llm_preprocess
     assert preprocess.keywords == {
         "assistant_prefill": None,
+        "prompt_template": DEFAULT_PROMPT,
         "request_mm_processor_kwargs": {"do_sample_frames": False},
         "sampling_params": {
             "temperature": 0.7,
@@ -571,6 +589,7 @@ def test_llm_processor_applies_model_runtime_bindings(
     assert preprocess.func is caption_llm_preprocess
     assert preprocess.keywords == {
         "assistant_prefill": "<think></think>",
+        "prompt_template": DEFAULT_PROMPT,
         "request_mm_processor_kwargs": {},
         "sampling_params": {
             "temperature": 0.7,
@@ -859,6 +878,33 @@ def test_postprocess_keeps_only_small_identity_and_token_values() -> None:
         "caption_text": "caption",
         "prompt_token_count": 4,
         "generated_token_count": 5,
+    }
+
+
+def test_postprocess_carries_only_declared_small_context_values() -> None:
+    """Context digest crosses the shared engine boundary without transient prompt or media bytes."""
+    output = caption_llm_postprocess(
+        {
+            "fragment_id": 2,
+            "row_offset": 3,
+            "episode_id": "episode",
+            "context_digest": "c" * 64,
+            "rendered_prompt": "large prompt",
+            "video_data_url": "large video",
+            "generated_text": "caption",
+        },
+        staged_binding_columns=("episode_id",),
+        carried_result_columns=("context_digest",),
+    )
+
+    assert output == {
+        "fragment_id": 2,
+        "row_offset": 3,
+        "episode_id": "episode",
+        "context_digest": "c" * 64,
+        "caption_text": "caption",
+        "prompt_token_count": None,
+        "generated_token_count": None,
     }
 
 

@@ -7,7 +7,7 @@ import copy
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
 import yaml
@@ -21,8 +21,11 @@ _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 SchemaVersion = Literal[1]
 MultimodalCaptionKind = Literal["multimodal-caption"]
-ContextVariant = Literal["video_only"]
+ContextVariant = Literal["video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses"]
 ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"]
+PromptMode = Literal["default", "custom"]
+
+_RESULT_KEY_PATTERN = r"^[a-z][a-z0-9_]{0,47}$"
 
 
 def _normalize_location(location: str, *, label: str) -> str:
@@ -63,12 +66,29 @@ class MultimodalCaptionInputConfig(BaseModel):
         return _normalize_location(location, label="input.episodes_lance_uri")
 
 
-class MultimodalCaptionContextConfig(BaseModel):
-    """The explicit visual treatment selected for each episode."""
+class EgoContextConfig(BaseModel):
+    """Runtime source selection for the fixed EgoTrajectory context contract."""
 
     model_config = _MODEL_CONFIG
 
-    variant: ContextVariant
+    sensor_key: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    frame: str = Field(min_length=1)
+
+    @field_validator("sensor_key", "topic", "frame")
+    @classmethod
+    def _forbid_surrounding_whitespace(cls, value: str) -> str:
+        if value != value.strip():
+            msg = "Ego context values cannot have surrounding whitespace"
+            raise ValueError(msg)
+        return value
+
+
+class _CaptionContextBase(BaseModel):
+    """Fields shared by every explicit context selection."""
+
+    model_config = _MODEL_CONFIG
+
     camera_key: str = Field(min_length=1)
 
     @field_validator("camera_key")
@@ -80,6 +100,61 @@ class MultimodalCaptionContextConfig(BaseModel):
         return value
 
 
+class VideoOnlyContextConfig(_CaptionContextBase):
+    """Context-free captioning over one selected camera."""
+
+    variant: Literal["video_only"]
+
+
+class EgoCaptionContextConfig(_CaptionContextBase):
+    """Captioning over one camera plus the configured EgoTrajectory source."""
+
+    variant: Literal["ego_trajectory_summary", "ego_trajectory_absolute_poses"]
+    ego: EgoContextConfig
+
+
+MultimodalCaptionContextConfig = Annotated[
+    VideoOnlyContextConfig | EgoCaptionContextConfig,
+    Field(discriminator="variant"),
+]
+
+
+class DefaultPromptConfig(BaseModel):
+    """Select the chosen context definition's code-owned default prompt."""
+
+    model_config = _MODEL_CONFIG
+
+    mode: Literal["default"]
+
+
+class CustomPromptConfig(BaseModel):
+    """Select one exact caller-supplied prompt template."""
+
+    model_config = _MODEL_CONFIG
+
+    mode: Literal["custom"]
+    template: str
+
+    @field_validator("template")
+    @classmethod
+    def _require_non_whitespace_template(cls, value: str) -> str:
+        if not value.strip():
+            msg = "inference.prompt.template must contain at least one non-whitespace character"
+            raise ValueError(msg)
+        return value
+
+
+PromptConfig = Annotated[DefaultPromptConfig | CustomPromptConfig, Field(discriminator="mode")]
+
+
+class MultimodalCaptionInferenceConfig(BaseModel):
+    """Required prompt-selection provenance."""
+
+    model_config = _MODEL_CONFIG
+
+    prompt: PromptConfig
+
+
 class MultimodalCaptionModelConfig(BaseModel):
     """Pinned caption model choice."""
 
@@ -89,10 +164,11 @@ class MultimodalCaptionModelConfig(BaseModel):
 
 
 class MultimodalCaptionOutputConfig(BaseModel):
-    """Durable recovery workspace location."""
+    """Human-readable result identity and durable recovery workspace."""
 
     model_config = _MODEL_CONFIG
 
+    result_key: str = Field(default="default", pattern=_RESULT_KEY_PATTERN)
     staging_root_uri: str = ""
 
     @field_validator("staging_root_uri")
@@ -140,6 +216,7 @@ class ResolvedMultimodalCaptionConfig(BaseModel):
     input: MultimodalCaptionInputConfig
     context: MultimodalCaptionContextConfig
     model: MultimodalCaptionModelConfig = Field(default_factory=MultimodalCaptionModelConfig)
+    inference: MultimodalCaptionInferenceConfig
     output: MultimodalCaptionOutputConfig = Field(default_factory=MultimodalCaptionOutputConfig)
     execution: MultimodalCaptionExecutionConfig = Field(default_factory=MultimodalCaptionExecutionConfig)
 
@@ -164,6 +241,13 @@ class ResolvedMultimodalCaptionConfig(BaseModel):
         resolved["output"] = output
         return resolved
 
+    @model_validator(mode="after")
+    def _validate_prompt_result_namespace(self) -> "ResolvedMultimodalCaptionConfig":
+        if self.inference.prompt.mode == "custom" and self.output.result_key == "default":
+            msg = "custom prompt mode requires output.result_key other than 'default'"
+            raise ValueError(msg)
+        return self
+
 
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
@@ -171,14 +255,20 @@ _TEMPLATE_BASE: dict[str, Any] = {
     "input": {"episodes_lance_uri": "s3://example-bucket/curated/multimodal-split/episodes.lance"},
     "context": {"variant": "video_only", "camera_key": "front_wide"},
     "model": {"variant": "qwen3_8_27b_fp8"},
-    "output": {},
+    "inference": {"prompt": {"mode": "default"}},
+    "output": {"result_key": "default"},
     "execution": {"storage_profile": "default"},
 }
 _TEMPLATE = ResolvedMultimodalCaptionConfig.model_validate(_TEMPLATE_BASE).model_dump(mode="json", exclude_none=True)
 _TEMPLATE_PREAMBLE = """\
-# All supported settings and defaults are shown. Unchanged settings may be removed.
+# A runnable default configuration and its defaults are shown. Unchanged settings may be removed.
+# See the generated schema and multimodal AV captioning guide for alternative context and prompt shapes.
 # staging_root_uri defaults beside episodes.lance under staging/multimodal-caption.
 # camera_key is required; front_wide is only an example value, not a default camera policy.
+# Every run explicitly selects prompt mode. result_key defaults to default; custom mode requires another key.
+# Custom prompt strings are preserved exactly; YAML folding, indentation, and chomping therefore affect identity.
+# video_only custom prompts require zero literal {ego_trajectory_context} sentinels.
+# Custom Ego prompts require exactly one literal {ego_trajectory_context} sentinel.
 # Model weights must already exist under /config/models on every inference worker.
 """
 
@@ -239,7 +329,10 @@ def config_template_payload() -> dict[str, Any]:
     """Return structured template metadata."""
     return {
         "kind": "multimodal-caption",
-        "description": "Caption one explicitly selected complete camera MP4 per canonical episode.",
+        "description": (
+            "Caption one explicitly selected complete camera MP4 per canonical episode, optionally augmented with "
+            "Ego-trajectory context."
+        ),
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-caption"},
@@ -249,6 +342,7 @@ def config_template_payload() -> dict[str, Any]:
             },
             {"path": "context.variant", "example": "video_only"},
             {"path": "context.camera_key", "example": "front_wide"},
+            {"path": "inference.prompt.mode", "example": "default"},
         ],
         "config": config_template(),
     }

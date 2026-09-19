@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+fields:
+  sensor_timestamp_ns:
+    from: timestamp
+    type: protobuf_timestamp
+
+  align_timestamp_ns:
+    from: $mcap.logtime
+    type: timestamp
+    unit: ns
+
+  position_m:
+    group: [pose.position.x, pose.position.y, pose.position.z]
+    type: float
+
+  orientation_xyzw:
+    group: [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+    type: float
+
+  pose_valid:
+    default: true
