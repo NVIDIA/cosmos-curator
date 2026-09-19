@@ -468,6 +468,7 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         memory_gb: float | None = None,
         planner_num_cpus: float = 0.125,
         read_buffer_bytes: int | None = None,
+        whole_session: bool = False,
     ) -> ResolvedMultimodalSplitConfig:
         camera_map = cameras or {camera_key: uri_pattern}
         return ResolvedMultimodalSplitConfig.model_validate(
@@ -517,7 +518,7 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                     },
                 },
                 "output": {"path": str(media_root)},
-                "clip": {"duration_s": duration_s, "sampling_fps": output_fps},
+                "clip": {"duration_s": duration_s, "sampling_fps": output_fps, "whole_session": whole_session},
                 "video": {
                     "max_delta_s": max_delta_s,
                     "encoder": {"video_bitrate": video_bitrate, "gop_size": gop_size},

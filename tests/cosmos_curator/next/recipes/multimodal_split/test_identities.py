@@ -158,7 +158,7 @@ def test_episode_and_materialization_digest_fixtures(
     assert split_clip_id == "e2d8eef2b261db0f41f75affa52c7d7bb77b812057705a8209d63c306ceda282"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "3f1bf1202fd727885e30b719e74fe5912f7053a74f1101eee98b6890c550a4c9"
+    assert split_digest == "9b19fe0edb21bfcdc561d5ec2b160b523475aee456c6d2e0314e3c0f0d7f323a"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "375453a30354b5c455e1e504655334013b9fb154313808b47b17e36a30e711fe"
+        == "38d340b327919269c2eac214785bcf955b144c0faa186638e9ee50f82ef2a600"
     )
 
 
@@ -199,6 +199,40 @@ def test_allow_pts_fallback_changes_the_split_contract(
     with_fallback = make_config(tmp_path / "input", tmp_path / "output", pts_fallback_cameras=frozenset({"front"}))
 
     assert make_split_contract_digest(with_fallback) != make_split_contract_digest(without_fallback)
+
+
+def test_whole_session_changes_the_split_contract(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Whole-session mode publishes an entirely different clip than tiling does.
+
+    A rerun that flips ``whole_session`` on a dataset already published under
+    tiling must not reconcile against those episodes: it produces a different
+    clip for the same source, not a corrected rendering of the same one.
+    """
+    tiled = make_config(tmp_path / "input", tmp_path / "output")
+    whole_session = make_config(tmp_path / "input", tmp_path / "output", whole_session=True)
+
+    assert make_split_contract_digest(whole_session) != make_split_contract_digest(tiled)
+
+
+def test_duration_s_is_inert_in_whole_session_mode(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A setting that no longer decides the output should not decide the contract either.
+
+    ``plan_common_spans`` ignores ``duration_s`` once ``whole_session`` is set, so
+    two such configs that differ only in that unused value produce the same
+    clip. Their split contract must agree, or an operator tidying up a stale
+    ``duration_s`` triggers a needless re-split of every already-published
+    whole-session episode.
+    """
+    short = make_config(tmp_path / "input", tmp_path / "output", whole_session=True, duration_s=1.0)
+    long = make_config(tmp_path / "input", tmp_path / "output", whole_session=True, duration_s=9.0)
+
+    assert make_split_contract_digest(short) == make_split_contract_digest(long)
 
 
 def _sensor(key: str, marker: str) -> dict[str, object]:

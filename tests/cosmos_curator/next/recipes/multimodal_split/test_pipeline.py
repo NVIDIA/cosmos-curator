@@ -35,6 +35,7 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
     ResolvedMultimodalSplitConfig,
 )
 from cosmos_curator.next.recipes.multimodal_split.pipeline import run_config
+from cosmos_curator.next.recipes.multimodal_split.plan import plan_common_spans
 from cosmos_curator.next.recipes.multimodal_split.reports import (
     failure,
     plan_error_uri,
@@ -95,6 +96,52 @@ def test_a_run_writes_one_clip_per_span_across_every_session(
     episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
     assert len(episodes) == 6
     selected = episodes[0]["camera_media"][0]
+    payload = Path(selected["media_location"]).read_bytes()
+    assert len(payload) == selected["media_size_bytes"]
+    assert hashlib.sha256(payload).hexdigest() == selected["media_sha256"]
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
+def test_whole_session_mode_publishes_one_episode_covering_the_full_session(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A whole-session run collapses what would tile into three clips into one.
+
+    The same session that ``test_a_run_writes_one_clip_per_span_across_every_session``
+    turns into three clips at ``duration_s=1.0`` becomes exactly one here, and
+    that one clip's window is the camera's own recorded span rather than a
+    ``duration_s`` multiple of it.
+    """
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    media = tmp_path / "media"
+    config = make_config(root, media, whole_session=True)
+
+    summary = run_config(config)
+
+    assert summary["sessions"] == 1
+    assert summary["camera_clips_written"] == 1
+    assert summary["episodes_planned"] == 1
+    assert summary["episodes_already_canonical"] == 0
+    assert summary["episodes_newly_published"] == 1
+    assert summary["episodes_dropped"] == 0
+    assert summary["failures"] == 0
+    assert len(list(media.rglob("*.mp4"))) == 1
+
+    timestamps_ns = np.load(session / "camera" / "front.mp4.timestamps.npy")
+    spans = plan_common_spans({"front": timestamps_ns}, config)
+    assert len(spans) == 1
+
+    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode["start_ns"] == spans[0].start_ns
+    assert episode["exclusive_end_ns"] == spans[0].end_ns
+    assert [camera["camera_key"] for camera in episode["camera_media"]] == ["front"]
+    selected = episode["camera_media"][0]
     payload = Path(selected["media_location"]).read_bytes()
     assert len(payload) == selected["media_size_bytes"]
     assert hashlib.sha256(payload).hexdigest() == selected["media_sha256"]

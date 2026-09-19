@@ -565,6 +565,25 @@ def test_an_mcap_bound_is_converted_from_inclusive_to_exclusive(
     assert [(span.start_ns, span.end_ns) for span in spans] == [(0, _SECOND), (_SECOND, 2 * _SECOND)]
 
 
+def test_whole_session_mode_ignores_duration_s_and_emits_one_span(
+    tmp_path: Path,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A whole-session clip is one span covering everything the rig recorded.
+
+    ``clip.whole_session`` trades the fixed-duration tiling for a single span
+    the length of the common window, so a short ``duration_s`` here -- which
+    would normally tile the same window into several clips -- must not change
+    the outcome.
+    """
+    config = make_config(tmp_path / "input", tmp_path / "media", duration_s=1.0, whole_session=True)
+    camera = np.arange(0, 4 * _SECOND, _SECOND // 30, dtype=np.int64)
+
+    spans = plan_common_spans({"front": camera}, config, bounds={"ego": (0, 2 * _SECOND - 1)})
+
+    assert [(span.start_ns, span.end_ns) for span in spans] == [(0, 2 * _SECOND)]
+
+
 def test_a_transient_failure_on_an_optional_sensor_still_refuses_the_session(
     tmp_path: Path,
     make_session: Callable[..., Path],

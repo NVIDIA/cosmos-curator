@@ -190,6 +190,11 @@ class MultimodalSplitClipConfig(BaseModel):
         ge=1,
         description="Rate the episode timeline is sampled at; every sensor is sampled or derived against it.",
     )
+    whole_session: bool = Field(
+        default=False,
+        description="Treat the entire session as one clip instead of tiling it into duration_s spans. "
+        "duration_s is unused in this mode. Requires exactly one camera and no other sensors.",
+    )
 
     @model_validator(mode="after")
     def _validate_clip_geometry(self) -> Self:
@@ -206,10 +211,15 @@ class MultimodalSplitClipConfig(BaseModel):
         ``65693361999.99999`` in binary floating point -- which would make a
         remainder test reject a clip that is exact.
 
+        A whole-session clip has no tiling for ``duration_s`` to be a stride of,
+        so this geometry rule does not apply to it.
+
         Raises:
             ValueError: If the duration is not a whole number of sampled frames.
 
         """
+        if self.whole_session:
+            return self
         frames_per_clip = Decimal(str(self.duration_s)) * self.sampling_fps
         if frames_per_clip % 1 != 0:
             msg = (
@@ -665,6 +675,26 @@ class ResolvedMultimodalSplitConfig(BaseModel):
         if not self.cameras:
             kinds = ", ".join(sorted({sensor.sensor_type for sensor in self.sensors.values()})) or "none"
             msg = f"sensors must include at least one camera, which defines the episode timeline; got {kinds}"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_whole_session_is_a_single_camera(self) -> Self:
+        """Refuse a whole-session clip with more than one sensor.
+
+        A whole-session span still runs through ``partition_by_coverage``, but
+        with one camera that check no longer arbitrates disagreement between
+        views -- it only confirms the one camera can serve its own sampling
+        grid. It also loses the window an mcap sensor would narrow. Neither is
+        meaningful outside a rig of exactly one camera and nothing else.
+        """
+        if not self.clip.whole_session:
+            return self
+        if len(self.cameras) != 1 or self.mcap_sensors:
+            msg = (
+                f"clip.whole_session requires exactly one camera and no other sensors, got "
+                f"{len(self.cameras)} camera(s) and {len(self.mcap_sensors)} other sensor(s)"
+            )
             raise ValueError(msg)
         return self
 

@@ -490,6 +490,9 @@ def plan_common_spans(
     never coverage. A sensor placed on the grid does have a tolerance, but it
     applies per row while the clip is cut, not here -- this decides which spans
     exist, and that one decides which of them a sensor can actually serve.
+
+    ``config.clip.whole_session`` skips the tiling and returns that window as
+    one span, so a session becomes exactly one clip regardless of its length.
     """
     starts = [int(timestamps[0]) for timestamps in timelines.values()]
     ends = [timeline_end_ns(timestamps) for timestamps in timelines.values()]
@@ -498,11 +501,10 @@ def plan_common_spans(
         # Exclusive, like a timeline's end: the last message is an instant, and a
         # span ending on it would be asking for one that has not arrived.
         ends.append(last_ns + 1)
-    return plan_clip_spans(
-        start_ns=max(starts),
-        end_ns=min(ends),
-        duration_ns=clip_duration_ns(config),
-    )
+    start_ns, end_ns = max(starts), min(ends)
+    if config.clip.whole_session:
+        return (Span(start_ns=start_ns, end_ns=end_ns),)
+    return plan_clip_spans(start_ns=start_ns, end_ns=end_ns, duration_ns=clip_duration_ns(config))
 
 
 def partition_by_coverage(

@@ -37,6 +37,12 @@ from cosmos_curator.next.utils.identity import canonical_digest
 # ``.observations.npy`` to ``.sensor_timestamps.npy``.
 MEDIA_CONTRACT_VERSION = 3
 EPISODE_IDENTITY_VERSION = 1
+# 5: clip.whole_session joined the contract, because it decides whether a span
+# is tiled by duration_s or is the whole session -- an entirely different clip
+# for the same source, not a corrected rendering of the one duration_s already
+# names. Without it, a rerun that flips the flag on a published dataset could
+# only be told apart by episode_id, which differs for every geometry except
+# the degenerate case where a session is exactly one duration_s clip long.
 # 4: a camera's allow_pts_fallback joined the contract, because it decides
 # whether the camera can produce output at all and which clock its timeline
 # came from -- result-defining, not execution tuning, so a rerun that flips it
@@ -51,7 +57,7 @@ EPISODE_IDENTITY_VERSION = 1
 # identity matches but whose contract does not is a conflict, and
 # ``reconcile_planned_episode`` raises. So adding a sensor to a config that has
 # already published needs a new output path, not a rerun into the old one.
-SPLIT_CONTRACT_DIGEST_VERSION = 4
+SPLIT_CONTRACT_DIGEST_VERSION = 5
 # 2: non-camera sensor artifacts joined the digest. An episode published under
 # version 1 was its cameras and nothing else, so it cannot be compared byte for
 # byte against one that also carries a trajectory.
@@ -139,8 +145,13 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
             "split_contract_digest_version": SPLIT_CONTRACT_DIGEST_VERSION,
             "media_contract_version": MEDIA_CONTRACT_VERSION,
             "clip": {
-                "duration_ns": clip_duration_ns(config),
+                # Absent rather than fixed in whole-session mode: plan_common_spans
+                # never reads it there, so binding it would make an operator's
+                # leftover duration_s trigger a needless re-split of every
+                # already-published whole-session episode.
+                **({} if config.clip.whole_session else {"duration_ns": clip_duration_ns(config)}),
                 "sampling_fps": config.clip.sampling_fps,
+                "whole_session": config.clip.whole_session,
             },
             "cameras": [
                 {

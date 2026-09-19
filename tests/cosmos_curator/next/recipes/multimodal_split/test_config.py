@@ -589,6 +589,35 @@ def test_several_cameras_are_accepted() -> None:
     assert sorted(config.cameras) == ["front", "left"]
 
 
+def test_whole_session_requires_exactly_one_camera() -> None:
+    """A whole-session clip skips the coverage check that arbitrates disagreement between views."""
+    two = {
+        "front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"},
+        "left": {"sensor_type": "camera", "uri_pattern": "camera/left.mp4"},
+    }
+    with pytest.raises(ValidationError, match="whole_session"):
+        _resolved(sensors=two, clip={"whole_session": True})
+
+
+def test_whole_session_rejects_an_mcap_sensor() -> None:
+    """A whole-session clip skips the tiling an mcap sensor's window would narrow."""
+    with pytest.raises(ValidationError, match="whole_session"):
+        _resolved(
+            sensors={
+                "front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"},
+                "ego": {"sensor_type": "egotrajectory", "uri_pattern": "ego.mcap"},
+            },
+            clip={"whole_session": True},
+        )
+
+
+def test_whole_session_accepts_a_single_camera() -> None:
+    """The one config shape a whole-session clip is meaningful for."""
+    config = _resolved(clip={"whole_session": True})
+
+    assert config.clip.whole_session is True
+
+
 @pytest.mark.parametrize("key", ["", "front/left", "..", ".", "front camera", "front\tleft"])
 def test_a_camera_key_that_cannot_be_a_path_segment_is_rejected(key: str) -> None:
     """The key is written into the output layout, so it has to survive being a directory name.
