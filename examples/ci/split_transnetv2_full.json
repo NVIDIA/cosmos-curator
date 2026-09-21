@@ -1,5 +1,9 @@
 {
     "pipeline": "split",
+    "expected_output": {
+        "min_processed_videos": 1,
+        "min_passed_clips": 1
+    },
     "args": {
         "input_video_path": "FILL_IN",
         "input_video_list_json_path": null,
@@ -13,7 +17,9 @@
         "embedding_algorithm": "internvideo2",
         "generate_previews": true,
         "generate_captions": true,
+        "caption_quality_stats_enabled": true,
         "upload_clips": true,
+        "upload_cds_parquet": false,
         "upload_clip_info_in_chunks": false,
         "upload_clip_info_in_lance": false,
         "generate_cosmos_predict_dataset": true,

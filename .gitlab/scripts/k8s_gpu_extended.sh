@@ -103,47 +103,16 @@ PY
         python -m pytest -m env "${REPO_ROOT}/tests/cosmos_curator/pipelines/video/super_resolution/"
 fi
 
-# Per-scenario output path so concurrent matrix pods never collide.
-K8S_OUTPUT_PATH="${S3_OUTPUT_PATH}/k8s-gpu-extended/${SCENARIO}"
+# Retried and concurrent matrix jobs have distinct job IDs and cannot reuse stale artifacts.
+: "${CI_JOB_ID:?CI_JOB_ID must be set}"
+K8S_OUTPUT_PATH="${S3_OUTPUT_PATH}/jobs/${CI_JOB_ID}/k8s-gpu-extended/${SCENARIO}"
 
 run_pipeline_from_config "${CONFIG_PATH}" "${K8S_OUTPUT_PATH}"
+pixi run --as-is python -m cosmos_curator.pipelines.video.output_validation \
+    "${CONFIG_PATH}" "${K8S_OUTPUT_PATH}"
 
 if [ "${SCENARIO}" = "split_openai" ]; then
     rm -f /cosmos_curator/config/cosmos_curator.yaml
-fi
-
-if [ "${SCENARIO}" = "split_openai" ]; then
-    CAPTION_QUALITY_STATS_PATH="${K8S_OUTPUT_PATH}/caption_quality_stats.json" pixi run --as-is python - <<'PY'
-import os
-import sys
-
-from cosmos_curator.core.utils.storage import storage_utils
-
-stats_path = os.environ["CAPTION_QUALITY_STATS_PATH"]
-client = storage_utils.get_storage_client(stats_path, profile_name="default")
-try:
-    stats = storage_utils.read_json_file(stats_path, client)
-except Exception as exc:
-    print(f"ERROR: Failed to read OpenAI caption quality stats from {stats_path}: {exc}", file=sys.stderr)
-    raise SystemExit(1) from exc
-
-counts = stats.get("caption_status_counts") or {}
-checked = int(stats.get("caption_windows_checked") or 0)
-success = int(counts.get("success") or 0)
-errors = int(counts.get("error") or 0)
-
-if checked <= 0:
-    print(f"ERROR: OpenAI validation found no caption windows in {stats_path}", file=sys.stderr)
-    raise SystemExit(1)
-if success <= 0:
-    print(f"ERROR: OpenAI validation found no successful captions in {stats_path}: {counts}", file=sys.stderr)
-    raise SystemExit(1)
-if errors:
-    print(f"ERROR: OpenAI validation found caption errors in {stats_path}: {counts}", file=sys.stderr)
-    raise SystemExit(1)
-
-print(f"OpenAI validation passed: {success}/{checked} caption windows succeeded")
-PY
 fi
 
 echo "✓ K8s GPU extended pipeline test (${SCENARIO}) completed successfully"

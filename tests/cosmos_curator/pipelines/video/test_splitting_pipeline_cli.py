@@ -787,7 +787,7 @@ def test_nemotron_forces_model_preprocess_mode(monkeypatch: pytest.MonkeyPatch) 
 
 def test_vllm_video_max_pixels_help_text_names_scope_bounds_and_grid() -> None:
     """Help text should describe the upper-bound scope, bounds, and grid quantization."""
-    help_text = _parser().format_help()
+    help_text = " ".join(_parser().format_help().split())
 
     assert "--vllm-video-max-pixels-per-frame" in help_text
     assert "regular" in help_text

@@ -1,10 +1,21 @@
 {
     "pipeline": "split",
+    "expected_output": {
+        "min_processed_videos": 1,
+        "min_passed_clips": 1
+    },
     "args": {
         "input_video_path": "FILL_IN",
         "output_clip_path": "FILL_IN",
+        "output_s3_profile_name": "default",
         "limit": 1,
         "generate_embeddings": false,
+        "generate_previews": false,
+        "generate_captions": true,
+        "caption_quality_stats_enabled": true,
+        "upload_clips": true,
+        "upload_cds_parquet": false,
+        "generate_cosmos_predict_dataset": false,
         "splitting_algorithm": "fixed-stride",
         "captioning_algorithm": "openai",
         "openai_model_name": "nvidia/nvidia/nemotron-nano-12b-v2-vl"
