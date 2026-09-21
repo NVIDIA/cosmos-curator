@@ -3,11 +3,13 @@
 
 """Define what ``clips.lance`` must contain and which rows an attempt owes.
 
-Functions over a dataset the CALLER opened, following the same shape as the
-embeddings recipe's ``columns`` module: there is no bound URI and no private
-opener here, so which version a call reads is visible at the call site. That
-matters more than usual for this recipe, because ``ensure_caption_fields``
-COMMITS and the run's read version must be pinned from the handle it advances.
+Every function here reads a dataset the CALLER opened, following the same shape
+as the embeddings recipe's ``columns`` module, so which version a call reads is
+visible at the call site. ``ensure_caption_fields`` is the deliberate exception
+and takes the URI: it COMMITS, and a lost schema race cannot be retried while
+holding the handle that lost it. It RETURNS the advanced handle, which makes "the
+read version is pinned from the handle that widened the table" structural rather
+than a call-site convention.
 
 The table boundary keeps validation before mutation even when registration is
 called before explicit context resolution::
@@ -21,10 +23,10 @@ called before explicit context resolution::
     validate context fields     shared by resolution and registration
           |
           v
-    ensure_caption_fields(ds)   register the complete caption group (metadata-only)
-          |
+    ensure_caption_fields(uri)  register the complete caption group; opens its
+          |                     own handle per attempt (metadata-only commit)
           v
-    pin read_version
+    pin read_version            from the handle that call RETURNED
           |
           v
     owed_clip_ids(ds, id, row_filter)   owed clips in one fragment
@@ -45,12 +47,14 @@ and committing caption values belongs to the publication phase, which owns its
 own ``LanceOperation.Update`` semantics.
 """
 
+import enum
 import re
 from collections.abc import Sequence
-from typing import Final
+from typing import Final, assert_never
 
 import lance
 import pyarrow as pa
+from lance.fragment import LanceFragment
 from loguru import logger
 
 from cosmos_curator.next.recipes.robot_action_caption.contracts import (
@@ -84,7 +88,23 @@ CURATE_SELECTED_VALUE: Final = "selected"
 # columns are deliberately NOT here - see `resolve_context_fields`.
 REQUIRED_SOURCE_COLUMNS: Final[tuple[str, ...]] = (CLIP_ID_COLUMN, CLIP_URI_COLUMN)
 
+# How many COMMIT passes a contended widening gets, on top of which the loop
+# always spends one final read-only pass. Deliberately not a parameter: the bound
+# exists so a deterministic storage failure still surfaces, and the number of
+# jobs racing to widen is not something an operator tunes against. Three is
+# enough for any number of them, because every losing job reopens to find the
+# group already present rather than retrying its own commit.
+_REGISTRATION_ATTEMPTS: Final = 3
+
 _HEX64: Final = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+class _CaptionGroupPresence(enum.StrEnum):
+    """How much of the caption field group one snapshot already carries."""
+
+    ABSENT = "absent"
+    PARTIAL = "partial"
+    PRESENT = "present"
 
 
 def require_source_columns(dataset: lance.LanceDataset) -> None:
@@ -307,60 +327,133 @@ def caption_work_filter(digest: str, model_id: str, *, selected_only: bool) -> s
     return f"({pending} AND {CURATE_SELECTION_REASON} = {selected})"
 
 
-def ensure_caption_fields(dataset: lance.LanceDataset) -> None:
-    """Register or validate the complete caption field group.
+def _caption_group_presence(dataset: lance.LanceDataset) -> _CaptionGroupPresence:
+    """Classify the caption field group's presence on one snapshot.
 
-    ``add_columns`` with an all-nullable schema records the fields in the
-    manifest and reads them as NULL for every existing row: no data file is
-    rewritten and no row is replaced, so this is cheap on a large table and
-    cannot create a tombstone.
+    Raises:
+        ValueError: If a complete group's fields do not match
+            :data:`CAPTION_FIELDS` exactly.
 
-    The group has exactly three states: all absent is widened in one commit, all
-    present is validated exactly without a commit, and a non-empty strict subset
-    is refused without repair. A partial group has ambiguous ownership and must
-    never be normalized into a valid published schema.
+    """
+    stored = set(dataset.schema.names)
+    present = [name for name in CAPTION_COLUMNS if name in stored]
+    if not present:
+        return _CaptionGroupPresence.ABSENT
+    if len(present) != len(CAPTION_COLUMNS):
+        return _CaptionGroupPresence.PARTIAL
+    _require_fields_match(dataset.schema, dataset.uri, CAPTION_COLUMNS)
+    return _CaptionGroupPresence.PRESENT
+
+
+def _partial_group_message(uri: str, schema: pa.Schema) -> str:
+    """Return the refusal naming which caption fields exist and which do not."""
+    stored = set(schema.names)
+    present = [name for name in CAPTION_COLUMNS if name in stored]
+    missing = [name for name in CAPTION_COLUMNS if name not in stored]
+    return (
+        f"partial caption column group on {uri}: present={present}, missing={missing}; "
+        f"the group is registered atomically and a strict subset cannot be repaired safely"
+    )
+
+
+def ensure_caption_fields(
+    uri: str,
+    *,
+    storage_options: dict[str, str] | None,
+) -> lance.LanceDataset:
+    """Register or validate the complete caption field group, returning the handle to pin.
 
     Args:
-        dataset: The clip table to widen. Advanced in place when fields are added.
+        uri: The clip table to widen.
+        storage_options: Backend credentials and endpoint settings, or ``None``
+            for the backend's own resolution.
+
+    Returns:
+        The table open at a version where the complete caption group exists. The
+        caller pins the run's read version from this handle.
 
     Raises:
         ValueError: If a required source column is absent or unusable, if only
             part of the group exists, if a complete group's fields do not match
             :data:`CAPTION_FIELDS` exactly, or if a supported context column has
             a non-text type.
+        RuntimeError: If every commit lost the schema race and the group is
+            still absent.
 
     """
-    # Structural identity first: a missing clip_id / clip_uri makes every row
-    # uncaptionable, and add_columns below would still bump the Lance version.
-    # Context fields stay optional and are validated next, before that commit.
-    require_source_columns(dataset)
-    # Keep registration fail-closed when a caller has not resolved context yet:
-    # a metadata commit here must not precede reporting a malformed source field.
-    _validated_context_fields(dataset)
-
-    stored = set(dataset.schema.names)
-    present = [name for name in CAPTION_COLUMNS if name in stored]
-    if present and len(present) != len(CAPTION_COLUMNS):
-        missing = [name for name in CAPTION_COLUMNS if name not in stored]
-        msg = (
-            f"partial caption column group on {dataset.uri}: present={present}, missing={missing}; "
-            f"the group is registered atomically and a strict subset cannot be repaired safely"
-        )
-        raise ValueError(msg)
-    if present:
-        _require_fields_match(dataset.schema, dataset.uri, CAPTION_COLUMNS)
-        # No commit, so no version bump - a contract rather than an optimization.
-        # An already-complete field set is the case a resume must hit, so that it
-        # pins the SAME read version as the run it resumes; a spurious bump would
-        # land the two in different recovery namespaces with no checkpoint in
-        # common. Widening runs at most once per table per contract generation,
-        # so this is the path every later attempt takes.
-        return
-    dataset.add_columns(CAPTION_FIELDS)
-    # add_columns advances THIS handle, so the version below is the widening's
-    # own and no re-open is needed - which is what lets the caller pin the read
-    # version straight after this call.
-    logger.info(f"registered caption fields {list(CAPTION_COLUMNS)} on {dataset.uri} as v{int(dataset.version)}")
+    # Takes a URI rather than a handle - the one place this module does not read
+    # a caller-supplied dataset - because it COMMITS. A concurrent first launch
+    # (several jobs dividing one campaign, all finding the table unwidened) loses
+    # the race on every job but one, and a lost commit cannot be retried from the
+    # handle that lost it: the group the loser needs exists only at a version its
+    # handle cannot see. So every pass reopens.
+    #
+    # One pass more than the commit budget, and the extra one is read-only. A
+    # conflict on the final commit is itself evidence that SOME writer committed,
+    # so the loop has to look once more before reporting failure - and by making
+    # that final look an ordinary iteration, a group that turns out partial is
+    # refused as partial rather than misreported as absent.
+    last_error: Exception | None = None
+    for attempt in range(_REGISTRATION_ATTEMPTS + 1):
+        dataset = lance.dataset(uri, storage_options=storage_options)
+        # Structural identity first: a missing clip_id / clip_uri makes every row
+        # uncaptionable, and add_columns below would still bump the Lance version.
+        # Context fields stay optional and are validated next, before that commit.
+        require_source_columns(dataset)
+        # Keep registration fail-closed when a caller has not resolved context yet:
+        # a metadata commit here must not precede reporting a malformed source field.
+        _validated_context_fields(dataset)
+        presence = _caption_group_presence(dataset)
+        match presence:
+            case _CaptionGroupPresence.PRESENT:
+                # No commit, so no version bump - a contract rather than an
+                # optimization. An already-complete field set is the case a resume
+                # must hit; widening runs at most once per table per contract
+                # generation, so this is the path every later attempt takes.
+                return dataset
+            case _CaptionGroupPresence.PARTIAL:
+                # Refused, never topped up: a strict subset has ambiguous
+                # ownership, and completing it would turn an unexplained schema
+                # into a published one that looks deliberate.
+                raise ValueError(_partial_group_message(uri, dataset.schema))
+            case _CaptionGroupPresence.ABSENT:
+                pass
+            case _:
+                assert_never(presence)
+        if attempt == _REGISTRATION_ATTEMPTS:
+            break
+        try:
+            # Metadata-only: an all-nullable schema is recorded in the manifest
+            # and read as NULL for every existing row, so no data file is
+            # rewritten and no row is replaced. That is what makes retrying this
+            # cheap on a large table, and why it cannot create a tombstone.
+            dataset.add_columns(CAPTION_FIELDS)
+        except OSError as e:
+            # Measured at the locked pylance 10.0.0: a lost widening race is a
+            # bare OSError, and RuntimeError is raised on this path at neither
+            # 10.0.0 nor 11.0.0 (where the same race is CommitConflictError,
+            # itself an OSError). Re-measure on a pylance bump.
+            #
+            # A deterministic "Invalid user input" fault is the SAME type there,
+            # so the two cannot be told apart by type, and the only thing that
+            # separates them is a human-readable message no code may parse. What
+            # keeps the broad catch acceptable is that both such faults are
+            # unreachable here: this call is gated on the group being absent, so
+            # no column can already exist, and CAPTION_FIELDS is frozen
+            # all-nullable. One arriving anyway still surfaces, as the cause of
+            # the RuntimeError below.
+            last_error = e
+            continue
+        # add_columns advances THIS handle, so the version logged is the
+        # widening's own and no reopen is needed.
+        logger.info(f"registered caption fields {list(CAPTION_COLUMNS)} on {uri} as v{int(dataset.version)}")
+        return dataset
+    msg = (
+        f"could not register caption fields {list(CAPTION_COLUMNS)} on {uri} "
+        f"in {_REGISTRATION_ATTEMPTS} attempt(s); "
+        f"the group is still absent, so no concurrent writer registered it either"
+    )
+    raise RuntimeError(msg) from last_error
 
 
 def require_clip_id(value: object) -> str:
@@ -399,14 +492,68 @@ def owed_clip_ids(
 
     """
     _require_registered(dataset)
-    fragment = dataset.get_fragment(fragment_id)
-    if fragment is None:
-        msg = f"fragment {fragment_id} is not present in {dataset.uri} at v{int(dataset.version)}"
-        raise ValueError(msg)
+    fragment = _fragment_or_raise(dataset, fragment_id)
     scanner = fragment.scanner(columns=[CLIP_ID_COLUMN], filter=row_filter)
     return tuple(
         require_clip_id(value) for batch in scanner.to_batches() for value in batch.column(CLIP_ID_COLUMN).to_pylist()
     )
+
+
+def count_rows_in_fragments(
+    dataset: lance.LanceDataset,
+    fragment_ids: Sequence[int],
+    row_filter: str,
+) -> int:
+    """Return how many rows match ``row_filter`` across exactly these fragments.
+
+    Scoped rather than table-wide on purpose. A job that owns part of the table
+    must not report a count covering the rest of it: a diagnostic drawn from the
+    whole table sends an operator after a backlog some other job already owns.
+
+    Args:
+        dataset: The clip table, open at the run's pinned version.
+        fragment_ids: The fragments to count over, all present at this version.
+        row_filter: Predicate to count matches of.
+
+    Returns:
+        How many rows in those fragments match. Zero for an empty fragment list.
+
+    Raises:
+        ValueError: If a fragment is absent at this version.
+
+    """
+    # Ids are resolved first, and that is what keeps a planned-but-absent
+    # fragment a refusal rather than a smaller number. It is close to free:
+    # measured at pylance 10.0.0, resolving 1,000 ids cost 0.8 ms against the
+    # 56 ms the count itself took.
+    fragments = [_fragment_or_raise(dataset, fragment_id) for fragment_id in fragment_ids]
+    # One scanner across the named fragments, NOT a filtered count per fragment:
+    # measured over those same 1,000 fragments, 56 ms against 828 ms, because the
+    # per-fragment form pays a separate filtered scan every time. At the ~31k
+    # fragments a 250M-row table reaches, that is the difference between about
+    # two seconds of driver time and about twenty-six.
+    #
+    # And NOT `dataset.count_rows(filter=..., fragments=...)`, whose signature
+    # invites exactly that: it accepts `fragments` into `**kwargs` and forwards
+    # it NOWHERE, so it silently counts the WHOLE TABLE - measured returning
+    # 10,000 where the one named fragment held 10. The scanner form is
+    # scope-correct, and counts an empty list as zero rather than as everything.
+    scanner = dataset.scanner(columns=[], with_row_id=True, filter=row_filter, fragments=fragments)
+    return int(scanner.count_rows())  # type: ignore[no-untyped-call]  # Untyped in Lance stubs.
+
+
+def _fragment_or_raise(dataset: lance.LanceDataset, fragment_id: int) -> LanceFragment:
+    """Return one fragment, refusing a planned id the pinned version does not hold.
+
+    Absence is a planning fault, not an empty result: the plan named this
+    fragment at the version it pinned, so a caller that skipped it would report a
+    count or a work list covering less of the table than it claims to own.
+    """
+    fragment = dataset.get_fragment(fragment_id)
+    if fragment is None:
+        msg = f"fragment {fragment_id} is not present in {dataset.uri} at v{int(dataset.version)}"
+        raise ValueError(msg)
+    return fragment
 
 
 def _require_registered(dataset: lance.LanceDataset) -> None:

@@ -27,14 +27,25 @@ so re-running a clip does not reproduce its caption — it produces a different 
    Parquet under a snapshot-scoped workspace. Ray Data's job-level row
    checkpointing records completed rows, so a restart pays only for clips that had
    not finished. Phase A never touches Lance.
-2. **Phase B — one atomic publication.** The staged rows are validated, every
-   touched fragment is prepared, and a **single** `LanceOperation.Update` commits
-   all of them.
+2. **Phase B — validate everything, then commit in bounded waves.** The staged
+   rows are validated as one set, every touched fragment is prepared, and the
+   prepared set is published by at most 16 `LanceOperation.Update` transactions —
+   exactly one when the publication is narrow.
 
 A row is pending when no run has claimed it, when the run that did used different
 semantics or model identity, or when its five-column caption group is not a valid
 terminal row. Latest contract wins, and malformed current rows are re-owed: both
-are recomputed and overwritten in the same atomic commit.
+are recomputed and overwritten by the same publication.
+
+At corpus scale one job is not enough, so `input.shard` divides the table's
+fragments across independently launched jobs — different clusters, different
+times, independent retries — whose union covers the work with no gap and no
+overlap. That is a second, complementary reliability mechanism: row checkpointing
+makes one attempt cheap to resume, and sharding bounds what one job's total
+failure can cost. Neither reaches the caption contract, so which job captioned a
+clip cannot change what that caption says. See
+[Sharding a caption campaign](#sharding-a-caption-campaign) and, for the shared
+primitive, [Deterministic Work Sharding](curator-next-sharding.md).
 
 For one pinned attempt, **owed rows are the intersection of caption-pending rows
 and the configured input scope**. Every phase uses the same Lance predicate for
@@ -65,7 +76,13 @@ without seeing each other's columns, because neither rewrites base columns. What
 is outside the consistency model is two concurrent writers of the *same* group.
 
 That sibling independence holds for writes that are **time-separated or
-fragment-disjoint**, and only for those. Lance decides an `Update` commit's
+fragment-disjoint**, and only for those — which is precisely why a work shard
+owns whole fragments rather than rows. Concurrent shards of one campaign land in
+the fragment-disjoint case by construction, so their `Update` commits do not
+conflict with each other however they interleave. The one commit they *do* race
+on is the shared `add_columns` widening, which is handled where it is issued
+([Concurrent shards and the schema
+widening](#concurrent-shards-and-the-schema-widening)). Lance decides an `Update` commit's
 conflicts by fragment id, so two sibling legs whose commits interleave across
 each other's pinned versions on a **shared fragment** do not silently merge —
 the later commit is **rejected** with a retryable conflict error. A sibling
@@ -78,8 +95,8 @@ Rejection is the safe outcome rather than a defect. `LanceOperation.Update`
 replaces a fragment's *entire* file list, so committing a list assembled before
 the sibling's file existed would unlink that file — which is exactly the
 cross-leg data loss the check prevents. For this recipe a conflict rejection
-surfaces as a `RuntimeError` — Lance routes commit conflicts and write contention
-there rather than to `OSError`, which it reserves for IO faults — so it lands in
+surfaces as an `OSError` — Lance routes commit conflicts there, not past it — so
+it lands in
 the [ambiguous-commit path](#an-ambiguous-commit-is-verified-not-trusted), which
 re-reads the table, finds the wave's rows still pending, and raises. That is one
 of three outcomes there, and it is the one a sibling conflict necessarily reaches:
@@ -102,11 +119,13 @@ The recipe relies on these upstream properties:
   `clip_uri` is immutable for an existing row. That is what makes a pinned table
   version a sufficient stand-in for media identity — there is no per-row media
   fingerprint. This recipe does not re-scan the table to prove global `clip_id`
-  uniqueness: Phase A recovery keys physical row address, while Phase B scopes
-  staging, coverage, and `update_columns` by fragment, so its mutation identity
-  is `(fragment_id, clip_id)`. Equal ids in different fragments therefore cannot
-  fold together or receive each other's captions; consumers that need the
-  producer's global uniqueness guarantee validate it at the producer boundary.
+  uniqueness, and does not need to: neither half keys on `clip_id` alone.
+  Phase A's checkpoint id is the row's own Lance address, and Phase B scopes
+  staging, coverage, and `update_columns` by fragment, so the identity is always
+  a row or a fragment rather than a bare clip. Equal ids in different fragments
+  therefore cannot fold together or receive each other's captions; consumers that
+  need the producer's global uniqueness guarantee validate it at the producer
+  boundary.
 - `clip_id` and `clip_uri` **exist and hold usable text**. They are the only two
   structurally required columns, because without them no row is captionable at
   all: one is the caption's identity, the other its media location. In default
@@ -159,34 +178,42 @@ descriptor described in the [embeddings design](curator-next-embeddings.md).
 ## Design Invariants
 
 1. **Lance is canonical.** Readers never need the staging workspace.
-2. **Publication is one commit.** Before it the table shows no new captions; after
-   it, all of them. There is no partially-published state, so the pending
-   predicate is never half-true for a fragment, an attempt, or the table.
+2. **Publication accepts all or nothing, and publishes in whole fragments.** Every
+   staged row is validated before the first transaction, so a run either refuses
+   with the table untouched or commits only rows it has already accepted. The
+   writing is then split into at most 16 waves, so an *interrupted* publication
+   can leave earlier waves canonical — but never a partially published fragment,
+   which is what keeps the pending predicate honest at every instant.
 3. **Completed inference is durable and reusable.** A crash before publication
    loses no generation whose staged row and checkpoint were committed.
 4. **Two runs share staged work if and only if every namespace input matches.**
-   The workspace path encodes the source snapshot, the contract digest, and the
-   staging layout, so runs any of those separate cannot see each other's rows and
-   no per-row compatibility check exists. Input scope is deliberately absent, so
-   a widened attempt resumes the narrower one it widens. What the path does *not* declare — the
-   identity of the table at the source URI, and which other run is writing the
-   namespace — is operator discipline rather than an invariant
-   ([Limitations](#limitations)).
-5. **Result identity is independent of throughput tuning.** Replica counts, batch
+   The workspace path encodes the source URI, the contract digest, the shard, and
+   the staging layout, so runs any of those separate cannot see each other's rows
+   and no per-row compatibility check exists. Input scope is deliberately absent,
+   so a widened attempt resumes the narrower one it widens; the pinned read
+   version is absent too, so a resume reuses work across a commit that moved the
+   version without moving rows. What the path does *not* declare — the identity of
+   the table at the source URI, and which other run is writing one namespace — is
+   operator discipline rather than an invariant ([Limitations](#limitations)).
+5. **A shard divides execution, never results.** Which job captioned a clip
+   cannot change what that caption says, so the shard reaches the recovery
+   namespace and the run's logs and summary, and reaches no digest or durable
+   column ([Sharding a caption campaign](#sharding-a-caption-campaign)).
+6. **Result identity is independent of throughput tuning.** Replica counts, batch
    sizes, retry budgets, and CPU reservations do not appear in the digest.
-6. **One corrupt clip does not fail a run; one bad credential does not become
+7. **One corrupt clip does not fail a run; one bad credential does not become
    millions of error rows.** The invariant governs **classification, not
    extent**: it decides which side of the line a fault lands on, and nothing
    bounds how many rows end up carrying a row-local verdict. See
    [Error taxonomy](#error-taxonomy).
-7. **An attempt is finite.** Work is selected from one pinned snapshot.
+8. **An attempt is finite.** Work is selected from one pinned snapshot.
 
 ## End-to-end Data Flow
 
 The step order is load-bearing rather than incidental. This section is the
 authoritative explanation; the compact
 [`pipeline.py`](../../../cosmos_curator/next/recipes/robot_action_caption/pipeline.py)
-module contract links here. Four orderings each prevent a specific failure,
+module contract links here. Five orderings each prevent a specific failure,
 called out under the diagram.
 
 ```text
@@ -197,13 +224,14 @@ Driver
   require_selection_column(ds, selected_only=...)
         │                      default scope requires Curate's string verdict
         ▼
-  resolve_context_fields(ds)   which optional context this snapshot supplies,
-        │                      also BEFORE mutating it
+  ds = ensure_caption_fields(uri)  add the five nullable columns if absent
+        │                      (metadata-only; opens its own handle per attempt
+        │                       and retries a LOST schema race — see below)
         ▼
-  ensure_caption_fields(ds)    add the five nullable columns if absent
-        │                      (metadata-only; no data-file rewrite)
+  context_fields = resolve_context_fields(ds)
+        │                      same snapshot as the pin below
         ▼
-  read_version = ds.version    pin AFTER the widening
+  read_version = ds.version    pin from the handle that widened the table
         │
         ▼
   digest = caption_contract_digest(model, context_fields,
@@ -212,8 +240,9 @@ Driver
   row_filter = caption_work_filter(digest, model, selected_only=...)
         │
         ▼
-  plan_caption_scan(ds, row_filter)      one owed-row count per fragment
-        │
+  plan_caption_scan(ds, row_filter, shard=...)
+        │                      keep the fragments this job OWNS, then one
+        │                      owed-row count per owned fragment
         ├── nothing owed ──►  return; no model validation/workspace/Ray
         │
         ▼
@@ -226,7 +255,7 @@ Phase A — Ray Data, one streaming plan
   ┌──────────────────────────────────────────────────────────────────────┐
   │ Read      pinned Lance fragments, one block per owed fragment        │
   │           emits clip_id, fragment_id, clip_uri, prompt_text,         │
-  │           __checkpoint_id (uint64 row address)                       │
+  │           __checkpoint_id (the row's Lance address)                  │
   │             │                                                        │
   │             ▼  Ray CheckpointFilter (already-completed rows dropped) │
   │ repartition lightweight rows into bounded, fragment-local fetch      │
@@ -253,10 +282,10 @@ Phase B — publication
   refuse set mismatch, duplicate envelopes, or metadata/envelope id mismatch
         │
         ▼
-  ONE LanceOperation.Update over every prepared fragment
+  at most 16 LanceOperation.Update waves over the prepared fragments
         │
         ▼
-  clips.lance @ v+1        ← the sole completion signal
+  clips.lance @ v+K        ← a clip is complete once its wave lands
         │
         ▼
   cleanup of the staging namespace (after commit, never fatal)
@@ -264,17 +293,30 @@ Phase B — publication
 
 - **Validating before widening** means an invalid source is refused without
   having committed a schema change to somebody else's table.
-- **Resolving the context fields before widening** extends that to the optional
-  columns: a present-but-wrong-typed context column is a source fault, and
-  refusing it after the widening would leave five new fields on a table this run
-  never captioned. It is safe to do first because the widening is metadata-only
-  and changes no source or context value.
-- **Pinning after the widening** means a first run and its resume pin the same
-  version and so land in one namespace with a shared checkpoint.
+- **Validating context before widening** happens inside
+  `ensure_caption_fields` on every reopen (`_validated_context_fields`): a
+  present-but-wrong-typed context column is refused before any metadata commit,
+  so the table is not left with five new caption fields from a run that never
+  captioned. **Resolving** which optional columns supply the prompt happens
+  **after** widening, from the same handle whose version is pinned: that call
+  may reopen past an earlier driver open, and the digest must describe the
+  pinned snapshot, not a stale one.
+- **Pinning after the widening** means the run reads a snapshot whose caption
+  columns exist, so its own predicate can reference them. It is pinned from the
+  handle `ensure_caption_fields` **returned** rather than from the handle the
+  caller held, because that call may have lost a schema race to a concurrent
+  shard and reopened: a stale handle would pin a version predating the columns.
+  Unlike the earlier design, the pinned version no longer has to *match* between
+  a run and its resume — it is not a namespace input.
+- **Owning before counting** means each job's owed figures describe its own
+  slice. Counting first and filtering after would have every shard scan the
+  whole table rather than the fragments it owns, and make every job report work
+  it will not do.
 - **Planning before acquiring anything** means a run that owes nothing needs no
   model-directory validation, workspace, Ray cluster, or model initialization.
   That is the case a monitoring loop re-runs constantly, and it is the one that
-  must be cheap.
+  must be cheap. It is also what makes re-launching a finished shard safe and
+  nearly free, which is how a campaign is closed out.
 
 The prompt is rendered **once**, on the scan, and travels as a `prompt_text`
 column. It is not re-derived closer to the engine: two code paths normalizing the
@@ -321,7 +363,7 @@ ownership of columns this recipe never registered — and if that other writer o
 the missing fields, the repair is the data loss. Refusing costs an operator one
 diagnosis; repairing costs the wrong answer to a question nobody asked.
 
-Two details are load-bearing:
+Three details are load-bearing:
 
 - **Validation precedes any commit.** The context-column type check runs first,
   fail-closed, so a metadata commit can never precede reporting a malformed
@@ -329,12 +371,29 @@ Two details are load-bearing:
   the columns around it. Type and nullability are published contracts and cannot
   be narrowed in place.
 - **The complete-group path commits nothing, deliberately.** It is a contract,
-  not an optimization: a resume must pin the *same* read version as the run it
-  resumes, and the pinned version is part of the [namespace
-  digest](#the-path-is-the-whole-compatibility-mechanism). A spurious second
-  commit would land the two in different namespaces with no checkpoint in common.
-  Widening runs at most once per table per contract generation, so this no-commit
-  path is the one every later attempt takes.
+  not an optimization, and for two reasons that survive the read version having
+  been removed from the namespace identity (see the comment in
+  [`workspace.py`](../../../cosmos_curator/next/recipes/robot_action_caption/workspace.py)
+  — two attempts pinning different versions are *meant* to share completed work,
+  so a second commit no longer splits namespaces). First, this function runs on
+  every launch, resumes included, and widening happens at most once per table per
+  contract generation: committing here would advance the table's version once per
+  launch forever, for a schema that never changes, on the one table every
+  concurrent job reads. Second, it is what makes a contended first launch
+  terminate — every job that loses the race reopens onto this path instead of
+  committing a widening of its own.
+- **The state is re-read one more time than it is committed.** Registration gets
+  a small fixed number of commit passes — not a configurable one, because the
+  bound exists so a deterministic storage failure still surfaces, and the number
+  of jobs racing to widen is not something an operator tunes against. Each pass
+  re-opens the table, because a lost commit cannot be retried from the handle
+  that lost it: the group the loser needs exists only at a version that handle
+  cannot see. After the last commit the loop looks once more without committing,
+  because a conflict on that commit is itself evidence that *some* writer
+  committed — and if that writer registered this same group, there is nothing
+  left to do. That final look is an ordinary classification pass, so a group that
+  turns out to be a strict subset is refused as partial rather than reported as
+  absent.
 
 `add_columns` advances the handle in place, which is why the caller can pin the
 read version on the very next line without re-opening the table. See
@@ -476,15 +535,15 @@ that leave `STAGED_SCHEMA` byte-identical while changing a staged row's meaning
 or recovery. Three kinds qualify:
 
 - **how a completed row is identified** — the checkpoint id column, the value it
-  derives from (`_rowaddr` today), and whether the checkpoint outlives a
-  successful Phase A;
+  derives from (the Lance row address today), and whether the checkpoint
+  outlives a successful Phase A;
 - **where and in what format the rows land** — the `results` and `checkpoints`
   segment names, the partition columns and their Hive `key=value` scheme, the
   Parquet format, the append-versus-overwrite mode;
-- **what the sink's transaction is assumed to guarantee** — that a shard which
-  became durable without its checkpoint entry is discarded and replayed, so a Ray
-  upgrade that moves the commit protocol or the checkpoint index format qualifies
-  as well.
+- **what the sink's transaction is assumed to guarantee** — that a staged file
+  which became durable without its checkpoint entry is discarded and replayed, so
+  a Ray upgrade that moves the commit protocol or the checkpoint index format
+  qualifies as well.
 
 The enumerated trigger list is maintained beside the constant in
 [`workspace.py`](../../../cosmos_curator/next/recipes/robot_action_caption/workspace.py),
@@ -721,9 +780,10 @@ same contract. The namespace *is* the check:
 ```text
 <staging_root>/inference/<namespace digest>/     digest over:
         │                                          canonical source URI
-        ├── results/                               exact pinned read version
-        └── checkpoints/                           contract digest (model, prompt,
-                                                     sampling, frames, caps)
+        ├── results/                               contract digest (model, prompt,
+        └── checkpoints/                             sampling, frames, caps)
+                                                   shard (count and index, or
+                                                     "unsharded")
                                                    staging protocol version
                                                    staged schema fingerprint
 ```
@@ -737,14 +797,33 @@ split](#staging-layout-is-versioned-in-the-namespace-never-in-the-digest):
 staged Parquet written under the old field set or protocol cannot be read back
 under the new one.
 
+The **shard** is in the namespace for a different reason, and the distinction
+matters: it is not that two shards' staged rows would be *incompatible*, but that
+two shards are **concurrent writers**. Separating them by namespace is what makes
+a campaign safe to run at once, and it is why the shard reaches the namespace
+while staying out of the contract digest entirely — see
+[Sharding a caption campaign](#sharding-a-caption-campaign).
+
+The **pinned read version is deliberately absent**, and that is a change from an
+earlier design that digested it. A version that moved without moving rows
+invalidates nothing, so digesting the version forfeited every finished caption to
+any commit that advanced it — including this recipe's own metadata-only widening,
+which is a commit the recipe *itself* issues between a crash and its retry. Under
+unseeded generation that is lost output, not lost time. The removal landed
+alongside a since-removed composite id and was attributed to it, but the two
+are independent: the [row address](#the-checkpoint-id-is-the-row-address) that replaced it is equally
+unmoved by those commits, as measured. What the version can still
+invalidate is a *compaction*, and that is now handled by naming it an
+operational rule rather than by discarding progress on every version bump; see
+[No recovery across compaction](#no-recovery-across-compaction).
+
 ### Why input scope is not a namespace input
 
 `input.selected_only` decides which rows an attempt owes, so it is a plausible
-sixth input and was one until it was measured against the case that actually
-arises. Two attempts differ in scope only while pinning **one read version**,
-which means the first never committed — a successful attempt advances the
-version and deletes its namespace, so the flag could not separate anything
-there. On the crash path the two directions are not alike:
+namespace input and was one until it was measured against the case that actually
+arises. Two attempts differ in scope only on the **crash path** — a successful
+attempt commits and deletes its namespace, leaving nothing for the flag to
+separate — and on that path the two directions are not alike:
 
 | Resume | Staged rows against what it owes | Outcome |
 | --- | --- | --- |
@@ -789,11 +868,11 @@ name already answered.
 ### One writer at a time per namespace
 
 Two runs that resolve to one directory are **compatible as far as the namespace
-declares**: the five inputs it digests are the ones that could make one run's
-staged captions invalid for another. A sixth could — the identity of the table
-that occupies the source URI — and it is deliberately [not among
-them](#limitations). Compatible is not the same as concurrent either, and that
-distinction is the precondition this design carries:
+declares**: the inputs it digests are the ones that could make one run's staged
+captions invalid for another, or make the two concurrent. One further input
+could — the identity of the table that occupies the source URI — and it is
+deliberately [not among them](#limitations). Compatible is not the same as
+concurrent either, and that distinction is the precondition this design carries:
 
 - **Compatibility** asks whether two runs *may* share rows. The path answers it.
 - **Concurrency** asks whether two runs may *write* the same rows at once. The
@@ -828,8 +907,14 @@ with nothing published and a re-run that works. Two concurrent *caption runs* in
 one namespace are not rejected anywhere until publication, and the state they
 leave behind is terminal until an operator deletes the directory.
 
-There is likewise no completion marker. The single Lance commit is the completion
-signal.
+Note the precondition is *per namespace*, not per table. Two caption runs on one
+table are safe when they resolve to different namespaces and own disjoint rows,
+which is exactly what [sharding](#sharding-a-caption-campaign) arranges. The
+prohibition is on two writers in **one** directory, and a shard is what keeps
+concurrent captioning out of that case rather than an exception to it.
+
+There is likewise no completion marker. The Lance commits are the completion
+signal: a clip is complete once the wave carrying it has landed.
 
 The workspace carries **its own filesystem**, and the staged rows and the
 checkpoint that indexes them both use that bound capability. It also carries the
@@ -847,14 +932,16 @@ the active plan's process-global configuration. Two independently resolved
 filesystems would let the sink write where the checkpoint cannot read, or let
 cleanup run under different credentials. The first
 failure surfaces as a resume that silently redoes everything rather than as an
-access error; the second leaves an inert namespace after the already-canonical
-commit and is logged without failing the run.
+access error; the second leaves an uncollected namespace after the
+already-canonical commit and is logged without failing the run.
 
 An earlier design carried a per-row `request_fingerprint` so a checkpoint could
 survive a source-version change. It was dropped: it bought a narrow case (a
 metadata-only schema add between attempts) at the cost of a per-row column, a
 per-row comparison at load time, and a subtle argument about which input changes
-count as semantic.
+count as semantic. That rejection has only hardened, because the narrow case
+turned out not to need buying at all: a metadata-only add does not move a
+[row address](#the-checkpoint-id-is-the-row-address) either, as measured.
 
 ### Snapshot pinning order
 
@@ -865,28 +952,88 @@ the version — the common case (first run adds the columns, the resume finds th
 pins the same version both times. The order is the first three steps of
 [the data flow diagram](#end-to-end-data-flow).
 
-### The checkpoint id is a Lance row address
+### The checkpoint id is the row address
 
-`__checkpoint_id` is a `uint64` **Lance row address** emitted directly by the
-datasource, not a hash. Within a pinned snapshot a row address is unique and
-stable by construction, so unlike a hash it has no collision case at all, and it
-carries the fragment id in its high bits — which the staged partitioning reuses
-for free.
+`__checkpoint_id` is the row's `uint64` **Lance address**, carried straight off
+the scan in
+[`datasource.py`](../../../cosmos_curator/next/recipes/robot_action_caption/datasource.py).
+It is unique per row within the pinned snapshot by construction, so recovery
+leans on no uniqueness contract of its own. The same value supplies
+`fragment_id`, its high 32 bits, which is what makes a row's checkpoint entry and
+its staged partition unable to disagree — a join back to the table could resolve
+differently.
 
-Two properties make it the right key rather than the obvious `clip_id` string:
+Keying on `clip_id` alone would not do. Publication scopes staging, coverage, and
+`update_columns` by fragment, so two fragments holding one clip id would see the
+resume filter mark the second complete and no attempt would ever caption it — a
+gap with no error. That is a real hazard rather than a hypothetical one, because
+this recipe deliberately declines to rely on table-wide `clip_id` uniqueness;
+`require_exact_coverage` asserts it per fragment instead of re-deriving it.
 
-- **Index memory.** Ray's checkpoint filter sorts loaded ids into a NumPy array
-  and `searchsorted`s each block against it, so the id dtype sets the index size.
-  A `uint64` array costs 8 bytes per completed row — about 4 GB at 500M clips —
-  where a 64-character hex key would cost roughly nine times that.
+**Stability is scoped to a fragment rewrite, not to a table version.** This is
+the point the design previously got wrong, in both directions, so it is now
+stated as a measurement. Probed at the locked pylance 10.0.0 and at 11.0.0, with
+identical results, against the mutations that can occur between a crash and its
+resume:
+
+| Mutation | `_rowaddr` |
+| --- | --- |
+| `add_columns` with the all-nullable caption schema (`ensure_caption_fields`) | preserved |
+| `fragment.update_columns` + `Transaction(Update)` on one fragment (`prepare_fragment`, `commit_prepared`) | preserved |
+| a later wave on a **sibling** fragment, which is the concurrent-shard case | preserved |
+| the pending predicate pushed into the scan | true addresses, not renumbered |
+| `delete` | survivors preserved; a tombstone moves no offset |
+| `compact_files` | **changed**, into a fresh fragment id |
+
+An earlier design replaced the address with the string pair
+`"<fragment_id>:<clip_id>"` on the belief that every commit advancing the version
+discarded the attempt's completed inference — the recipe's own metadata-only
+widening included, which under unseeded generation is lost output rather than
+lost time. The table above is the refutation. The compensating claim, that the
+pair survived "a compaction moving a row within its fragment", was unreachable
+too: compaction **never reuses** a fragment id, measured both merging three
+fragments into the single id `3` and rewriting one fragment carrying two
+tombstoned rows from id `0` to id `1`. The pair's fragment half therefore moved
+exactly where the address moves. Same stability set, roughly 71 bytes per
+completed clip against 8, so the pair was removed.
+
+Never reusing a fragment id also fixes the **direction** of the compaction
+failure: a stale id matches no row rather than aliasing onto a different one, so
+the cost is re-inference and never a silently skipped clip. See
+[no recovery across compaction](#no-recovery-across-compaction).
+
+That safety rests on **two** dependency behaviours, and both are recorded beside
+`STAGING_PROTOCOL_VERSION` in
+[`workspace.py`](../../../cosmos_curator/next/recipes/robot_action_caption/workspace.py)
+as re-measure items on a pylance bump — the caveat that went wrong here went
+wrong by being left implicit, so neither premise is left to follow from the
+other. Uniqueness *within* a snapshot is Lance's own construction, but a stale id
+never naming a different **live** row needs both that fragment ids are never
+recycled and that an offset inside a surviving fragment is never reassigned. The
+second is the one other writers on `clips.lance` could break, so it was measured
+rather than inferred: an append opens a new fragment instead of extending an
+existing one, a delete tombstones without renumbering survivors, and the offsets
+a delete frees are not handed to later appended rows.
+
+Two properties the key must keep, both easy to break in the same two places:
+
+- **Index memory.** Ray's checkpoint filter loads the completed ids into an array
+  and matches each block against it, so the id width sets the index size, and the
+  **driver** process pays it. At 8 bytes the index is about 4 GB at 500M
+  completed clips; the string pair was roughly 71 characters — 64 hex, one
+  separator, a decimal fragment id — which scaled naively to tens of GB. Both
+  figures are derivations from the id width, not measurements. The narrow id is
+  also what keeps checkpointability independent of campaign shape: the pair was
+  affordable only because [sharding](#sharding-a-caption-campaign) divides the
+  index by the shard count, whereas ~4 GB is affordable unsharded.
 - **Id survival.** Ray commits a row as complete by reading the configured id
   column off the **written output**, so the column must survive into the staged
   Parquet. A staged schema that drops it checkpoints nothing while appearing to
   work.
 
-Both are easy to get wrong in the same two places: the id must be present on the
-**first** operator of the dataset (a column added later in the plan is invisible
-to the filter) and it must reach the terminal write.
+The id must be present on the **first** operator of the dataset — a column added
+later in the plan is invisible to the filter — and it must reach the terminal
+write.
 
 The column name is spelled once, in
 [`datasource.py`](../../../cosmos_curator/next/recipes/robot_action_caption/datasource.py),
@@ -896,6 +1043,12 @@ records no progress while the run appears to work — so the string has exactly 
 definition, in the module that produces its values. A generic home would make it
 look like an independent contract a leg merely opts into, which is the opposite of
 how it behaves.
+
+Retyping the id did not bump `STAGING_PROTOCOL_VERSION`, and did not need to:
+the type is part of `STAGED_SCHEMA`, so `staged_schema_fingerprint` moved and
+older namespaces are isolated automatically. Publication is untouched — it joins
+on `clip_id` and addresses a partition by `fragment_id`, and only Ray's filter
+reads this id.
 
 ### Staged Parquet, and why it is needed alongside the checkpoint
 
@@ -910,8 +1063,10 @@ entry point — `run_config` in
 [`pipeline.py`](../../../cosmos_curator/next/recipes/robot_action_caption/pipeline.py)
 — and publication cannot be invoked on its own. A re-run that owes nothing but a
 republish still resolves the model, verifies the staged weight files, initializes
-Ray, and enters Phase A, whose engine pool is sized from the *table's* pending
-count — nothing has been published yet, so that is the whole wave — and starts its
+Ray, and enters Phase A, whose engine pool is sized from the count this job
+*owes* — nothing has been published yet, so that is the whole wave it is
+republishing, and on a sharded run it is owed within the fragments this job owns
+rather than across the table — and starts its
 initial replicas whether or not the checkpoint filter leaves them a row to
 caption. A republish therefore costs an **engine cold start and no inference**: the
 split removes the expensive half of the bill, not the whole bill. An operator
@@ -919,8 +1074,8 @@ planning one should budget a fresh run's startup and none of its GPU time.
 
 The staged schema is `clip_id`, `fragment_id`, `__checkpoint_id`, plus the five
 output columns, written with `partition_cols=["fragment_id"]` so Phase B reads
-only the fragments it needs, and `mode="append"` so a second attempt's shards land
-beside the first's. `APPEND` is passed explicitly even though it is Ray's current
+only the fragments it needs, and `mode="append"` so a second attempt's staged
+files land beside the first's. `APPEND` is passed explicitly even though it is Ray's current
 default: were that default ever to become `OVERWRITE`, a resume would silently
 delete the captions it exists to preserve, and unseeded generation makes them
 unrecoverable.
@@ -932,34 +1087,76 @@ that protocol and can disable recovery with only a warning, so the plan must
 remain one logical read-to-write DAG.
 
 Sink sizing is a real concern: `write_parquet` otherwise emits one file per output
-block, which is O(batch count) shards and a listing cost every resume pays. Both
+block, which is O(batch count) staged files and a listing cost every resume pays. Both
 `min_rows_per_file` and `max_rows_per_file` are set from
-`execution.parquet_rows_per_file`, whose default keeps a staged file small enough
-that a crash mid-phase leaves usable partial work. They are documented upstream
-as **hints, not strict limits**, so correctness must not depend on them, and no
-sink-side repartition is added to enforce them: paying another data movement
-step to hit an exact file size would cost more than the uneven files it avoids.
+`execution.parquet_rows_per_file`.
+
+The two halves are not equally advisory, and the difference is what sets recovery
+granularity. Ray's sink adopts the **minimum** as the Write operator's
+`min_rows_per_bundle` and the bundler accumulates blocks until it reaches that
+floor — measured at Ray 2.58.0, sixteen 32-row blocks coalesced into a single
+512-row bundle under a 4096-row floor. One bundle is one checkpoint, so what a
+preemption re-generates is:
+
+```text
+rows at risk per in-flight bundle = max(parquet_rows_per_file,
+                                        rows in the block reaching the sink)
+```
+
+A bundle can never hold fewer rows than the block it receives, which is why
+lowering this knob beneath that block size splits files without checkpointing any
+more often. The **maximum**, by contrast, only ever splits a bundle into files and
+never changes what is durable. Exact file sizes remain unguaranteed either way, so
+correctness must not depend on them, and no sink-side repartition is added to
+enforce them: paying another data movement step to hit an exact file size would
+cost more than the uneven files it avoids.
+
+The default of 256 sets the floor equal to `lance_read_batch_size`, so the two
+coincide and neither silently dominates the other. Raising one alone re-creates a
+gap in which the larger is the only bound that matters; raise both together to
+trade recovery granularity for fewer staged objects.
 
 The phase also depends on Ray's two-phase commit around that write — pending
 checkpoint first, then the data file, then commit by rename, with a later attempt
-deleting any shard left uncommitted. A shard that became durable *without* its
-checkpoint entry would be regenerated as a different caption under unseeded
-sampling, and publication would then refuse the conflicting pair permanently
-rather than merely repeat the work.
+deleting any staged file left uncommitted. A staged file that became durable
+*without* its checkpoint entry would be regenerated as a different caption under
+unseeded sampling, and publication would then refuse the conflicting pair
+permanently rather than merely repeat the work.
 
 ### No recovery across compaction
 
-Staged rows are partitioned by fragment id and keyed by row address. A compaction
-rewrites fragments, so both become meaningless — the partitions point at fragments
-that no longer exist and the addresses resolve to different rows.
+Staged rows are partitioned by fragment id and keyed by the
+[row address](#the-checkpoint-id-is-the-row-address), so every commit
+this recipe issues costs nothing: measured at the locked pylance 10.0.0, neither
+the metadata-only widening nor a per-fragment caption update moves an address. A
+compaction is the case that breaks: it rewrites fragments and **never reuses**
+their ids, so the staged partitions point at fragments that no longer exist and
+no owed row's id matches a staged one.
 
 There is no transparent recovery across that and none will be built. The rule is
-operational: **do not compact or otherwise mutate the source while a workspace
-holds progress.** Nothing has to refuse it, because the pinned read version is
-part of the namespace digest: a run against a moved source resolves to a
-*different* directory, so it reuses nothing and cannot see — or corrupt — the
-stale namespace's rows. The old namespace is left in place and is inert; delete
-it once no run needs it.
+operational: **do not compact or otherwise mutate the source's fragment geometry
+while a workspace holds progress.**
+
+Nothing refuses it, and the reason is worth being explicit about because it
+changed. The namespace no longer digests the read version, so a compacted source
+resolves to the **same** directory rather than a fresh one — a compaction is no
+longer self-isolating. What that costs is bounded and non-corrupting: the staged
+rows are keyed by fragment ids the new manifest does not contain, so no owed row
+can match one, and the attempt re-infers its whole owed set instead of reusing
+anything. The stale partitions are never read and are not published from; they
+are dead weight in the namespace until it is deleted, not a source of wrong
+captions.
+
+That is a deliberate trade against the alternative it replaced. Digesting the
+version made a compaction isolate itself, at the cost of discarding completed
+captions on **every** version bump — including the recipe's own widening — which
+is the far more frequent event. Paying re-inference on the rare compaction is
+cheaper than paying it on every routine commit, and both cost only inference:
+neither can publish a caption the current contract did not produce.
+
+Because fragment ids are never reused, the stale key cannot collide with a live
+row either, which is what bounds the cost to re-inference — the failure is lost
+work, never a clip silently marked complete.
 
 ### There is no switch that disables reuse
 
@@ -983,7 +1180,265 @@ directory by hand. The first is a semantic decision and recaptions the configure
 design; the second is an operator action taken deliberately, with the run's own log
 line naming the directory it resolved.
 
-## Publication: One Atomic Commit
+## Sharding a Caption Campaign
+
+`input.shard` divides the table's fragments across independently launched jobs,
+this job taking the shard at the given zero-based index. Absent — the default —
+means one job owns every fragment, which is how this recipe behaved before the
+field existed.
+
+```yaml
+input:
+  clips_lance_uri: s3://bucket/clips.lance
+  shard:
+    count: 8      # the campaign is eight jobs
+    index: 3      # this job is the fourth of them
+```
+
+The ownership mechanism, the terminology it fixes, and the checklist a recipe
+works through before adopting it are generic and live in
+[Deterministic Work Sharding](curator-next-sharding.md). This section is this
+recipe's adoption: what made it safe, what it changes about the run, and how an
+operator drives a campaign.
+
+One note on the word, because this document had two other uses for it before this
+one. An upstream **LeRobot/Mecka shard** is a source directory
+`robot-action-split` reads. A staged file written by Ray's Parquet sink was also
+called a shard, and those passages now say **staged file** instead. Throughout
+this section, and in `input.shard`, the word means one job's **execution scope**
+and nothing else.
+
+### Why a caption run needs two reliability mechanisms
+
+Row checkpointing already makes an attempt cheap to resume. What it cannot do is
+raise the ceiling on a single attempt, and at corpus scale that ceiling is the
+binding constraint: 500M clips is more GPU-hours than one allocation holds, in
+one place, for as long as it takes. The two mechanisms are layered, and each one
+makes the other worth having.
+
+```text
+        one logical caption run over clips.lance
+                          │
+      ┌───────────────────┼───────────────────┐
+      ▼                   ▼                   ▼
+ shard 0/3            shard 1/3           shard 2/3     ← SHARDING divides the
+ fragments 0,3,6…     fragments 1,4,7…    fragments 2,5,8…  fragment universe.
+ cluster A            cluster A           cluster B      Separate namespaces,
+      │                   │                   │          separate commits.
+      │                   │                   │
+ attempt 1 ✗ OOM     attempt 1 ✓        attempt 1 ✗ preempted
+      │                                       │
+ attempt 2 ✓              ← CHECKPOINTING     attempt 2 ✓
+ resumes from the           resumes an        resumes from the
+ last committed             attempt inside    last committed
+ row                        one shard         row
+      │                   │                   │
+      └───────────────────┼───────────────────┘
+                          ▼
+            three Update commits, one per shard,
+            each touching only the rows it owns
+```
+
+- **Sharding bounds what one failure costs in scheduling terms.** A job lost to
+  a dead cluster is one shard's in-flight work, not the corpus, and the other
+  shards neither wait for it nor notice.
+- **Checkpointing bounds what a retry costs inside a shard.** Without it, a
+  shard failing in its last hour would restart from nothing, which would make
+  shards have to be small — and small shards mean many jobs, which is its own
+  operational cost.
+- **Sharding also bounds the checkpoint index.** Ray's filter loads the completed
+  ids of *its own namespace*, so the driver-side index divides by the shard
+  count. It mattered more under the wide composite id that
+  [preceded the row address](#the-checkpoint-id-is-the-row-address), where the index
+  was the expensive part of recovery; at 8 bytes per completed clip the index is
+  affordable at 500M rows whether or not a campaign is sharded.
+
+### What a shard owns, and what it never touches
+
+A shard owns **whole fragments**, assigned by the manifest's own fragment id. It
+does not own rows, subsets of fragments, or anything the plan derives at runtime.
+
+Ownership is decided on the id **before** any owed-row count, and both halves of
+that order matter. A fragment's owner does not change as its rows complete, so
+re-launching shard 3 of 8 is reproducible; and a job never pays for a filtered
+count over fragments it will not read, so the driver cost of a campaign does not
+grow with its width.
+
+What a shard does **not** do:
+
+- It does not rewrite, compact, or repartition the source. Fragment geometry
+  stays [`robot-action-split`](curator-next-robot-action-split.md)'s.
+- It does not appear in the contract digest, so re-sharding a corpus recaptions
+  nothing. A caption produced by shard 3 of 8 is identical in meaning to the same
+  caption from an unsharded run, and the pending predicate cannot tell them
+  apart — which is the property that makes a campaign's shape freely changeable
+  between campaigns.
+- It does not write a "not mine" verdict. Rows this job does not own are left
+  **owed**, for whichever job does own them.
+
+### Why shards cannot share one staging namespace
+
+`input.shard` is a namespace input, so `count=4 index=1` and `count=4 index=3`
+stage under different directories. That is deliberate, and two independent
+mechanisms — one ours, one Ray's — destroy in-flight work if they share one.
+
+- **Post-commit cleanup is whole-namespace.** `cleanup_workspace` deletes the
+  namespace root, not this job's fragment partitions. Measured end to end with
+  the digest forced to ignore shard scope: shard 1 of 2 staged four captions and
+  one committed checkpoint, shard 0 then published successfully, and the commit's
+  cleanup left zero staged rows and zero checkpoint files — so shard 1 recaptioned
+  all four clips. Generation is unseeded, so that is destroyed GPU work rather
+  than a repeated one.
+- **Ray's checkpoint recovery is job-blind.** Every job's `load_checkpoint` first
+  runs `_clean_pending_checkpoints_task`, which lists *every* `*.pending.parquet`
+  in the checkpoint directory, deletes any data file whose name they prefix, and
+  then deletes the pending entries. Measured at Ray 2.58.0 on a shared directory
+  holding one job's committed pair and two jobs' in-flight pairs: both in-flight
+  pairs were deleted, including the one belonging to the other job, which was
+  still running. Committed entries survived. Nothing on this side can scope that
+  — it runs inside Ray before the first row is read — so shard-scoping our own
+  cleanup would not make sharing safe.
+
+Sharing is also unnecessary for most of the reuse it looks like it would buy.
+Completed work becomes reusable by being **committed**, not by being staged: the
+pending predicate reads the caption columns and the contract digest, so a job
+under any `count` finds committed clips complete and never re-owns them. Only
+uncommitted staged rows are namespace-scoped, and those live for one attempt by
+design.
+
+Publication commits in [waves](#why-publication-commits-in-waves-and-why-not-one-commit-per-fragment)
+rather than once precisely to make that reuse start earlier: an interrupted
+publication leaves the waves that landed reusable under any later `count`. It
+cannot reach further back than that, though. Publication runs only after
+inference finishes, so a failure **during Phase A** still strands every staged
+row of that job against a `count` change, and no commit granularity alters it.
+That is the residual cost of choosing `count` per campaign.
+
+What a shared directory *would* add, beyond the two mechanisms above, is a
+checkpoint index no commit ever prunes: entries are named by Ray's write uuid and
+task index and hold whatever ids their task carried, so they cannot be filtered
+down to one shard without reading and rewriting every entry.
+
+### Concurrent shards and the schema widening
+
+Sharding makes concurrent commits on one table the expected case, and the recipe
+issues exactly one commit every job needs before it can do anything: the
+metadata-only widening that registers the five caption columns. Eight jobs
+launched together will race on it, and seven of them will lose.
+
+`ensure_caption_fields` therefore takes the **URI** rather than an open dataset,
+and owns its own handle:
+
+```text
+attempt 1   open uri  →  columns absent  →  add_columns  →  ✗ lost the race
+                                                │
+attempt 2   open uri  →  columns PRESENT  →  validate  →  ✓ return this handle
+                (reopening is the point: the handle that lost the race
+                 cannot see the commit that beat it)
+```
+
+A retry that held the original handle would re-read a snapshot predating the
+winner's commit, conclude the columns are still absent, and fail the same way
+until its budget ran out. Reopening per attempt is what makes the race
+self-resolving. The function returns the advanced handle so the read version is
+pinned from the snapshot that actually has the columns — a structural guarantee
+rather than a call-site convention.
+
+The retry budget is bounded and small. A lost race resolves on the next attempt
+because the winner has already committed; a failure that persists across the
+budget is not a race, and surfacing it is correct.
+
+### What made this recipe safe to shard
+
+Two prerequisites had to be met first, and neither was cosmetic.
+
+- **A checkpoint id that survives a sibling's commit.** Concurrent shards commit
+  constantly, so a key invalidated by a version bump would let each bump
+  invalidate every other shard's staged work — fatal to a campaign rather than
+  merely wasteful. The [row address](#the-checkpoint-id-is-the-row-address)
+  survives one: measured, a caption wave on one fragment leaves every other
+  fragment's addresses intact. A composite id was adopted for this reason and
+  later removed, because what the campaign actually needed was for the
+  **namespace** to stop digesting the read version, and that is independent of
+  the key.
+- **Shard-scoped owed accounting.** Every figure a job reports is now its own —
+  owned fragments, owed fragments, owed rows within them. A table-wide count in
+  a sharded job describes work the job will never do, and an operator reading it
+  concludes the job is stuck.
+
+Independence was already true and did not need work: a caption is a pure function
+of one clip's media and the contract digest. There is no corpus-wide reduction,
+so dividing the rows cannot change what any caption says. A recipe with a fitted
+basis or a population-derived threshold would not have this property, which is
+why the [generic checklist](curator-next-sharding.md#adoption-checklist) asks.
+
+### What a sharded run logs and reports
+
+Every owed figure is shard-relative, and the scope is named on the line so the
+number cannot be misread as a corpus-wide claim:
+
+```text
+Caption work shard 3/8 on <uri>: this job owns the fragments whose manifest id
+  mod 8 equals 3. Indices are zero-based, so a complete campaign launches
+  indices 0 through 7.
+Caption attempt on <uri> @v12 (shard 3/8): 61 owned fragment(s), 47 of them
+  owed, 1,208,411 owed row(s), largest owed fragment 31,004 row(s), under
+  selected-only scope and contract <digest>.
+```
+
+An unsharded run prints `(unsharded)` in the same position, so the two are
+distinguishable in a log without knowing which was configured.
+
+`CaptionRunResult` carries `shard_count` and `shard_index`, both null on an
+unsharded run, so a campaign's summaries can be attributed to their slices after
+the fact. They are run metadata and reach no table column.
+
+The "nothing owed" warning is scoped the same way. When a selected-only job finds
+no work it counts pending rows **within the fragments it owns**, and says so:
+rows in other shards' fragments are not this job's to explain, and naming them
+would send an operator looking for a fault in the wrong job.
+
+### Driving a campaign
+
+There is no campaign command, by design — a campaign is `count` launches of one
+config differing only in `input.shard.index`.
+
+```bash
+# One config per index, identical but for input.shard.index. Indices are
+# ZERO-BASED, so count 8 means 0 through 7 inclusive.
+for index in $(seq 0 7); do
+  yq ".input.shard = {\"count\": 8, \"index\": ${index}}" caption.yaml \
+    > "caption-shard-${index}.yaml"
+  cosmos-curator pipeline render "caption-shard-${index}.yaml"   # confirm the scope
+  pixi run --as-is run-pipeline  "caption-shard-${index}.yaml"   # or submit to Slurm
+done
+```
+
+Each shard issues its own `Update` transactions when it finishes, so captions
+become visible shard by shard rather than all at once. That is a real difference
+from an unsharded run and worth stating: [publication validates everything, then
+commits in bounded
+waves](#publication-validate-everything-then-commit-in-bounded-waves) **per
+job**, and the invariant it guarantees — no partially-published fragment — holds
+per fragment, which is what downstream readers actually depend on. A reader
+mid-campaign sees some fragments captioned and others not, with no fragment
+half-done.
+
+A failed shard is re-launched with the same index. It resumes from its checkpoint
+if its staged progress survived, and from its owed set if it did not; either way
+it captions only what its own slice still owes.
+
+To close a campaign out, launch every index again. A shard that owes nothing
+returns before validating the model directory, resolving a workspace, or
+initializing Ray, so a finished shard costs one driver plan and no GPU — which
+makes "re-launch everything" both the cheapest check that a campaign is complete
+and the action that completes it.
+
+Nothing asserts that a campaign finished. No registry records which indices ran,
+so launching 0, 1, 2 and 4 of 5 leaves shard 3's work owed with nothing reporting
+it. Campaign bookkeeping belongs where jobs are launched.
+
+## Publication: Validate Everything, Then Commit in Bounded Waves
 
 Phase B reads the staged Parquet, folds duplicate `clip_id` rows, and validates
 **before** touching Lance. Every operation below is per fragment. Equal
@@ -1062,9 +1517,9 @@ Three guards then stand between preparation and the commit:
   transaction construction, so an expected envelope cannot smuggle another
   fragment's prepared descriptor into the commit.
 
-Finally **one** `LanceOperation.Update` carries every prepared fragment plus
+Finally each `LanceOperation.Update` carries one wave of prepared fragments plus
 `fields_modified`. `LanceOperation.Update` accepts a partial fragment list, which
-is what makes a single multi-fragment commit possible; the embeddings leg's
+is what makes a multi-fragment commit possible; the embeddings leg's
 [`fill.py`](../../../cosmos_curator/next/recipes/embeddings/fill.py) already does
 exactly this, and this recipe follows that precedent rather than inventing a
 second commit shape. Columns outside the caption group survive because each
@@ -1073,18 +1528,54 @@ not just the one `update_columns` wrote; `fields_modified` does not decide that 
 it lists the modified field ids so Lance can drop those fragments from indices
 covering them.
 
-### What one commit buys over committing fragment by fragment
+### Why publication commits in waves, and why not one commit per fragment
 
-With N commits there are N+1 observable table states, and a crash between them
-leaves the table genuinely half-published. Everything downstream then has to
-reason about partial state, and the pending predicate stops being honest — which
-is what forces commit-attempt counters, partial-run states, and a reconciliation
-state machine. With one commit there are two states. The predicate is always
-honest, resume is always correct, and the only failure mode is "nothing published,
-staged rows intact" — exactly the case recovery already handles.
+Validation is all-or-nothing; publishing is not. Every refusal runs over the
+whole prepared set before a single transaction is issued, so a run that commits
+anything has already accepted all of it — that ordering is what lets the commits
+be split at all. What is then split is the writing: one bound,
+`_PUBLICATION_WAVE_BOUND` (16), applies at both ends of the commit sequence, so
+the prepared fragments are committed in never more than that many transactions
+and never one carrying fewer than that many fragments. A publication too narrow
+to fill two waves therefore still commits exactly once, and a campaign-scale one
+commits a fixed number of times.
 
-The cost is O(touched fragments) of preparation before a single visible byte
-changes. That work is parallel Ray tasks and is small next to inference.
+What splitting buys is that a landed wave is **committed**, and committed work is
+reusable under any campaign shape, because the owed-work predicate reads the
+caption columns and the contract digest and knows nothing about `input.shard`. A
+publication interrupted after eight waves costs the next attempt only the
+remaining eight — even if that attempt runs under a different `count`, where an
+all-or-nothing commit would have left the whole corpus owed. What it does **not**
+buy is any reuse of Phase A: publication begins only once inference has finished,
+so the staged rows are at risk for the whole of Phase A either way.
+
+The bound has both halves because a commit's cost is one manifest and a manifest
+enumerates **every** fragment of the table, not the ones the commit touched —
+measured at pylance 11.0.0 as 82 bytes per fragment, linear from 100 to 4,000.
+So N commits over a table of F fragments write O(N × F) manifest bytes however
+the work is divided:
+
+- **Capping the count** is what makes splitting affordable. One commit per
+  fragment is O(F²): for the ~31k fragments of a 250M-row table that is roughly
+  73 GiB of manifests and 31k serialized commit round trips, against ~40 MiB and
+  16 round trips under the cap.
+- **Flooring the size** follows because a wave's cost does not shrink with its
+  contents while the loss it prevents does, so splitting a narrow publication
+  pays full price per piece for nothing. The floor binds *every* wave rather
+  than only the first, which is why the split is derived as a wave count and
+  then divided evenly: a fixed slice width divides with a remainder, and that
+  remainder would be a final wave below the floor, paying a whole manifest for
+  fragments its predecessor would have carried at the same price. So the
+  prepared set takes as many waves as the floor affords — no more, and never one
+  that ends in a short tail.
+
+Commits after the first read against a version their predecessors have already
+advanced past, and are not re-opened: measured at pylance 11.0.0, an `Update`
+naming fragments no earlier wave touched lands against a stale read version.
+That is the same property that lets two shards commit into one table.
+
+The preparation cost is unchanged — O(touched fragments) before a single visible
+byte changes, as parallel Ray tasks, and small next to inference.
 
 `update_columns` **preserves unmatched left rows**: a row whose caption columns
 were already populated and which is not in the staged set keeps its values. It is
@@ -1094,9 +1585,14 @@ missing from the owed set rather than trusting the commit to complain.
 
 ### An ambiguous commit is verified, not trusted
 
-Lance's commit raises `OSError` for IO faults and `RuntimeError` for its
-commit-conflict and write-contention variants, and **neither tells you whether the
-commit landed**. A response lost after the manifest was written raises exactly as
+Lance's commit raises `OSError` both for IO faults and for a commit conflict —
+measured at the locked pylance 10.0.0 as a bare `OSError`, and at 11.0.0 as
+`CommitConflictError`, which is itself an `OSError` — and **no exception type
+tells you whether the commit landed**. Nor can the two be separated by type at
+the locked version: a deterministic "invalid user input" rejection arrives as the
+same bare `OSError` as a retryable conflict, and the only thing distinguishing
+them is a human-readable message that no code may parse.
+A response lost after the manifest was written raises exactly as
 an outright rejection does. Re-raising unconditionally would send an operator to
 re-publish a wave that already succeeded, and re-publishing under unseeded
 generation writes different captions over good ones.
@@ -1499,6 +1995,10 @@ kind: robot-action-caption
 input:
   clips_lance_uri: s3://example-bucket/robot_clips/lance/clips.lance
   selected_only: true
+  # shard is optional; omitting it means this one job owns every fragment.
+  # shard:
+  #   count: 8
+  #   index: 0
 
 execution:
   storage_profile: default
@@ -1510,6 +2010,7 @@ That is the entire surface:
 | --- | --- | --- |
 | `input.clips_lance_uri` | required | The `clips.lance` to read **and widen**. Input and output are the same table. |
 | `input.selected_only` | `true` | Input scope. When true, require exact-string `curate_selection_reason` and owe only rows equal to `selected`; other values and NULL remain untouched. Set false to caption every otherwise-pending row, including tables without the Curate column. Excluded from the caption contract digest **and** from workspace identity, so a widened attempt resumes a crashed narrower one instead of stranding its captions ([why](#why-input-scope-is-not-a-namespace-input)). |
+| `input.shard` | absent | Execution scope across independently launched jobs. Absent means one job owns every fragment. When present, `count` and `shard.index` are both required — a half-configured pair would leave work claimed by no job — and `index` must be less than `count`, refused at parse time. Excluded from the contract digest, so re-sharding recaptions nothing; **included** in workspace identity, so concurrent shards do not share a staging directory ([Sharding a caption campaign](#sharding-a-caption-campaign)). |
 | `output.staging_root_uri` | `<clips_lance_uri>__caption_staging` | Root of the recovery workspace. Derived on read from the **already-normalized** table URI, so one table reached by two spellings cannot produce two workspaces that cannot see each other's work. Configured local paths are canonicalized to absolute paths; the workspace boundary rejects any relative local value that reaches it. Absolute bare paths, absolute local `file://` URIs, and supported remote URIs such as `s3://` are valid. |
 | `generation.temperature` | `0.7` | Sampling temperature. **Digested.** |
 | `generation.top_p` | `0.8` | Nucleus sampling mass; must be in (0, 1]. **Digested.** |
@@ -1525,12 +2026,14 @@ That is the entire surface:
 | `execution.max_concurrent_batches` | `8` | In-flight Ray batch calls per vLLM replica. Raises overlap and host-memory demand without changing the GPU count. Minimum 1. |
 | `execution.tensor_parallel_size` | `1` | Tensor-parallel factor within each vLLM replica. Minimum 1. The replica GPU width is this value multiplied by `pipeline_parallel_size`; model compatibility and placement feasibility are unchecked here — see the corresponding [limitation](#limitations). |
 | `execution.pipeline_parallel_size` | `1` | Pipeline-parallel factor within each vLLM replica. Minimum 1. Multiplies `tensor_parallel_size` into the replica GPU width and is execution-only. |
-| `execution.max_num_batched_tokens` | unset | Optional positive vLLM scheduler token budget. Unset preserves the backend/model default. Execution-only and excluded from caption identity. |
+| `execution.max_num_batched_tokens` | unset | Positive vLLM scheduler token budget per step. Unset preserves vLLM's own default, which at the pinned version is **2048** — far below one multimodal prompt, so the prefill is spread over `ceil(prompt / 2048)` scheduler steps and this is a throughput knob on any large-prompt run rather than a rarely-needed override ([the default trap](#the-scheduler-token-budget-and-its-default)). Execution-only and excluded from caption identity. |
+| `execution.gpu_memory_utilization` | unset | Fraction of each GPU vLLM may claim, in (0, 1]. Unset preserves vLLM's own default. Whatever the weights leave becomes KV cache, which fixes how many requests one replica can hold at once, so on a large model this is the knob that sets engine residency — vLLM prints the result as `Maximum concurrency for N tokens per request`. Raising it trades startup headroom for residency and can fail at CUDA-graph capture. Execution-only: it never changes a caption. |
+| `execution.enable_prefix_caching` | `false` | Whether vLLM retains KV blocks for prefix reuse. Two-state, not tri-state: vLLM's own default is **on**, and inheriting it is the known-wrong value here, so there is no way to ask for it ([why](#prefix-caching-ships-off-and-the-default-is-a-measurement)). Execution-only: prefix reuse is semantically transparent, so it cannot change a caption. |
 | `execution.media_attempts` | `3` | Transport read attempts per clip before the reader gives up. Minimum 1. The only lever over an intermittently failing object store. |
 | `execution.media_fetch_workers` | `4` | Clips one media actor reads at once, and also its batch size. Minimum 1. Raises concurrency while block-bound and partitions the node's budget once slot-bound — see the [limitation](#limitations). Rejected on the driver if no live node can satisfy the resulting CPU and `curator_io` request together. |
 | `execution.media_cpus_per_fetch` | `0.25` | CPU reservation per concurrent clip read. The actor multiplies it by `media_fetch_workers`, so widening an actor does not silently reduce its declared CPU share per read. Must be positive and finite. |
 | `execution.lance_read_batch_size` | `256` | Rows per Lance scan batch before media fetching. Minimum 1. |
-| `execution.parquet_rows_per_file` | `4096` | Shared minimum and maximum staged-row hints passed to Ray's Parquet sink. Minimum 1; the sink does not guarantee exact file sizes. |
+| `execution.parquet_rows_per_file` | `256` | Shared minimum and maximum staged-row hints passed to Ray's Parquet sink. Minimum 1. Ray's sink adopts the minimum as the write bundle's row floor, and one bundle is one checkpoint, so this is the recovery granularity — see [Staged Parquet, and why it is needed alongside the checkpoint](#staged-parquet-and-why-it-is-needed-alongside-the-checkpoint). Lowering it below `lance_read_batch_size` only splits files, because a bundle can never hold fewer rows than the block reaching the sink. |
 | `execution.source_frame_pixels` | `921600` (1280×720) | Pixels in one decoded source frame. With `video.max_frames` it sizes the heap reservations the three media-carrying CPU stages declare to the scheduler, so it changes actor packing density and never a caption. Set it from the widest camera in the corpus: understating it packs more actors per node than their working set fits, and the symptom is an OOM kill rather than an error ([how the reservations are derived](#what-a-media-carrying-stage-reserves)). |
 | `execution.progress` | `false` | Ray Data progress bars. |
 
@@ -1633,6 +2136,92 @@ model/runtime policy. Pinned vLLM permits a value below `max_model_len` while
 chunked prefill is enabled; if a backend disables chunked prefill or imposes
 other scheduler constraints, vLLM remains the validation authority.
 
+#### The scheduler token budget and its default
+
+Omitting the key does not mean "no setting". It means vLLM's own default, which
+at the pinned version is **2048 tokens per step** — and that number is the
+reason the knob is described above as a throughput lever rather than a rare
+override. A prompt longer than the budget is prefilled over `ceil(prompt /
+budget)` scheduler steps, and this recipe's prompts are long: a measured
+8×H100 run carried **12,657 prompt tokens** producing **90 output tokens**, a
+140:1 ratio that makes prefill essentially the whole cost of a request. At the
+inherited 2048 each clip's prefill was chopped into roughly seven steps.
+
+Nothing downstream can tell an inherited value from a chosen one once it is a
+plain `int` inside the engine, and grepping this repository for the knob returns
+only the forwarding branch — which reads as *not relevant* rather than as
+*inherited*. So the resolved budget is reported at startup **with its
+provenance**, naming vLLM as the source when the key is omitted; the value alone
+would have been in that run's log and still been missed, because it was vLLM
+printing it rather than Curator. See [What the startup log says about
+capacity](#what-the-startup-log-says-about-capacity).
+
+#### The GPU memory fraction, and why it is a config field
+
+`execution.gpu_memory_utilization` exists because the recipe previously could not
+express it *at all*: the knob passes through `engine_kwargs` unhindered, but no
+config field and no call site supplied one, so the most consequential memory
+number in the run was whatever vLLM's own default happened to be — 0.9 at the
+pinned version, and vLLM has already moved that default once, from 0.9 to 0.92.
+A dependency upgrade could therefore reshape the run's memory budget with no
+config change, and a grep of this repository for the knob's name returned
+nothing, which reads as *not relevant* rather than as *inherited*.
+
+What makes it worth a field rather than a diagnostic is what the fraction buys
+on a large model. The measured run loaded a dense bf16 checkpoint whose weights
+alone are **51.08 GiB**; whatever the fraction leaves after that becomes KV
+cache, and the cache is what fixes residency. vLLM printed the resulting ceiling
+directly — `GPU KV cache size: 270,336 tokens` and `Maximum concurrency for
+32,768 tokens per request: 8.25x` — against a measured time-weighted **7.34
+requests Running** and **0.49 Waiting**. The engine was running at essentially
+its residency ceiling with almost nothing queued behind it, which is the shape
+that says the ceiling itself is the bound. Raising the fraction is the lever that
+moves it; nothing else in the config can.
+
+The field is optional, and `None` is load-bearing rather than a placeholder: it
+is what keeps vLLM's own value in force. A recipe-side default would silently
+override the dependency on every run that never mentioned the knob, which is the
+same defect one level along from the one this field closes.
+
+#### Prefix caching ships off, and the default is a measurement
+
+Prefix reuse is *structurally unreachable* for this recipe's request shape rather
+than merely unhelpful: `REQUEST_CONTENT_TYPES` renders `video_url` before `text`,
+so every prompt opens with its own clip's vision tokens and two requests diverge
+at the first token. No block is ever a shared prefix. The measured run bears it
+out at **0.0% hit rate across all 11,188 engine statistics samples**, while the
+retained blocks still counted against reported KV usage — inflating exactly the
+figure an operator reads to judge residency — and the block hashing still ran
+over every 12,657-token prompt.
+
+So `execution.enable_prefix_caching` defaults to `false`, and that default is
+where the reasoning lives: an operator reads a field description, not a call
+site. The field is **two-state**, and that is the one thing about it worth
+stating twice. Its neighbours `max_num_batched_tokens` and
+`gpu_memory_utilization` are optional precisely so a run can decline to have an
+opinion and inherit vLLM's; here the inherited value is **on**, which is the
+known-wrong one, so there must be no way to select it. The key is therefore
+written into `engine_kwargs` unconditionally rather than behind an
+`is not None` guard.
+
+What would make `true` worth measuring is rendering the instruction text
+**first**, which would give every request a genuinely shared prefix. That is a
+change to `REQUEST_CONTENT_TYPES` — which the caption contract digests, so it
+cannot happen quietly and it recaptions the configured scope — and it is the
+change to make, not this flag on its own.
+
+#### The preparation stage is built with the engine's own context length
+
+`PrepareMultimodalStageConfig.model_config_kwargs` carries `max_model_len`
+alongside `media_io_kwargs`, and both are copied from the same engine mapping
+the engine itself is built from. The preparation stage constructs its own vLLM
+`ModelConfig`, so left unpassed it resolves the context length from the
+checkpoint instead: the measured run had all 21 `PrepareMultimodalUDF` actors
+logging `Using max model len 262144` while the engine ran at `32768`. Nothing
+raises, because only the engine's limit is ever enforced — the two halves of one
+request simply size for different windows, and the disagreement is visible
+solely as that stray log line.
+
 Declaring the pair in that runtime YAML prevents the staged artifact from
 silently widening the pixel ceiling for that run. It does not make the numeric
 values interpretation-stable: Transformers or vLLM can reinterpret the same
@@ -1659,7 +2248,7 @@ set does not fit, and the node is OOM-killed rather than raising.
 [`VllmProcessorConfig.stage_heap_reservations`](../../../cosmos_curator/next/recipes/robot_action_caption/engine.py)
 derives two figures from three terms:
 
-```
+```text
 reservation = resident + batches_in_flight × copies_held × batch_size × bytes_per_row
 ```
 
@@ -1703,6 +2292,54 @@ each figure multiplied by that pool floor — not the figure alone. And because
 `node_memory / reservation`: lowering `inference_batch_size` now genuinely
 reduces the media in flight rather than only redistributing it across more
 workers.
+
+#### Both roles are sized from the pre-resize ceiling, and the forwarding pair over-reserves
+
+`bytes_per_row` is one figure for both roles, and for the two forwarding stages
+it is measurably too large. It is a ceiling on the payload **inside** the
+preparation stage, before the processor resizes; the column that leaves that
+stage has already been resized to the processor's pixel budget. On the measured
+run the payload actually crossing the `ChatTemplate` and `Tokenize` boundaries
+was **11.05 MiB per row** — agreeing to within 4% across three independent
+readings, 171–177 MiB per 16-row block at each of those two stages and at the
+engine — against the **168.75 MiB per row** both roles were sized from, a factor
+of **15.3** on the per-row term.
+
+That factor does not carry through whole, because `resident` does not scale with
+it. Substituting the measured row into the same formula at the shipped batch of
+16 gives `3 GiB + 2 × 2 × 16 × 11.05 MiB` = **3.69 GiB** per forwarding worker
+against the **13.55 GiB** declared: over-declared **3.67×**, with the fixed 3 GiB
+term absorbing the rest. Across that run's 28 forwarding workers it is 379.3 GiB
+declared where 103.3 GiB would have covered it, so roughly **276 GiB was
+reserved for payload that never arrived** — against 395.2 GiB legitimately
+declared by the 21 preparation workers, on a cluster the run drove to 79.4% of
+node memory. Meanwhile 91 of 192 CPUs sat idle, because the reservation rather
+than the CPU budget capped how many of those cheap actors could be placed.
+
+The consequence is stranded reservation, not overcommit, and that asymmetry is
+the whole reason it is tolerable.
+
+**It is deliberately not fixed, and the reason is that it cost nothing.** The
+engine was the constraint on that run: it was never backpressured, and every
+upstream stage was throttled behind it — fetch by `DownstreamCapacity` 88% of
+samples, the four preparation stages by `ResourceBudget` 94%. Placing more of
+the cheap CPU actors would have produced rows the engine could not consume any
+faster. Splitting the figure also cannot be done *well* today: the honest
+forwarding number is the resize ratio applied to the decode ceiling, and that
+ratio is only derivable when `video.max_pixels` is set, which the measured run
+left unset. A hand-set second field would be one corpus's measurement applied to
+every later one, in the direction where being wrong is unrecoverable —
+under-declaring is what OOM-kills a node, because `memory` is a placement hint
+Ray never enforces.
+
+So the direction of the error is the justification for leaving it: over-declaring
+wastes budget, under-declaring kills the job. **Revisit it when the object store
+or host memory becomes the binding constraint rather than the GPU** — the signal
+is the engine stage no longer reporting itself throttle-free while the CPU stages
+sit on `ResourceBudget`, or host memory refusing actors the CPU budget could
+otherwise place. At that point derive the forwarding figure from
+`video.max_pixels` so it stays a property of the configured policy rather than a
+second number to keep true by hand.
 
 The shape is derived; the constants are fitted to one measured run, in which a
 `MapBatches(PrepareMultimodalUDF)` worker's resident set reached 16.47 GB
@@ -1790,17 +2427,21 @@ faults are refused before a GPU is allocated is listed under
 | Last durable event | What the next invocation does |
 | --- | --- |
 | Failure before or during Phase A | Re-pins the same version (the columns already exist), resumes into the same namespace, and infers only the clips whose rows were not checkpointed. |
-| Staged file written but its checkpoint still pending | Ray discards the pending output and replays that shard. Bounded to one shard's worth of GPU work. |
-| Phase A finished, crash before publication | **The case this design exists for.** Every staged row is reused; nothing is inferred again; one commit publishes the lot. |
+| Staged file written but its checkpoint still pending | Ray discards the pending output and replays that staged file. Bounded to one staged file's worth of GPU work. |
+| Phase A finished, crash before publication | **The case this design exists for.** Every staged row is reused; nothing is inferred again; publication commits the lot. |
+| A crash between publication waves | The waves that landed are canonical and their clips are complete under any later `count`. The next attempt re-prepares and republishes only the fragments no wave reached; nothing is re-inferred, and no fragment is half-published. |
 | A validation failure in Phase B | Nothing is published. Fix the cause (a conflicting duplicate, a clip pending twice, a digest mismatch, a missing or extra staged clip) and re-run; the staged rows are intact. |
 | Commit raised, the table shows no pending row in the wave, and this attempt's marker is in a newer transaction | The commit landed and the error was a lost response. The run reports the latest observed version with a WARNING; nothing to redo. |
 | Commit raised and the table shows no pending row, but this attempt's marker is absent | Another writer may have completed the rows. The run raises a conflict error because it cannot attribute the canonical state to this attempt. |
 | Commit raised and pending rows remain | Nothing was published. The staged rows are intact and a re-run publishes them without re-inferring. |
 | Commit raised and a targeted fragment is absent | Whether it landed cannot be determined, so the run refuses as unverifiable rather than guessing. The staged rows are intact; inspect the table before re-running. |
-| Commit succeeded, cleanup failed | The captions are canonical. Retry cleanup later, or leave the workspace; nothing reads it. |
+| Commit succeeded, cleanup failed | The captions are canonical. Delete the workspace by hand: the namespace is version-independent, so a later attempt resolves to it again. Owing nothing, that attempt never opens it and the cost is storage alone; owing a row in a fragment that also holds the leftover staged rows, publication refuses before committing until the workspace is gone. |
 | `PROMPT_VERSION` or any digested constant changed | A different namespace and a different contract. **Nothing is reused**, by design, and the rows captioned under the old contract become pending again and are overwritten. |
 | An upstream schema change added or removed a supported context column | Same as above: the resolved subset moved, so the digest moved. The corpus is recaptioned. |
-| Source version moved (a compaction, another leg's commit) while a workspace holds progress | Resolves to a fresh namespace and re-infers. **Nothing is reused**, because the pinned version is in the namespace digest; the stale namespace is left untouched. |
+| Source version moved *without moving rows* (another leg's commit, this recipe's own widening) while a workspace holds progress | Resumes the **same** namespace and reuses every staged row. The checkpoint id names no location, and the version is not a namespace input. |
+| Source **compacted** while a workspace holds progress | Resumes the same namespace, but the staged rows are keyed by retired fragment ids so none matches an owed row: the attempt re-infers its whole owed set. Nothing is corrupted, and the unmatchable partitions are dead weight until the namespace is deleted ([why](#no-recovery-across-compaction)). |
+| A shard failed and is re-launched at the same index | Resumes its own namespace and infers only what its own slice still owes. Other shards are unaffected and were never waiting on it. |
+| A shard's `count` changed mid-campaign | A different partition, so a different namespace. Committed captions are unaffected — a shard is not result identity — and that now includes every publication wave that landed before an interruption. What is stranded is progress the old count had only *staged*: a job that crashed during Phase A loses all of it. Choose `count` per campaign and keep it. |
 | `input.selected_only` widened from `true` to `false` after a crash | Resumes the **same** namespace and infers only the clips that were not checkpointed, plus the newly in-scope ones. Scope is [not a namespace input](#why-input-scope-is-not-a-namespace-input). |
 | `input.selected_only` narrowed from `false` to `true` after a crash | Resumes the same namespace, but publication refuses the staged clips the narrower attempt does not owe. Nothing is committed and the staged rows are intact; re-run widened to publish them. |
 | `robot-action-split` appended rows after the pin | Those rows are outside this attempt and stay pending for the next one. |
@@ -1843,9 +2484,13 @@ write inside Phase A.
 
 The run prints two lines worth watching before any GPU work starts: the resolved
 context columns (`resolved caption context columns [...] out of supported [...]`)
-and the plan (`N pending fragment(s), M pending row(s) under contract <digest>`).
-The first tells you which optional columns this snapshot supplied, and the second
-gives you the digest every query below needs.
+and the plan (`Caption attempt on <uri> @v<N> (<scope>): ... owned fragment(s),
+... of them owed, ... owed row(s) ... and contract <digest>`). The first tells
+you which optional columns this snapshot supplied, and the second gives you the
+digest every query below needs. Its `<scope>` reads `unsharded` or
+`shard <index>/<count>`, and **every count on that line is relative to what this
+job owns** — see [Sharding a caption
+campaign](#sharding-a-caption-campaign) for driving a multi-job campaign.
 
 For multi-node capacity, submit the same driver command to a managed Ray cluster
 as described in [Managed Ray Clusters on Slurm](curator-next-slurm-ray.md); the
@@ -1975,6 +2620,18 @@ diagnosable from them alone, without reconstructing any of it from source.
   replicas than the supply has reads, which integer division renders as `0` — an
   absence of supply rather than the thin margin it is.
 
+- **The scheduler token budget, and whether anyone chose it.** `Engine scheduler
+  token budget: 2048 token(s) per step, from vLLM's own default because
+  execution.max_num_batched_tokens is unset, not from a choice. A prompt longer
+  than this takes more than one scheduler step to prefill, so a multimodal
+  prompt of tens of thousands of tokens is spread over many steps at this
+  value.` Reported either way, and the provenance half is the point for the same
+  reason it is on the IO-budget line: an omitted key is a non-trivial dependency
+  default, and `2048` against this recipe's ~12,657-token prompts is the
+  difference between one prefill step and seven. When the YAML does set it the
+  line instead reads `…, from execution.max_num_batched_tokens.`, so the two
+  cases are told apart by the source clause rather than by the number — see [The
+  scheduler token budget and its default](#the-scheduler-token-budget-and-its-default).
 - **The resolved video policy the engine is built with.** `Caption video policy
   reaching the engine: media_io_kwargs={'video': {'fps': 3.0, 'min_frames': 4,
   'max_frames': 64}}, mm_processor_kwargs={'min_pixels': 3136, 'max_pixels':
@@ -2078,6 +2735,85 @@ diagnosable from them alone, without reconstructing any of it from source.
   finite and non-zero for that reason; see
   [`ACTOR_RESTART_BOUNDS`](../../../cosmos_curator/next/recipes/robot_action_caption/engine.py).
 
+### What the run log says while the phase executes
+
+The startup lines above describe what the phase was *configured* to hold. Three
+more diagnostics describe what it actually did, and they exist because Ray's own
+progress output cannot answer the questions a slow run raises. All three are
+periodic or post-run rather than per-row: at this recipe's batch sizes a per-row
+line is hundreds of thousands of lines, and every quantity here is only
+meaningful over many samples anyway.
+
+- **What the object store sustained.** Each `ClipMediaFetch` actor summarises its
+  own transport every 100 batches: bytes read, transport-seconds against
+  batch-wall-seconds, MiB/s, per-clip read p50/p90/max over its successful reads,
+  and — the two figures no recipe-level clock could produce — the **attempts**
+  those reads consumed and the seconds that **delivered nothing**. Attempts above
+  delivered reads are retried transport faults and refused objects, so a store
+  answering two requests in three is visible here and nowhere else: every `read()`
+  call still returns bytes, so a rate alone reports a degrading store as a merely
+  slow one. Nothing else in the phase measures the store, and the stage's *queue
+  depth* cannot stand in for it — that depth is set by downstream backpressure,
+  so a fetch-bound run and a fetch-idle one look identical without this. The two
+  time figures are reported separately rather than differenced into a "CPU"
+  number: reads overlap on the actor's thread pool, so wall time can fall either
+  side of the summed transport time and their ratio is the overlap achieved, not
+  a duty cycle. Only reads that **delivered bytes** reach the transport term and
+  the quantiles; a failed attempt's duration is an attempt budget and is charged
+  to the undelivered term instead, because folding it into the rate would make a
+  degraded store look slow. Below two delivered reads the line says so rather
+  than quoting quantiles — a p50 of `0.00s` reads as an instantaneous store,
+  which is the opposite of what no measurement means.
+
+  The measurement itself is taken one layer down, in
+  [`MediaObjectReader`](../../../cosmos_curator/next/utils/media_reader.py).
+  `read()` retries internally, so a clock wrapped around the call spans every
+  failed attempt plus the backoff between them and reports the total as
+  "transport": a clip delivered on its third attempt looked like one slow
+  transfer, and the attempt count was not observable from outside the reader at
+  all. The reader therefore times the delivering attempt alone, derives the rest
+  of the call as a residual, counts every attempt whether or not it delivered,
+  and accumulates all of it under its own lock — which is what makes the stage's
+  concurrent thread-pool reads safe to measure without the stage collecting
+  anything itself. `transport_stats()` hands back a frozen `MediaTransportStats`
+  snapshot whose figures are cumulative since the actor built its reader, the
+  same span the "after N batch(es)" count covers, so this recipe prints the
+  snapshot as it stands and diffs nothing. What stays here is **presentation**:
+  the 100-batch cadence, the quantile method, and the wording. The reader logs
+  nothing at all — it is a shared utility under
+  [`next/utils`](../../../cosmos_curator/next/utils/), and a cadence that suits a
+  100-clip batch suits neither a single-object read nor a per-row one, so the
+  interval is the caller's decision. This recipe is its only caller today; a
+  second one gets the same figures by asking for a snapshot, with no change
+  there.
+
+  The snapshot keeps one float per delivered read for the actor's whole life,
+  uncapped, and **this stage is the layer that bounds it** — only here is the
+  rate that fills the sequence known. So long as the stage feeds a GPU-bound
+  engine under backpressure its reads arrive at that engine's row rate, and a
+  node added to the run adds a media actor and engine throughput together, so
+  run duration is the only axis left and the allocation's time limit caps it:
+  measured at the default `media_fetch_workers=4`, a nine-hour actor retained
+  under a megabyte. Capping in the reader would be the wrong layer anyway — it
+  makes a shared utility choose the summary it exists to leave open.
+- **What the recipe's own two hooks cost.** `preprocess` and `postprocess` are
+  the only seam this recipe owns inside the processor's stage graph — every other
+  stage is Ray's, runs in its own actor, and emits no timing of its own. Each
+  wrapped hook reports its cumulative and per-row cost every 2,000 rows, so a
+  phase spending its time in request construction or result canonicalization is
+  distinguishable from one spending it in the engine. A row that **raised** still
+  contributes its cost: a hook that fails slowly is exactly the case worth
+  seeing, and counting only the survivors hides it.
+- **What each operator spent and what rate it achieved.** After the sink, the
+  phase logs Ray Data's own statistics for the executed plan. Verified against
+  Ray 2.58.0, that summary carries per-operator remote wall, CPU and UDF time,
+  output rows and bytes *per block*, rows per task, tasks per node, and each
+  operator's own throughput in rows/s, plus cluster and dataset spill totals and
+  a dataset-level rows/s. The per-operator **rows/s** lines are what a bottleneck
+  claim from this log may rest on, because a rate is the same quantity at every
+  operator. What the summary does *not* carry is any queue depth at all — see
+  [the gap that stays open](#limitations).
+
 ### Telling whether a run finished
 
 **The committed Lance version is the sole completion signal.** There is no
@@ -2090,7 +2826,8 @@ CLI prints one of two messages:
 Here `N`, `VERSION`, `E`, and `T` are the corresponding
 `CaptionRunResult` counts and ending version. The run summary carries exactly
 `clips_lance_uri`, `source_version`, `ending_version`, `published_rows`,
-`error_rows`, `truncated_rows`, and `caption_contract_digest` — see
+`error_rows`, `truncated_rows`, `caption_contract_digest`, `shard_count`, and
+`shard_index` — see
 [`CaptionRunResult`](../../../cosmos_curator/next/recipes/robot_action_caption/pipeline.py).
 The digest is the one name that differs between the two surfaces: the
 `CaptionRunResult` attribute is `contract_digest`, while `as_summary()` publishes
@@ -2098,6 +2835,12 @@ it under `caption_contract_digest`, matching the Lance column it stamps.
 `ending_version` is never null: a run that published
 reports its commit, and a run that owed nothing reports the pinned version, which
 already includes the widening commit.
+
+The summary also carries `shard_count` and `shard_index`, both null on an
+unsharded run, so a campaign's per-job summaries can be attributed to their
+slices afterwards. They are run metadata: no table column records which job
+captioned a row, because the shard is
+[execution scope, not result semantics](#sharding-a-caption-campaign).
 
 ### The summary reports the verdict split
 
@@ -2172,18 +2915,45 @@ how many rows *no* run has ever claimed. A non-zero count after a successful run
 means rows were appended after the run pinned its version — expected while
 `robot-action-split` is still appending.
 
+Every count above is **table-wide**, which is the right scope for a cross-check
+and the wrong scope for judging one job of a campaign. A shard's own owed count
+is on its plan line. To reproduce it, count per fragment over the fragments that
+shard owns rather than over the table:
+
+```python
+shard_count, shard_index = 8, 3
+owed = sum(
+    fragment.count_rows(filter=caption_work_filter(digest, model_id, selected_only=True))
+    for fragment in ds.get_fragments()
+    if fragment.fragment_id % shard_count == shard_index
+)
+```
+
+The table-wide count is the sum of that over every index, which is the cheapest
+way to confirm a campaign has nothing left owed.
+
 ### Resuming after a crash
 
 Re-run the **same config against the same table**. Nothing else is required and
 there is no resume flag: the namespace digest resolves to the same directory and
-Ray's checkpoint filter drops the completed rows.
+Ray's checkpoint filter drops the completed rows. On a sharded campaign, re-run
+the failed shard with the **same** `input.shard.index` — a different index is a
+different job with a different namespace, and it would re-infer.
 
-One thing silently prevents reuse rather than failing, so check it if a resume
-re-infers work you expected it to skip: the source version must not have moved.
-The pinned version is in the namespace digest, so another leg's commit or a
-compaction between attempts resolves the resume to a fresh namespace with nothing
-in it. The run's own log line names the workspace it resolved, so compare it
-against the previous run's.
+A commit by another leg between the two attempts no longer prevents reuse. The
+version is not a namespace input and the checkpoint id names no row location, so
+a resume across it reuses everything. Two things still do silently prevent reuse
+rather than failing, so check them if a resume re-infers work you expected it to
+skip:
+
+- **A compaction between the attempts.** It retires fragment ids, so the staged
+  rows can no longer be matched to owed ones and the attempt re-infers its whole
+  owed set ([why](#no-recovery-across-compaction)).
+- **A changed `input.shard.count`.** That is a different partition and therefore
+  a different namespace, so the previous count's progress is not visible.
+
+In both cases the run's own log line names the workspace it resolved, so compare
+it against the previous run's.
 
 Do **not** change a digested constant to "retry with a better prompt" mid-recovery.
 That is a different contract, so it resolves to a different namespace, re-infers
@@ -2243,23 +3013,32 @@ filesystem construction follow the endpoint-scoped compatibility policy in
 [Ray Data: S3-compatible object storage (GCS)](ray-data.md#s3-compatible-object-storage-gcs).
 Useful readings:
 
-- **Two sibling `<namespace digest>` directories** mean two incompatible attempts
-  ran against this table — they differ in source URI, pinned read version,
-  contract digest, staging protocol version, or staged schema fingerprint. The
-  digest is one-way, so the path cannot tell you *which*; the runs' own log lines
-  can, since each names both the source version and the namespace it resolved.
+- **Two sibling `<namespace digest>` directories** mean two attempts that cannot
+  share rows ran against this table — they differ in source URI, contract digest,
+  shard, staging protocol version, or staged schema fingerprint. On a sharded
+  campaign this is the **expected** shape: one sibling per shard, all live at
+  once. The digest is one-way, so the path cannot tell you *which* input differs;
+  the runs' own log lines can, since each names its scope and the namespace it
+  resolved.
 - **`results/fragment_id=…` populated but no new table version** means Phase A got
   some way in and publication never happened. Re-run to finish it.
 - **Staged rows are not canonical.** Never read captions from Parquet for
   anything downstream; if they are not in Lance, they are not published.
-- **An orphaned namespace after a successful commit** is inert. Nothing references
-  it; delete it at leisure. It only exists if cleanup failed, which is logged as a
-  WARNING and never fails the run.
+- **An orphaned namespace after a successful commit** is *not* inert, and this is
+  the one case where that changed when the read version left the namespace digest.
+  It only exists if cleanup failed, which is logged as a WARNING and never fails
+  the run — but a later attempt on the same table, contract and scope resolves to
+  that same namespace. It lands one of two ways. Owing nothing, it returns before
+  the workspace is opened and never examines the leftover, so the cost is storage
+  alone. Owing a row in a fragment that also holds the leftover staged rows,
+  publication folds those extras and refuses *before* the commit with every
+  staged row intact. Delete the namespace by hand; the published captions are
+  canonical either way.
 - **A namespace stranded by a contract-generation bump** is inert for a different
   reason: nothing ever resolves to it again. A generation bump — a new caption
   column, or any change to the prompt, the model pin, or a `generation` / `video`
-  / `media` field — moves the contract digest, and adding a column also commits a
-  widening that moves the pinned read version. Each of those is a namespace input,
+  / `media` field — moves the contract digest, and a new column also moves the
+  staged schema fingerprint. Either is a namespace input,
   so the next run lands somewhere new. Cleanup follows only a
   commit *under the namespace it published from*, so the previous generation's
   staged rows are never collected, however successfully the new generation
@@ -2293,6 +3072,36 @@ Useful readings:
 
 ## Limitations
 
+- **Per-operator queued *rows* cannot be read from this run's artifacts, and that
+  gap is open.** Verified against Ray 2.58.0: `Dataset.stats()` carries no queue
+  depth of any kind, and the progress lines carry it only in **blocks**. A block
+  is not a fixed amount of work — fusion, dynamic splitting and batch
+  re-bundling all change rows per block along the plan — so two operators' block
+  counts are quantities that merely share a name, and their difference means
+  nothing. **That invalid comparison is what mis-attributed this very run's
+  bottleneck**, crowning the batching stage over the engine that was actually
+  the constraint. The only queue figure Ray publishes at all is the
+  `data_operator_queued_blocks` Prometheus gauge, fed from live executor state
+  ([`ray/data/_internal/stats.py`](https://github.com/ray-project/ray/blob/ray-2.58.0/python/ray/data/_internal/stats.py)),
+  which needs a metrics backend and is still in blocks. So no driver-log-only
+  change closes this. Until it is closed, rest a starvation claim on a
+  **per-consumer** figure whose numerator and denominator belong to the same
+  operator — queued blocks divided by that operator's own replica count — or on
+  the per-operator rows/s the post-run summary does provide.
+- **The two forwarding stages reserve for a payload that no longer exists.** Both
+  reservation roles are sized from the pre-resize decode ceiling, so on the
+  measured run the `ChatTemplate` and `Tokenize` workers declared 13.55 GiB each
+  where 3.69 GiB covered the column they actually carried — 3.67× over, and
+  roughly 276 GiB of node memory reserved for payload that never arrived,
+  capping those actors while 91 of 192 CPUs sat idle. Left as-is on purpose: it cost that run
+  no throughput, because the engine was the constraint and every upstream stage
+  was already throttled behind it, and the error is in the safe direction —
+  over-declaring strands budget where under-declaring OOM-kills a node, since
+  `memory` is a placement hint Ray never enforces. A correct second figure is
+  also not derivable while `video.max_pixels` is unset, and a hand-set one would
+  be one corpus's measurement applied to every later corpus. [The condition that
+  makes it worth fixing, and how to derive it
+  then](#both-roles-are-sized-from-the-pre-resize-ceiling-and-the-forwarding-pair-over-reserves).
 - **Selection narrows rows, not necessarily fragments.** The selection predicate
   is pushed into Lance before Ray sees a row, but a sparse selected population
   can still touch many source fragments. One selected row in each of 100
@@ -2329,32 +3138,59 @@ Useful readings:
   every worker at every startup buys nothing that an operator convention does
   not. The convention: **treat a staged model directory as immutable, and bump
   the registry revision whenever its contents change.**
-- **No recovery across compaction or any source mutation.** Nothing refuses it.
-  The pinned read version is part of the namespace digest, so a run against a
-  moved or compacted source resolves to a *fresh* namespace and re-infers from
-  scratch — prior progress is lost rather than corrupted, and the stale
-  namespace is left inert. The rule is therefore operational: do not compact or
-  otherwise mutate the source while a workspace holds progress. Transparent
-  recovery across that will not be built.
+- **No recovery across compaction.** Nothing refuses it. Staged rows are keyed
+  by the row's Lance address, so a compaction — which rewrites fragments into
+  fresh ids — leaves the staged partitions unmatchable and the attempt re-infers
+  its whole owed set.
+  Progress is lost rather than corrupted — an unmatchable staged row cannot be
+  published — but unlike the earlier version-digesting design the stale namespace
+  is the *same* namespace, so the dead partitions sit beside the live ones until
+  it is deleted. The rule is operational: do not compact or otherwise rewrite the
+  source's fragment geometry while a workspace holds progress. Transparent
+  recovery across that will not be built. A row moving *within* its fragment,
+  which is what a metadata-only commit or a version bump does, costs nothing.
 - **The namespace digest is not reversible.** With no manifest beside it, two
   sibling namespaces cannot be told apart from the filesystem alone; the runs'
   log lines are the only record of which inputs produced which directory. That is
   the accepted cost of having exactly one source of truth for compatibility.
 - **The namespace carries no table identity.** `resolve_workspace` digests the
-  canonical source URI, the pinned read version, the contract digest, the staging
-  protocol version, and the staged schema fingerprint — and the URI is a *path*,
-  not an identity. Two different
-  tables that occupy that path at different times (a table dropped and recreated,
-  or one path reused across environments) consequently resolve to one namespace if
-  their read versions and contract digests coincide as well. It is worth being
-  plain about how narrow that is: the recreated table has to reach the *same*
-  version number and be captioned under the *same* contract before the collision is
-  reachable at all, so this is unlikely rather than routine, which is why it is
-  accepted instead of closed by digesting a table uuid. The discipline is to give a
-  recreated table a fresh path, or to point `output.staging_root_uri` somewhere the
-  previous table's namespaces do not live.
+  canonical source URI, the contract digest, the shard, the staging protocol
+  version, and the staged schema fingerprint — and the URI is a *path*, not an
+  identity. Two different tables that occupy that path at different times (a table
+  dropped and recreated, or one path reused across environments) consequently
+  resolve to one namespace whenever their contract digests coincide. Removing the
+  read version from the digest **widened** this exposure, and that is worth stating
+  plainly rather than leaving for a reader to infer: the recreated table previously
+  had to reach the same version number as well, and now does not.
+
+  It is accepted on the same terms as before, because the collision is only
+  reachable while a namespace is live — cleanup follows the commit — and what a
+  colliding attempt can do is bounded by the checks that already exist. Staged
+  rows carry `clip_id`, and publication refuses a staged set that does not match
+  what the table owes *before* the commit, with every staged row intact. So the
+  failure is a refusal an operator clears, not a caption published onto the wrong
+  row. Closing it would mean digesting a per-table identity, and Lance exposes
+  none that is durable: there is no dataset uuid on the manifest, and the first
+  version's timestamp is not a substitute because version cleanup can delete
+  version 1 outright. The discipline is therefore to give a recreated table a
+  fresh path, or to point `output.staging_root_uri` somewhere the previous
+  table's namespaces do not live.
+- **A campaign's completeness is not asserted anywhere.** No registry records
+  which shard indices ran, so launching indices 0, 1, 2 and 4 of 5 leaves shard
+  3's work owed with nothing reporting it — each launched job succeeds and
+  reports only its own slice. Completeness is *observable*, by re-launching every
+  index and reading the owed counts, but nothing checks it. Campaign bookkeeping
+  belongs where jobs are launched, for the same reason mutual exclusion does.
+- **Shard balance is by fragment count, not by cost.** Modulo distributes
+  fragment ids evenly and knows nothing about how many rows each fragment still
+  owes, so a corpus whose remaining work is concentrated in a few fragments
+  divides unevenly. Cost-balancing would need a coordinator or a manifest, which
+  is the state this design deliberately lacks; where skew matters, raise `count`
+  so each shard's worst-case share is smaller.
 - **One writer at a time per namespace, documented and not enforced.** The path
-  pins compatibility, not exclusivity. Two runs resolving to one namespace
+  pins compatibility, not exclusivity. Note this is *per namespace*: concurrent
+  shards are safe precisely because they resolve to different namespaces, so the
+  limitation is about two jobs in **one** directory. Two runs resolving to one namespace
   concurrently generate different captions for the same clip under unseeded
   sampling, both append them into the same partition, and publication refuses the
   differing pair — permanently, because cleanup follows only a commit and every

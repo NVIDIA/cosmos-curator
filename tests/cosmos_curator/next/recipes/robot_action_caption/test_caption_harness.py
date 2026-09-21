@@ -44,6 +44,7 @@ from cosmos_curator.next.recipes.robot_action_caption.datasource import (
 )
 from cosmos_curator.next.recipes.robot_action_caption.request import STAGED_SCHEMA
 from cosmos_curator.next.recipes.robot_action_caption.table import CLIP_ID_COLUMN
+from tests.cosmos_curator.next.conftest import row_address
 from tests.cosmos_curator.next.recipes.robot_action_caption import caption_harness
 
 type DigestTableFactory = Callable[[list[str | None]], str]
@@ -75,7 +76,7 @@ def _record_invocations(ledger: caption_harness.InferenceLedger, clip_ids: tuple
         {
             CLIP_ID_COLUMN: pa.array(list(clip_ids), pa.string()),
             FRAGMENT_ID_COLUMN: pa.array([0] * len(clip_ids), pa.int64()),
-            CHECKPOINT_ID_COLUMN: pa.array(range(len(clip_ids)), pa.uint64()),
+            CHECKPOINT_ID_COLUMN: pa.array([row_address(0, offset) for offset in range(len(clip_ids))], pa.uint64()),
         }
     )
     transform = caption_harness.fake_transform_builder(ledger=ledger)(
@@ -97,7 +98,7 @@ def staged_digest_table(tmp_path: pathlib.Path) -> DigestTableFactory:
             {
                 CLIP_ID_COLUMN: f"c{index}",
                 FRAGMENT_ID_COLUMN: 0,
-                CHECKPOINT_ID_COLUMN: index,
+                CHECKPOINT_ID_COLUMN: row_address(0, index),
                 CAPTION_COLUMN: f"caption {index}",
                 CAPTION_STATUS_COLUMN: "success",
                 CAPTION_ERROR_COLUMN: None,

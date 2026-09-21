@@ -35,7 +35,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import attrs
-import lance
 import pyarrow as pa
 import pyarrow.fs as pafs
 import pytest
@@ -57,6 +56,8 @@ from cosmos_curator.next.recipes.robot_action_caption.contracts import (
     CAPTION_MODEL_COLUMN,
     CAPTION_STATUS_COLUMN,
     DO_SAMPLE_FRAMES,
+    REQUEST_CONTENT_TYPES,
+    VIDEO_CONTENT_TYPE,
     CaptionStatus,
     caption_contract_digest,
 )
@@ -93,7 +94,11 @@ from cosmos_curator.next.recipes.robot_action_caption.table import (
     resolve_context_fields,
 )
 from cosmos_curator.next.recipes.robot_action_caption.workspace import CaptionWorkspace
-from tests.cosmos_curator.next.recipes.robot_action_caption.caption_harness import CaptionConfig, ClipsTable
+from tests.cosmos_curator.next.conftest import row_address
+from tests.cosmos_curator.next.recipes.robot_action_caption.caption_harness import (
+    CaptionConfig,
+    ClipsTable,
+)
 
 # A test-owned model identity. The registry's contents are not the subject here,
 # and resolving a real entry would couple every assertion below to whichever
@@ -182,7 +187,7 @@ def _fetched_row() -> dict[str, Any]:
         FRAGMENT_ID_COLUMN: 0,
         CLIP_URI_COLUMN: "s3://bucket/c0.mp4",
         PROMPT_COLUMN: "describe",
-        CHECKPOINT_ID_COLUMN: 1,
+        CHECKPOINT_ID_COLUMN: row_address(0, 0),
         MEDIA_URL_COLUMN: "data:video/mp4;base64,AA==",
         MEDIA_ERROR_COLUMN: None,
     }
@@ -360,10 +365,9 @@ def phase_plan(
             ),
         }
     )
-    dataset = lance.dataset(uri)
-    # Widens the handle in place, so the plan below is built against the version
+    # Returns the widened handle, so the plan below is built against the version
     # that carries the caption columns the pending predicate filters on.
-    ensure_caption_fields(dataset)
+    dataset = ensure_caption_fields(uri, storage_options=None)
     context_fields = resolve_context_fields(dataset)
     digest = caption_contract_digest(
         MODEL,
@@ -378,7 +382,7 @@ def phase_plan(
 
     run_inference_phase(
         dataset,
-        plan_caption_scan(dataset, row_filter),
+        plan_caption_scan(dataset, row_filter, shard=None),
         config,
         MODEL,
         workspace,
@@ -572,16 +576,28 @@ def test_a_fetch_width_that_strands_io_slots_reports_the_budget_it_cannot_spend(
 # satisfy the assertions by coincidence. The largest is deliberately close to the
 # sum without equalling it, which is the shape a resume's remainder really has.
 _PENDING_FRAGMENT_ROWS = (5, 41, 2617)
-_TOTAL_FRAGMENTS = 17
+
+# Fragments in the run's scope. Larger than the pending count so the two are
+# distinguishable in the reported ratio, and not a multiple of it so a line that
+# derived one from the other could not match.
+_OWNED_FRAGMENTS = 17
 
 
-def _plan(*fragment_rows: int) -> CaptionScanPlan:
-    """Return a plan holding one pending fragment per row count given."""
+def _plan(*fragment_rows: int, owned_fragments: int = _OWNED_FRAGMENTS) -> CaptionScanPlan:
+    """Return a plan holding one pending fragment per row count given.
+
+    The owned set is widened to ``owned_fragments`` ids beyond the pending ones,
+    which is the real shape: a run owns fragments that owe nothing. Keeping the
+    two equal would make every assertion about the pending-versus-owned ratio
+    pass under a reporter that printed either number.
+    """
+    fragments = tuple(
+        FragmentRead(fragment_id=index, num_rows=num_rows, input_files=(f"data/{index}.lance",))
+        for index, num_rows in enumerate(fragment_rows)
+    )
     return CaptionScanPlan(
-        fragments=tuple(
-            FragmentRead(fragment_id=index, num_rows=num_rows, input_files=(f"data/{index}.lance",))
-            for index, num_rows in enumerate(fragment_rows)
-        )
+        fragments=fragments,
+        owned_fragment_ids=tuple(range(max(owned_fragments, len(fragments)))),
     )
 
 
@@ -595,7 +611,7 @@ def _scan_tables(*fragment_rows: int) -> list[pa.Table]:
                     FRAGMENT_ID_COLUMN: fragment_id,
                     CLIP_URI_COLUMN: f"s3://bucket/f{fragment_id}-c{row_offset}.mp4",
                     PROMPT_COLUMN: f"describe f{fragment_id}-c{row_offset}",
-                    CHECKPOINT_ID_COLUMN: (fragment_id << 32) | row_offset,
+                    CHECKPOINT_ID_COLUMN: row_address(fragment_id, row_offset),
                 }
                 for row_offset in range(num_rows)
             ],
@@ -703,13 +719,13 @@ def test_the_plan_report_states_the_scan_tail_and_derived_fetch_blocks(
     """
     fetch_blocks = inference._report_pending_fragments(
         _plan(*_PENDING_FRAGMENT_ROWS),
-        total_fragments=_TOTAL_FRAGMENTS,
+        owned_fragments=_OWNED_FRAGMENTS,
         rows_per_block=_FETCH_ROWS_PER_BLOCK,
     )
 
     (reported,) = [record["message"] for record in loguru_records if record["level"].name == "INFO"]
     assert fetch_blocks == sum(math.ceil(rows / _FETCH_ROWS_PER_BLOCK) for rows in _PENDING_FRAGMENT_ROWS)
-    assert f"3 of {_TOTAL_FRAGMENTS} fragment(s) pending" in reported
+    assert f"3 of {_OWNED_FRAGMENTS} owned fragment(s) pending" in reported
     assert f"holding {sum(_PENDING_FRAGMENT_ROWS):,} row(s)" in reported
     assert f"with {max(_PENDING_FRAGMENT_ROWS):,} in the largest" in reported
     assert f"produce {fetch_blocks} fetch work block(s) at {_FETCH_ROWS_PER_BLOCK} row(s) per block" in reported
@@ -730,7 +746,7 @@ def test_a_pending_count_far_below_the_allocated_width_does_not_escalate(
     """
     inference._report_pending_fragments(
         _plan(131_602),
-        total_fragments=_TOTAL_FRAGMENTS,
+        owned_fragments=_OWNED_FRAGMENTS,
         rows_per_block=_FETCH_ROWS_PER_BLOCK,
     )
 
@@ -1189,6 +1205,160 @@ def test_an_omitted_scheduler_budget_preserves_the_engine_default() -> None:
     assert "max_num_batched_tokens" not in engine_kwargs
 
 
+def _scheduler_budget_report(records: list[dict[str, Any]]) -> str:
+    """Return the one scheduler-budget line among the build's diagnostics."""
+    (reported,) = [
+        record["message"]
+        for record in records
+        if record["level"].name == "INFO" and "scheduler token budget" in record["message"]
+    ]
+    return reported
+
+
+def test_an_omitted_scheduler_budget_is_reported_as_the_dependencys_own(
+    loguru_records: list[dict[str, Any]],
+) -> None:
+    """An omitted key is a non-trivial dependency default, not the absence of a setting.
+
+    This one is the scheduler's whole per-step token budget, and nothing
+    downstream can tell an inherited value from a chosen one once it is a plain
+    int inside the engine -- a grep of this repo for the knob returns nothing,
+    which reads as "not relevant" rather than "inherited". So the value AND its
+    provenance are both reported, and the value alone would not have closed it.
+
+    The 2048 is a literal rather than the module constant: the claim under test
+    is what the pinned vLLM actually defaults to, and re-reading the constant
+    would only prove it equals itself.
+    """
+    processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION.model_copy(update={"max_num_batched_tokens": None}),
+        pending_rows=1,
+    )
+
+    assert _scheduler_budget_report(loguru_records).startswith(
+        "Engine scheduler token budget: 2048 token(s) per step, from vLLM's own default"
+    )
+
+
+def test_a_configured_scheduler_budget_is_reported_as_the_operators_choice(
+    loguru_records: list[dict[str, Any]],
+) -> None:
+    """The other side of the provenance branch, which the report exists to separate.
+
+    Pinned as a whole clause rather than by the number alone: a report naming
+    the right value but crediting the wrong source is the defect that sends an
+    operator looking for a YAML key they never set, and only the source phrase
+    can tell the two branches apart -- the field's NAME appears in both.
+    """
+    processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION,
+        pending_rows=1,
+    )
+
+    assert _scheduler_budget_report(loguru_records).startswith(
+        f"Engine scheduler token budget: {_CONFIGURED_SCHEDULER_BUDGET} token(s) per step, "
+        f"from execution.max_num_batched_tokens."
+    )
+
+
+def test_a_configured_gpu_memory_fraction_reaches_the_engine() -> None:
+    """The residency knob must arrive, because nothing else in the run can set it.
+
+    What is left of the device after the weights becomes KV cache, which fixes
+    how many requests a replica can hold at once. The value differs from vLLM's
+    0.9 and from the 0.92 a later release moved it to, so an engine built on the
+    dependency default cannot satisfy this.
+    """
+    engine_kwargs = processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION.model_copy(update={"gpu_memory_utilization": 0.83}),
+        pending_rows=1,
+    ).engine_kwargs
+
+    assert engine_kwargs["gpu_memory_utilization"] == 0.83
+
+
+def test_an_omitted_gpu_memory_fraction_leaves_the_key_off_the_engine() -> None:
+    """The paired control: absence must preserve vLLM's policy, not substitute one.
+
+    The test above passes identically whether the field is forwarded or a
+    recipe-side constant is inserted, so only the omission case can tell
+    forwarding from an invented fallback. A key present with any value here
+    would override the dependency on every run that never mentioned the knob.
+    """
+    engine_kwargs = processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION.model_copy(update={"gpu_memory_utilization": None}),
+        pending_rows=1,
+    ).engine_kwargs
+
+    assert "gpu_memory_utilization" not in engine_kwargs
+
+
+def test_the_default_run_builds_an_engine_with_prefix_caching_off() -> None:
+    """Reuse is unreachable for this request shape, so the feature can only cost.
+
+    Every prompt opens with its own clip's vision tokens, because
+    ``REQUEST_CONTENT_TYPES`` renders video before text, so two requests diverge
+    at the first token and no block is ever a shared prefix. Asserted against
+    ``False`` rather than merely "present": the default at the pinned version is
+    on, so a dropped key and a wrong key are the same outcome, and neither
+    raises -- the cost shows only as block hashing over every prompt and
+    retained blocks counted against reported KV usage.
+    """
+    engine_kwargs = processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION,
+        pending_rows=1,
+    ).engine_kwargs
+
+    assert engine_kwargs["enable_prefix_caching"] is False
+
+
+def test_an_enabled_prefix_cache_reaches_the_engine() -> None:
+    """The configured value must arrive, not the recipe's opinion of it.
+
+    Set to ``True`` deliberately: the field's own default is ``False``, so an
+    engine built from a hardcoded literal -- which is what this field replaced --
+    satisfies every assertion made at the default and only this one can tell
+    forwarding from a constant. Nothing raises either way, so the assertion is
+    the only thing standing between a knob and a decoration.
+    """
+    engine_kwargs = processor_config(
+        MODEL,
+        generation=GENERATION,
+        video=VIDEO,
+        execution=EXECUTION.model_copy(update={"enable_prefix_caching": True}),
+        pending_rows=1,
+    ).engine_kwargs
+
+    assert engine_kwargs["enable_prefix_caching"] is True
+
+
+def test_prefix_caching_stays_off_however_the_request_order_is_read() -> None:
+    """Pins the premise the decision rests on, where that premise actually lives.
+
+    The pin above is sound only while the clip is rendered FIRST. Text first
+    would give every request a genuinely shared prefix and make the setting
+    worth revisiting -- and that is a change to ``REQUEST_CONTENT_TYPES``, which
+    the caption contract digests, so it cannot happen quietly. This is the
+    assertion that would redden if it did.
+    """
+    assert REQUEST_CONTENT_TYPES[0] == VIDEO_CONTENT_TYPE
+
+
 def test_the_engine_actors_run_with_expandable_allocator_segments() -> None:
     """The engine actors carry the allocator setting the recipe's fragmentation needs."""
     resolved = processor_config(
@@ -1278,7 +1448,7 @@ def test_the_bound_request_hooks_execute_the_configured_generation(phase_plan: P
                 {
                     CLIP_ID_COLUMN: "c0",
                     FRAGMENT_ID_COLUMN: 0,
-                    CHECKPOINT_ID_COLUMN: 1,
+                    CHECKPOINT_ID_COLUMN: row_address(0, 0),
                     GENERATED_TEXT_COLUMN: "caption",
                     GENERATED_TOKENS_COLUMN: generated_token_count,
                     INPUT_TOKENS_COLUMN: phase_plan.config.generation.max_model_len - generated_token_count,

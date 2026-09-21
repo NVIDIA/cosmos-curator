@@ -38,9 +38,15 @@ from cosmos_curator.next.recipes.robot_action_caption.request import (
     read_generation,
 )
 from cosmos_curator.next.recipes.robot_action_caption.table import CLIP_ID_COLUMN, CLIP_URI_COLUMN
+from tests.cosmos_curator.next.conftest import row_address
 
 DIGEST = "test-digest"
 MODEL_ID = "test/model"
+
+# The address a scan would emit for this module's fixture row: fragment 1, first
+# offset. Opaque here on purpose - nothing in the request path derives it, so
+# these tests only require that it survives unchanged and keeps its width.
+CHECKPOINT_ID = row_address(1, 0)
 GENERATION = RobotActionCaptionGenerationConfig(
     temperature=0.17,
     top_p=0.63,
@@ -65,7 +71,7 @@ def fetched_row() -> FetchedRowFactory:
         return {
             CLIP_ID_COLUMN: "c0",
             FRAGMENT_ID_COLUMN: 1,
-            CHECKPOINT_ID_COLUMN: (1 << 32) | 4,
+            CHECKPOINT_ID_COLUMN: CHECKPOINT_ID,
             CLIP_URI_COLUMN: "s3://b/c0.mp4",
             PROMPT_COLUMN: prompt,
             MEDIA_URL_COLUMN: media_url,
@@ -130,7 +136,7 @@ def test_build_request_pre_seeds_every_output_column(fetched_row: FetchedRowFact
 
     assert set(CAPTION_COLUMNS) <= set(request)
     assert all(request[name] is None for name in CAPTION_COLUMNS)
-    assert request[CHECKPOINT_ID_COLUMN] == (1 << 32) | 4
+    assert request[CHECKPOINT_ID_COLUMN] == CHECKPOINT_ID
 
 
 def test_build_request_places_media_prompt_and_sampling_in_the_engine_request(
@@ -244,7 +250,7 @@ def test_canonicalize_stamps_contract_identity_on_every_row(
     assert table.column(CAPTION_DIGEST_COLUMN).to_pylist() == [DIGEST, DIGEST]
     assert table.column(CAPTION_MODEL_COLUMN).to_pylist() == [MODEL_ID, MODEL_ID]
     assert table.column(CHECKPOINT_ID_COLUMN).type == pa.uint64()
-    assert table.column(CHECKPOINT_ID_COLUMN).to_pylist() == [(1 << 32) | 4, (1 << 32) | 4]
+    assert table.column(CHECKPOINT_ID_COLUMN).to_pylist() == [CHECKPOINT_ID] * 2
 
 
 def test_canonicalize_names_a_missing_identity_column(staged_success: StagedRowFactory) -> None:

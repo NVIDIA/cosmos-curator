@@ -39,7 +39,7 @@ from cosmos_curator.next.recipes.embeddings.staged import (
     staged_schema,
     staged_schema_fingerprint,
 )
-from cosmos_curator.next.utils.lance_utils import ROW_ADDRESS_COLUMN, ROW_ADDRESS_FRAGMENT_SHIFT
+from cosmos_curator.next.utils.lance_utils import ROW_ADDRESS_COLUMN
 
 _FRAGMENT = 3
 
@@ -54,9 +54,20 @@ def _image_group(fields: list[pa.Field], *, provenance: str = "embedding_image_m
     )
 
 
+# The packing Lance uses for a row address: (fragment_id << 32) | offset. Spelled
+# out here rather than imported from the module under test, and deliberately not
+# taken from the shared ``row_address`` helper, because two tests below assert the
+# SPLIT: an input packed with the same constant the code unpacks with recovers the
+# fragment id whatever that constant holds, so those assertions would be satisfied
+# by the constant instead of by the behaviour. Measured by mutating the production
+# shift to 16: with the shared constant both tests stay green, with this literal
+# they fail.
+_ROW_ADDRESS_FRAGMENT_SHIFT = 32
+
+
 def _row_address(fragment_id: int, offset: int) -> int:
     """Pack a Lance row address the way the format documents."""
-    return (fragment_id << ROW_ADDRESS_FRAGMENT_SHIFT) | offset
+    return (fragment_id << _ROW_ADDRESS_FRAGMENT_SHIFT) | offset
 
 
 def test_the_fingerprint_is_stable_across_calls() -> None:

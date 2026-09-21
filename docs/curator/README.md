@@ -39,6 +39,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
   fragment-atomic Lance enrichment.
 - [Curator Next Incremental Curation](design/curator-next-incremental-curation.md) - a canonical Lance clip table that
   grows through split fragments and dynamically added curation columns.
+- [Deterministic Work Sharding](design/curator-next-sharding.md) - splitting one logical run into independently launched
+  jobs that cover the work with no gap or overlap, and how that composes with row checkpointing.
 - [Captioning Approaches](design/captioning-approaches.md) - comparison of captioning architectures.
 - [Multi-Camera Design](design/multicam.md) - multi-camera data model and implementation plan.
 - [Multimodal AV Pipeline Design](design/multimodal-av-pipeline.md) - Lance-backed aligned multiview AV clip

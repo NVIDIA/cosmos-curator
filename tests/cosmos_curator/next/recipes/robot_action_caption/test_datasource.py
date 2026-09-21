@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Row-address scan: the checkpoint id's type, uniqueness, stability, and fragment bits.
+"""Planning and scanning: shard ownership, owed counts, and checkpoint identity.
 
 The read tasks are exercised by calling ``read_pending_clips`` directly rather
 than through ``ray.data.read_datasource``: the behaviours under test are the
@@ -11,7 +11,15 @@ making them better checked.
 Fixtures are local to this module rather than in a ``conftest.py`` so it owns
 the table shape it needs, and the caption columns are written AT CREATION rather
 than with a later ``dataset.update``, which would tombstone and re-append the
-row and so move the row addresses these tests assert on.
+row - moving it into a different fragment, and so changing the very ids and
+ownership these tests assert on.
+
+Ownership is asserted over the FRAGMENT ids a fixture actually produces rather
+than over an assumed dense range, and the partition properties - disjointness,
+coverage, order-independence - are asserted here against a real manifest even
+though ``test_sharding.py`` already asserts them against a synthetic universe.
+The two are different claims: that the assignment partitions, and that planning
+applies it to the ids Lance hands back.
 
 The one context column the fixture writes is TEST-OWNED (:data:`CONTEXT_FIELD`)
 and names a column no source table has. What the scan owes is a relation - a
@@ -27,6 +35,7 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.core.sharding import ShardConfig
 from cosmos_curator.next.recipes.robot_action_caption.contracts import (
     CAPTION_COLUMN,
     CAPTION_DIGEST_COLUMN,
@@ -40,6 +49,7 @@ from cosmos_curator.next.recipes.robot_action_caption.datasource import (
     FRAGMENT_ID_COLUMN,
     PROMPT_COLUMN,
     SCAN_SCHEMA,
+    CaptionScanPlan,
     PinnedScan,
     plan_caption_scan,
     read_pending_clips,
@@ -57,11 +67,19 @@ from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 
 ROWS = 7
 ROWS_PER_FILE = 3
-_ROW_ADDRESS_FRAGMENT_SHIFT = 32
 
-# Lance's own name for the address column a scan adds under ``with_row_address``.
-# Spelled out because it is Lance's identifier and not one this recipe defines.
+# Fragment count for the ownership tests, built one row per fragment so a
+# fragment id and a clip index coincide and an assertion reads directly. Chosen
+# so the shard counts exercised below both divide it (2, 3) and do not (5), since
+# an uneven split is where an off-by-one in the assignment would surface.
+FRAGMENTS = 12
+
+# Lance's own name for the address column a scan adds under ``with_row_address``,
+# and the packing it uses: (fragment_id << 32) | offset_within_fragment. Spelled
+# out rather than imported from the module under test, so an assertion here
+# cannot be satisfied by the same constant it is checking.
 ROW_ADDRESS_COLUMN = "_rowaddr"
+ROW_ADDRESS_FRAGMENT_SHIFT = 32
 
 # Two well-formed digests belonging to no real contract. ``caption_work_filter``
 # validates the shape and then compares for equality only, so nothing below
@@ -186,7 +204,7 @@ def read_all(
         context_fields=context_fields,
         row_filter=row_filter,
     )
-    tables = list(read_pending_clips(scan, plan_caption_scan(dataset, row_filter).fragment_ids))
+    tables = list(read_pending_clips(scan, plan_caption_scan(dataset, row_filter, shard=None).fragment_ids))
     return pa.concat_tables(tables) if tables else SCAN_SCHEMA.empty_table()
 
 
@@ -195,12 +213,13 @@ def ids_by_clip(scanned: pa.Table) -> dict[str, int]:
     return {row[CLIP_ID_COLUMN]: row[CHECKPOINT_ID_COLUMN] for row in scanned.to_pylist()}
 
 
-def test_checkpoint_id_is_uint64(make_clips_table: ClipsTableFactory) -> None:
-    """The id is a uint64 row address, which is what bounds the checkpoint index's memory.
+def test_checkpoint_id_is_an_unsigned_integer(make_clips_table: ClipsTableFactory) -> None:
+    """The id is a row address, so it is the width Lance emits and not text.
 
-    Ray sorts the loaded ids into one numpy array and searchsorteds each block
-    against it, so the dtype sets that index's size: 8 bytes per completed row
-    where the composite string it replaces would occupy roughly nine times that.
+    The type is asserted at the scan boundary because Ray's checkpoint reads this
+    column straight off the Read output and the staged Parquet has to declare the
+    same thing; a wider or signed id here would make the whole recovery path
+    disagree about one column's type.
     """
     scanned = read_all(make_clips_table())
 
@@ -208,7 +227,7 @@ def test_checkpoint_id_is_uint64(make_clips_table: ClipsTableFactory) -> None:
 
 
 def test_checkpoint_ids_are_unique_across_fragments(make_clips_table: ClipsTableFactory) -> None:
-    """Within one snapshot every row address is distinct, so the id has no collision case."""
+    """Within one snapshot every id is distinct, so the id has no collision case."""
     scanned = read_all(make_clips_table())
     ids = scanned.column(CHECKPOINT_ID_COLUMN).to_pylist()
 
@@ -231,12 +250,42 @@ def test_checkpoint_ids_are_stable_across_two_reads(make_clips_table: ClipsTable
     assert len(first) == ROWS
 
 
-def test_checkpoint_id_high_bits_are_the_fragment_id(make_clips_table: ClipsTableFactory) -> None:
-    """The emitted fragment id is the row address's high 32 bits, not a separate lookup."""
+def test_the_fragment_id_is_the_high_half_of_the_checkpoint_id(make_clips_table: ClipsTableFactory) -> None:
+    """Both identity columns come from one scanned value, so they cannot disagree.
+
+    Publication addresses a staged partition by ``fragment_id`` while Ray matches
+    a resume against ``__checkpoint_id``. Deriving the first from the second is
+    what stops a row being checkpointed under one fragment and staged under
+    another; a join back to the table could resolve differently.
+    """
     scanned = read_all(make_clips_table())
 
     for row in scanned.to_pylist():
-        assert row[CHECKPOINT_ID_COLUMN] >> _ROW_ADDRESS_FRAGMENT_SHIFT == row[FRAGMENT_ID_COLUMN]
+        assert row[FRAGMENT_ID_COLUMN] == row[CHECKPOINT_ID_COLUMN] >> ROW_ADDRESS_FRAGMENT_SHIFT
+
+
+def test_two_fragments_holding_one_clip_id_get_distinct_checkpoint_ids() -> None:
+    """The id separates rows a clip id alone would fold together.
+
+    Built synthetically because the table boundary refuses a duplicate clip id
+    upstream; what is under test is that the id is taken from the row's address
+    rather than from its business key, which is what stops a resume marking one
+    fragment's row complete because a different fragment's row finished.
+    """
+    scanned = pa.table(
+        {
+            ROW_ADDRESS_COLUMN: pa.array([0, 1 << ROW_ADDRESS_FRAGMENT_SHIFT], pa.uint64()),
+            CLIP_ID_COLUMN: pa.array(["c0", "c0"], pa.string()),
+            CLIP_URI_COLUMN: pa.array(["s3://b/c0.mp4", "s3://b/c0.mp4"], pa.large_string()),
+        }
+    )
+
+    ids = scanned_rows(scanned, ()).column(CHECKPOINT_ID_COLUMN).to_pylist()
+
+    # The addresses themselves rather than their distinctness: distinctness alone
+    # is satisfied by any injective function of position, including a per-batch
+    # counter that would not name a row at all.
+    assert ids == [0, 1 << ROW_ADDRESS_FRAGMENT_SHIFT]
 
 
 def test_fragment_ids_span_every_fragment(make_clips_table: ClipsTableFactory) -> None:
@@ -281,6 +330,7 @@ def test_planning_counts_each_pending_row_once(make_clips_table: ClipsTableFacto
     plan = plan_caption_scan(
         lance.dataset(uri),
         caption_work_filter(DIGEST, MODEL, selected_only=False),
+        shard=None,
     )
 
     assert plan.num_rows == ROWS - 1
@@ -304,6 +354,7 @@ def test_planning_excludes_a_fragment_with_only_unselected_pending_rows(
     plan = plan_caption_scan(
         lance.dataset(uri),
         caption_work_filter(DIGEST, MODEL, selected_only=True),
+        shard=None,
     )
 
     assert plan.fragments == ()
@@ -327,6 +378,7 @@ def test_planning_counts_only_selected_pending_rows_in_a_mixed_fragment(
     plan = plan_caption_scan(
         lance.dataset(uri),
         caption_work_filter(DIGEST, MODEL, selected_only=True),
+        shard=None,
     )
 
     assert plan.fragment_ids == (0,)
@@ -349,7 +401,7 @@ def test_datasource_reads_exactly_the_selected_pending_rows(
     )
     dataset = lance.dataset(uri)
     row_filter = caption_work_filter(DIGEST, MODEL, selected_only=True)
-    plan = plan_caption_scan(dataset, row_filter)
+    plan = plan_caption_scan(dataset, row_filter, shard=None)
     scan = PinnedScan.for_dataset(
         dataset,
         storage_options=None,
@@ -370,6 +422,7 @@ def test_planning_a_fully_captioned_table_owes_nothing(make_clips_table: ClipsTa
     plan = plan_caption_scan(
         lance.dataset(uri),
         caption_work_filter(DIGEST, MODEL, selected_only=False),
+        shard=None,
     )
 
     assert plan.fragments == ()
@@ -391,10 +444,112 @@ def test_planning_re_plans_a_table_captioned_under_another_contract(
     plan = plan_caption_scan(
         lance.dataset(uri),
         caption_work_filter(DIGEST, MODEL, selected_only=False),
+        shard=None,
     )
 
     assert plan.fragment_ids == (0, 1, 2)
     assert plan.num_rows == ROWS
+
+
+def plan_for_shard(uri: str, shard: ShardConfig | None) -> CaptionScanPlan:
+    """Plan one shard's scope over a table that owes every row."""
+    return plan_caption_scan(
+        lance.dataset(uri),
+        caption_work_filter(DIGEST, MODEL, selected_only=False),
+        shard=shard,
+    )
+
+
+def test_an_unsharded_plan_owns_every_fragment(make_clips_table: ClipsTableFactory) -> None:
+    """``None`` is the unsharded scope and must claim the whole manifest.
+
+    The baseline the ownership tests below are relative to: without it a
+    partition assertion could be satisfied by a planner that owned nothing.
+    """
+    uri = make_clips_table(rows=FRAGMENTS, rows_per_file=1)
+
+    plan = plan_for_shard(uri, None)
+
+    assert plan.owned_fragment_ids == tuple(range(FRAGMENTS))
+    assert plan.fragment_ids == tuple(range(FRAGMENTS))
+    assert plan.num_rows == FRAGMENTS
+
+
+@pytest.mark.parametrize("count", [2, 3, 5])
+def test_the_shards_of_one_campaign_partition_the_fragments(make_clips_table: ClipsTableFactory, count: int) -> None:
+    """Every fragment is planned by exactly one shard: no gap, no overlap.
+
+    This is the whole correctness claim of a sharded campaign. A gap is a clip no
+    job ever captions and nothing reports; an overlap is two jobs captioning one
+    clip, which publication then refuses.
+
+    Counts that do and do not divide the fragment total are both covered, since
+    an uneven split is where an off-by-one in the assignment would show.
+    """
+    uri = make_clips_table(rows=FRAGMENTS, rows_per_file=1)
+
+    planned = [plan_for_shard(uri, ShardConfig(count=count, index=index)).fragment_ids for index in range(count)]
+
+    claimed = [fragment_id for ids in planned for fragment_id in ids]
+    assert sorted(claimed) == list(range(FRAGMENTS))
+    assert len(claimed) == len(set(claimed))
+
+
+def test_ownership_is_decided_on_the_fragment_id_not_the_owed_count(
+    make_clips_table: ClipsTableFactory,
+) -> None:
+    """A captioned fragment stays owned, so the partition cannot move as work completes.
+
+    Were ownership derived from anything the pending predicate sees, a job
+    resuming after a sibling published would compute a different scope than it
+    started with, and the fragments that changed hands would be owned by nobody.
+
+    Pinned against literals rather than against a second plan: the owned set is
+    what a modulo over ``count=3, index=1`` selects from twelve fragments, and the
+    owed set is the half of those the fixture left pending. The two differing is
+    what makes the first assertion a claim about ids rather than about counts.
+    """
+    captioned_fragments = 6
+    uri = make_clips_table(
+        rows=FRAGMENTS,
+        rows_per_file=1,
+        statuses=["success"] * captioned_fragments + [None] * (FRAGMENTS - captioned_fragments),
+    )
+
+    plan = plan_for_shard(uri, ShardConfig(count=3, index=1))
+
+    assert plan.owned_fragment_ids == (1, 4, 7, 10)
+    assert plan.fragment_ids == (7, 10)
+
+
+def test_a_shard_that_owns_no_owed_fragment_plans_nothing(make_clips_table: ClipsTableFactory) -> None:
+    """A no-op shard is a clean empty plan, and still reports the scope it owned.
+
+    The distinction the run summary rests on: ``fragments`` empty means THIS JOB
+    owes nothing, while ``owned_fragment_ids`` non-empty says that verdict was
+    reached over a real scope rather than by owning none of the table.
+    """
+    uri = make_clips_table(rows=FRAGMENTS, rows_per_file=1, statuses=["success"] * FRAGMENTS)
+
+    plan = plan_for_shard(uri, ShardConfig(count=3, index=1))
+
+    assert plan.fragments == ()
+    assert plan.owned_fragment_ids
+
+
+def test_a_count_above_the_fragment_total_leaves_shards_empty(make_clips_table: ClipsTableFactory) -> None:
+    """Over-sharding is a no-op for the surplus jobs, not an error.
+
+    An operator sizing a campaign against a table that later compacts should get
+    idle jobs rather than failures, and the fragments must still all be owned.
+    """
+    uri = make_clips_table(rows=2, rows_per_file=1)
+    count = 8
+
+    planned = [plan_for_shard(uri, ShardConfig(count=count, index=index)).fragment_ids for index in range(count)]
+
+    assert sorted(fragment_id for ids in planned for fragment_id in ids) == [0, 1]
+    assert sum(1 for ids in planned if not ids) == count - 2
 
 
 def test_a_null_clip_uri_is_carried_through_the_scan(make_clips_table: ClipsTableFactory) -> None:

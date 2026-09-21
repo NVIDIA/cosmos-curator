@@ -26,7 +26,6 @@ from cosmos_curator.next.recipes.embeddings.datasource import (
     read_owed_rows,
 )
 from cosmos_curator.next.recipes.embeddings.staged import CHECKPOINT_ID_COLUMN, FRAGMENT_ID_COLUMN
-from cosmos_curator.next.utils.lance_utils import ROW_ADDRESS_FRAGMENT_SHIFT
 
 from .conftest import ClipsTableFactory
 
@@ -39,6 +38,11 @@ _FRAGMENT_COUNT = _ROWS // _ROWS_PER_FILE
 _EVERYTHING = "clip_id IS NOT NULL"
 _SOURCE_COLUMNS = ("clip_id", "clip_uri")
 
+# Lance's own row-address pseudo-column. Spelled out rather than imported from
+# the production constant so the expected mapping below is read from the dataset
+# independently of the code that decodes it.
+_ROW_ADDRESS_COLUMN = "_rowaddr"
+
 
 def _scan(uri: str, row_filter: str, *, batch_size: int = 2) -> PinnedScan:
     """Bind a scan to the table's current version with the standard projection."""
@@ -49,6 +53,23 @@ def _scan(uri: str, row_filter: str, *, batch_size: int = 2) -> PinnedScan:
         row_filter=row_filter,
         batch_size=batch_size,
     )
+
+
+def _fragment_holding_each_row(uri: str) -> dict[int, int]:
+    """Map every row address in the table to the id of the fragment that really holds it.
+
+    Ground truth for the identity decode, taken from Lance's own manifest: each
+    fragment is asked for its own rows' addresses and reports its own
+    ``fragment_id``. Reading the expectation from the dataset is what gives the
+    assertion power, because restating the production shift would hold for any
+    shift width - including a wrong one.
+    """
+    return {
+        int(address): int(fragment.fragment_id)
+        for fragment in lance.dataset(uri).get_fragments()
+        for batch in fragment.scanner(columns=[], with_row_address=True).to_reader()
+        for address in batch.column(_ROW_ADDRESS_COLUMN).to_pylist()
+    }
 
 
 def test_a_fragment_owing_nothing_is_left_out_of_the_plan(make_clips_table: ClipsTableFactory) -> None:
@@ -160,14 +181,18 @@ def test_the_read_tasks_cover_every_planned_row_exactly_once(make_clips_table: C
     assert sum(task.metadata.num_rows or 0 for task in tasks) == _ROWS
 
 
-def test_every_scanned_row_carries_a_unique_id_naming_its_own_fragment(
+def test_every_scanned_row_carries_a_unique_id_naming_the_fragment_that_holds_it(
     make_clips_table: ClipsTableFactory,
 ) -> None:
-    """Checkpoint ids are unique table-wide and decompose to the fragment the plan named.
+    """Checkpoint ids are unique table-wide, and each row names the fragment actually holding it.
 
     Uniqueness is what Ray's row checkpoint rests on: a repeated id would mark
     an uncomputed row complete. Asserted across the whole read rather than per
     task, because the ids are only at risk of colliding BETWEEN fragments.
+
+    The fragment each row belongs to is read from the manifest rather than
+    recomputed from the address, so the assertion pins what the decode must
+    produce instead of restating how it produces it.
     """
     uri = make_clips_table(rows=_ROWS, rows_per_file=_ROWS_PER_FILE)
     plan = plan_embedding_scan(lance.dataset(uri), row_filter=_EVERYTHING, max_fragments=None)
@@ -177,8 +202,7 @@ def test_every_scanned_row_carries_a_unique_id_naming_its_own_fragment(
 
     checkpoint_ids = [row[CHECKPOINT_ID_COLUMN] for row in rows]
     assert len(set(checkpoint_ids)) == _ROWS
-    for row in rows:
-        assert row[CHECKPOINT_ID_COLUMN] >> ROW_ADDRESS_FRAGMENT_SHIFT == row[FRAGMENT_ID_COLUMN]
+    assert {row[CHECKPOINT_ID_COLUMN]: row[FRAGMENT_ID_COLUMN] for row in rows} == _fragment_holding_each_row(uri)
     assert {row[FRAGMENT_ID_COLUMN] for row in rows} == set(plan.fragment_ids)
 
 

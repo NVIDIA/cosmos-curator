@@ -1,19 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scan owed clips with prompt text and a checkpoint row address.
+"""Scan owed clips with prompt text and a durable per-row checkpoint id.
 
-The ``uint64`` Lance row address must exist on the Read output and survive to
-staged Parquet. Prompt rendering also happens at this boundary so optional
-context fields collapse into one fixed downstream schema.
+The checkpoint id must exist on the Read output and survive to staged Parquet.
+Prompt rendering also happens at this boundary so optional context fields
+collapse into one fixed downstream schema.
+
+Planning narrows the fragment universe in a fixed order, and the order is
+load-bearing rather than incidental::
+
+    fragment universe   every fragment the pinned manifest holds
+          |
+          v
+    shard ownership     this job's scope, decided on the manifest id alone
+          |
+          v
+    pending count       one filtered count per OWNED fragment
+          |
+          v
+    read tasks          one per owed fragment
+
+Ownership precedes the count for two reasons, and only these two: a job pays
+driver cost for its own scope rather than the whole table, and every owed figure
+it then reports is scoped to what it owns, so a sharded run's diagnostics do not
+send an operator after a backlog another job already holds. Both are properties
+of the ORDER - the plan itself would be identical either way.
 
 See ``docs/curator/design/curator-next-robot-action-caption.md`` for checkpoint
-identity, index-memory, partitioning, and prompt-ownership rationale.
+identity, index-memory, partitioning, and prompt-ownership rationale, and
+``curator-next-sharding.md`` for the shared ownership mechanism.
 """
 
 from collections.abc import Iterator
 from functools import partial
-from typing import Final
+from typing import Any, Final
 
 import attrs
 import lance
@@ -22,6 +43,7 @@ from ray.data.block import BlockMetadata
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource, ReadTask
 
+from cosmos_curator.next.core.sharding import ShardConfig
 from cosmos_curator.next.recipes.robot_action_caption.prompt import PromptContextField, render_prompt
 from cosmos_curator.next.recipes.robot_action_caption.table import (
     CLIP_ID_COLUMN,
@@ -29,12 +51,30 @@ from cosmos_curator.next.recipes.robot_action_caption.table import (
     REQUIRED_SOURCE_COLUMNS,
     require_clip_id,
 )
+from cosmos_curator.next.utils.lance_utils import ROW_ADDRESS_COLUMN, ROW_ADDRESS_FRAGMENT_SHIFT
 
 FRAGMENT_ID_COLUMN: Final = "fragment_id"
 PROMPT_COLUMN: Final = "prompt_text"
 
 CHECKPOINT_ID_COLUMN: Final = "__checkpoint_id"
 """Column Ray's row checkpoint keys on. Defined HERE, beside the scan that fills it.
+
+The value is the row's Lance address, unique per row within the pinned snapshot
+by construction - so recovery relies on no uniqueness contract of its own.
+Keying on ``clip_id`` alone would not do. Publication scopes staging, coverage,
+and ``update_columns`` by fragment, so two fragments holding one clip id would
+see the resume filter mark the second complete and no attempt would ever caption
+it, a gap with no error.
+
+Stability is scoped to a FRAGMENT REWRITE, not to a table version. Measured at
+pylance 10.0.0 and 11.0.0, every commit this recipe issues leaves an address
+untouched - the metadata-only widening in ``table.ensure_caption_fields`` and the
+per-fragment ``update_columns`` in ``publication.prepare_fragment``, a sibling
+shard's included - which is why the recovery namespace need not separate runs by
+read version. Only compaction moves an address, and that is excluded from
+recovery for every candidate key: compaction never reuses a fragment id, so a
+``(fragment_id, clip_id)`` pair moves with it while costing roughly nine times
+this id's width in the driver's filter index.
 
 The checkpoint filter and this scan are two halves of one mechanism: the Read
 output placement makes resume filtering possible, while the current Ray sink
@@ -44,9 +84,12 @@ values. A generic home would make it look like an independent contract that a
 leg merely opts into.
 """
 
-# Lance packs a row address as (fragment_id << 32) | offset_within_fragment.
-_ROW_ADDRESS_FRAGMENT_SHIFT: Final = 32
-_ROW_ADDRESS_COLUMN: Final = "_rowaddr"
+# One scanned address serves as both the checkpoint id and the source of the
+# staged partition key. Taking the fragment id from the same read as the row is
+# what makes the two unable to disagree; a join back to the table could resolve
+# differently. The packing itself is a property of the Lance format rather than
+# of this table, so both facts come from ``lance_utils``.
+
 
 SCAN_SCHEMA: Final = pa.schema(
     [
@@ -95,13 +138,23 @@ class CaptionScanPlan:
     two walks could disagree - the caller would then decide there was work from
     one count and size the engine pool from the other.
 
+    Both halves of the scope are recorded for the same reason. Every count a
+    caller reports must be relative to what this job owns, and deriving the
+    owned set a second time would put the ownership decision in two places,
+    free to disagree.
+
     Attributes:
         fragments: Fragments holding at least one owed row, in manifest order.
-            Empty means the run owes nothing.
+            A subset of ``owned_fragment_ids``. Empty means THIS JOB owes
+            nothing, which on a sharded run says nothing about the table.
+        owned_fragment_ids: Every fragment in this job's execution scope,
+            whether or not it owes a row, in manifest order. The whole manifest
+            on an unsharded run.
 
     """
 
     fragments: tuple[FragmentRead, ...]
+    owned_fragment_ids: tuple[int, ...]
 
     @property
     def num_rows(self) -> int:
@@ -113,21 +166,46 @@ class CaptionScanPlan:
         """Return the ids of the owed fragments, in manifest order."""
         return tuple(fragment.fragment_id for fragment in self.fragments)
 
+    @property
+    def owned_fragments(self) -> int:
+        """Return how many fragments this job's scope covers."""
+        return len(self.owned_fragment_ids)
 
-def plan_caption_scan(dataset: lance.LanceDataset, row_filter: str) -> CaptionScanPlan:
+
+def plan_caption_scan(
+    dataset: lance.LanceDataset,
+    row_filter: str,
+    *,
+    shard: ShardConfig | None,
+) -> CaptionScanPlan:
     """Find the fragments this run owes captions for, at the pinned version.
 
     Args:
         dataset: The clip table, open at the run's pinned version.
         row_filter: Predicate defining what this attempt owes.
+        shard: This job's execution scope over the fragment universe, or ``None``
+            when one job owns every fragment.
 
     Returns:
         The plan. A fragment with no row matching the attempt's combined scope
         and pending predicate is excluded, so a resume plans no read task for it.
 
     """
+    owned_fragment_ids = []
     fragments = []
     for fragment in dataset.get_fragments():
+        fragment_id = int(fragment.fragment_id)
+        # Ownership BEFORE the count, which is what keeps a job's driver cost
+        # proportional to its own scope rather than to the whole table: eight
+        # jobs each pay one eighth of the filtered counts, not all of them. It
+        # is also what makes every owed figure below scoped to this job.
+        #
+        # The manifest id, never the owed count: a partition decided on how much
+        # work remains would move under a later job as rows get captioned, so a
+        # re-launch of this index would own a different set than it owns now.
+        if shard is not None and not shard.owns(fragment_id):
+            continue
+        owned_fragment_ids.append(fragment_id)
         # One filtered count per fragment on one column. O(fragments) on the
         # driver, never O(rows): the count is pushed into the fragment's own
         # statistics rather than materializing the rows here.
@@ -136,7 +214,7 @@ def plan_caption_scan(dataset: lance.LanceDataset, row_filter: str) -> CaptionSc
             continue
         fragments.append(
             FragmentRead(
-                fragment_id=int(fragment.fragment_id),
+                fragment_id=fragment_id,
                 num_rows=num_rows,
                 input_files=tuple(
                     str(data_file.path)
@@ -144,7 +222,10 @@ def plan_caption_scan(dataset: lance.LanceDataset, row_filter: str) -> CaptionSc
                 ),
             )
         )
-    return CaptionScanPlan(fragments=tuple(fragments))
+    return CaptionScanPlan(
+        fragments=tuple(fragments),
+        owned_fragment_ids=tuple(owned_fragment_ids),
+    )
 
 
 @attrs.frozen
@@ -333,8 +414,8 @@ def scanned_rows(scanned: pa.Table, context_fields: tuple[PromptContextField, ..
         context_fields: The context subset to render, in render order.
 
     Returns:
-        The batch's rows with the prompt rendered and the row address split into
-        the checkpoint id and its fragment id.
+        The batch's rows with the prompt rendered, and the row address carried
+        through as the checkpoint id with its fragment half split out.
 
     Raises:
         ValueError: If a required column, or a resolved context column, is
@@ -345,24 +426,28 @@ def scanned_rows(scanned: pa.Table, context_fields: tuple[PromptContextField, ..
     # on the source table: resolution already decided this snapshot supplies them,
     # so one absent now means the projection and the render disagree, and the
     # prompt would silently lose a line the digest says it carries.
-    required = {_ROW_ADDRESS_COLUMN, *REQUIRED_SOURCE_COLUMNS, *(field.column for field in context_fields)}
+    required = {ROW_ADDRESS_COLUMN, *REQUIRED_SOURCE_COLUMNS, *(field.column for field in context_fields)}
     missing = sorted(required - set(scanned.schema.names))
     if missing:
         msg = f"caption scan is missing required column(s): {', '.join(missing)}"
         raise ValueError(msg)
-    rows = [
-        {
-            CLIP_ID_COLUMN: require_clip_id(row[CLIP_ID_COLUMN]),
-            # The high bits of the address, so the staged partition key is derived
-            # from the same read as the id rather than joined back to it later.
-            FRAGMENT_ID_COLUMN: int(row[_ROW_ADDRESS_COLUMN]) >> _ROW_ADDRESS_FRAGMENT_SHIFT,
-            # Carried through as it arrived, null included: refusing a null here
-            # would fail the read task and so the whole attempt, whereas the
-            # media stage can refuse the one row that names no location.
-            CLIP_URI_COLUMN: row[CLIP_URI_COLUMN],
-            PROMPT_COLUMN: render_prompt(row, context_fields),
-            CHECKPOINT_ID_COLUMN: int(row[_ROW_ADDRESS_COLUMN]),
-        }
-        for row in scanned.select(sorted(required)).to_pylist()
-    ]
+    rows = [_scanned_row(row, context_fields) for row in scanned.select(sorted(required)).to_pylist()]
     return pa.Table.from_pylist(rows, schema=SCAN_SCHEMA)
+
+
+def _scanned_row(row: dict[str, Any], context_fields: tuple[PromptContextField, ...]) -> dict[str, Any]:
+    """Project one scanned row onto :data:`SCAN_SCHEMA`."""
+    clip_id = require_clip_id(row[CLIP_ID_COLUMN])
+    row_address = int(row[ROW_ADDRESS_COLUMN])
+    return {
+        CLIP_ID_COLUMN: clip_id,
+        # The address's high bits, so the staged partition key and the checkpoint
+        # id come from the same read rather than from a join back to the table.
+        FRAGMENT_ID_COLUMN: row_address >> ROW_ADDRESS_FRAGMENT_SHIFT,
+        # Carried through as it arrived, null included: refusing a null here
+        # would fail the read task and so the whole attempt, whereas the
+        # media stage can refuse the one row that names no location.
+        CLIP_URI_COLUMN: row[CLIP_URI_COLUMN],
+        PROMPT_COLUMN: render_prompt(row, context_fields),
+        CHECKPOINT_ID_COLUMN: row_address,
+    }

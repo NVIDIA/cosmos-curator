@@ -14,25 +14,41 @@ see each other's rows and no per-row compatibility test exists downstream.
         results/          staged terminal rows (Parquet)
         checkpoints/      completed row ids
 
+    digested: source_uri, contract digest, staging protocol version,
+              staged schema fingerprint, work-shard scope
+
 The path IS the whole mechanism - no manifest, no lock, no claim. A manifest
 could only restate what the path already pins, and being a second copy of that
 state it could disagree with it. Interchangeability is all it pins, so two
 further guarantees a reader might expect of a namespace are operator discipline
 here rather than a runtime check:
 
-- ONE WRITER AT A TIME per namespace, a precondition the caller enforces where
-  runs are launched. A resume satisfies it: the earlier attempt has stopped and
-  the checkpoint leaves the two clip sets disjoint. Two concurrent runs instead
-  stage differing captions for one clip, publication refuses that pair, and
-  cleanup follows only a commit, so the namespace must be deleted before the leg
-  can proceed.
+- ONE WRITER AT A TIME per namespace, a precondition enforced where runs are
+  launched rather than here. A resume satisfies it: the earlier attempt has
+  stopped and the checkpoint leaves the two clip sets disjoint. Concurrent WORK
+  SHARDS satisfy it structurally, because shard scope is a digest input and so
+  each shard resolves to its own namespace. Two concurrent runs of the SAME
+  scope instead stage differing captions for one clip, publication refuses that
+  pair, and cleanup follows only a commit, so the namespace must be deleted
+  before the leg can proceed. Shard scope is in the namespace for two further
+  and independently fatal reasons. ``cleanup_workspace`` deletes the whole
+  namespace root after a commit, so shards sharing one would see the first to
+  publish destroy every other's staged rows - unseeded captions that cannot be
+  regenerated identically. And Ray's checkpoint recovery is job-blind: measured
+  at Ray Data 2.58.0, every job's ``load_checkpoint`` deletes EVERY pending
+  checkpoint entry in the directory and the data files those entries name, a
+  concurrent job's included, so scoping this cleanup to one shard's partitions
+  would not make sharing safe. Reuse across shard shapes comes from committed
+  rows and the owed-work predicate, never from a shared namespace.
 - TABLE IDENTITY. ``source_uri`` is a path rather than an identity, so a table
-  dropped and recreated there inherits its predecessor's namespace once the read
-  version and the contract digest coincide too. Give a recreated table a fresh
-  path, or a staging root the previous table's namespaces do not live under.
+  dropped and recreated there inherits its predecessor's namespace once the
+  contract digest coincides too. Give a recreated table a fresh path, or a
+  staging root the previous table's namespaces do not live under.
 
 Both are stated as limitations in
-``docs/curator/design/curator-next-robot-action-caption.md``.
+``docs/curator/design/curator-next-robot-action-caption.md``, whose sharding
+section develops the sharded case against this namespace. The shared mechanism
+is ``curator-next-sharding.md``.
 
 No completion marker either: the single Lance commit is the completion signal.
 
@@ -55,6 +71,7 @@ import pyarrow.fs as pafs
 from loguru import logger
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix, create_s3_client, is_s3path
+from cosmos_curator.next.core.sharding import ShardConfig
 from cosmos_curator.next.recipes.robot_action_caption.request import staged_schema_fingerprint
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path, normalize_location_root
 from cosmos_curator.next.utils.identity import canonical_digest
@@ -71,8 +88,17 @@ _CHECKPOINTS_SEGMENT: Final = "checkpoints"
 # to be exhaustive over what the current write and read paths depend on:
 #
 #   - checkpoint-id semantics: the `__checkpoint_id` column name, or the value it
-#     is derived from (today Lance's `_rowaddr`), because a resume matches new
-#     ids against the ids an earlier attempt recorded;
+#     is derived from (today the Lance row address), because a resume matches new
+#     ids against the ids an earlier attempt recorded. That derivation makes TWO
+#     dependency behaviours load-bearing, and together they are what stops a
+#     stale address ever naming a different LIVE row: Lance allocates a FRESH
+#     fragment id on a rewrite, and it never reassigns an offset inside a
+#     surviving fragment - an append opens a new fragment rather than extending
+#     one, and offsets freed by a delete are not handed to later rows. The second
+#     premise is the one other writers on this table could break, which is why it
+#     is stated rather than left to follow from the first. Both measured at
+#     pylance 10.0.0 and 11.0.0; re-measure on a pylance bump, and bump this
+#     constant if either stops holding;
 #   - the checkpoint surviving a successful Phase A
 #     (`delete_checkpoint_on_success=False`), without which a resume re-infers
 #     rows already staged and appends a second answer for each of them;
@@ -93,7 +119,7 @@ _CHECKPOINTS_SEGMENT: Final = "checkpoints"
 # It is not a caption-contract input, and that is the whole reason it exists
 # separately: none of those changes alters a caption's text, so a bump must
 # isolate old workspaces without recaptioning a single canonical row.
-STAGING_PROTOCOL_VERSION: Final = 1
+STAGING_PROTOCOL_VERSION: Final = 2
 
 
 @attrs.frozen
@@ -128,8 +154,8 @@ def resolve_workspace(
     *,
     staging_root: str,
     source_uri: str,
-    read_version: int,
     digest: str,
+    shard: ShardConfig | None,
     storage_profile: str = "default",
 ) -> CaptionWorkspace:
     """Return the namespace this run stages into, creating nothing.
@@ -143,9 +169,10 @@ def resolve_workspace(
         source_uri: Canonical (already normalized) URI of the clip table. Two
             spellings of one table must normalize to one value here, or the same
             work lands in two namespaces that cannot see each other.
-        read_version: Lance version pinned AFTER the caption columns exist, so a
-            first run and its resume pin the same one.
         digest: This run's caption contract digest.
+        shard: The work shard this run owns, or ``None`` when unsharded. Two
+            shards of one campaign must not share a namespace; see the module
+            docstring's one-writer entry.
         storage_profile: Credential profile for the staged writes and reads.
 
     Returns:
@@ -174,21 +201,45 @@ def resolve_workspace(
     if parsed_root.scheme.lower() != "s3" and not Path(root_path).is_absolute():
         msg = f"local staging_root must be absolute, got {staging_root!r}"
         raise ValueError(msg)
-    # The last two inputs are in the namespace identity but NOT in the contract
-    # digest, and the difference is deliberate. Neither changes any caption's text,
-    # so neither may invalidate canonical captions, but both change how a staged row
-    # is read back, so work across either boundary is incompatible with a resume.
-    # The namespace is the only place that distinction belongs.
+    # Three of these inputs are in the namespace identity but NOT in the contract
+    # digest, and the difference is deliberate. None changes any caption's text,
+    # so none may invalidate canonical captions, but each changes how a staged row
+    # is read back or WHICH rows a job may stage, so work across any of those
+    # boundaries is incompatible with a resume. The namespace is the only place
+    # that distinction belongs.
     #
-    # Selection scope is deliberately NOT here, though it decides which rows an
-    # attempt owes. Two attempts differ in scope only while pinning one read
-    # version, which means the first never committed, and the two directions are
-    # not alike: a WIDENED resume finds a subset of what it owes, which the
-    # checkpoint and publication's coverage check already handle, while a NARROWED
-    # one finds a superset and is refused before the commit with its staged rows
-    # intact. Digesting the flag would buy that refusal by stranding every
-    # completed caption whenever an attempt widens - unrecoverably, because
-    # generation is unseeded and cleanup follows only a commit.
+    # The read version is deliberately NOT here. A version that moved without
+    # moving rows invalidates nothing, so digesting it forfeited every finished
+    # caption to any commit that advanced it - this recipe's own metadata-only
+    # widening included, which under unseeded generation is lost output rather
+    # than lost time. The removal was originally attributed to a since-removed
+    # composite checkpoint id, but the two are independent: the row address that
+    # replaced it is equally unmoved by those commits, which is the measurement
+    # recorded beside STAGING_PROTOCOL_VERSION above. What a version can still
+    # invalidate is a compaction, and that is an operational rule rather than a
+    # digest input.
+    #
+    # The accepted cost is that a namespace whose post-commit cleanup failed is
+    # no longer unreachable - a later attempt on the same table, contract and
+    # scope resolves to it again - and it lands one of two ways depending on what
+    # that attempt owes. Owing nothing, it returns before the workspace is opened
+    # and the leftover is simply never examined: a storage leak, deleted by hand.
+    # Owing a row in a fragment that ALSO holds leftover staged rows, publication
+    # folds those extras and refuses BEFORE the commit with every staged row
+    # intact; the remedy is to delete the namespace. Only the second case reaches
+    # that check, which is why it must not be relaxed.
+    #
+    # Selection scope is deliberately NOT here either, though it decides which
+    # rows an attempt owes. The two directions are not alike: a WIDENED resume
+    # finds a subset of what it owes, which the checkpoint and publication's
+    # coverage check already handle, while a NARROWED one finds a superset and is
+    # refused before the commit with its staged rows intact. Digesting the flag
+    # would buy that refusal by stranding every completed caption whenever an
+    # attempt widens - unrecoverably, because generation is unseeded and cleanup
+    # follows only a commit. So the recoverable direction is kept and the other
+    # is left to the downstream check. Work-shard scope is NOT the same case: it
+    # partitions concurrent jobs rather than resuming one, and sharing a
+    # namespace would let the first shard's cleanup delete the rest's staged rows.
     #
     # The digest is a sha256, so the segment below is 64 hex characters: it can
     # carry neither a path separator nor a parent reference, and needs no
@@ -196,15 +247,16 @@ def resolve_workspace(
     namespace = canonical_digest(
         {
             "source_uri": source_uri,
-            "read_version": read_version,
             "contract_digest": digest,
             "staging_protocol_version": STAGING_PROTOCOL_VERSION,
             "staged_schema_fingerprint": staged_schema_fingerprint(),
+            "shard": None if shard is None else shard.identity(),
         }
     )
     separator = "" if base.endswith("/") else "/"
     root_uri = f"{base}{separator}{_NAMESPACE_SEGMENT}/{namespace}"
-    logger.info(f"Caption workspace for {source_uri} at v{read_version} resolves to {root_uri}.")
+    scope = "unsharded" if shard is None else f"shard {shard.label}"
+    logger.info(f"Caption workspace for {source_uri} ({scope}) resolves to {root_uri}.")
     return CaptionWorkspace(
         root_uri=root_uri,
         filesystem=arrow_filesystem(root_uri, storage_profile=storage_profile),

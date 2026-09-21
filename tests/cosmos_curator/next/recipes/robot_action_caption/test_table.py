@@ -50,12 +50,14 @@ from cosmos_curator.next.recipes.robot_action_caption.contracts import (
 )
 from cosmos_curator.next.recipes.robot_action_caption.prompt import SUPPORTED_CONTEXT_FIELDS
 from cosmos_curator.next.recipes.robot_action_caption.table import (
+    _REGISTRATION_ATTEMPTS,
     CLIP_ID_COLUMN,
     CLIP_URI_COLUMN,
     CURATE_SELECTED_VALUE,
     CURATE_SELECTION_REASON,
     REQUIRED_SOURCE_COLUMNS,
     caption_work_filter,
+    count_rows_in_fragments,
     ensure_caption_fields,
     owed_clip_ids,
     require_source_columns,
@@ -91,6 +93,16 @@ STRUCTURAL_FIELDS = (
     pa.field(CLIP_ID_COLUMN, pa.string(), nullable=False),
     pa.field(CLIP_URI_COLUMN, pa.large_string(), nullable=False),
 )
+
+
+def register(uri: str) -> lance.LanceDataset:
+    """Register the caption group on a local table, returning the widened handle.
+
+    ``storage_options`` is always ``None`` here: every fixture is a local
+    directory, so credentials would be a value the subject never reads.
+    """
+    return ensure_caption_fields(uri, storage_options=None)
+
 
 # Builds a clips.lance and returns its URI; see ``make_clips_table``.
 ClipsTableFactory = Callable[..., str]
@@ -269,16 +281,18 @@ def test_caption_registration_refuses_a_missing_structural_column_before_widenin
     omitted: str,
 ) -> None:
     """Refuse a missing clip_id or clip_uri without bumping the Lance version."""
-    dataset = lance.dataset(
-        make_schema_table(pa.schema([field for field in STRUCTURAL_FIELDS if field.name != omitted]))
-    )
-    before = int(dataset.version)
+    uri = make_schema_table(pa.schema([field for field in STRUCTURAL_FIELDS if field.name != omitted]))
+    before = int(lance.dataset(uri).version)
 
     with pytest.raises(ValueError, match=f"missing required source column.*{omitted}"):
-        ensure_caption_fields(dataset)
+        register(uri)
 
-    assert int(dataset.version) == before
-    assert set(dataset.schema.names).isdisjoint(CAPTION_COLUMNS)
+    # Re-read rather than inspected through a handle held across the call:
+    # registration opens its own, so a handle from before it could not observe a
+    # commit even if one had happened, and the assertion would pass vacuously.
+    after = lance.dataset(uri)
+    assert int(after.version) == before
+    assert set(after.schema.names).isdisjoint(CAPTION_COLUMNS)
 
 
 def test_a_non_text_clip_uri_is_refused(make_schema_table: SchemaTableFactory) -> None:
@@ -410,14 +424,17 @@ def test_caption_registration_validates_context_before_mutating_the_table(
 ) -> None:
     """Validate supported context fields before caption registration commits."""
     field, *_ = SUPPORTED_CONTEXT_FIELDS
-    dataset = lance.dataset(make_schema_table(context_schema(field.column, pa.int64())))
-    before = int(dataset.version)
+    uri = make_schema_table(context_schema(field.column, pa.int64()))
+    before = int(lance.dataset(uri).version)
 
     with pytest.raises(ValueError, match=rf"context column {field.column!r}.*non-text type int64"):
-        ensure_caption_fields(dataset)
+        register(uri)
 
-    assert int(dataset.version) == before
-    assert set(dataset.schema.names).isdisjoint(CAPTION_COLUMNS)
+    # Re-read: registration opens its own handle, so only a fresh one can show
+    # whether the refusal came before or after a commit.
+    after = lance.dataset(uri)
+    assert int(after.version) == before
+    assert set(after.schema.names).isdisjoint(CAPTION_COLUMNS)
 
 
 def test_an_absent_context_column_is_skipped_without_a_warning(
@@ -459,18 +476,18 @@ def test_the_resolved_fields_keep_the_supported_order(make_schema_table: SchemaT
 def test_registration_adds_every_caption_field(make_clips_table: ClipsTableFactory) -> None:
     """A table without the caption columns gains all five in one commit.
 
-    The version is read back off the handle that was PASSED rather than off a
-    re-open, because ``pipeline.py`` pins its read version from that same object
-    immediately after this call: in-place advancement is the property pinning
-    depends on, and a re-open would pass either way.
+    The version is read off the handle the call RETURNED rather than off a
+    re-open, because ``pipeline.py`` pins its read version from that same object:
+    the returned handle already sitting at the widened version is what makes the
+    pinning structural, and a re-open would pass whether it did or not.
     """
-    dataset = lance.dataset(make_clips_table())
-    before = int(dataset.version)
+    uri = make_clips_table()
+    before = int(lance.dataset(uri).version)
 
-    ensure_caption_fields(dataset)
+    widened = register(uri)
 
-    assert int(dataset.version) == before + 1
-    assert set(CAPTION_COLUMNS) <= set(lance.dataset(dataset.uri).schema.names)
+    assert int(widened.version) == before + 1
+    assert set(CAPTION_COLUMNS) <= set(widened.schema.names)
 
 
 def test_registration_does_not_rewrite_data_files(make_clips_table: ClipsTableFactory) -> None:
@@ -481,7 +498,7 @@ def test_registration_does_not_rewrite_data_files(make_clips_table: ClipsTableFa
         for fragment in lance.dataset(uri).get_fragments()
     ]
 
-    ensure_caption_fields(lance.dataset(uri))
+    register(uri)
 
     after = [
         (fragment.fragment_id, fragment.count_rows(), len(fragment.data_files()))
@@ -498,11 +515,11 @@ def test_registration_is_idempotent_without_a_version_bump(make_clips_table: Cli
     one, landing the two in different recovery namespaces with nothing in common.
     """
     uri = make_clips_table()
-    ensure_caption_fields(lance.dataset(uri))
-    widened_version = int(lance.dataset(uri).version)
+    widened_version = int(register(uri).version)
 
-    ensure_caption_fields(lance.dataset(uri))
+    resumed = register(uri)
 
+    assert int(resumed.version) == widened_version
     assert int(lance.dataset(uri).version) == widened_version
 
 
@@ -517,16 +534,15 @@ def test_registration_refuses_a_partially_present_field_set_without_a_version_bu
     """
     uri = make_clips_table()
     lance.dataset(uri).add_columns(pa.schema([CAPTION_FIELDS.field(CAPTION_STATUS_COLUMN)]))
-    partial = lance.dataset(uri)
-    before = int(partial.version)
+    before = int(lance.dataset(uri).version)
 
     with pytest.raises(ValueError, match="partial caption column group") as exc_info:
-        ensure_caption_fields(partial)
+        register(uri)
 
     message = str(exc_info.value)
     assert CAPTION_STATUS_COLUMN in message
     assert all(name in message for name in CAPTION_COLUMNS if name != CAPTION_STATUS_COLUMN)
-    assert int(partial.version) == before
+    assert int(lance.dataset(uri).version) == before
 
 
 def test_registration_refuses_a_mistyped_field_it_would_otherwise_widen_around(
@@ -544,7 +560,7 @@ def test_registration_refuses_a_mistyped_field_it_would_otherwise_widen_around(
     before = int(lance.dataset(uri).version)
 
     with pytest.raises(ValueError, match=rf"partial caption column group.*present.*{CAPTION_STATUS_COLUMN}.*missing"):
-        ensure_caption_fields(lance.dataset(uri))
+        register(uri)
 
     assert int(lance.dataset(uri).version) == before
 
@@ -560,16 +576,104 @@ def test_registration_rejects_an_incompatible_existing_field(make_clips_table: C
     lance.dataset(uri).add_columns(pa.schema([pa.field(name, pa.int64(), nullable=True) for name in CAPTION_COLUMNS]))
 
     with pytest.raises(ValueError, match=r"incompatible with the frozen contract.*int64.*contract: "):
-        ensure_caption_fields(lance.dataset(uri))
+        register(uri)
 
 
 def test_registration_preserves_the_source_columns(make_clips_table: ClipsTableFactory) -> None:
     """Every source column keeps its name, type, and nullability across the widening."""
     uri = make_clips_table()
-    ensure_caption_fields(lance.dataset(uri))
+    register(uri)
 
     schema = lance.dataset(uri).schema
     assert [schema.field(field.name) for field in CLIPS_SOURCE_SCHEMA] == list(CLIPS_SOURCE_SCHEMA)
+
+
+def test_a_lost_schema_race_is_resolved_by_reopening(
+    make_clips_table: ClipsTableFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit that loses to a concurrent widener resolves on the next pass.
+
+    This is the whole reason the function takes a URI instead of a handle: the
+    losing job cannot retry from the handle that lost, because the group it needs
+    exists only at a version that handle cannot see. The stub widens the table
+    for real before raising, so the reopened pass finds a genuinely present group
+    rather than a mock's say-so, and the returned handle must sit at THAT
+    version - the one the winner created.
+    """
+    uri = make_clips_table()
+    real_add_columns = lance.LanceDataset.add_columns
+
+    def lose_once(self: lance.LanceDataset, *args: object, **kwargs: object) -> None:
+        monkeypatch.setattr(lance.LanceDataset, "add_columns", real_add_columns)
+        real_add_columns(self, *args, **kwargs)  # type: ignore[arg-type]  # Untyped in Lance stubs.
+        msg = "commit conflict"
+        raise OSError(msg)
+
+    monkeypatch.setattr(lance.LanceDataset, "add_columns", lose_once)
+
+    widened = register(uri)
+
+    assert set(CAPTION_COLUMNS) <= set(widened.schema.names)
+    assert int(widened.version) == int(lance.dataset(uri).version)
+
+
+def test_a_deterministic_widening_failure_surfaces_once_the_attempts_are_spent(
+    make_clips_table: ClipsTableFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage fault that never resolves is reported, not retried forever.
+
+    The counterfactual to the test above, and what the bound buys: the same
+    exception type, raised by a stub that never lets the commit through, must end
+    the attempt with the cause attached rather than loop.
+    """
+    uri = make_clips_table()
+
+    def always_fail(_self: lance.LanceDataset, *_args: object, **_kwargs: object) -> None:
+        msg = "storage is unreachable"
+        raise OSError(msg)
+
+    monkeypatch.setattr(lance.LanceDataset, "add_columns", always_fail)
+
+    with pytest.raises(RuntimeError, match="could not register caption fields") as exc_info:
+        register(uri)
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert set(lance.dataset(uri).schema.names).isdisjoint(CAPTION_COLUMNS)
+
+
+def test_a_partial_group_found_after_the_attempts_are_spent_is_refused_as_partial(
+    make_clips_table: ClipsTableFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group that turns partial while the commits are failing is named partial.
+
+    The loop's last look at the table is an ordinary classification pass, not a
+    present-or-fail check, so the state it finds decides the refusal. Here every
+    commit loses and a concurrent writer leaves a strict subset behind: reporting
+    that as "still absent, so no concurrent writer registered it either" would
+    send an operator looking for contention instead of for the half-written group
+    that is actually blocking them.
+    """
+    uri = make_clips_table()
+    real_add_columns = lance.LanceDataset.add_columns
+    commits = 0
+
+    def lose_every_commit(_self: lance.LanceDataset, *_args: object, **_kwargs: object) -> None:
+        # The subset lands during the LAST commit pass, so the loop cannot see it
+        # until the read-only pass. Planting it earlier would be caught by an
+        # in-loop check that already existed and would prove nothing.
+        nonlocal commits
+        commits += 1
+        if commits == _REGISTRATION_ATTEMPTS:
+            real_add_columns(  # type: ignore[call-arg]  # Untyped in Lance stubs.
+                lance.dataset(uri), pa.schema([CAPTION_FIELDS.field(CAPTION_STATUS_COLUMN)])
+            )
+        msg = "commit conflict"
+        raise OSError(msg)
+
+    monkeypatch.setattr(lance.LanceDataset, "add_columns", lose_every_commit)
+
+    with pytest.raises(ValueError, match=rf"partial caption column group.*{CAPTION_STATUS_COLUMN}"):
+        register(uri)
 
 
 def test_an_uncaptioned_row_is_pending(make_clips_table: ClipsTableFactory) -> None:
@@ -837,12 +941,69 @@ def test_owed_clip_ids_refuses_an_unregistered_table(make_clips_table: ClipsTabl
 def test_owed_clip_ids_rejects_an_absent_fragment(make_clips_table: ClipsTableFactory) -> None:
     """A fragment id the pinned version does not carry is an error, not an empty list."""
     uri = make_clips_table(rows=7, rows_per_file=3)
-    ensure_caption_fields(lance.dataset(uri))
+    register(uri)
 
     with pytest.raises(ValueError, match="is not present in"):
         owed_clip_ids(
             lance.dataset(uri),
             99,
+            caption_work_filter(CURRENT_DIGEST, MODEL_ID, selected_only=False),
+        )
+
+
+def test_a_scoped_count_ignores_the_pending_rows_of_fragments_it_was_not_given(
+    make_clips_table: ClipsTableFactory,
+) -> None:
+    """The count covers exactly the fragments named, never the table.
+
+    Built adversarially: every pending row sits in the fragment NOT counted, and
+    the counted fragment's rows are all captioned. A table-wide count would
+    report 3 here and, in the caller that uses this, would blame Curate for a
+    backlog belonging to another job - sending an operator to a remedy that
+    changes nothing.
+    """
+    uri = make_clips_table(
+        rows=6,
+        rows_per_file=3,
+        statuses=["success", "success", "success", None, None, None],
+    )
+    register(uri)
+    row_filter = caption_work_filter(CURRENT_DIGEST, MODEL_ID, selected_only=False)
+    dataset = lance.dataset(uri)
+
+    assert count_rows_in_fragments(dataset, [0], row_filter) == 0
+    # The pending rows do exist, which is what stops the zero above being a
+    # property of the fixture rather than of the scoping.
+    assert count_rows_in_fragments(dataset, [1], row_filter) == 3
+    assert count_rows_in_fragments(dataset, [0, 1], row_filter) == 3
+
+
+def test_a_scoped_count_over_no_fragments_is_zero(make_clips_table: ClipsTableFactory) -> None:
+    """A shard owning nothing counts nothing, rather than falling back to the table."""
+    uri = make_clips_table(rows=3, rows_per_file=3)
+    register(uri)
+
+    assert (
+        count_rows_in_fragments(
+            lance.dataset(uri), [], caption_work_filter(CURRENT_DIGEST, MODEL_ID, selected_only=False)
+        )
+        == 0
+    )
+
+
+def test_a_scoped_count_rejects_an_absent_fragment(make_clips_table: ClipsTableFactory) -> None:
+    """A fragment id this version does not carry is an error, not a silent zero.
+
+    A silent zero would read exactly like "this shard owes nothing", which is the
+    verdict the caller acts on.
+    """
+    uri = make_clips_table(rows=3, rows_per_file=3)
+    register(uri)
+
+    with pytest.raises(ValueError, match="is not present in"):
+        count_rows_in_fragments(
+            lance.dataset(uri),
+            [0, 99],
             caption_work_filter(CURRENT_DIGEST, MODEL_ID, selected_only=False),
         )
 

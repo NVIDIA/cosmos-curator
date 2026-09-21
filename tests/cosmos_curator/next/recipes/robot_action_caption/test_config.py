@@ -74,7 +74,7 @@ def test_a_minimal_config_resolves_with_every_section_defaulted(raw_config: RawC
     assert resolved.execution.media_attempts == 3
     assert resolved.execution.media_cpus_per_fetch == 0.25
     assert resolved.execution.lance_read_batch_size == 256
-    assert resolved.execution.parquet_rows_per_file == 4_096
+    assert resolved.execution.parquet_rows_per_file == 256
     assert resolved.execution.progress is False
 
 
@@ -483,6 +483,109 @@ def test_scheduler_token_budget_accepts_an_explicit_runtime_value(raw_config: Ra
     resolved = resolve_config_data(raw_config(execution={"max_num_batched_tokens": 32_768}))
 
     assert resolved.execution.max_num_batched_tokens == 32_768
+
+
+def test_the_gpu_memory_fraction_defaults_to_deferring_to_vllm(raw_config: RawConfigFactory) -> None:
+    """Absent from the YAML, the recipe must not invent a fraction of its own.
+
+    ``None`` is the load-bearing default: it is what keeps vLLM's own value in
+    force, and a recipe-side number would override the dependency silently on
+    every run that never mentioned the knob.
+    """
+    assert resolve_config_data(raw_config()).execution.gpu_memory_utilization is None
+
+
+def test_the_gpu_memory_fraction_preserves_an_operator_supplied_value(raw_config: RawConfigFactory) -> None:
+    """Preserve the exact fraction an operator set.
+
+    The value is neither vLLM's 0.9 default nor the 0.92 a later release moved it
+    to, so a resolve that dropped the field and reported a dependency default
+    cannot satisfy this.
+    """
+    resolved = resolve_config_data(raw_config(execution={"gpu_memory_utilization": 0.83}))
+
+    assert resolved.execution.gpu_memory_utilization == 0.83
+
+
+def test_the_gpu_memory_fraction_accepts_the_whole_device(raw_config: RawConfigFactory) -> None:
+    """The inclusive ceiling must be reachable, or the bound is off by one device.
+
+    Sits on the boundary the bound is written at: an exclusive ceiling would
+    refuse the one value that asks for the whole GPU, which is a legitimate
+    setting rather than an error.
+    """
+    assert (
+        resolve_config_data(raw_config(execution={"gpu_memory_utilization": 1.0})).execution.gpu_memory_utilization
+        == 1.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        pytest.param(0.0, "greater than 0", id="zero-leaves-no-memory"),
+        pytest.param(-0.5, "greater than 0", id="negative"),
+        pytest.param(1.01, "less than or equal to 1", id="above-the-whole-device"),
+        pytest.param(float("inf"), "finite number", id="infinite"),
+        pytest.param(float("nan"), "finite number", id="nan"),
+    ],
+)
+def test_the_gpu_memory_fraction_rejects_an_unusable_share(
+    raw_config: RawConfigFactory,
+    value: float,
+    message: str,
+) -> None:
+    """Refuse a share no GPU can honour, at parse time rather than at graph capture.
+
+    vLLM resolves this into an absolute byte budget during startup profiling, so
+    an out-of-range value surfaces as a CUDA failure minutes into a run that has
+    already claimed its allocation.
+    """
+    with pytest.raises(ValidationError, match=rf"gpu_memory_utilization[\s\S]*{message}"):
+        resolve_config_data(raw_config(execution={"gpu_memory_utilization": value}))
+
+
+@pytest.mark.parametrize(
+    "misspelling",
+    [
+        pytest.param("gpu_memory_utilisation", id="british-spelling"),
+        pytest.param("gpu_mem_utilization", id="abbreviated"),
+    ],
+)
+def test_a_near_miss_gpu_memory_key_is_refused_rather_than_ignored(
+    raw_config: RawConfigFactory,
+    misspelling: str,
+) -> None:
+    """A key that is nearly the real one must fail, not be silently dropped.
+
+    The failure mode this closes is an operator raising residency in YAML,
+    seeing no error, and getting the dependency default anyway.
+    """
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        resolve_config_data(raw_config(execution={misspelling: 0.83}))
+
+
+def test_prefix_caching_defaults_off(raw_config: RawConfigFactory) -> None:
+    """The shipped default must be off, because vLLM's own default is on.
+
+    Unlike its neighbours this field has no third "inherit the dependency" state,
+    and that is the whole reason it exists: reuse is unreachable for this
+    recipe's request shape, so inheriting vLLM's default would buy block hashing
+    over every prompt and retained blocks inflating reported KV usage for a
+    measured 0.0% hit rate. A default of ``True`` here, or a ``None`` that let
+    the key be omitted, are the same defect.
+    """
+    assert resolve_config_data(raw_config()).execution.enable_prefix_caching is False
+
+
+def test_prefix_caching_can_be_turned_on_from_the_yaml(raw_config: RawConfigFactory) -> None:
+    """The other state must be reachable, or the field is a constant with a schema.
+
+    Off is the right default rather than the only legal value: reshaping the
+    request to lead with shared text makes reuse real, and an operator measuring
+    that needs to be able to ask for it without editing the recipe.
+    """
+    assert resolve_config_data(raw_config(execution={"enable_prefix_caching": True})).execution.enable_prefix_caching
 
 
 def test_a_file_uri_clip_table_normalizes_to_the_path_it_names(

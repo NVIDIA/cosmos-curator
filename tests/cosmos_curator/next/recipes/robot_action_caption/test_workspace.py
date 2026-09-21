@@ -12,19 +12,29 @@ cleanup, and the assertion that resolution itself leaves no trace.
 Five inputs decide that URI, and they split into two groups the assertions keep
 apart:
 
-    source_uri, read_version, contract_digest   the run's own identity
-    schema fingerprint, protocol                Phase A compatibility
+    source_uri, contract_digest, shard   the run's own identity
+    schema fingerprint, protocol         Phase A compatibility
 
 The second group is why the golden namespace below is pinned as a literal. A
 change to the staged fields or to the staging protocol has to isolate old
 workspaces, and comparing two live resolutions cannot see it: both sides would
 move together and agree.
 
-Selection scope is deliberately not among the five, so a widened attempt resumes
-the narrower one it widens. Resolution can no longer express that - there is no
-scope argument left to vary - so the golden literal is what turns red if the flag
-is digested again, and the reuse it buys is pinned end to end in
-``test_recovery_integration.py``.
+The read version is deliberately not among the five, so an attempt can resume one
+that pinned a different snapshot. Selection scope is not among them either, so a
+widened attempt resumes the narrower one it widens. Resolution can express
+neither - there is no version or scope argument left to vary - so the golden
+literal is what turns red if either is digested again, and the reuse that buys is
+pinned end to end in ``test_recovery_integration.py``.
+
+Work-shard scope IS among the five, and for the opposite reason to those two: it
+divides concurrent jobs rather than resuming one, and post-commit cleanup deletes
+a whole namespace root, so two shards sharing one would have the first to publish
+destroy the rest's staged rows. Ray's checkpoint recovery deletes a concurrent
+job's pending entries and their data files for the same directory, so scoping
+this side's cleanup could not rescue a shared one either. Its serialization
+inside the digest is pinned rather than merely varied, because the namespace is a
+durable directory name.
 
 Location refusals stop a blank or relative local staging root before it can name
 different physical directories in different processes. They arrive from two
@@ -42,6 +52,7 @@ from unittest.mock import Mock
 import pyarrow.fs as pafs
 import pytest
 
+from cosmos_curator.next.core.sharding import ShardConfig
 from cosmos_curator.next.recipes.robot_action_caption import workspace
 
 # Stand-ins for a caption contract digest. Their VALUES are never asserted in the
@@ -60,8 +71,14 @@ _OTHER_DIGEST = "b" * 64
 # names itself.
 _GOLDEN_STAGING_ROOT = "/staging"
 _GOLDEN_SOURCE_URI = "/tables/clips.lance"
-_GOLDEN_READ_VERSION = 7
-_GOLDEN_NAMESPACE = "994762424b18445f4a2ba8623908f426d8fd1ce58a2052050d9106fccee6498c"
+_GOLDEN_NAMESPACE = "3886681f1d9549627e9d0d397e23c03fd653e3923263ab45a6c67782043e4a21"
+
+# The same identity with a work shard, pinned for the same reason: the shard's
+# serialization inside the digest is a choice, and the only thing that can catch
+# it drifting is a literal. A live comparison against an unsharded resolution
+# would keep agreeing under any encoding.
+_GOLDEN_SHARD = ShardConfig(count=8, index=3)
+_GOLDEN_SHARDED_NAMESPACE = "de9c77fdec003334f30b69bc748e74761ed0c6d13988f3f57243ddeb74d3f06e"
 
 # Resolves a workspace with one fixed identity, each input overridable; see
 # ``resolve``.
@@ -82,8 +99,8 @@ def resolve(staging_root: str) -> WorkspaceFactory:
         inputs: dict[str, object] = {
             "staging_root": staging_root,
             "source_uri": _GOLDEN_SOURCE_URI,
-            "read_version": _GOLDEN_READ_VERSION,
             "digest": _DIGEST,
+            "shard": None,
         }
         inputs.update(overrides)
         return workspace.resolve_workspace(**inputs)  # type: ignore[arg-type]
@@ -112,21 +129,57 @@ def test_two_runs_with_the_same_inputs_resolve_to_one_namespace(resolve: Workspa
     ("field", "value"),
     [
         ("source_uri", "/tables/other.lance"),
-        ("read_version", 8),
         ("digest", _OTHER_DIGEST),
+        ("shard", _GOLDEN_SHARD),
     ],
 )
 def test_a_changed_identity_input_resolves_to_a_different_namespace(
     resolve: WorkspaceFactory, field: str, value: object
 ) -> None:
-    """Runs that cannot reuse each other's staged rows cannot see each other's directory.
+    """Runs that must not share staged rows cannot see each other's directory.
 
-    Another table, a moved snapshot, and different caption semantics invalidate
-    the staged rows for three different reasons, but they share one consequence:
-    no per-row compatibility test exists downstream, so separation happens in the
-    path or it does not happen.
+    Another table, different caption semantics, and a different work shard are
+    three different reasons, but they share one consequence: no per-row
+    compatibility test exists downstream, so separation happens in the path or it
+    does not happen.
     """
     assert resolve().root_uri != resolve(**{field: value}).root_uri
+
+
+def test_one_sharded_identity_resolves_to_the_golden_sharded_namespace(resolve: WorkspaceFactory) -> None:
+    """The shard's serialization inside the digest is pinned, not merely varied.
+
+    A live comparison against the unsharded resolution stays green under any
+    encoding of the pair, including one that collapses two distinct shards, so
+    only a literal can catch that shape drifting.
+    """
+    resolved = resolve(staging_root=_GOLDEN_STAGING_ROOT, shard=_GOLDEN_SHARD)
+
+    assert resolved.root_uri == f"{_GOLDEN_STAGING_ROOT}/inference/{_GOLDEN_SHARDED_NAMESPACE}"
+
+
+def test_every_shard_of_one_campaign_resolves_to_its_own_namespace(resolve: WorkspaceFactory) -> None:
+    """Concurrent shards must not share a root, because cleanup deletes the whole root.
+
+    They agree on every other identity input by construction - one table, one
+    contract - so the shard is the only thing that can separate them. If it
+    cannot, the first shard to publish deletes every other's staged rows, and
+    because generation is unseeded those captions cannot be reproduced.
+    """
+    count = 8
+    roots = {resolve(shard=ShardConfig(count=count, index=index)).root_uri for index in range(count)}
+
+    assert len(roots) == count
+
+
+def test_an_unsharded_run_does_not_share_the_namespace_of_a_single_shard(resolve: WorkspaceFactory) -> None:
+    """``None`` and a one-shard scope are different scopes and must serialize apart.
+
+    They own the same fragments, so a digest that folded them together would look
+    harmless. It is not: the two are launched by different campaigns, and a
+    ``count=1`` job publishing would delete an unsharded attempt's staged rows.
+    """
+    assert resolve(shard=None).root_uri != resolve(shard=ShardConfig(count=1, index=0)).root_uri
 
 
 def test_a_changed_staged_schema_separates_namespaces_while_the_contract_stays_equal(

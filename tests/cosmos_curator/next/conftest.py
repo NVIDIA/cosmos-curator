@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared fixtures for the Curator Next test tree.
+"""Shared fixtures and helpers for the Curator Next test tree.
 
-Holds the single local Ray cluster and the mecka action-artifact builders, which
-are needed by both the component tests (``next/embeddings/``) and the recipe
-tests (``next/recipes/embeddings/``) and so cannot live under either.
+Holds the single local Ray cluster, the mecka action-artifact builders, and the
+row-address builder, each of which is needed by more than one package below this
+one and so cannot live under any of them.
 """
 
 import pathlib
@@ -32,6 +32,7 @@ from loguru import logger
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from cosmos_curator.next.media.action_binary import ACTION_BINARY_SPEC_BY_DATASET, encode_action_bin
+from cosmos_curator.next.utils.lance_utils import ROW_ADDRESS_FRAGMENT_SHIFT
 
 # A wrist track needs enough surviving frames that the validity gates are not
 # testing the fixture's own size. Sixteen leaves room for a test to mask several
@@ -60,6 +61,18 @@ CURATOR_IO_SLOTS = 16
 # moved, and the guard's answer to that disagreement is to restart the cluster on
 # every test that asks for it.
 SHARED_CLUSTER_CPUS = 4
+
+
+def row_address(fragment_id: int, offset: int) -> int:
+    """Return the Lance address of the row at ``offset`` within ``fragment_id``.
+
+    Inverts the shared format fact so a hand-built row carries a checkpoint id
+    consistent with the fragment id beside it. Building from that constant is
+    safe HERE because every caller treats the id as opaque and asserts only that
+    it survives; the tests that assert the DERIVATION spell the shift themselves,
+    so that they cannot be satisfied by the constant they are checking.
+    """
+    return (fragment_id << ROW_ADDRESS_FRAGMENT_SHIFT) | offset
 
 
 @pytest.fixture

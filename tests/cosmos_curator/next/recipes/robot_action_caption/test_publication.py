@@ -189,6 +189,37 @@ def clips(tmp_path: pathlib.Path) -> lance.LanceDataset:
     return lance.dataset(uri)
 
 
+# A table wide enough that publication splits its commit, and wide enough that
+# the split is uneven: 50 one-row fragments become waves of 16, 17 and 17, of
+# which ``_WIDE_WAVE`` is the first - the one an interruption after wave 1
+# leaves published. Stated as literals rather than derived from the publication
+# bound so that a change to that bound fails these tests instead of silently
+# redefining what they cover.
+_WIDE_FRAGMENTS = 50
+_WIDE_WAVE = 16
+
+
+@pytest.fixture
+def wide_clips(tmp_path: pathlib.Path) -> lance.LanceDataset:
+    """Write a pending clip table of ``_WIDE_FRAGMENTS`` single-row fragments."""
+    uri = str(tmp_path / "wide-clips.lance")
+    lance.write_dataset(
+        pa.table(
+            {
+                "clip_id": pa.array([f"c{i}" for i in range(_WIDE_FRAGMENTS)], pa.string()),
+                "clip_uri": pa.array([f"s3://b/c{i}.mp4" for i in range(_WIDE_FRAGMENTS)], pa.large_string()),
+                **{field.name: pa.array([None] * _WIDE_FRAGMENTS, field.type) for field in CAPTION_FIELDS},
+                CURATE_SELECTION_REASON: pa.array([CURATE_SELECTED_VALUE] * _WIDE_FRAGMENTS, pa.string()),
+            },
+            schema=CLIPS_SCHEMA,
+        ),
+        uri,
+        max_rows_per_file=1,
+        data_storage_version=LANCE_DATA_STORAGE_VERSION,
+    )
+    return lance.dataset(uri)
+
+
 @pytest.fixture
 def workspace(tmp_path: pathlib.Path) -> CaptionWorkspace:
     """Return a local workspace whose results tree the tests populate by hand.
@@ -344,6 +375,36 @@ def prepare(
         return [
             prepare_fragment(
                 clips,
+                workspace,
+                fragment_id,
+                digest=DIGEST,
+                model_id=MODEL,
+                row_filter=ROW_FILTER,
+            )
+            for fragment_id in fragment_ids
+        ]
+
+    return build
+
+
+@pytest.fixture
+def wide_prepare(
+    wide_clips: lance.LanceDataset,
+    workspace: CaptionWorkspace,
+    staged_row: StagedRowFactory,
+) -> WaveFactory:
+    """Return ``prepare``'s builder bound to the wide table instead of the two-fragment one."""
+
+    def build(*fragment_ids: int, row: StagedRowFactory | None = None) -> list[dict[str, object]]:
+        build_row = row if row is not None else staged_row
+        for fragment_id in fragment_ids:
+            partition = pathlib.Path(workspace.results_uri) / f"fragment_id={fragment_id}"
+            partition.mkdir(parents=True, exist_ok=True)
+            rows = [build_row(clip_id) for clip_id in owed_clip_ids(wide_clips, fragment_id, ROW_FILTER)]
+            pq.write_table(pa.Table.from_pylist(rows, schema=_PARTITION_SCHEMA), partition / "part-0.parquet")
+        return [
+            prepare_fragment(
+                wide_clips,
                 workspace,
                 fragment_id,
                 digest=DIGEST,
@@ -696,14 +757,17 @@ def test_contract_digest_is_refused_before_terminal_values(
     assert int(lance.dataset(clips.uri).version) == starting_version
 
 
-def test_one_commit_publishes_every_prepared_fragment(
+def test_a_narrow_publication_commits_once(
     clips: lance.LanceDataset,
     prepare: WaveFactory,
 ) -> None:
     """Both fragments become canonical at one version, with no intermediate state.
 
-    Exercised through the module's own commit path rather than the Ray fan-out so
-    the assertion is about the transaction, not about Ray.
+    A publication is split into waves only once it is wide enough for an
+    interruption to cost something, so this one is not split at all: the version
+    advancing by exactly one is what says so. Exercised through the module's own
+    commit path rather than the Ray fan-out so the assertion is about the
+    transaction, not about Ray.
     """
     starting_version = int(clips.version)
     payloads = prepare(0, 1)
@@ -715,6 +779,105 @@ def test_one_commit_publishes_every_prepared_fragment(
     published = lance.dataset(clips.uri, version=result.ending_version)
     assert published.count_rows(filter="caption_status IS NULL") == 0
     assert published.to_table(columns=["caption"]).column("caption").to_pylist() == ["a caption"] * 4
+
+
+def test_wave_splitting_floors_the_size_before_it_caps_the_count() -> None:
+    """The split obeys a minimum width first and a maximum count second.
+
+    Pinned against literals rather than re-derived from the bound, because an
+    expectation computed from the constant under test is satisfied by any value
+    of it. 34 fragments is the interesting width: wide enough that the floor
+    still decides the size, so it exposes a split that applied the cap alone
+    (which would give 16 waves of two or three rather than 2 waves of 17).
+    """
+    assert publication_module._publication_waves(list(range(16))) == [tuple(range(16))]
+    assert publication_module._publication_waves(list(range(34))) == [
+        tuple(range(17)),
+        tuple(range(17, 34)),
+    ]
+    # The cap binds only once the corpus is wide enough for the floor to stop
+    # binding, and it is the half that keeps manifest cost flat at scale.
+    assert len(publication_module._publication_waves(list(range(100_000)))) == 16
+
+
+@pytest.mark.parametrize("width", [17, 31, 100, 255, 257])
+def test_no_wave_carries_fewer_fragments_than_the_floor(width: int) -> None:
+    """A remainder too small for its own wave is absorbed, never committed alone.
+
+    Every width here leaves a remainder under the floor, at both ends of the
+    range the floor binds over. A wave costs one whole-table manifest whatever
+    it carries, so committing such a remainder by itself pays the full price of
+    a transaction for fragments the wave before it would have carried at the
+    same price. The floor is a literal for the reason the test above gives.
+    """
+    waves = publication_module._publication_waves(list(range(width)))
+
+    assert min(len(wave) for wave in waves) >= 16
+
+
+def test_a_wide_publication_commits_in_several_waves(
+    wide_clips: lance.LanceDataset,
+    wide_prepare: WaveFactory,
+) -> None:
+    """A publication past the split width lands in more than one transaction.
+
+    The whole point of splitting is that a wave is durable before its successors
+    run, so the version advancing by more than one IS the property; a table left
+    fully captioned at a single version would mean the split never happened.
+    """
+    starting_version = int(wide_clips.version)
+    fragment_ids = tuple(range(_WIDE_FRAGMENTS))
+    payloads = wide_prepare(*fragment_ids)
+
+    result = commit_prepared(wide_clips, payloads, fragment_ids, row_filter=ROW_FILTER, storage_options=None)
+
+    assert result.ending_version == starting_version + 3
+    assert result.published_rows == _WIDE_FRAGMENTS
+    assert lance.dataset(wide_clips.uri).count_rows(filter=ROW_FILTER) == 0
+
+
+def test_an_interrupted_publication_keeps_the_waves_that_already_landed(
+    wide_clips: lance.LanceDataset,
+    wide_prepare: WaveFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A commit that fails part way leaves the earlier waves published, not rolled back.
+
+    This is what splitting buys. A landed wave is COMMITTED, and the owed-work
+    predicate reads the caption columns and the contract digest and knows nothing
+    about ``input.shard`` - so those clips are complete for the next attempt
+    whatever campaign shape it runs under, where an all-or-nothing publication
+    would have left the whole corpus owed.
+
+    The second commit is failed WITHOUT writing its manifest, so the recipe's
+    ambiguous-response check finds the wave's rows still owed and correctly
+    reports that nothing of it was published.
+    """
+    fragment_ids = tuple(range(_WIDE_FRAGMENTS))
+    payloads = wide_prepare(*fragment_ids)
+    commit = lance.LanceDataset.commit
+    attempts: list[int] = []
+
+    def fail_after_the_first_wave(base_uri: str, transaction: lance.Transaction, **kwargs: object) -> object:
+        attempts.append(len(attempts))
+        if attempts == [0]:
+            return commit(base_uri, transaction, **kwargs)  # type: ignore[arg-type]
+        msg = "Generic error: the object store went away"
+        raise OSError(msg)
+
+    monkeypatch.setattr(lance.LanceDataset, "commit", staticmethod(fail_after_the_first_wave))
+
+    with pytest.raises(ValueError, match="still owed, so nothing was published"):
+        commit_prepared(wide_clips, payloads, fragment_ids, row_filter=ROW_FILTER, storage_options=None)
+
+    # The first wave's fragments are canonical; every later one is still owed,
+    # so a re-run republishes only the remainder rather than all of it.
+    published = lance.dataset(wide_clips.uri)
+    assert published.count_rows(filter=ROW_FILTER) == _WIDE_FRAGMENTS - _WIDE_WAVE
+    assert published.to_table(columns=["caption"]).column("caption").to_pylist() == [
+        *["a caption"] * _WIDE_WAVE,
+        *[None] * (_WIDE_FRAGMENTS - _WIDE_WAVE),
+    ]
 
 
 def test_equal_clip_ids_in_different_fragments_publish_independently(

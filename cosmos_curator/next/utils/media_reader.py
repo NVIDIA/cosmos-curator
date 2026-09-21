@@ -21,7 +21,7 @@ to and from one: those helpers are stateless and single-shot, and a backend
 failure reaches the caller as whatever the backend raised.
 
 Reach for this module when the bytes are a per-row media object pulled by a
-pipeline worker. That read carries two obligations a plain download helper must
+pipeline worker. That read carries three obligations a plain download helper must
 not take on, which is why it sits behind its own boundary:
 
 * a size ceiling enforced from the store's metadata BEFORE the transfer, so one
@@ -29,15 +29,24 @@ not take on, which is why it sits behind its own boundary:
   that worker was holding;
 * a verdict on every failure, as one of the :class:`MediaReadError` subclasses,
   so the caller can choose between dropping this row, spending a retry, and
-  failing the whole run without re-deriving each backend's error vocabulary.
+  failing the whole run without re-deriving each backend's error vocabulary;
+* a measurement of what those reads cost, because the retries happen INSIDE one
+  call: a timer wrapped around :meth:`MediaObjectReader.read` reports a clip
+  that succeeded on its third attempt as one slow transfer, and cannot see the
+  attempt count at all. Only the reader can separate the two, so it does, and
+  :meth:`MediaObjectReader.transport_stats` hands the terms back separately.
+  Nothing here logs them: a shared reader cannot know the right cadence for
+  every recipe on it, so reporting stays with the caller.
 
 Serving those obligations also makes a reader stateful and long-lived - it
-retries, and it caches a storage client per backend across calls - which the
-location and byte helpers next door deliberately are not.
+retries, it caches a storage client per backend across calls, and it accumulates
+what those calls cost - which the location and byte helpers next door
+deliberately are not.
 """
 
 import errno
 import threading
+import time
 from typing import Final
 from urllib.parse import urlsplit
 
@@ -89,8 +98,9 @@ _SYSTEMIC_S3_ERROR_CODES: Final = frozenset(
 _OBJECT_AZURE_ERROR_CODES: Final = frozenset({"BlobNotFound"})
 _SYSTEMIC_AZURE_ERROR_CODES: Final = frozenset({"ContainerNotFound"})
 
-# Backoff for transport faults only. Not a contract: the reader's caller
-# observes how many attempts it gets, never the schedule between them.
+# Backoff for transport faults only. The schedule is not a contract: a caller
+# observes how many attempts a read got and how long the waiting between them
+# cost in total, never which interval was spent where.
 _TRANSPORT_RETRY_MULTIPLIER_S: Final = 0.5
 _TRANSPORT_RETRY_MAX_WAIT_S: Final = 8.0
 
@@ -129,22 +139,124 @@ class MediaSystemicError(MediaReadError):
 
 
 @attrs.frozen
+class MediaTransportStats:
+    """What one reader's reads have cost, as of the instant it was asked.
+
+    Splits each call's wall time into the attempt that delivered bytes and
+    everything else, which is the split a caller wrapping :meth:`read` cannot
+    make for itself: a clip that succeeded on its third attempt spent most of
+    that call waiting, and folding the waiting into the transport rate makes a
+    degraded store look like a slow one.
+
+    Attributes:
+        delivered_bytes: Bytes returned by the reads that succeeded.
+        transport_durations: One entry per delivered read, in completion order,
+            covering that attempt alone - its metadata lookup and its transfer.
+            Left unreduced so each caller picks its own summary and so several
+            readers' sequences concatenate into a corpus-wide one; the cost is
+            one float retained per delivered read, which only the caller's own
+            read rate and reader lifetime bound.
+        attempts: Attempts consumed by every read, delivered or not. A corpus
+            that quietly costs three transfers per clip is visible here and
+            nowhere else.
+        undelivered_seconds: Time in those calls that produced no bytes: every
+            attempt that raised, plus the backoff waited between them.
+
+    """
+
+    delivered_bytes: int = 0
+    transport_durations: tuple[float, ...] = ()
+    attempts: int = 0
+    undelivered_seconds: float = 0.0
+
+
+class _TransportMeter:
+    """Accumulate one reader's transport measurements under concurrent reads.
+
+    Mutable, which is exactly why it is not the type handed out:
+    :meth:`snapshot` copies into a frozen :class:`MediaTransportStats` so a
+    caller can neither mutate the totals nor watch them move underneath it.
+    """
+
+    def __init__(self) -> None:
+        # Guards every accumulation below, and is NOT redundant with the GIL.
+        # ``x += n`` on an attribute is a load-modify-store rather than one
+        # bytecode, and the GIL serialises bytecodes individually: two threads
+        # finishing together can both load the same total and one write is then
+        # lost, silently and with no error anywhere. The known consumer calls
+        # ``read`` from a ThreadPoolExecutor, so that is the normal case rather
+        # than a rare one.
+        self._lock = threading.Lock()
+        self._attempts = 0
+        self._delivered_bytes = 0
+        self._undelivered_seconds = 0.0
+        # A list, though the snapshot publishes a tuple: appending to a tuple
+        # rebuilds it, which would make a reader's Nth read cost O(N).
+        #
+        # Deliberately uncapped. A window here would make this layer choose the
+        # summary it exists to leave open, and would desynchronize the scalar
+        # totals beside it from the sequence a caller sums, so two figures on
+        # one line would describe different populations. A caller for whom the
+        # retention is material bounds it in its own summary, where its read
+        # rate and reader lifetime are both known.
+        self._transport_durations: list[float] = []
+
+    def record_failed_attempt(self) -> None:
+        """Charge one attempt that ran and delivered nothing."""
+        with self._lock:
+            self._attempts += 1
+
+    def record_delivered(self, *, nbytes: int, transport_seconds: float, undelivered_seconds: float) -> None:
+        """Charge the one attempt that delivered ``nbytes``, plus that call's other time."""
+        with self._lock:
+            self._attempts += 1
+            self._delivered_bytes += nbytes
+            self._transport_durations.append(transport_seconds)
+            self._undelivered_seconds += undelivered_seconds
+
+    def record_undelivered(self, *, seconds: float) -> None:
+        """Charge a whole call that ended with no bytes, whose attempts are already counted."""
+        with self._lock:
+            self._undelivered_seconds += seconds
+
+    def snapshot(self) -> MediaTransportStats:
+        """Return the totals so far as a value later reads cannot change."""
+        with self._lock:
+            return MediaTransportStats(
+                delivered_bytes=self._delivered_bytes,
+                # Copied, not aliased: handing out the live list would let a
+                # caller's summary change under it mid-computation, and let a
+                # later read rewrite a snapshot already taken. The copy is O(N)
+                # in delivered reads and is the cheapest thing any caller does
+                # with the result, since summarising the sequence sorts it.
+                transport_durations=tuple(self._transport_durations),
+                attempts=self._attempts,
+                undelivered_seconds=self._undelivered_seconds,
+            )
+
+
+@attrs.frozen
 class MediaObjectReader:
     """Read a stored media object into memory under a hard byte ceiling.
 
     Owns the transport for one storage profile: it resolves a storage client per
     backend, caches it for its own lifetime, refuses an oversized object before
-    the bytes are pulled in, retries only transient transport faults, and reports
-    every failure as one of the three :class:`MediaReadError` subclasses.
+    the bytes are pulled in, retries only transient transport faults, reports
+    every failure as one of the three :class:`MediaReadError` subclasses, and
+    measures what the reads cost (:meth:`transport_stats`).
 
-    A reader is picklable whether or not it has already read: the client cache is
-    excluded from the pickled state and restored empty, which costs nothing
-    because every process rebuilds it on demand from the profile.
+    A reader is picklable whether or not it has already read: the client cache
+    and the accumulated measurements are both excluded from the pickled state and
+    restored empty. For the cache that costs nothing, because every process
+    rebuilds it on demand from the profile; for the measurements it is the
+    intended reading, since each worker then reports the transport IT saw rather
+    than a total carrying whatever the process that shipped it had already done.
 
-    One reader may be shared across threads. The client cache is the only mutable
-    state and its miss path is guarded, so concurrent first use resolves each
-    backend once rather than once per thread. :meth:`warm_client` is therefore an
-    optimisation and a determinism aid, not a safety prerequisite.
+    One reader may be shared across threads. Both mutable holders are guarded -
+    the client cache on its miss path, the measurements on every accumulation -
+    so concurrent first use resolves each backend once rather than once per
+    thread, and reads finishing together lose no samples. :meth:`warm_client` is
+    therefore an optimisation and a determinism aid, not a safety prerequisite.
 
     Attributes:
         storage_profile: Credential profile used for remote reads.
@@ -165,6 +277,10 @@ class MediaObjectReader:
     # Guards the MISS path of ``_client`` so a shared reader resolves each backend
     # once. A hit never takes it.
     _client_lock: threading.Lock = attrs.field(factory=threading.Lock, init=False, eq=False, repr=False)
+    # Per-process transport measurements, excluded from equality and repr for the
+    # same reason as the cache: two readers configured identically are
+    # interchangeable however many bytes each has already moved.
+    _meter: _TransportMeter = attrs.field(factory=_TransportMeter, init=False, eq=False, repr=False)
 
     # Both hooks below must stay, and neither may be deleted as redundant. attrs
     # generates a getstate/setstate PAIR for every slotted class, and declaring
@@ -178,9 +294,10 @@ class MediaObjectReader:
         return {
             field.name: getattr(self, field.name)
             for field in attrs.fields(type(self))
-            # Both fields are rebuilt by ``__setstate__``. The cache is
-            # process-local derived state, and a lock cannot be pickled.
-            if field.name not in {"_clients", "_client_lock"}
+            # All three are rebuilt by ``__setstate__``. The cache and the meter
+            # are process-local derived state, and neither a bare lock nor the
+            # meter holding one can be pickled.
+            if field.name not in {"_clients", "_client_lock", "_meter"}
         }
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -191,6 +308,7 @@ class MediaObjectReader:
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_clients", {})
         object.__setattr__(self, "_client_lock", threading.Lock())
+        object.__setattr__(self, "_meter", _TransportMeter())
 
     def warm_client(self, uri: str) -> None:
         """Resolve and cache this URI's backend client without reading the object.
@@ -214,8 +332,16 @@ class MediaObjectReader:
         if is_remote_path(uri):
             self._client(uri)
 
+    def transport_stats(self) -> MediaTransportStats:
+        """Return what this reader's reads have cost so far in this process.
+
+        A fresh value each call, so a caller may hold one reading beside a later
+        one and compare them.
+        """
+        return self._meter.snapshot()
+
     def read(self, uri: str, *, max_bytes: int) -> bytes:
-        """Return the object's complete bytes.
+        """Return the object's complete bytes, recording what the read cost.
 
         Args:
             uri: Local path, ``file://``, ``s3://``, or ``az://`` object URI.
@@ -257,7 +383,59 @@ class MediaObjectReader:
             retry=tenacity.retry_if_exception_type(MediaTransportError),
             reraise=True,
         )
-        return retrying(self._read_once, uri, max_bytes=max_bytes)
+        # Started here rather than inside the retry wrapper, because the whole
+        # point is the difference between the two: this clock spans every
+        # attempt and every backoff, the inner one spans a single attempt.
+        started = time.monotonic()
+        try:
+            data, transport_seconds = retrying(self._timed_read_once, uri, max_bytes=max_bytes)
+        except MediaReadError:
+            # No attempt delivered bytes, so the entire call is undelivered
+            # time. The attempts themselves were charged one at a time as each
+            # one raised, which is why none is added here.
+            self._meter.record_undelivered(seconds=time.monotonic() - started)
+            raise
+        # The second term is a RESIDUAL, not a second measurement: subtracting
+        # the delivering attempt from the call's wall time leaves the failed
+        # attempts, the backoff between them, and the retry bookkeeping, with no
+        # interval counted twice and none unaccounted for. Deriving it instead
+        # of timing it is what keeps the two terms from disagreeing.
+        self._meter.record_delivered(
+            nbytes=len(data),
+            transport_seconds=transport_seconds,
+            undelivered_seconds=time.monotonic() - started - transport_seconds,
+        )
+        return data
+
+    def _timed_read_once(self, uri: str, *, max_bytes: int) -> tuple[bytes, float]:
+        """Perform one attempt, returning its bytes beside how long that attempt took.
+
+        Args:
+            uri: The object URI, as :meth:`read` received it.
+            max_bytes: Ceiling on the object's size.
+
+        Returns:
+            The delivered bytes, and the seconds this one attempt spent on them.
+
+        Raises:
+            MediaReadError: Whatever the attempt raised, after charging it.
+
+        """
+        started = time.monotonic()
+        try:
+            data = self._read_once(uri, max_bytes=max_bytes)
+        except Exception:
+            # Broader than this module's own taxonomy on purpose. The count
+            # means "an attempt ran and delivered nothing", which is true of any
+            # exception, so a raise some later edit forgets to classify still
+            # shows up in the attempt total instead of vanishing from it.
+            self._meter.record_failed_attempt()
+            raise
+        # The duration and the bytes leave in ONE expression, which is what
+        # makes success-only counting structural rather than a matter of
+        # statement order: an attempt that raised never reaches this line, so no
+        # later rearrangement can hand its duration to the transport term.
+        return data, time.monotonic() - started
 
     def _read_once(self, uri: str, *, max_bytes: int) -> bytes:
         """Perform one full attempt: size check, then transfer, then verify."""

@@ -21,6 +21,7 @@ import attrs
 import pytest
 from ray.data import ActorPoolStrategy
 
+from cosmos_curator.next.recipes.robot_action_caption import engine
 from cosmos_curator.next.recipes.robot_action_caption.config import (
     DEFAULT_INFERENCE_BATCH_SIZE,
     DEFAULT_SOURCE_FRAME_PIXELS,
@@ -218,6 +219,92 @@ def test_the_published_reservation_figures_still_match_the_shipped_defaults(
         preparation=20_208_156_672.0,
         forwarding=14_545_846_272.0,
     )
+
+
+@pytest.fixture
+def short_hook_report_interval(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Shorten the timed hook's reporting interval and return the value set.
+
+    The shipped interval is a log-volume choice rather than a contract, so
+    driving thousands of rows to observe one line would pin the constant instead
+    of the accounting it gates.
+    """
+    interval = 3
+    monkeypatch.setattr(engine, "_HOOK_REPORT_EVERY_ROWS", interval, raising=True)
+    return interval
+
+
+def test_a_timed_hook_returns_what_the_wrapped_hook_returned() -> None:
+    """Timing must be transparent: the row the engine sees is the hook's own.
+
+    The wrapper sits on the request-construction and result-canonicalization
+    path, so a row it rebuilt, copied, or replaced with its own bookkeeping
+    would change what the engine is asked to generate.
+    """
+    produced = {"prompt": "describe", "sampling_params": {"temperature": 0.0}}
+
+    returned = engine._timed_hook(lambda _row: produced, "preprocess")({"clip_id": "c0"})
+
+    assert returned is produced
+
+
+def test_a_timed_hook_propagates_the_wrapped_hooks_failure() -> None:
+    """A failing row must still fail. Timing may not convert a fault into a row."""
+
+    def explode(row: dict[str, Any]) -> dict[str, Any]:
+        del row
+        msg = "request could not be built"
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="request could not be built"):
+        engine._timed_hook(explode, "preprocess")({"clip_id": "c0"})
+
+
+def test_a_timed_hook_accounts_a_row_that_raised(
+    short_hook_report_interval: int,
+    loguru_records: list[dict[str, Any]],
+) -> None:
+    """A raising row must contribute its cost, which is what the ``finally`` buys.
+
+    A hook that fails slowly is exactly the case worth seeing, and accounting
+    only successful rows hides it: the tally then advances on the surviving rows
+    alone. Driven so the LAST row of the interval is the one that raises, so the
+    report can only appear if that row was counted -- accounting placed after
+    the wrapped call leaves the tally one short and emits nothing.
+    """
+    calls = iter(range(short_hook_report_interval))
+
+    def failing_last(row: dict[str, Any]) -> dict[str, Any]:
+        if next(calls) == short_hook_report_interval - 1:
+            msg = "the slow one"
+            raise ValueError(msg)
+        return row
+
+    hook = engine._timed_hook(failing_last, "preprocess")
+    for _ in range(short_hook_report_interval - 1):
+        hook({"clip_id": "c0"})
+    with pytest.raises(ValueError, match="the slow one"):
+        hook({"clip_id": "c0"})
+
+    (reported,) = [record["message"] for record in loguru_records if record["level"].name == "INFO"]
+    assert f"preprocess hook after {short_hook_report_interval} row(s)" in reported
+
+
+def test_a_timed_hook_stays_silent_below_its_reporting_interval(
+    short_hook_report_interval: int,
+    loguru_records: list[dict[str, Any]],
+) -> None:
+    """The negative control for the interval, on the other side of its comparison.
+
+    Every assertion above is satisfied by a hook that logged on each row, which
+    at this recipe's batch sizes is hundreds of thousands of lines. Only a row
+    count BELOW the interval can tell periodic reporting from unconditional.
+    """
+    hook = engine._timed_hook(lambda row: row, "postprocess")
+    for _ in range(short_hook_report_interval - 1):
+        hook({"clip_id": "c0"})
+
+    assert [record for record in loguru_records if record["level"].name == "INFO"] == []
 
 
 def test_reservations_refuse_a_preparation_figure_that_does_not_exceed_forwarding() -> None:

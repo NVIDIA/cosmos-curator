@@ -30,21 +30,24 @@ What each starting state costs the next attempt:
     empty                 all pending
     partial (4 of 8)      the 4 that did not finish
     complete              none, and the attempt still publishes
-    moved source version  all pending, from a different namespace
+    moved source version  the 4 that did not finish; a version is not an identity
     widened input scope   the 4 that did not finish; scope is not a namespace input
     changed semantics     all pending, and the captions are overwritten
     changed execution     the 4 that did not finish, exactly as before
+    changed shard shape   only what the new shape owes and no commit has done
     published             none, and nothing is committed
 
-The last two rows are the digest's whole purpose, and they are the pair that must
-be tested together: a prompt or model change makes completed rows unreusable, and
-a throughput change must not. Getting either wrong is invisible in the published
-table, which is complete and plausible in both cases.
+The semantics and execution rows are the digest's whole purpose, and they are the
+pair that must be tested together: a prompt or model change makes completed rows
+unreusable, and a throughput change must not. Getting either wrong is invisible
+in the published table, which is complete and plausible in both cases.
 
-The moved-version row is the exact-version identity: staged rows are keyed by
-Lance row address, which only means anything inside the snapshot that produced
-it, so a moved version must share nothing. That address is the whole of a staged
-row's identity - there is no per-row request fingerprint to fall back on.
+The moved-version row is the reason a staged row is keyed by its fragment and its
+clip id rather than by a row address. A row address means nothing outside the
+snapshot that produced it, so keying on it forfeited every finished caption to
+any commit that advanced the version - including the recipe's OWN schema
+widening. The pair survives that, and survives compaction moving a row within
+its fragment, because neither identity component is physical.
 
 Further concerns are only observable end to end, which is why they live here
 rather than beside the code they constrain:
@@ -155,7 +158,9 @@ class Attempt:
     Attributes:
         uri: The clip table it read and would have published to.
         config: The configuration a retry reuses unchanged.
-        read_version: The version it pinned, and the version a retry must pin.
+        read_version: The version it pinned, which a retry reading an unmoved
+            table pins again. It is not part of the staging namespace, so a
+            retry that pins a DIFFERENT version still reuses this attempt's rows.
         workspace_root: The namespace it staged into.
         ledger: The clips its engine was asked to caption.
         staged: Its staged terminal rows.
@@ -435,21 +440,32 @@ def test_a_complete_checkpoint_publishes_without_returning_to_inference(
     ]
 
 
-def test_a_moved_source_version_reuses_nothing(
+def test_a_moved_source_version_still_reuses_the_finished_captions(
     crashed_attempt: Attempt,
     fake_engine: FakeEngine,
 ) -> None:
-    """Staged rows are keyed by row address, which means nothing outside their snapshot."""
+    """A version that moved without moving rows costs the retry nothing.
+
+    Widening the schema between the two attempts advances the table version and
+    rewrites no row. A staged row is keyed by its fragment and its clip id,
+    neither of which that commit touches, so the retry recovers the finished
+    fragment and pays inference only for the refused one.
+
+    The engine tag is what proves reuse rather than coincidence: a run that
+    re-captioned everything would also publish a complete table, and the
+    surviving captions still carry the FIRST attempt's tag only if they were
+    genuinely recovered.
+    """
     lance.dataset(crashed_attempt.uri).add_columns(pa.schema([pa.field("unrelated", pa.string())]))
     retry = fake_engine(caption_tag=RETRY_TAG)
 
     result = run_config(crashed_attempt.config)
 
-    assert retry.clip_ids == list(ALL_CLIPS)
+    assert retry.clip_ids == list(UNFINISHED)
     assert result.published_rows == CLIPS
     assert _captions_in_clip_order(crashed_attempt.uri, version=result.ending_version) == [
-        f"{RETRY_TAG} caption for {clip_id}" for clip_id in ALL_CLIPS
-    ]
+        f"{FIRST_ATTEMPT_TAG} caption for {clip_id}" for clip_id in FINISHED
+    ] + [f"{RETRY_TAG} caption for {clip_id}" for clip_id in UNFINISHED]
 
 
 def test_a_changed_prompt_contract_reuses_nothing_from_the_crashed_attempt(
@@ -725,6 +741,64 @@ def test_a_cleanup_failure_still_reports_the_canonical_commit(
     assert caption_harness.namespaces(config.staging_root) != []
 
 
+def test_a_later_attempt_re_owning_a_leftover_fragment_is_refused(
+    curator_io_cluster: None,
+    staged_weights: pathlib.Path,
+    caption_clips: ClipsTable,
+    caption_config: CaptionConfig,
+    fake_engine: FakeEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover namespace refuses a later attempt rather than publishing a partial wave.
+
+    Reachable only since the read version left the namespace digest: the
+    namespace used to move with every commit, so a tree left by a failed cleanup
+    could never be resolved again. Now it can, and the extra-row check is the
+    only thing between it and an ``update_columns`` that would silently drop the
+    unmatched staged rows. That makes this test the control for the cost that
+    removal accepted, so it must be able to go red.
+
+    The second attempt widens scope, which is what makes it owe rows in the very
+    fragments the leftover tree holds staged rows for while resolving to the same
+    namespace - selection scope is deliberately not a namespace input.
+
+    Selection is written when the table is BUILT rather than updated afterwards,
+    and that is a requirement of the scenario. A Lance ``update`` rewrites the
+    rows it matches into a fragment of their own, which would segregate the two
+    attempts' rows into different fragments and leave nothing overlapping to
+    refuse - measured: the two attempts then owe disjoint fragments and the
+    second publishes cleanly.
+    """
+    del curator_io_cluster, staged_weights
+    unselected = ("c1", "c3", "c5", "c7")
+    uri = caption_clips(
+        rows=CLIPS,
+        rows_per_file=ROWS_PER_FRAGMENT,
+        selection=[None if clip_id in unselected else CURATE_SELECTED_VALUE for clip_id in ALL_CLIPS],
+    )
+    config = caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS)
+
+    def refuse_to_clean(*_args: object, **_kwargs: object) -> None:
+        raise OSError(_INJECTED_CLEANUP_FAILURE)
+
+    fake_engine(caption_tag=FIRST_ATTEMPT_TAG)
+    monkeypatch.setattr(pipeline, "cleanup_workspace", refuse_to_clean)
+    published = run_config(config)
+    assert caption_harness.namespaces(config.staging_root) != []
+
+    fake_engine(caption_tag=RETRY_TAG)
+    with pytest.raises(CaptionPublicationError, match="does not owe"):
+        run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, selected_only=False))
+
+    # Refused BEFORE the commit: the first attempt's captions are still the
+    # table's, and the widened rows stayed pending rather than being half
+    # published.
+    assert _captions_in_clip_order(uri, version=None) == [
+        None if clip_id in unselected else f"{FIRST_ATTEMPT_TAG} caption for {clip_id}" for clip_id in ALL_CLIPS
+    ]
+    assert int(lance.dataset(uri).version) == published.ending_version
+
+
 def test_the_configured_progress_setting_reaches_ray_data(
     local_run: tuple[str, ResolvedRobotActionCaptionConfig],
     caption_config: CaptionConfig,
@@ -747,6 +821,128 @@ def test_the_configured_progress_setting_reaches_ray_data(
 
     assert result.published_rows == CLIPS
     assert observed == [True]
+
+
+def test_two_work_shards_publish_disjoint_fragments_into_one_table(
+    local_run: tuple[str, ResolvedRobotActionCaptionConfig],
+    caption_config: CaptionConfig,
+    fake_engine: FakeEngine,
+) -> None:
+    """Two shards committing into one table compose rather than overwrite.
+
+    Sharding makes concurrent commits to one Lance table the expected case
+    rather than an accident, and the property that makes it safe is that each
+    shard's ``Update`` names only its own fragments. Nothing else in this suite
+    drives two shards, so without this the central claim of the feature rests on
+    the write operation's documented scoping alone.
+
+    The fixture's two fragments map one-to-one onto the two shards of ``count=2``
+    (ids 0 and 1, so ``id mod 2`` separates them), which is what lets each
+    shard's captions be told apart by tag.
+    """
+    uri, _ = local_run
+
+    first = fake_engine(caption_tag="shard0")
+    shard_0 = run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 0)))
+    second = fake_engine(caption_tag="shard1")
+    shard_1 = run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 1)))
+
+    # Each shard captioned only its own fragment, so neither did the other's
+    # work: without this the assertions below would also pass if one shard had
+    # captioned everything and the other had found nothing owed.
+    assert first.clip_ids == list(FINISHED)
+    assert second.clip_ids == list(UNFINISHED)
+    assert shard_0.published_rows == shard_1.published_rows == ROWS_PER_FRAGMENT
+    # The second commit preserved the first's captions rather than reverting the
+    # fragment it did not own, and the table owes nothing once both have run.
+    assert _captions_in_clip_order(uri, version=shard_1.ending_version) == [
+        *[f"shard0 caption for {clip_id}" for clip_id in FINISHED],
+        *[f"shard1 caption for {clip_id}" for clip_id in UNFINISHED],
+    ]
+    assert _pending_rows(uri, shard_1.contract_digest, version=shard_1.ending_version) == 0
+
+
+def test_a_shard_resuming_after_another_shard_committed_keeps_both_waves(
+    local_run: tuple[str, ResolvedRobotActionCaptionConfig],
+    caption_config: CaptionConfig,
+    fake_engine: FakeEngine,
+) -> None:
+    """A shard whose table moved under it republishes without re-inferring or clobbering.
+
+    The realistic campaign shape: shards finish at different times, so one
+    commits while another holds staged progress. The resuming shard pins a
+    version it has never seen, and its recovery has to survive that - which it
+    does because a sibling fragment's ``update_columns`` commit leaves this
+    fragment's row addresses untouched, so the ids the stalled attempt
+    checkpointed still name its rows. It must also leave the intervening shard's
+    captions alone, since its own commit targets only its own fragment.
+
+    This is the executable half of the address-stability measurement recorded in
+    ``docs/curator/design/curator-next-robot-action-caption.md``: the sibling-wave
+    row of that table is what this test drives.
+    """
+    uri, _ = local_run
+
+    def refuse_to_publish(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(_INJECTED_PUBLICATION_FAILURE)
+
+    staged = fake_engine(caption_tag="shard1")
+    with pytest.MonkeyPatch.context() as publication:
+        publication.setattr(pipeline, "publish_captions", refuse_to_publish)
+        with pytest.raises(RuntimeError, match=_INJECTED_PUBLICATION_FAILURE):
+            run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 1)))
+    assert staged.clip_ids == list(UNFINISHED)
+
+    # The other shard commits, moving the version the stalled shard had pinned.
+    fake_engine(caption_tag="shard0")
+    run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 0)))
+
+    resumed = fake_engine(caption_tag="resumed")
+    result = run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 1)))
+
+    # Nothing re-inferred: the staged rows survived another shard's commit, which
+    # is what the address's stability across a sibling's commit buys. The
+    # "resumed" tag can therefore appear on no caption below.
+    assert resumed.clip_ids == []
+    assert result.published_rows == ROWS_PER_FRAGMENT
+    assert _captions_in_clip_order(uri, version=result.ending_version) == [
+        *[f"shard0 caption for {clip_id}" for clip_id in FINISHED],
+        *[f"shard1 caption for {clip_id}" for clip_id in UNFINISHED],
+    ]
+
+
+def test_a_changed_shard_count_recaptions_nothing_a_previous_shape_committed(
+    local_run: tuple[str, ResolvedRobotActionCaptionConfig],
+    caption_config: CaptionConfig,
+    fake_engine: FakeEngine,
+) -> None:
+    """Reuse across campaign shapes comes from the committed table, not the namespace.
+
+    An operator re-partitioning a campaign lands in a namespace no earlier shape
+    resolves to, and that is safe only because a committed caption is complete
+    under every shape: the pending predicate reads the caption columns and the
+    contract digest, neither of which carries a shard. Without this, the property
+    that lets ``count`` change between campaigns rests on the predicate's
+    inputs by inspection alone.
+    """
+    uri, _ = local_run
+
+    fake_engine(caption_tag="shard0")
+    committed = run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(2, 0)))
+    assert committed.published_rows == ROWS_PER_FRAGMENT
+
+    recounted = fake_engine(caption_tag="recounted")
+    result = run_config(caption_config(uri, geometry_rows=FETCH_BLOCK_ROWS, shard=(1, 0)))
+
+    # The one-shard job owns every fragment, so it would have recaptioned the
+    # committed half had the commit not already satisfied the predicate.
+    assert recounted.clip_ids == list(UNFINISHED)
+    assert result.published_rows == ROWS_PER_FRAGMENT
+    assert _captions_in_clip_order(uri, version=result.ending_version) == [
+        *[f"shard0 caption for {clip_id}" for clip_id in FINISHED],
+        *[f"recounted caption for {clip_id}" for clip_id in UNFINISHED],
+    ]
+    assert _pending_rows(uri, result.contract_digest, version=result.ending_version) == 0
 
 
 def test_publishing_captions_leaves_an_unrelated_source_column_unchanged(

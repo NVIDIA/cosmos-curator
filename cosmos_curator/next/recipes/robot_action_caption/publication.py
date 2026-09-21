@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Phase B: validate every staged row, then publish all of them in ONE commit.
+"""Phase B: validate every staged row, then publish them in a bounded wave sequence.
 
 ::
 
@@ -15,26 +15,34 @@
               -> new column file + rebound field ids; nothing visible yet
               |
     driver:   v
-        ONE Transaction(Update(every prepared fragment, fields_modified))
+        check the prepared set is EXACTLY the planned set   <- before any commit
               |
               v
-        clips.lance @ v+1     <- the sole completion signal
+        Transaction(Update(wave 1)) ... Transaction(Update(wave K <= 16))
+              |
+              v
+        clips.lance @ v+K     <- each wave is durable the instant it lands
 
 A refusal can leave invisible, unreferenced Lance column files; operator-owned
 table maintenance reclaims them (see ``docs/curator/design/curator-next-robot-action-caption.md``).
 
-Everything is refused BEFORE the commit because after it there is nothing left to
-refuse: a caption is stochastic and unseeded, so a wrongly published row cannot be
-recomputed into the right one. That is also why a conflicting duplicate is a hard
-error rather than last-write-wins - two differing rows for one clip are two
-different answers, not a retry artifact.
+Every per-row fault is refused BEFORE the first commit, because after one there is
+nothing left to refuse: a caption is stochastic and unseeded, so a wrongly
+published row cannot be recomputed into the right one. That is also why a
+conflicting duplicate is a hard error rather than last-write-wins - two differing
+rows for one clip are two different answers, not a retry artifact. Validating the
+whole prepared set up front is what lets the commits be split at all: a wave can
+only land once nothing in the run can still be refused.
 
-One commit rather than one per fragment. With N commits there are N+1 observable
-table states and a crash between them leaves the table genuinely half-published,
-which is what forces commit counters and a reconciliation state machine
-downstream. With one there are two states, the full caption-group pending
-predicate is honest at every instant, and the only failure mode is "nothing
-published, staged rows intact" - the case recovery already handles.
+Waves rather than one commit, and rather than one commit per fragment. A landed
+wave is COMMITTED, and committed work is reusable under any campaign shape,
+because the owed-work predicate reads the caption columns and the contract digest
+and knows nothing about shards. So a publication that fails part way costs the
+next attempt only its unlanded waves, even if that attempt runs under a different
+``input.shard``. What this does not buy is reuse of Phase A: publication starts
+only once inference has finished, so the staged rows are at risk for the whole of
+Phase A either way, and only a namespace change could alter that
+(see ``docs/curator/design/curator-next-sharding.md``).
 
 ``update_columns`` preserves unmatched LEFT rows, so a clip already captioned and
 absent from this wave keeps its values. It silently DROPS unmatched right rows,
@@ -45,6 +53,7 @@ rather than left for the commit to complain about: it never would.
 import json
 from collections.abc import Generator, Iterable, Sequence
 from contextlib import closing
+from itertools import pairwise
 from typing import Any, Final
 from uuid import uuid4
 
@@ -95,6 +104,27 @@ _REFUSAL_KEY: Final = "refusal"
 
 _FRAGMENTS_PER_TASK: Final = 1
 
+# Bounds a publication's commit sequence from BOTH ends: never more than this
+# many transactions, and never a transaction carrying fewer than this many
+# fragments (so a publication no wider than this commits exactly once).
+#
+# Both halves follow from one measured fact: a commit costs one manifest, and a
+# manifest enumerates every fragment of the WHOLE table rather than the ones the
+# commit touched - 82 bytes per fragment at pylance 11.0.0, linear from 100 to
+# 4000 fragments. So N commits over a table of F fragments write O(N x F)
+# manifest bytes regardless of how the work is divided among them.
+#
+# Capping the COUNT is what keeps that affordable: one commit per fragment is
+# O(F^2), about 73 GiB of manifests and as many serialized commit round trips for
+# the ~31k fragments of a 250M-row table, while a cap holds it at 16 manifests
+# (~40 MiB there) however wide the campaign grows.
+#
+# Flooring the SIZE follows because a wave's cost does not shrink with its
+# contents while the loss it prevents does. Splitting a publication that could
+# be interrupted only into small pieces buys nothing and pays full price per
+# piece, so below this width a single transaction is strictly better.
+_PUBLICATION_WAVE_BOUND: Final = 16
+
 # What a staged partition is read as, and what one prepared update table holds.
 # ``fragment_id`` is absent on purpose: it is the Hive partition key, so reading
 # it back would only restate the directory name it was written from.
@@ -128,10 +158,11 @@ class PublicationResult:
     """What one publication changed, in counts the driver can hold at any scale.
 
     Attributes:
-        ending_version: A Lance version at which this wave is verified canonical.
-            Normally the exact caption commit; after an ambiguous response it can
-            be a later version that also includes an allowed sibling commit.
-            Never null: this publication either verifies canonical state or raises.
+        ending_version: A Lance version at which every published row is verified
+            canonical. Normally the last wave's commit; after an ambiguous
+            response it can be a later version that also includes an allowed
+            sibling commit. Never null: this publication either verifies
+            canonical state or raises.
         published_rows: Rows the commit published, of every terminal verdict.
         error_rows: How many of ``published_rows`` carry the ``error`` verdict, so
             a SUBSET of that count rather than an addition to it. Reported rather
@@ -164,11 +195,17 @@ def publish_captions(  # noqa: PLR0913 - a phase boundary; each input is indepen
     row_filter: str,
     storage_options: dict[str, str] | None,
 ) -> PublicationResult:
-    """Validate the staged rows and publish every touched fragment atomically.
+    """Validate every staged row, then publish the touched fragments.
+
+    Nothing commits until every fragment has passed validation, so a run either
+    refuses with the table untouched or publishes rows it has already accepted.
+    The publishing itself is a bounded sequence of commits rather than one, which
+    is what makes a failure part way through cost only the unlanded remainder -
+    see :func:`commit_prepared`.
 
     Args:
         dataset: The clip table, open at the run's pinned version. Both the read
-            base of the transaction and the table it commits to.
+            base of the transactions and the table they commit to.
         workspace: The namespace Phase A staged into.
         fragment_ids: Fragments the attempt owes. Never empty: the
             caller returns before reaching publication when nothing is owed, and
@@ -186,7 +223,7 @@ def publish_captions(  # noqa: PLR0913 - a phase boundary; each input is indepen
             cover its owed clips under this run's scope and contract, if the prepared
             fragment set differs from the planned one, or if no fragment could be
             prepared while owed fragments existed.
-        ValueError: If two workers claim one fragment, or the commit fails.
+        ValueError: If two workers claim one fragment, or a commit fails.
 
     """
     payloads = _prepare_fragments(
@@ -216,7 +253,7 @@ def publish_captions(  # noqa: PLR0913 - a phase boundary; each input is indepen
     )
 
 
-def commit_prepared(  # Coordinator inputs independently guard one atomic commit.
+def commit_prepared(  # Coordinator inputs independently guard the commit sequence.
     dataset: lance.LanceDataset,
     payloads: list[dict[str, Any]],
     expected_fragment_ids: tuple[int, ...],
@@ -224,10 +261,20 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
     row_filter: str,
     storage_options: dict[str, str] | None,
 ) -> PublicationResult:
-    """Publish every prepared fragment in ONE transaction.
+    """Publish every prepared fragment, in one transaction or in a bounded sequence of them.
+
+    Every refusal below runs before the first transaction, so a run that commits
+    anything has already accepted all of it. What splitting then costs is that an
+    interrupted publication leaves the waves that landed published: a later
+    attempt finds those clips complete under any campaign shape and republishes
+    only the rest. A publication too narrow to fill two waves is not split at
+    all.
 
     Args:
-        dataset: The clip table at the version the transaction reads against.
+        dataset: The clip table at the version every transaction reads against.
+            Left pinned across the sequence rather than re-opened: measured at
+            pylance 11.0.0, an ``Update`` naming fragments no earlier wave touched
+            lands against a read version those waves have already advanced past.
         payloads: One decoded payload per prepared fragment.
         expected_fragment_ids: Exactly the fragments the attempt planned. A
             prepared set that differs is refused before anything is committed.
@@ -235,7 +282,8 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
         storage_options: Lance credentials for the commit.
 
     Returns:
-        The publication's accounting.
+        The publication's accounting, its ``ending_version`` naming the last
+        wave's commit.
 
     Raises:
         CaptionPublicationError: If the prepared set is not exactly the expected
@@ -243,7 +291,7 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
             its payload envelope.
         CaptionPublicationConflictError: If canonical rows cannot be attributed
             to this publication attempt after an ambiguous commit response.
-        ValueError: If two payloads claim the same fragment, or the commit fails
+        ValueError: If two payloads claim the same fragment, or a commit fails
             and the table shows it did not land.
 
     """
@@ -258,7 +306,7 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
         )
         raise ValueError(msg)
     _require_expected_fragments(prepared.keys(), expected_fragment_ids, uri=dataset.uri)
-    metadata = []
+    metadata: dict[int, FragmentMetadata] = {}
     for fragment_id, payload in prepared.items():
         fragment_metadata = FragmentMetadata.from_json(str(payload["metadata_json"]))
         if int(fragment_metadata.id) != fragment_id:
@@ -267,19 +315,29 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
                 f"{int(fragment_metadata.id)}; refusing to commit a prepared descriptor under the wrong fragment id"
             )
             raise CaptionPublicationError(msg)
-        metadata.append(fragment_metadata)
-    field_ids = sorted({int(field_id) for payload in prepared.values() for field_id in payload["modified_field_ids"]})
+        metadata[fragment_id] = fragment_metadata
     published_rows = sum(int(payload["rows"]) for payload in prepared.values())
     error_rows = sum(int(payload["error_rows"]) for payload in prepared.values())
     truncated_rows = sum(int(payload["truncated_rows"]) for payload in prepared.values())
-    ending_version = _commit_verified(
-        dataset,
-        metadata,
-        field_ids,
-        expected_fragment_ids=expected_fragment_ids,
-        row_filter=row_filter,
-        storage_options=storage_options,
-    )
+    # Sorted so that the same prepared set always splits into the same waves in
+    # the same order, which is what makes an interrupted publication's partial
+    # outcome reproducible rather than a function of Ray's completion order.
+    ordered = sorted(metadata)
+    waves = _publication_waves(ordered)
+    ending_version = int(dataset.version)
+    for number, wave in enumerate(waves, start=1):
+        ending_version = _commit_verified(
+            dataset,
+            [metadata[fragment_id] for fragment_id in wave],
+            sorted({int(field_id) for fragment_id in wave for field_id in prepared[fragment_id]["modified_field_ids"]}),
+            expected_fragment_ids=wave,
+            row_filter=row_filter,
+            storage_options=storage_options,
+        )
+        logger.info(
+            f"Caption publication wave {number}/{len(waves)} landed {len(wave)} fragment(s) "
+            f"of {dataset.uri} at v{ending_version}"
+        )
     logger.info(
         f"Published {published_rows} caption row(s), {error_rows} of them terminal error(s) and "
         f"{truncated_rows} truncated, across {len(prepared)} fragment(s) of {dataset.uri}: "
@@ -291,6 +349,37 @@ def commit_prepared(  # Coordinator inputs independently guard one atomic commit
         error_rows=error_rows,
         truncated_rows=truncated_rows,
     )
+
+
+def _publication_waves(fragment_ids: Sequence[int]) -> list[tuple[int, ...]]:
+    """Split the prepared fragments into the transactions that publish them.
+
+    At most ``_PUBLICATION_WAVE_BOUND`` slices, none holding fewer than that many
+    fragments unless the whole publication does, so a publication too narrow to
+    fill two waves commits exactly once and a campaign-scale one commits a fixed
+    number of times however wide it grows.
+
+    Args:
+        fragment_ids: Every prepared fragment, in the order the waves commit them.
+
+    Returns:
+        Consecutive slices, each one transaction's worth. Empty only when
+        ``fragment_ids`` is, which publication refuses before reaching here.
+
+    """
+    if not fragment_ids:
+        return []
+    total = len(fragment_ids)
+    # Derived as a wave COUNT and then split evenly, rather than as a slice
+    # width walked across the sequence: a width divides with a remainder, and
+    # that remainder is a final wave below the floor - the one shape the floor
+    # exists to refuse, since it pays a whole manifest for fragments the wave
+    # before it would have carried at the same price. Taking every wave the
+    # floor affords is what keeps an interrupted publication's reusable prefix
+    # as long as the floor allows.
+    count = min(_PUBLICATION_WAVE_BOUND, max(1, total // _PUBLICATION_WAVE_BOUND))
+    edges = [total * number // count for number in range(count + 1)]
+    return [tuple(fragment_ids[start:stop]) for start, stop in pairwise(edges)]
 
 
 def staged_captions(workspace: CaptionWorkspace, fragment_id: int) -> pa.Table:
@@ -429,10 +518,17 @@ def require_exact_coverage(
         raise CaptionPublicationError(msg)
     extra = sorted(folded.keys() - owed_set)
     if extra:
+        # Names its remedy, because unlike the foreign-digest case this fault
+        # does identify its own cause: the rows carry THIS contract's digest, so
+        # they were staged by an earlier attempt under this same namespace whose
+        # post-commit cleanup did not run. The namespace is version-independent,
+        # so this attempt resolved to that leftover tree; deleting it is repair,
+        # and the captions the earlier attempt published are already canonical.
         msg = (
             f"fragment {fragment_id} has staged caption row(s) for {len(extra)} clip(s) that this attempt does not owe "
             f"(first: {extra[:3]}); update_columns drops an unmatched staged row silently, so this is refused "
-            f"here rather than published as a partial wave"
+            f"here rather than published as a partial wave; these rows are left by an earlier attempt whose "
+            f"cleanup did not run, so delete {namespace_uri} and re-run"
         )
         raise CaptionPublicationError(msg)
     # ONE expression feeds both the test and the message, so the two can never
@@ -720,11 +816,14 @@ def _commit_verified(  # noqa: PLR0913 - one commit, and every input decides whe
     row_filter: str,
     storage_options: dict[str, str] | None,
 ) -> int:
-    """Commit every prepared fragment as ONE ``Update`` transaction.
+    """Commit one wave of prepared fragments as a single ``Update`` transaction.
 
     Args:
         dataset: The clip table at the version the transaction reads against.
-        fragments: The prepared fragment metadata.
+            An earlier wave of the same publication may have advanced the table
+            past it; a disjoint ``Update`` still lands, so the handle is not
+            re-opened between waves.
+        fragments: The prepared fragment metadata of this wave.
         field_ids: The field ids the update modified.
         expected_fragment_ids: Fragments that must hold no owed row once the
             commit has landed.
@@ -765,9 +864,14 @@ def _commit_verified(  # noqa: PLR0913 - one commit, and every input decides whe
     try:
         committed = lance.LanceDataset.commit(dataset.uri, transaction, storage_options=storage_options)
     except (OSError, RuntimeError) as e:
-        # Lance routes only IO faults to OSError; its commit-conflict and
-        # write-contention variants fall through to RuntimeError, so both must be
-        # caught. Neither, though, tells us whether the commit LANDED: a response
+        # Lance routes a commit conflict to OSError, not past it: measured at the
+        # locked 10.0.0 a stale-version Update raises bare OSError, and at 11.0.0
+        # CommitConflictError(OSError). RuntimeError is raised at neither, and is
+        # kept only because catching wider here fails SAFE - every caught type
+        # routes to the table-authority check below, whereas an uncaught one
+        # skips it and leaves the commit's fate undecided.
+        #
+        # What no exception type tells us is whether the commit LANDED: a response
         # lost after the manifest was written raises here just as an outright
         # rejection does. Re-raising unconditionally would send an operator to
         # re-publish a wave that already succeeded, and re-publishing under

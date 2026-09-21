@@ -33,6 +33,7 @@ from cosmos_curator.next.recipes.robot_action_caption.table import (
     CURATE_SELECTED_VALUE,
     CURATE_SELECTION_REASON,
     caption_work_filter,
+    count_rows_in_fragments,
     ensure_caption_fields,
     require_selection_column,
     require_source_columns,
@@ -65,9 +66,9 @@ class CaptionRunResult:
         clips_lance_uri: The table read and widened.
         source_version: The version the attempt pinned and selected work from.
         ending_version: The version the table is canonical at when the attempt
-            finished. Never null: an attempt that published returns its commit
-            version, and one that owed nothing returns the pinned version, which
-            already includes the widening commit.
+            finished. Never null: an attempt that published returns the version
+            its last wave landed at, and one that owed nothing returns the
+            pinned version, which already includes the widening commit.
         published_rows: Caption rows published, of every terminal verdict.
         error_rows: How many of ``published_rows`` carry the ``error`` verdict, so
             a SUBSET of that count rather than an addition to it. A share
@@ -81,6 +82,14 @@ class CaptionRunResult:
             and only this count separates a corpus of complete captions from one
             largely cut off. ``success`` needs no field: it is the remainder.
         contract_digest: The semantics that produced them.
+        shard_count: Total shards the campaign divided the fragments across, or
+            ``None`` when one job owned every fragment. Execution scope, not
+            caption semantics, which is why it is absent from the digest and
+            present here: the summary is the machine-readable record of what one
+            job did, and several jobs of one campaign are otherwise
+            distinguishable only by their row counts.
+        shard_index: The zero-based shard this job owned, ``None`` on the same
+            terms. Null together with ``shard_count`` or neither.
 
     """
 
@@ -91,6 +100,8 @@ class CaptionRunResult:
     error_rows: int
     truncated_rows: int
     contract_digest: str
+    shard_count: int | None
+    shard_index: int | None
 
     def as_summary(self) -> dict[str, object]:
         """Return the JSON-compatible run summary the CLI publishes."""
@@ -102,6 +113,8 @@ class CaptionRunResult:
             "error_rows": self.error_rows,
             "truncated_rows": self.truncated_rows,
             "caption_contract_digest": self.contract_digest,
+            "shard_count": self.shard_count,
+            "shard_index": self.shard_index,
         }
 
     def as_message(self) -> str:
@@ -157,14 +170,31 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
     dataset = lance.dataset(uri, storage_options=storage_options)
     require_source_columns(dataset)
     require_selection_column(dataset, selected_only=config.input.selected_only)
+    # Rebound, not called for effect: the widening opens its own handle so it can
+    # retry a lost schema race, and the version pinned below must be the one the
+    # winning pass left behind rather than this now-stale handle's.
+    dataset = ensure_caption_fields(uri, storage_options=storage_options)
     context_fields = resolve_context_fields(dataset)
-    ensure_caption_fields(dataset)
     read_version = int(dataset.version)
-    # Logged because inference reads one Ray Data block per PENDING fragment, so
-    # this geometry is the ceiling on fetch concurrency and its largest fragment
-    # is what the run's final block spends its time on. Neither is recoverable
-    # from any later line once the run is over.
-    report_table_shape(dataset, f"Caption source {uri}")
+    shard = config.input.shard
+    if shard is None:
+        scope_label = "unsharded"
+    else:
+        scope_label = f"shard {shard.label}"
+        # Stated once, because the two numbers are easy to read the other way
+        # round and a campaign launched one-based would silently leave the last
+        # shard's fragments owned by nobody.
+        logger.info(
+            f"Caption work {scope_label} on {uri}: this job owns the fragments whose manifest id "
+            f"mod {shard.count} equals {shard.index}. Indices are zero-based, so a complete "
+            f"campaign launches indices 0 through {shard.count - 1}."
+        )
+    # The WHOLE table's geometry, whatever this job owns: it is the only line
+    # that records what the campaign was run against, and it is not recoverable
+    # from any later line once the run is over. This job's own geometry - the
+    # ceiling on its fetch concurrency, and the largest fragment its final block
+    # spends its time on - is the owed distribution logged after planning.
+    report_table_shape(dataset, f"Caption source table {uri}")
 
     digest = caption_contract_digest(
         model,
@@ -184,22 +214,34 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
     # one string. Logged BEFORE planning so a filter Lance refuses to parse is
     # still readable from the log that reports the failure.
     logger.info(f"Caption row filter on {uri} @v{read_version}: {row_filter}")
-    plan = plan_caption_scan(dataset, row_filter)
-    scope = "selected-only" if config.input.selected_only else "all-pending"
+    plan = plan_caption_scan(dataset, row_filter, shard=shard)
+    row_scope = "selected-only" if config.input.selected_only else "all-pending"
+    # Every number here is relative to what this job owns, which is why the
+    # owned total is reported beside the owed one: on a sharded run "12 owed
+    # fragments" alone says nothing about whether this job has a small scope or
+    # a nearly-complete one. The largest owed fragment sizes the tail, since one
+    # Ray Data block reads one owed fragment.
     logger.info(
-        f"Caption attempt on {uri} @v{read_version}: {len(plan.fragments)} owed fragment(s), "
-        f"{plan.num_rows} owed row(s) under {scope} scope and contract {digest}."
+        f"Caption attempt on {uri} @v{read_version} ({scope_label}): {plan.owned_fragments} owned fragment(s), "
+        f"{len(plan.fragments)} of them owed, {plan.num_rows} owed row(s), "
+        f"largest owed fragment {max((fragment.num_rows for fragment in plan.fragments), default=0)} row(s), "
+        f"under {row_scope} scope and contract {digest}."
     )
     if not plan.fragments:
         if config.input.selected_only:
             unscoped_filter = caption_work_filter(digest, model.model_id, selected_only=False)
-            unselected_pending = int(dataset.count_rows(filter=unscoped_filter))
+            # Counted over THIS JOB's fragments, never the table: an unowned
+            # backlog belongs to whichever job owns it, and blaming Curate for
+            # it sends the operator to a remedy that would change nothing. It is
+            # also the only unbounded driver cost on an otherwise cheap path.
+            unselected_pending = count_rows_in_fragments(dataset, plan.owned_fragment_ids, unscoped_filter)
             if unselected_pending:
                 logger.warning(
-                    f"Caption attempt on {uri} @v{read_version} owes nothing under selected-only scope, but "
-                    f"{unselected_pending} row(s) are caption-pending: no such pending row carries "
-                    f"{CURATE_SELECTION_REASON} = {CURATE_SELECTED_VALUE!r}. Run the curate leg first, or set "
-                    "input.selected_only=false to caption every pending row."
+                    f"Caption attempt on {uri} @v{read_version} ({scope_label}) owes nothing under "
+                    f"selected-only scope, but {unselected_pending} row(s) in the fragments this job owns are "
+                    f"caption-pending: no such pending row carries {CURATE_SELECTION_REASON} = "
+                    f"{CURATE_SELECTED_VALUE!r}. Run the curate leg first, or set input.selected_only=false to "
+                    "caption every pending row."
                 )
         # Returned before model validation, workspace, Ray, or initialization is
         # touched. Publication is skipped rather than called with an empty wave,
@@ -214,6 +256,8 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
             error_rows=0,
             truncated_rows=0,
             contract_digest=digest,
+            shard_count=None if shard is None else shard.count,
+            shard_index=None if shard is None else shard.index,
         )
         logger.info(f"{no_work.as_message()}; {no_work.as_summary()}")
         return no_work
@@ -222,9 +266,9 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
     workspace = resolve_workspace(
         staging_root=config.staging_root,
         source_uri=uri,
-        read_version=read_version,
         digest=digest,
         storage_profile=storage_profile,
+        shard=shard,
     )
 
     ensure_ray_initialized(
@@ -277,6 +321,8 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
         error_rows=publication.error_rows,
         truncated_rows=publication.truncated_rows,
         contract_digest=digest,
+        shard_count=None if shard is None else shard.count,
+        shard_index=None if shard is None else shard.index,
     )
     logger.info(f"{result.as_message()}; {result.as_summary()}")
     return result
@@ -285,14 +331,18 @@ def run_config(config: ResolvedRobotActionCaptionConfig) -> CaptionRunResult:
 def _cleanup(workspace: CaptionWorkspace) -> None:
     """Remove the published namespace, never failing the run for it.
 
-    Swallowed rather than raised because the captions are already canonical: a
-    stale workspace costs storage, whereas failing here would cost an
-    investigation into a run that actually succeeded.
+    Swallowed rather than raised because the captions are already canonical, so
+    failing here would cost an investigation into a run that actually succeeded.
+    A leftover workspace is not free - the namespace is version-independent, so a
+    later attempt can resolve to it - but it cannot corrupt a published caption,
+    only refuse an attempt that re-owns one of its fragments.
     """
     try:
         cleanup_workspace(workspace)
-    except Exception as e:  # noqa: BLE001 - the captions are canonical; a stale workspace only costs storage
+    except Exception as e:  # noqa: BLE001 - the captions are canonical; the leftover can only refuse a later attempt
         logger.warning(
             f"Captions are canonical, but cleanup of {workspace.root_uri} failed ({e!r}); "
-            f"nothing reads the workspace, so delete it at leisure."
+            f"delete it by hand. A later attempt on this table, contract and scope resolves to "
+            f"the same workspace, and if it owes a row in a fragment holding these leftover "
+            f"staged rows, publication refuses before committing until the workspace is gone."
         )

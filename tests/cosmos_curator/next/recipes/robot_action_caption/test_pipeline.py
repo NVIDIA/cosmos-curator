@@ -15,11 +15,11 @@ expensive steps were never reached::
     require_selection_column refuse a missing default scope BEFORE mutating it
           |
           v
-    resolve_context_fields   refuse a bad context column, also before
-          |
+    ensure_caption_fields    widen (metadata-only); validates context on
+          |                  each reopen before committing
           v
-    ensure_caption_fields    widen (metadata-only)
-          |
+    resolve_context_fields   optional columns for the digest, from the same
+          |                  handle whose version is pinned next
           v
     read_version = version   pin AFTER the widening
           |
@@ -220,7 +220,12 @@ def test_selected_only_no_work_warns_when_unselected_rows_are_pending(
     refuse_every_acquisition: None,
     loguru_records: list[dict[str, Any]],
 ) -> None:
-    """Name the hidden pending population and the two operator remedies."""
+    """Name the hidden pending population and the two operator remedies.
+
+    The count is asserted with the phrase that scopes it, because a bare row
+    count would also pass against a table-wide total - the number a sharded job
+    must not print, since rows another shard owns are not this job's to explain.
+    """
     del refuse_every_acquisition
     config = caption_config(_write_clips(tmp_path, selection="duplicate"))
 
@@ -228,7 +233,7 @@ def test_selected_only_no_work_warns_when_unselected_rows_are_pending(
 
     assert result.published_rows == 0
     (warning,) = _warnings(loguru_records)
-    assert f"{CLIPS} row(s) are caption-pending" in warning
+    assert f"{CLIPS} row(s) in the fragments this job owns are caption-pending" in warning
     assert "Run the curate leg first" in warning
     assert "input.selected_only=false" in warning
 
@@ -552,8 +557,7 @@ def fully_captioned_clips(
     turn this into a test of the PENDING path while still passing its own setup.
     """
     config = caption_config(_write_clips(tmp_path))
-    dataset = lance.dataset(config.input.clips_lance_uri)
-    ensure_caption_fields(dataset)
+    dataset = ensure_caption_fields(config.input.clips_lance_uri, storage_options=None)
     model = resolve_registered_model(config.model.variant)
     digest = caption_contract_digest(
         model,
@@ -582,8 +586,7 @@ def malformed_current_clips(
 ) -> ResolvedRobotActionCaptionConfig:
     """Return a current-digest table whose caption and model remain NULL."""
     config = caption_config(_write_clips(tmp_path))
-    dataset = lance.dataset(config.input.clips_lance_uri)
-    ensure_caption_fields(dataset)
+    dataset = ensure_caption_fields(config.input.clips_lance_uri, storage_options=None)
     model = resolve_registered_model(config.model.variant)
     digest = caption_contract_digest(
         model,

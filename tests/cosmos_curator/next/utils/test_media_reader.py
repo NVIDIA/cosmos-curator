@@ -15,7 +15,7 @@
 
 """``MediaObjectReader`` contracts: the byte cap, the retry budget, the fault class.
 
-Covers the three decisions a caller depends on:
+Covers the decisions a caller depends on:
 
 * the size ceiling is enforced before the transfer, and again on the delivered
   bytes when the store reports no size;
@@ -24,7 +24,11 @@ Covers the three decisions a caller depends on:
 * which of the three ``MediaReadError`` subclasses a given backend failure
   becomes, since that choice decides drop-the-row versus fail-the-run;
 * a reader survives a pickle round-trip after it has read, and the copy still
-  reads, because Ray pickles one to reach a worker.
+  reads, because Ray pickles one to reach a worker;
+* what the reads cost: the delivering attempt's own duration kept apart from the
+  failed attempts and the backoff, the attempts consumed whether or not any
+  delivered, an immutable snapshot, and no sample dropped when several threads
+  read at once.
 
 Every remote branch is exercised through a fake storage client, so no test needs
 network or credentials.
@@ -33,9 +37,12 @@ network or credentials.
 import pathlib
 import pickle
 import threading
+import time
 from collections.abc import Callable
-from typing import Never
+from concurrent.futures import ThreadPoolExecutor
+from typing import Final, Never
 
+import attrs
 import pytest
 import tenacity
 from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError
@@ -43,6 +50,28 @@ from botocore.exceptions import ClientError, NoCredentialsError
 
 from cosmos_curator.core.utils.storage.storage_client import StoragePrefix, StorageStat
 from cosmos_curator.next.utils import media_reader
+
+# Bytes the scripted client delivers, and the size its metadata reports.
+_SCRIPTED_OBJECT_BYTES: Final = b"abc"
+
+# Threads and reads for the concurrency test. Every read yields inside the
+# accumulator (see ``_YieldingSeconds``), so a handful per thread is enough and
+# the count is kept low to keep the suite quick.
+_CONCURRENT_READERS: Final = 8
+_READS_PER_THREAD: Final = 25
+
+# Long enough that the sleeping thread certainly loses the GIL to a waiting one
+# rather than merely offering to.
+_GIL_HANDOFF_S: Final = 5e-4
+
+# One step per clock reading. The value is arbitrary; what matters is that the
+# reader's four readings per call make the recorded terms whole multiples of it.
+_CLOCK_STEP_S: Final = 1.0
+
+# Transport and retry seconds one read records against ``_PerThreadClock``:
+# the delivering attempt spans one reading pair, the whole call spans three.
+_STEPS_PER_TRANSPORT: Final = 1
+_STEPS_PER_RETRY: Final = 2
 
 
 class _FakeMediaClient:
@@ -83,7 +112,124 @@ class _FakeMediaClient:
         return self._download_result
 
 
+class _FakeClock:
+    """Monotonic clock a test advances by hand.
+
+    Stands in for the ``time`` module inside the reader, so every duration the
+    reader records is a number this test chose rather than one it measured.
+    Asserting the transport term against a literal is the whole point: a
+    tolerance wide enough for a real clock is also wide enough to hide a retry
+    interval that leaked into the transfer.
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def monotonic(self) -> float:
+        """Return the current reading."""
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward, never back."""
+        self._now += seconds
+
+
+class _ScriptedTransferClient:
+    """Storage client whose transfers each take a scripted slice of a fake clock.
+
+    Every ``download_object_as_bytes`` consumes the next script entry: the clock
+    jumps by that many seconds, then the entry's outcome is raised or returned.
+    The metadata lookup deliberately costs nothing, so each second the reader
+    reports is attributable to exactly one scripted transfer.
+
+    Attributes:
+        download_calls: Transfers attempted, so a test can confirm the script
+            was consumed as far as it expected rather than short.
+
+    """
+
+    def __init__(self, clock: _FakeClock, *, transfers: list[tuple[float, bytes | Exception]]) -> None:
+        self._clock = clock
+        self._transfers = list(transfers)
+        self.download_calls = 0
+
+    def stat(self, _dest: StoragePrefix) -> StorageStat:
+        # Advances no clock, so the scripted transfer seconds are the only ones
+        # an assertion below has to account for.
+        return StorageStat(size_bytes=len(_SCRIPTED_OBJECT_BYTES))
+
+    def download_object_as_bytes(self, _uri: StoragePrefix, _chunk_size_bytes: int = 0) -> bytes:
+        seconds, outcome = self._transfers[self.download_calls]
+        self.download_calls += 1
+        self._clock.advance(seconds)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _YieldingSeconds(float):
+    """A duration whose accumulation hands the GIL to another thread.
+
+    Widens the meter's load-modify-store window on purpose, because at its
+    natural width that window is a small fraction of one read and an unguarded
+    accumulator survives the concurrency test below. Measured: 0 detections in
+    10 runs of 1,600 reads across 8 threads, with the interpreter's switch
+    interval already shortened to a microsecond and every thread released from
+    its transfer by a shared barrier. A test that green-lights the broken
+    version is not evidence, so the window is widened until a lost update is
+    the expected outcome rather than a rare one.
+
+    Python tries the reflected operation first when the right operand's type is
+    a proper subclass overriding it, so ``plain_total += duration`` routes into
+    ``__radd__`` here.
+    """
+
+    def __sub__(self, other: float) -> "_YieldingSeconds":
+        # Keeps the yielding type through the reader's own arithmetic, which
+        # derives every duration it records by subtracting two clock readings.
+        return _YieldingSeconds(float(self) - float(other))
+
+    def __radd__(self, other: float) -> float:
+        time.sleep(_GIL_HANDOFF_S)
+        return float(self) + float(other)
+
+
+class _PerThreadClock:
+    """Monotonic clock advancing one fixed step per call, counted per thread.
+
+    Thread-local, so what one read measures does not depend on how the threads
+    interleaved: each read takes four readings from its own sequence and so
+    records exactly one step of transport and two of retry whatever else is
+    running. That is what lets the concurrent test assert an exact total rather
+    than an inequality, and an exact total is what a lost update violates.
+    """
+
+    def __init__(self) -> None:
+        self._readings = threading.local()
+
+    def monotonic(self) -> _YieldingSeconds:
+        reading = getattr(self._readings, "elapsed", 0.0) + _CLOCK_STEP_S
+        self._readings.elapsed = reading
+        return _YieldingSeconds(reading)
+
+
+class _StatelessTransferClient:
+    """Storage client with no mutable state, for the concurrent-read test.
+
+    Counts nothing deliberately: a harness counter would need a lock of its own
+    to avoid losing updates exactly as the subject is being tested for losing
+    them, and the read total here is fixed by construction anyway.
+    """
+
+    def stat(self, _dest: StoragePrefix) -> StorageStat:
+        return StorageStat(size_bytes=len(_SCRIPTED_OBJECT_BYTES))
+
+    def download_object_as_bytes(self, _uri: StoragePrefix, _chunk_size_bytes: int = 0) -> bytes:
+        return _SCRIPTED_OBJECT_BYTES
+
+
 type InstallStatErrorClient = Callable[[Exception], _FakeMediaClient]
+type InstallScriptedTransfers = Callable[[list[tuple[float, bytes | Exception]]], _ScriptedTransferClient]
 type WrapProviderError = Callable[[Exception], Exception]
 
 
@@ -136,6 +282,41 @@ def install_stat_error_client(monkeypatch: pytest.MonkeyPatch) -> InstallStatErr
         return client
 
     return install
+
+
+@pytest.fixture
+def install_scripted_transfers(monkeypatch: pytest.MonkeyPatch) -> InstallScriptedTransfers:
+    """Install a fake remote client and a hand-advanced clock in place of the reader's.
+
+    Also redirects tenacity's backoff into the same clock, so a retry wait
+    costs the suite nothing while still moving the reading the reader
+    subtracts. That matters: the backoff has to land in the retry term, and a
+    test that skipped it entirely could not tell whether it did.
+    """
+
+    def install(transfers: list[tuple[float, bytes | Exception]]) -> _ScriptedTransferClient:
+        clock = _FakeClock()
+        client = _ScriptedTransferClient(clock, transfers=transfers)
+        # Patched on the module that READS ``time.monotonic``, so a rename or a
+        # move of that call fails here loudly instead of leaving a real clock in
+        # place and the assertions measuring wall time.
+        monkeypatch.setattr(media_reader, "time", clock)
+        monkeypatch.setattr(tenacity.nap.time, "sleep", clock.advance)
+        monkeypatch.setattr(media_reader, "get_storage_client", lambda *_a, **_k: client)
+        return client
+
+    return install
+
+
+@pytest.fixture
+def contended_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install a per-thread clock whose durations yield the GIL while being accumulated.
+
+    Together these make a dropped sample the expected outcome of an unguarded
+    accumulator and an exactly predictable total for a guarded one.
+    """
+    monkeypatch.setattr(media_reader, "time", _PerThreadClock())
+    monkeypatch.setattr(media_reader, "get_storage_client", lambda *_a, **_k: _StatelessTransferClient())
 
 
 def test_media_object_reader_returns_a_local_object_verbatim(tmp_path: pathlib.Path) -> None:
@@ -609,3 +790,175 @@ def test_media_object_reader_rebuilds_its_client_after_unpickling(monkeypatch: p
 
     assert copy.read("s3://bucket/clips/b.mp4", max_bytes=16) == b"abc"
     assert len(resolutions) == 2
+
+
+def test_a_delivered_read_records_its_bytes_and_one_attempt(tmp_path: pathlib.Path) -> None:
+    """A read that succeeds first time is one attempt carrying one transport sample."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x01\x02")
+    reader = media_reader.MediaObjectReader()
+
+    reader.read(str(clip), max_bytes=16)
+
+    stats = reader.transport_stats()
+    assert stats.delivered_bytes == 3
+    assert stats.attempts == 1
+    assert len(stats.transport_durations) == 1
+
+
+def test_a_read_that_succeeds_after_two_faults_keeps_the_retry_time_out_of_the_transport_term(
+    install_scripted_transfers: InstallScriptedTransfers,
+) -> None:
+    """The delivering attempt is measured alone; the failed ones and the backoff are not.
+
+    This is the quantity a caller wrapping ``read`` cannot obtain. Two 4 s
+    failures precede a 0.5 s success, so a timer around the whole call would
+    report 8.5 s of "transport" for a transfer that took 0.5 s - and on a
+    degraded store that is the difference between diagnosing the store and
+    diagnosing the network.
+
+    The strict inequality is what pins the backoff: the two failed attempts are
+    exactly 8.0 s between them, so anything above that is the waiting. A
+    residual computed from the failed attempts alone would land on 8.0 s
+    exactly and turn this red.
+    """
+    client = install_scripted_transfers(
+        [
+            (4.0, ConnectionResetError("connection reset by peer")),
+            (4.0, ConnectionResetError("connection reset by peer")),
+            (0.5, _SCRIPTED_OBJECT_BYTES),
+        ]
+    )
+    reader = media_reader.MediaObjectReader(max_attempts=3)
+
+    assert reader.read("s3://bucket/clips/a.mp4", max_bytes=16) == _SCRIPTED_OBJECT_BYTES
+
+    assert client.download_calls == 3
+    stats = reader.transport_stats()
+    assert stats.transport_durations == pytest.approx((0.5,))
+    assert stats.undelivered_seconds > 8.0
+
+
+def test_a_read_that_succeeds_after_two_faults_charges_three_attempts(
+    install_scripted_transfers: InstallScriptedTransfers,
+) -> None:
+    """Every attempt is counted, so a corpus quietly costing three transfers per clip shows up.
+
+    The attempt count is visible nowhere else: ``read`` returns the bytes and
+    raises nothing, so a caller that only sees a successful call cannot tell a
+    healthy store from one answering two requests in three.
+    """
+    install_scripted_transfers(
+        [
+            (4.0, ConnectionResetError("connection reset by peer")),
+            (4.0, ConnectionResetError("connection reset by peer")),
+            (0.5, _SCRIPTED_OBJECT_BYTES),
+        ]
+    )
+    reader = media_reader.MediaObjectReader(max_attempts=3)
+
+    reader.read("s3://bucket/clips/a.mp4", max_bytes=16)
+
+    stats = reader.transport_stats()
+    assert stats.attempts == 3
+    assert stats.delivered_bytes == len(_SCRIPTED_OBJECT_BYTES)
+
+
+def test_an_exhausted_read_records_its_attempts_and_no_transport_sample(
+    install_scripted_transfers: InstallScriptedTransfers,
+) -> None:
+    """A read that never delivers contributes attempts and waiting, never a transfer rate.
+
+    Folding a failed call's duration into the transport samples is the specific
+    error this design exists to prevent: those seconds are an attempt budget,
+    so a store failing every request would report itself as merely slow.
+    """
+    client = install_scripted_transfers([(2.0, ConnectionResetError("connection reset by peer")) for _ in range(3)])
+    reader = media_reader.MediaObjectReader(max_attempts=3)
+
+    with pytest.raises(media_reader.MediaTransportError, match="media read failed transiently"):
+        reader.read("s3://bucket/clips/a.mp4", max_bytes=16)
+
+    assert client.download_calls == 3
+    stats = reader.transport_stats()
+    assert stats.transport_durations == ()
+    assert stats.delivered_bytes == 0
+    assert stats.attempts == 3
+    assert stats.undelivered_seconds > 6.0
+
+
+def test_a_later_read_does_not_change_an_earlier_transport_stats_snapshot(tmp_path: pathlib.Path) -> None:
+    """A snapshot is a copy of the totals, not a live view of them.
+
+    Handing out the accumulator itself would let a caller's summary shift
+    mid-computation, and would make two readings taken minutes apart report the
+    same numbers - which is the one thing a caller takes two readings for.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x01\x02")
+    reader = media_reader.MediaObjectReader()
+    reader.read(str(clip), max_bytes=16)
+    first = reader.transport_stats()
+
+    reader.read(str(clip), max_bytes=16)
+
+    assert len(first.transport_durations) == 1
+    assert first.delivered_bytes == 3
+    assert len(reader.transport_stats().transport_durations) == 2
+    assert reader.transport_stats().delivered_bytes == 6
+
+
+def test_a_transport_stats_snapshot_cannot_be_mutated(tmp_path: pathlib.Path) -> None:
+    """Neither the value nor its duration sequence can be written through.
+
+    Both halves matter: a frozen wrapper around a list would still let a caller
+    append to the reader's own samples, and a mutable wrapper would let one
+    consumer's bookkeeping rewrite what every other consumer reads.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x01\x02")
+    reader = media_reader.MediaObjectReader()
+    reader.read(str(clip), max_bytes=16)
+
+    stats = reader.transport_stats()
+
+    assert isinstance(stats.transport_durations, tuple)
+    with pytest.raises(attrs.exceptions.FrozenInstanceError):
+        stats.delivered_bytes = 0
+
+
+@pytest.mark.usefixtures("contended_transport")
+def test_concurrent_reads_lose_no_transport_samples() -> None:
+    """Reads running together all land in the totals, none overwritten by another thread.
+
+    The reader's known consumer fans its reads out over a thread pool, and
+    ``x += n`` on an attribute is a load-modify-store rather than one bytecode:
+    the GIL serialises bytecodes individually, so without the meter's lock two
+    threads read the same total and one write disappears with no error anywhere.
+
+    The seconds total carries the power, which is why the clock is worth its
+    machinery: every read contributes exactly two clock steps, so the expected
+    figure is a literal a single lost update violates. ``list.append`` is one
+    operation and survives an unguarded accumulator, and the integer totals are
+    only probabilistically affected at this scale - so asserting them alone
+    would be the passing-against-broken-code trap rather than a check on it.
+    """
+    reader = media_reader.MediaObjectReader()
+
+    def read_repeatedly() -> None:
+        for _ in range(_READS_PER_THREAD):
+            reader.read("s3://bucket/clips/a.mp4", max_bytes=16)
+
+    with ThreadPoolExecutor(max_workers=_CONCURRENT_READERS) as pool:
+        submitted = [pool.submit(read_repeatedly) for _ in range(_CONCURRENT_READERS)]
+        for future in submitted:
+            # Re-raises whatever a worker raised, so a read that failed is a
+            # failed test rather than a total that quietly counted fewer reads.
+            future.result()
+
+    expected_reads = _CONCURRENT_READERS * _READS_PER_THREAD
+    stats = reader.transport_stats()
+    assert stats.undelivered_seconds == pytest.approx(expected_reads * _STEPS_PER_RETRY * _CLOCK_STEP_S)
+    assert stats.transport_durations == pytest.approx((_STEPS_PER_TRANSPORT * _CLOCK_STEP_S,) * expected_reads)
+    assert stats.attempts == expected_reads
+    assert stats.delivered_bytes == expected_reads * len(_SCRIPTED_OBJECT_BYTES)

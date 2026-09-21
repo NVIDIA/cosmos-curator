@@ -19,8 +19,11 @@ makes retuning a run safe: it never invalidates the completed GPU work a resume
 would reuse. Raising the media byte cap, changing sampling, or changing the frame
 budget has the opposite effect on purpose, so each recaptions the configured
 input scope.
-``input.selected_only`` instead defines which source rows this attempt owes. It
-does not change a row's caption and therefore never reaches the caption digest.
+``input.selected_only`` and ``input.shard`` instead define which source rows this
+attempt owes - the first by row scope, the second by dividing the table's
+fragments across independently launched jobs. Neither changes a row's caption, so
+neither reaches the caption digest: rows a shard does not own are simply left
+owed, to be captioned identically by whichever job does own them.
 
 Prompt text and fixed request-shape invariants remain frozen beside the code that
 owns them; legitimate experiment controls are explicit typed config values.
@@ -39,6 +42,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cosmos_curator.core.utils.config.pydantic_config import STRICT_CONFIG_MODEL_CONFIG
 from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.core.sharding import ShardConfig
 from cosmos_curator.next.utils.local_uri import local_media_path
 from cosmos_curator.next.utils.uris import normalize_s3_uri
 
@@ -161,6 +165,18 @@ class RobotActionCaptionInputConfig(BaseModel):
             "Caption only rows whose curate_selection_reason is 'selected'. Requires the Curate-owned column; "
             "set false to caption every otherwise-pending row without requiring curation output. This is input "
             "scope, not caption semantics, and never reaches the caption contract digest."
+        ),
+    )
+    shard: ShardConfig | None = Field(
+        default=None,
+        description=(
+            "Divide the table's fragments across independently launched jobs, this job taking the shard "
+            "at the given zero-based index. Absent means one job owns every fragment. This is execution "
+            "scope, not caption semantics: it never reaches the caption contract digest, so which job "
+            "captioned a clip cannot change what that caption says. It IS part of the recovery namespace, "
+            "which is what keeps concurrent shards from sharing a staging directory - so hold count fixed "
+            "for a campaign: changing it re-partitions the table and strands any uncommitted progress "
+            "staged under the old count, and shards of unequal counts silently claim the same fragments."
         ),
     )
 
@@ -409,8 +425,35 @@ class RobotActionCaptionExecutionConfig(BaseModel):
         default=None,
         gt=0,
         description=(
-            "Optional vLLM scheduler token budget. Null preserves vLLM's model/runtime default; "
-            "changing it affects capacity and memory headroom but not completed caption identity."
+            "vLLM scheduler token budget per step. Null preserves vLLM's own default, which at the "
+            "pinned version is 2048 - small enough that a multimodal prompt of tens of thousands of "
+            "tokens is prefilled over several steps, so this is a throughput knob on any "
+            "large-prompt run rather than a rarely-needed override. Affects capacity and memory "
+            "headroom but not completed caption identity."
+        ),
+    )
+    gpu_memory_utilization: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description=(
+            "Fraction of each GPU vLLM may claim. Null preserves vLLM's own default. What is left "
+            "after the model weights becomes KV cache, which sets how many requests a replica can "
+            "hold at once - so on a large model this is the knob that decides engine concurrency, "
+            "and vLLM prints the resulting ceiling as 'Maximum concurrency for N tokens per "
+            "request'. Raising it trades startup headroom for residency and can fail at graph "
+            "capture; it never changes a caption."
+        ),
+    )
+    enable_prefix_caching: bool = Field(
+        default=False,
+        description=(
+            "Whether vLLM retains KV blocks for prompt-prefix reuse. Off because "
+            "contracts.REQUEST_CONTENT_TYPES puts the clip before the text, so every prompt opens "
+            "with its own vision tokens and no two requests share a prefix - measured at a 0.0% "
+            "hit rate. Worth enabling only once the request leads with shared text, which is a "
+            "change to REQUEST_CONTENT_TYPES rather than to this setting."
         ),
     )
     media_attempts: int = Field(
@@ -459,11 +502,15 @@ class RobotActionCaptionExecutionConfig(BaseModel):
         description="Rows per Lance scan batch before media fetching.",
     )
     parquet_rows_per_file: int = Field(
-        default=4_096,
+        default=256,
         ge=1,
         description=(
-            "Minimum and maximum staged rows requested per Parquet file. Ray treats both "
-            "values as sizing hints rather than exact limits."
+            "Minimum and maximum staged rows requested per Parquet file. Ray's sink adopts the "
+            "minimum as the write bundle's row floor and one bundle is one checkpoint, so this is "
+            "the recovery granularity: a preemption re-generates at most this many rows per bundle "
+            "in flight, and generation is unseeded. The bundle can never be smaller than the block "
+            "reaching the sink, so lowering this below lance_read_batch_size only splits files. "
+            "Raise the two together to trade recovery granularity for fewer staged objects."
         ),
     )
     source_frame_pixels: int = Field(

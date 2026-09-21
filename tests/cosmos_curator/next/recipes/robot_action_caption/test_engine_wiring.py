@@ -214,6 +214,10 @@ def test_transform_copies_media_io_kwargs_into_the_preparation_stage_config(
 
     It constructs its own model config, so an uncopied argument lets it decode
     media the engine was not configured for, with neither side wrong alone.
+
+    Asserted as the WHOLE mapping rather than one key, so a stage argument added
+    here without a test cannot arrive unnoticed. The context length is the
+    other member today, and the test below is the one that pins its value.
     """
     media_io_kwargs = {"video": {"num_frames": 8}}
     recorded = build_transform(
@@ -225,7 +229,41 @@ def test_transform_copies_media_io_kwargs_into_the_preparation_stage_config(
     )
 
     stage = recorded.engine_config.kwargs["prepare_multimodal_stage"]
-    assert stage.model_config_kwargs == {"media_io_kwargs": media_io_kwargs}
+    assert stage.model_config_kwargs == {"media_io_kwargs": media_io_kwargs, "max_model_len": 4096}
+
+
+def test_the_preparation_stage_is_built_with_the_engines_own_context_length(
+    make_config: Callable[..., VllmProcessorConfig],
+    build_transform: TransformBuilder,
+) -> None:
+    """The preparation stage must budget against the window the engine admits.
+
+    Left unpassed, the stage builds its ModelConfig on the checkpoint's native
+    maximum instead, and the two halves of one request size for different
+    windows while only the engine's limit is ever enforced. Nothing raises: the
+    disagreement is visible solely as the stage logging a context length the
+    engine never uses.
+
+    The configured value is not a power of two and matches no default on the
+    path -- neither this fixture's 4096, nor the recipe's shipped 32768, nor the
+    262144 a Qwen3-VL checkpoint reports -- so a build that hardcoded any of
+    them, or read the checkpoint instead of the config, cannot satisfy it.
+    """
+    configured_context = 20_481
+
+    recorded = build_transform(
+        make_config(
+            prepare_multimodal=True,
+            max_model_len=configured_context,
+            media_bytes_per_row=11 * 1024 * 1024,
+        ),
+    )
+
+    stage = recorded.engine_config.kwargs["prepare_multimodal_stage"]
+    assert stage.model_config_kwargs["max_model_len"] == configured_context
+    # The engine half of the same number, so the test fails if the two are ever
+    # sourced separately -- agreeing is the entire point of passing it.
+    assert recorded.engine_config.kwargs["engine_kwargs"]["max_model_len"] == configured_context
 
 
 def test_transform_pins_an_engine_side_failure_as_fatal_to_the_run(

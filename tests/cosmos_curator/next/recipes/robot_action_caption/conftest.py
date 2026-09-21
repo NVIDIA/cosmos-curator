@@ -62,6 +62,7 @@ def caption_config(tmp_path: pathlib.Path) -> caption_harness.CaptionConfig:
         geometry_rows: int | None = None,
         progress: bool | None = None,
         selected_only: bool | None = None,
+        shard: tuple[int, int] | None = None,
     ) -> ResolvedRobotActionCaptionConfig:
         return caption_harness.build_caption_config(
             uri,
@@ -71,6 +72,7 @@ def caption_config(tmp_path: pathlib.Path) -> caption_harness.CaptionConfig:
             geometry_rows=geometry_rows,
             progress=progress,
             selected_only=selected_only,
+            shard=shard,
         )
 
     return build

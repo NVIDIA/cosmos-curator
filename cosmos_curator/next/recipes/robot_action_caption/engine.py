@@ -25,6 +25,7 @@ and installation remain with the recipe datasource and Ray runtime.
 """
 
 import copy
+import time
 import types
 from collections.abc import Callable, Mapping
 from typing import Any, Final, Protocol
@@ -107,6 +108,11 @@ _BATCHES_IN_FLIGHT_PER_ACTOR: Final = 2
 # where the fixed cost is most of the footprint. Measured 2.45 GB on a settled
 # chat-template actor between batches, rounded up for the heavier decode stage.
 _ACTOR_RESIDENT_BYTES: Final = 3 * 1024 * 1024 * 1024
+
+# Rows one worker's hook completes between timing summaries. Chosen so a run
+# produces tens of lines per worker rather than one per row, which at the batch
+# sizes this recipe uses would be hundreds of thousands of lines.
+_HOOK_REPORT_EVERY_ROWS: Final = 2000
 
 
 def _copied_mapping(
@@ -488,6 +494,46 @@ def apply_restart_bounds(processor: StagedProcessor) -> tuple[str, ...]:
     return tuple(bounded)
 
 
+def _timed_hook(
+    hook: Callable[[dict[str, Any]], dict[str, Any]], label: str
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Wrap a row hook so its cumulative cost is reported periodically.
+
+    These two hooks are the ONLY seam this recipe owns inside the processor's
+    stage graph: every other stage is Ray's, runs in its own actor, and emits no
+    timing. Without this, a phase that spends its time in request construction
+    or result canonicalization is indistinguishable from one that spends it in
+    the engine.
+
+    Args:
+        hook: The row callable to wrap.
+        label: Name used in the diagnostic.
+
+    Returns:
+        A callable with the same contract as ``hook``.
+
+    """
+    state = {"rows": 0, "seconds": 0.0}
+
+    def timed(row: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            return hook(row)
+        finally:
+            # In a finally so a raising row still contributes its cost: a hook
+            # that fails slowly is exactly the case worth seeing.
+            state["seconds"] += time.monotonic() - started
+            state["rows"] += 1
+            if not state["rows"] % _HOOK_REPORT_EVERY_ROWS:
+                logger.info(
+                    f"Engine {label} hook after {state['rows']} row(s): {state['seconds']:.1f}s "
+                    f"cumulative, {state['seconds'] / state['rows'] * 1000:.2f} ms/row. Wall time in "
+                    f"this worker only; Ray runs several of them per stage."
+                )
+
+    return timed
+
+
 def build_vllm_transform(
     config: VllmProcessorConfig,
     preprocess: Callable[[dict[str, Any]], dict[str, Any]],
@@ -548,6 +594,14 @@ def build_vllm_transform(
                 memory=reservations.preparation if reservations else None,
                 model_config_kwargs={
                     _MEDIA_IO_KWARGS: copy.deepcopy(engine_kwargs.get(_MEDIA_IO_KWARGS, {})),
+                    # Passed so the preparation stage budgets against the SAME
+                    # context length the engine admits. Left out, it builds its
+                    # ModelConfig on the checkpoint's native maximum instead -
+                    # measured at 262,144 against an engine configured for
+                    # 32,768 - so the two halves of one request disagree about
+                    # the window they are sizing for, and only the engine's
+                    # limit is ever enforced.
+                    "max_model_len": config.max_model_len,
                 },
             )
             if config.prepare_multimodal
@@ -587,7 +641,11 @@ def build_vllm_transform(
         # publish a corrupt engine's output as ordinary per-row data.
         should_continue_on_error=False,
     )
-    processor = build_processor(processor_config, preprocess=preprocess, postprocess=postprocess)
+    processor = build_processor(
+        processor_config,
+        preprocess=_timed_hook(preprocess, "preprocess"),
+        postprocess=_timed_hook(postprocess, "postprocess"),
+    )
     bounded = apply_restart_bounds(processor)
     # ``min_size`` is a FLOOR, not a starting point: Ray Data never scales an
     # actor pool below it, so those GPUs are reserved for the whole run whether

@@ -253,7 +253,8 @@ FakeEngine = Callable[..., InferenceLedger]
 ClipsTable = Callable[..., str]
 
 # Builds a resolved config for one table. Keyword arguments: ``max_clip_bytes``,
-# ``media_attempts``, ``geometry_rows``, ``progress``, and ``selected_only``.
+# ``media_attempts``, ``geometry_rows``, ``progress``, ``selected_only``, and
+# ``shard``.
 CaptionConfig = Callable[..., ResolvedRobotActionCaptionConfig]
 
 
@@ -342,6 +343,7 @@ def build_caption_config(
     geometry_rows: int | None = None,
     progress: bool | None = None,
     selected_only: bool | None = None,
+    shard: tuple[int, int] | None = None,
 ) -> ResolvedRobotActionCaptionConfig:
     """Return a resolved config for one attempt inside a test process.
 
@@ -364,6 +366,9 @@ def build_caption_config(
             Execution-only like ``media_attempts``, so it is free to set.
         selected_only: Whether to restrict work to Curate-selected rows, or
             ``None`` for the shipped default.
+        shard: This job's execution scope as ``(count, index)``, or ``None`` for
+            an unsharded run. Passed as a pair rather than as a
+            ``ShardConfig`` so the resolver validates it like operator input.
 
     Returns:
         The resolved configuration.
@@ -384,6 +389,9 @@ def build_caption_config(
     input_config: dict[str, Any] = {"clips_lance_uri": uri}
     if selected_only is not None:
         input_config["selected_only"] = selected_only
+    if shard is not None:
+        count, index = shard
+        input_config["shard"] = {"count": count, "index": index}
     return resolve_config_data(
         {
             "schema_version": 1,

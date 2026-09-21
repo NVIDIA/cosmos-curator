@@ -70,6 +70,12 @@ _BYTES_PER_DECODED_PIXEL: Final = 3
 _BYTES_PER_MIB: Final = 1024 * 1024
 _BYTES_PER_GIB: Final = 1024 * _BYTES_PER_MIB
 
+# vLLM's own SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS at the pinned
+# version. Restated only so the diagnostic below can NAME the value an omitted
+# ``execution.max_num_batched_tokens`` lands on; nothing here passes it, so a
+# version bump changes behavior and this label together only if it is re-read.
+_VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS: Final = 2048
+
 # VideoMediaIO's own ``num_frames`` default, which it hands to whichever backend
 # resolves. Restated here because the payload ceiling depends on it and nothing
 # in this repo would look different if a vLLM release moved it. It bounds the
@@ -310,7 +316,7 @@ def _verify_media_resources(fetch_workers: int, *, cpus_per_fetch: float) -> _Me
 def _report_pending_fragments(
     plan: CaptionScanPlan,
     *,
-    total_fragments: int,
+    owned_fragments: int,
     rows_per_block: int,
 ) -> int:
     """Log pending scan geometry and return the derived fetch-block count.
@@ -322,7 +328,10 @@ def _report_pending_fragments(
 
     Args:
         plan: The pending fragments and their post-filter row counts.
-        total_fragments: Fragments the table holds at the pinned version.
+        owned_fragments: Fragments in this run's execution scope at the pinned
+            version, the whole manifest when the run owns all of it. The
+            denominator the pending count is reported against, so it must
+            describe the same scope the numerator was drawn from.
         rows_per_block: Target rows per fetch work block.
 
     Returns:
@@ -339,7 +348,7 @@ def _report_pending_fragments(
     # depends on service time and the cluster's idle policy, neither of which
     # this phase owns or can infer at startup.
     logger.info(
-        f"Caption plan: {pending} of {total_fragments} fragment(s) pending, holding {plan.num_rows:,} "
+        f"Caption plan: {pending} of {owned_fragments} owned fragment(s) pending, holding {plan.num_rows:,} "
         f"row(s) with {largest:,} in the largest. Non-strict row repartition will produce "
         f"{fetch_blocks} fetch work block(s) at {rows_per_block} row(s) per block without coalescing "
         f"fragments. The largest pending fragment still bounds one source scan task's tail, but no "
@@ -514,11 +523,13 @@ def run_inference_phase(  # noqa: PLR0913 - a phase boundary; each input is inde
         pending_rows=plan.num_rows,
         available_gpus=float(ray.available_resources().get("GPU", 0.0)),  # type: ignore[no-untyped-call]
     )
-    # get_fragments() resolves from the open manifest and reads no column data,
-    # so the table total costs nothing against remote storage.
     fetch_input_blocks = _report_pending_fragments(
         plan,
-        total_fragments=len(dataset.get_fragments()),
+        # The plan's own owned total, not the table's: a "12 of 4000 pending"
+        # ratio computed against a denominator this job never reads describes
+        # the campaign rather than the run the line appears in, and reads as a
+        # nearly-idle job on what is in fact a fully loaded shard.
+        owned_fragments=plan.owned_fragments,
         rows_per_block=execution.lance_read_batch_size,
     )
     _report_video_policy(config.video)
@@ -644,6 +655,17 @@ def run_inference_phase(  # noqa: PLR0913 - a phase boundary; each input is inde
             min_rows_per_file=execution.parquet_rows_per_file,
             max_rows_per_file=execution.parquet_rows_per_file,
         )
+        # Ray's own post-run summary, read after the sink so every operator has
+        # finished. It carries per-operator wall, CPU and UDF time, rows and
+        # bytes per block, and each operator's own rows/s - but NO queue depth of
+        # any kind, at any unit. The one queue figure Ray publishes is a live
+        # Prometheus gauge, so a bottleneck claim from this log rests on the RATE
+        # lines; see the design document on what remains unobtainable here.
+        logger.info(
+            "Ray Data statistics for the executed inference plan - per-operator wall, CPU and UDF "
+            "time, rows and bytes per block, and each operator's own rows/s. No queue depth of any "
+            f"kind: Ray publishes that only as a live gauge to a metrics backend.\n{terminal.stats()}"
+        )
     logger.info(
         f"Phase A staged terminal caption rows for {len(plan.fragments)} fragment(s) under {workspace.results_uri}."
     )
@@ -711,6 +733,14 @@ def processor_config(  # noqa: PLR0913 - phase-facing semantic and execution inp
         # complete or empty; empty preserves backend/artifact ownership.
         "media_io_kwargs": video.media_io_kwargs(),
         "limit_mm_per_prompt": {"video": VIDEO_ITEMS_PER_PROMPT},
+        # Written UNCONDITIONALLY, unlike the optional knobs below. Those have
+        # three states and the third - inherit whatever the dependency defaults
+        # to - is a legitimate choice for them. Here it is not: vLLM defaults
+        # this ON, and reuse is structurally unreachable for this recipe's
+        # request shape, so an omitted key would buy the cost with none of the
+        # benefit. The field is two-state for that reason and the measurement
+        # behind its default lives in its description.
+        "enable_prefix_caching": execution.enable_prefix_caching,
         # A configured pair passes through in processor-native units.
         # Curator never derives it from the selected model identity.
         "mm_processor_kwargs": video.mm_processor_kwargs(),
@@ -721,6 +751,26 @@ def processor_config(  # noqa: PLR0913 - phase-facing semantic and execution inp
         # processors may have different memory/concurrency trade-offs. Preserve
         # dependency defaults unless the runtime config explicitly opts in.
         engine_kwargs["max_num_batched_tokens"] = execution.max_num_batched_tokens
+    # Reported either way, and NAMING THE DEFAULT when the key is omitted. An
+    # unset key is a non-trivial dependency default rather than "no setting", and
+    # this one is the scheduler's whole per-step token budget: a multimodal prompt
+    # of tens of thousands of tokens is chopped into ceil(prompt / budget) steps,
+    # so leaving it unset caps prefill efficiency on exactly the workloads this
+    # recipe runs. Nothing downstream can tell an inherited value from a chosen
+    # one once it is a plain int inside the engine.
+    if execution.max_num_batched_tokens is None:
+        budget = _VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS
+        budget_source = "vLLM's own default because execution.max_num_batched_tokens is unset, not from a choice"
+    else:
+        budget = execution.max_num_batched_tokens
+        budget_source = "execution.max_num_batched_tokens"
+    logger.info(
+        f"Engine scheduler token budget: {budget} token(s) per step, from {budget_source}. A prompt "
+        f"longer than this takes more than one scheduler step to prefill, so a multimodal prompt of "
+        f"tens of thousands of tokens is spread over many steps at this value."
+    )
+    if execution.gpu_memory_utilization is not None:
+        engine_kwargs["gpu_memory_utilization"] = execution.gpu_memory_utilization
 
     media_bytes_per_row = _media_bytes_per_row(video, execution.source_frame_pixels)
     resolved = VllmProcessorConfig(

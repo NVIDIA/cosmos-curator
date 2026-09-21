@@ -77,6 +77,10 @@ def _result(*, published_rows: int, error_rows: int = 3, truncated_rows: int = 4
     captioned corpus from one that errored on every clip. They are overridable
     because both are SUBSETS of ``published_rows``, so a no-work result has to
     pass zeros to stay a shape the recipe could actually return.
+
+    The shard pair is set to a real scope rather than ``None`` so the summary
+    assertions below see the values a sharded campaign would emit, and distinct
+    from every other integer here for the same reason the verdict counts are.
     """
     return CaptionRunResult(
         clips_lance_uri="/clips.lance",
@@ -86,6 +90,8 @@ def _result(*, published_rows: int, error_rows: int = 3, truncated_rows: int = 4
         error_rows=error_rows,
         truncated_rows=truncated_rows,
         contract_digest="d" * 64,
+        shard_count=8,
+        shard_index=5,
     )
 
 
@@ -201,7 +207,7 @@ def test_a_run_that_owed_no_work_says_so_while_still_naming_the_version(
     assert output.message == "robot-action-caption: no caption owed at v2"
 
 
-def test_the_run_payload_is_the_seven_published_fields(
+def test_the_run_payload_is_the_published_fields(
     config_file: ConfigFile,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,6 +217,10 @@ def test_the_run_payload_is_the_seven_published_fields(
     re-derives both sides through one function, so a renamed or dropped key would
     move them together and agree. Pinning the mapping is what makes a change to
     the payload a deliberate one.
+
+    The shard pair is part of that mapping because it is what tells one campaign
+    job's summary from another's - without it eight jobs emit payloads
+    distinguishable only by their row counts.
     """
     monkeypatch.setattr(pipeline, "run_config", lambda _config: _result(published_rows=7))
 
@@ -224,4 +234,6 @@ def test_the_run_payload_is_the_seven_published_fields(
         "error_rows": 3,
         "truncated_rows": 4,
         "caption_contract_digest": "d" * 64,
+        "shard_count": 8,
+        "shard_index": 5,
     }
