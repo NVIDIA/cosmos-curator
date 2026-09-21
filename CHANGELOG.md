@@ -2,11 +2,27 @@
 
 ## Latest
 
+## [2.7.0]
+
+### Released
+
+- 2026-09-21
+
 ### Breaking Changes
 
 - Remove the Curator Next `video-split` recipe. Use [video-cut](docs/curator/design/curator-next-video-cut.md), then
   [video-transcode](docs/curator/design/curator-next-video-transcode.md), then `video-caption`;
   existing split tables require a fresh output or an explicit migration.
+- Replace `EgoTrajectory.poses` with `positions_m` and `orientations_xyzw`, and update the
+  ego-trajectory protobuf schema and mappings to position/quaternion fields. Update producers and
+  mappings; matrix consumers can use `as_homogeneous_matrices()`.
+- Require an explicit `NearestTimestampPolicy` for `EgoTrajectorySensor.sample()`. GPS sampling
+  now requires `NearestTimestampPolicy` or `GpsInterpolationPolicy` instead of `NoSamplingPolicy`;
+  use `read_all()` to retrieve unaligned source samples.
+- Restructure `multimodal-split` configs around `sensors`, `video`, and `clip`. Update existing
+  configs to the current template; complete episodes are published in `episodes.lance`.
+- Advance the data-integrity store schema to version 3 with timestamp-source provenance. Older
+  stores remain readable, but version 1 and 2 stores require a fresh root for new measurements.
 - Enable Ray cluster authentication by default (`rayAuth.enabled: true`). Upgrading from a prior
   chart version may rotate the auth token and trigger a rolling restart. GitOps users (ArgoCD/Flux)
   can pin `rayAuth.token` to a stable value to keep renders idempotent. To restore the previous
@@ -15,6 +31,25 @@
 
 ### Added
 
+- Add checkpointed Curator Next `video-cut` and `video-transcode` recipes: plan fixed-stride spans
+  in Lance, then encode and upload clips while preserving span rows for downstream enrichment.
+- Implement `multimodal-split` execution for synchronized multicamera episodes with ego-trajectory,
+  GPS, and IMU MCAP artifacts, durable recovery, and one canonical Lance row per complete episode.
+  Add `clip.whole_session` for one unsplit episode from a single camera with no other sensors,
+  and an opt-in container-PTS fallback when a camera's timestamp sidecar is missing.
+- Add `multimodal-caption` with Qwen and Cosmos3 Nano model support, a selected camera per episode,
+  optional ego-trajectory summaries or absolute poses, and checkpointed Lance publication.
+- Add `robot-action-caption` for robot-action split outputs, including resumable inference and
+  publication, configurable prompts, and deterministic work sharding. Preserve task descriptions
+  in robot-action split output rows.
+- Add checkpointing and staged publication to the Curator Next embeddings recipe so interrupted
+  runs can resume without repeating durable embedding work.
+- Persist session-level data-integrity measurements and verdicts alongside stream-level results,
+  support re-evaluation from stored measurements, and add per-session stream glob selection.
+- Add sensor timestamp provenance, GPS nearest-neighbor and interpolation alignment,
+  ego-trajectory nearest-neighbor alignment, and Foxglove `PoseInFrame` mapping support.
+- Add model-weight checksum collection and NGC verification commands, and validate NVCF model
+  downloads against pinned checksums and transfer status.
 - Add `networkPolicy.enabled` to the Helm chart: a NetworkPolicy that blocks all ingress to curator
   pods except Ray inter-pod traffic, with explicit allow-lists for the invocation port
   (`networkPolicy.allowInvocationFrom`) and the bundled OTel collector metrics scrape. Enabled by
@@ -22,8 +57,33 @@
 
 ### Fixed
 
+- Reject path traversal in video and NVCF input/output paths, and constrain clip reads to configured
+  input roots.
+- Preserve Slurm and `srun` exit codes so failed workloads are reported as failures.
+- Improve robot-action split discovery correctness and performance, including recovery discovery
+  and output-profile handling.
+- Prevent Ray Data from terminating long-running data-integrity jobs when no session finishes
+  within the default progress timeout.
+- Apply Azure bucket-name validation only to the bucket component, and relax S3 bucket validation
+  for compatible storage providers.
 - Remove vestigial headless-service vllm port mapping to dead targetPort 8001 (headless services
   do no NAT; the entry was unreachable and misleading).
+
+### Changed
+
+- Measure data-integrity timing metrics on recorded sensor timestamps when available, record the
+  timestamp source, and skip cross-sensor session timing checks when the clocks are unsuitable.
+- Upgrade vLLM and vLLM-Omni to 0.28.0, and Pixi in runtime images to 0.81.0.
+- Run CPU Ray integration tests separately on Kubernetes, extend runtime test collection to
+  Curator Next, and add parallel CPU unit-test execution with improved crash diagnostics.
+
+### Documentation
+
+- Document video cut/transcode, multimodal episode publication and captioning, and robot-action
+  captioning, including checkpoint recovery and sharded execution.
+- Update sensor-library and data-integrity documentation for timestamp provenance, GPS and
+  ego-trajectory alignment, quaternion-based poses, and session-level store schemas.
+- Document Helm authentication, network-policy configuration, and deployment upgrade requirements.
 
 ## [2.6.0]
 
