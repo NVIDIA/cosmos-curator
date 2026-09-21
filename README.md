@@ -45,8 +45,6 @@ Comprehensive documentation is available under [docs/](docs/README.md) directory
 
 ### AI Agent Context Files
 - [AGENTS.md](AGENTS.md) - Canonical AI agent context
-- [CLAUDE.md](CLAUDE.md) - Claude Code loader for `AGENTS.md`
-- [GEMINI.md](GEMINI.md) - Gemini loader for `AGENTS.md`
 
 ## Directory Structure
 
