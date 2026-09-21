@@ -1012,7 +1012,9 @@ A future motion-compensation helper (transform a
 `motion_compensated=False, reference_frame="sensor"` `LidarData` into a
 `motion_compensated=True, reference_frame="rig"` one, using an
 `EgoTrajectory` from the same `AlignedFrame`) belongs alongside the data
-classes but is not part of them.
+classes but is not part of them. The transform math it would apply is
+derived in
+[LiDAR Motion Compensation](sensor-library-lidar-motion-compensation.md).
 
 A future **grid-binning / re-alignment helper** (map an existing
 `LidarData`'s `align_timestamps_ns` onto a different target grid — for
