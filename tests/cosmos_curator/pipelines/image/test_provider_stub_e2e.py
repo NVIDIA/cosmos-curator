@@ -21,11 +21,10 @@ starting Ray or writing duplicate fixture data.
 """
 
 import argparse
-import importlib
 import pathlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Literal, cast
 
 import numpy as np
@@ -34,24 +33,17 @@ import pytest
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
 from cosmos_curator.core.interfaces.stage_interface import CuratorStageSpec
 from cosmos_curator.core.utils.config.config import ConfigFileData, Gemini, OpenAIConfig, OpenAIEndpointConfig
-from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.common import openai_embedding_utils
 from cosmos_curator.pipelines.image.annotate_pipeline import _assemble_stages, add_annotate_command
 from cosmos_curator.pipelines.image.captioning import image_api_caption_stages
 from cosmos_curator.pipelines.image.embedding import image_embedding_stages
 from cosmos_curator.pipelines.image.read_write.image_writer_stage import ImageWriterStage
 from cosmos_curator.pipelines.image.utils.data_model import ImagePipeTask
-from tests.cosmos_curator.pipelines.provider_stub_utils import GeminiStub, OpenAIStubServer
+from tests.cosmos_curator.pipelines.provider_stub_utils import GeminiStub, OpenAIStubServer, require_provider_module
 
 Provider = Literal["openai", "gemini"]
 ProviderStub = OpenAIStubServer | GeminiStub
 OpenAIEndpointKey = Literal["caption", "embedding", "filter", "classifier"]
-
-# This coverage is required to run in the CPU unit-test job, which activates the pixi ``dev``
-# environment. Other pixi environments still import this module while collecting ``pytest -m env``
-# runs, so a missing provider SDK skips there but fails loudly in ``dev`` rather than turning
-# required provider coverage into a silent green skip.
-UNIT_TEST_PIXI_ENV_NAME = "dev"
 
 # The prep stage re-encodes images as PNG; raw-image fallbacks would use a different media type.
 OPENAI_PREP_DATA_URL_PREFIX = "data:image/png;base64,"
@@ -84,27 +76,6 @@ def image_provider_e2e_context(
         task=sample_image_task,
         sequential_runner=sequential_runner,
     )
-
-
-def _require_provider_module(module_name: str) -> ModuleType:
-    """Import a provider SDK, failing instead of skipping in the unit-test environment.
-
-    Importing (rather than ``pytest.importorskip``) keeps collection working in the pixi
-    environments used by ``pytest -m env`` runs, while guaranteeing that the required
-    provider coverage cannot silently disappear from the CPU unit-test job.
-    """
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        current_env = pixi_utils.get_env_name()
-        if current_env == UNIT_TEST_PIXI_ENV_NAME:
-            pytest.fail(
-                f"{module_name!r} must be installed in the {UNIT_TEST_PIXI_ENV_NAME!r} pixi environment "
-                f"so image provider coverage runs in the CPU unit-test job, but importing it failed: {exc}"
-            )
-        pytest.skip(f"{module_name!r} is not installed in the {current_env or 'active'} environment")
-    else:
-        return module
 
 
 def _parse_annotate_args(
@@ -152,8 +123,8 @@ def _configure_openai(
     endpoint_key: OpenAIEndpointKey,
 ) -> None:
     """Point production image provider modules at the real SDK and local stub."""
-    openai = _require_provider_module("openai")
-    embedding_response_module = _require_provider_module("openai.types.create_embedding_response")
+    openai = require_provider_module("openai")
+    embedding_response_module = require_provider_module("openai.types.create_embedding_response")
 
     endpoint = OpenAIEndpointConfig(api_key="test-key", base_url=server.base_url)
     endpoint_configs: dict[OpenAIEndpointKey, OpenAIConfig] = {
@@ -189,7 +160,7 @@ def _configure_provider(
         server.set_chat_content(response_text)
         return server
 
-    genai_types = _require_provider_module("google.genai.types")
+    genai_types = require_provider_module("google.genai.types")
 
     factory = cast("Callable[..., GeminiStub]", request.getfixturevalue("gemini_stub"))
     stub = factory(text=response_text)
@@ -232,17 +203,11 @@ def _assert_provider_request(stub: ProviderStub, provider: Provider, expected_mo
     assert isinstance(stub, GeminiStub)
     assert len(stub.calls) == 1
     assert stub.calls[0]["model"] == expected_model
-    contents = stub.calls[0]["contents"]
-    parts = contents.get("parts") if isinstance(contents, dict) else getattr(contents, "parts", None)
+    # The stage builds a real ``genai_types.Content`` and ``genai_types`` is patched with the
+    # real module, so the recorded contents are always SDK objects rather than plain dicts.
+    parts = stub.calls[0]["contents"].parts
     assert isinstance(parts, list)
-    text_parts = [
-        text
-        for part in parts
-        if isinstance(
-            text := (part.get("text") if isinstance(part, dict) else getattr(part, "text", None)),
-            str,
-        )
-    ]
+    text_parts = [part.text for part in parts if isinstance(part.text, str)]
     assert text_parts
     return "\n".join(text_parts)
 

@@ -44,6 +44,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     VllmSamplingConfig,
     WindowConfig,
 )
+from tests.cosmos_curator.pipelines.stage_test_utils import stage_object
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SPLIT_INVOKE_TEMPLATES = (
@@ -57,12 +58,6 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     _setup_parser(parser)
     return parser
-
-
-def _stage_object(stage: CuratorStage | CuratorStageSpec) -> CuratorStage:
-    if isinstance(stage, CuratorStageSpec):
-        return stage.stage
-    return stage
 
 
 class _EmbeddingMarkerStage(CuratorStage):
@@ -172,7 +167,7 @@ def test_embedding_sampling_fps_default_assembly_is_equivalent(
     """Omission and an explicit 2-FPS value should assemble the same wiring."""
     captured = _capture_embedding_config(monkeypatch)
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(_embedding_args(extra_args))]
+    stages = [stage_object(stage) for stage in _assemble_stages(_embedding_args(extra_args))]
 
     extraction_stage = next(stage for stage in stages if isinstance(stage, ClipFrameExtractionStage))
     marker_stage = next(stage for stage in stages if isinstance(stage, _EmbeddingMarkerStage))
@@ -205,7 +200,7 @@ def test_embedding_sampling_fps_override_reaches_extraction_and_backend_config(
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stage = next(stage for stage in stages if isinstance(stage, ClipFrameExtractionStage))
     marker_stage = next(stage for stage in stages if isinstance(stage, _EmbeddingMarkerStage))
@@ -222,7 +217,7 @@ def test_embedding_sampling_fps_is_not_constructed_when_embeddings_are_disabled(
     args = _embedding_args(["--no-generate-embeddings", "--aesthetic-threshold", "3.5"])
     args.embedding_sampling_fps = float("nan")
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stage = next(stage for stage in stages if isinstance(stage, ClipFrameExtractionStage))
     assert extraction_stage._target_fps == [1.0]
@@ -351,7 +346,7 @@ def test_no_caption_quality_stats_reaches_clip_writer(monkeypatch: pytest.Monkey
     )
 
     stages = _assemble_stages(args)
-    writers = [stage for stage in map(_stage_object, stages) if isinstance(stage, ClipWriterStage)]
+    writers = [stage for stage in map(stage_object, stages) if isinstance(stage, ClipWriterStage)]
 
     assert len(writers) == 1
     assert writers[0]._caption_quality_stats_enabled is False

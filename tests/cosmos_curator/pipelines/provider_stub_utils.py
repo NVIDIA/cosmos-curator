@@ -12,12 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reusable stub endpoints for OpenAI / Gemini chat + embedding provider tests.
+"""Shared SDK import guard and stub endpoints for OpenAI / Gemini provider tests.
 
 This is the shared foundation for provider end-to-end tests across both the
-video and image pipelines. It exposes two complementary stubbing strategies,
-one per provider, because the two SDKs are injectable in fundamentally
-different ways:
+video and image pipelines.
+
+:func:`require_provider_module` is the import guard those tests use to acquire a
+provider SDK: it makes a missing SDK a hard failure in the CPU unit-test
+environment and a skip everywhere else.
+
+On top of that it exposes two complementary stubbing strategies, one per
+provider, because the two SDKs are injectable in fundamentally different ways:
 
 * :class:`OpenAIStubServer` — a *real* localhost ``ThreadingHTTPServer`` that
   speaks the OpenAI-compatible REST surface (``POST /v1/chat/completions``,
@@ -36,15 +41,26 @@ different ways:
 """
 
 import contextlib
+import importlib
 import json
 import socketserver
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from cosmos_curator.core.utils.model import pixi_utils
+
+# Provider coverage is required to run in the CPU unit-test job, which activates the pixi ``dev``
+# environment. Other pixi environments still import the provider test modules while collecting
+# ``pytest -m env`` runs, so a missing provider SDK skips there but fails loudly in ``dev`` rather
+# than turning required provider coverage into a silent green skip.
+UNIT_TEST_PIXI_ENV_NAME = "dev"
 
 # Logical endpoint keys used to look up / override canned responses.
 CHAT_COMPLETIONS = "chat.completions"
@@ -55,6 +71,35 @@ MODELS = "models"
 # Valid keys for OpenAIStubServer.set_response; guards against typos that would
 # silently register an unused override while the real route serves the default.
 _VALID_ENDPOINTS = frozenset({CHAT_COMPLETIONS, RESPONSES, EMBEDDINGS, MODELS})
+
+
+def require_provider_module(module_name: str) -> ModuleType:
+    """Import a provider SDK, failing instead of skipping in the unit-test environment.
+
+    Importing (rather than ``pytest.importorskip``) keeps collection working in the pixi
+    environments used by ``pytest -m env`` runs, while guaranteeing that the required
+    provider coverage cannot silently disappear from the CPU unit-test job.
+
+    Only an absent SDK is skippable. An import that fails *inside* an installed SDK
+    propagates, so a broken install cannot masquerade as a missing one.
+    """
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        # Python reports the outermost missing package, so ``google.genai.types`` surfaces
+        # as ``google``; anything outside the requested path is a real failure, not absence.
+        missing_name = exc.name or ""
+        if missing_name != module_name and not module_name.startswith(f"{missing_name}."):
+            raise
+        current_env = pixi_utils.get_env_name()
+        if current_env == UNIT_TEST_PIXI_ENV_NAME:
+            pytest.fail(
+                f"{module_name!r} must be installed in the {UNIT_TEST_PIXI_ENV_NAME!r} pixi environment "
+                f"so provider coverage runs in the CPU unit-test job, but importing it failed: {exc}"
+            )
+        pytest.skip(f"{module_name!r} is not installed in the {current_env or 'active'} environment")
+    else:
+        return module
 
 
 @dataclass

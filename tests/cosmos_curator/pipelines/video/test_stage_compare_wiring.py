@@ -23,6 +23,7 @@ import pytest
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.core.utils.misc.stage_compare import get_stage_name_after, get_stages_to_compare
 from cosmos_curator.pipelines.video.splitting_pipeline import _split
+from tests.cosmos_curator.pipelines.stage_test_utils import stage_object
 
 
 class StageA(CuratorStage):
@@ -76,10 +77,7 @@ def test_get_stages_to_compare_uses_half_open_interval_and_preserves_specs() -> 
 
     compare_stages = get_stages_to_compare(stages, "StageA", "StageC")
 
-    assert [type(stage.stage if isinstance(stage, CuratorStageSpec) else stage) for stage in compare_stages] == [
-        StageA,
-        StageB,
-    ]
+    assert [type(stage_object(stage)) for stage in compare_stages] == [StageA, StageB]
     assert compare_stages[1] is stage_b_spec
 
 

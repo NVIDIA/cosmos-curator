@@ -23,7 +23,6 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
-from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.core.sensors.data.camera_data import CameraData, MotionVectorData, MotionVectorFrameData
 from cosmos_curator.core.sensors.data.video import VideoMetadata
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
@@ -42,6 +41,7 @@ from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
 from cosmos_curator.pipelines.video.utils.decoder_utils import FrameExtractionPolicy, FrameExtractionSignature
+from tests.cosmos_curator.pipelines.stage_test_utils import stage_object
 
 
 def _make_task(tmp_path: Path, clip_bytes: bytes, *, clip_uuid: UUID | None = None) -> SplitPipeTask:
@@ -70,10 +70,6 @@ def _frame_signature(fps: float) -> str:
         extraction_policy=FrameExtractionPolicy.sequence,
         target_fps=fps,
     ).to_str()
-
-
-def _stage_object(stage: CuratorStage | CuratorStageSpec) -> CuratorStage:
-    return stage.stage if isinstance(stage, CuratorStageSpec) else stage
 
 
 _SEC = 1_000_000_000
@@ -421,7 +417,7 @@ def test_split_assemble_motion_filter_extracts_before_filtering() -> None:
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
     assert len(extraction_stages) == 1
@@ -449,7 +445,7 @@ def test_split_assemble_single_extraction_serves_motion_and_aesthetics() -> None
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
     # Exactly one extraction stage serves both the motion export and the aesthetics consumer.
@@ -474,7 +470,7 @@ def test_split_assemble_no_motion_filter_when_motion_disabled() -> None:
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     assert not any(isinstance(stage, MotionFilterStage) for stage in stages)
 
@@ -512,7 +508,7 @@ def test_split_assemble_aesthetics_configures_frame_ownership_for_embedding(
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stage = next(stage for stage in stages if isinstance(stage, ClipFrameExtractionStage))
     aesthetic_stage = next(stage for stage in stages if isinstance(stage, AestheticFilterStage))
@@ -567,7 +563,7 @@ def test_split_assemble_accepts_signature_alias_rate_without_aesthetics() -> Non
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stage = next(stage for stage in stages if isinstance(stage, ClipFrameExtractionStage))
     embedding_stage = next(stage for stage in stages if isinstance(stage, OpenAIEmbeddingStage))
@@ -593,7 +589,7 @@ def test_split_assemble_extraction_without_motion_when_aesthetics_only() -> None
         ]
     )
 
-    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    stages = [stage_object(stage) for stage in _assemble_stages(args)]
 
     extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
     aesthetic_stage = next(stage for stage in stages if isinstance(stage, AestheticFilterStage))
