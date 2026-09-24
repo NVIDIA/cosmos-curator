@@ -513,6 +513,12 @@ wheel and do not rebuild it against the mounted prefix.
 
 ### **PLEASE READ: For end users walking through this section, the guide assumes that you have already set up a local environment and have launched a reference pipeline locally per [Initial Setup](#initial-setup) + [Run the Reference Video Pipeline](#run-the-reference-video-pipeline).**
 
+The `slurm import-image`, `slurm shell`, `slurm submit`, and `slurm ray submit` commands use `--propagate=NONE`
+for Slurm allocations. Jobs use compute-node shell resource limits instead of inheriting login-node limits on
+virtual memory, stack size, open files, and process count. A login-node virtual-memory limit can otherwise cause
+`mksquashfs` to fail with `Out of memory (cache_alloc)` even when `--mem` requests more memory. Slurm still enforces
+the requested memory allocation.
+
 ### Prerequisites for Slurm Run
 
 #### Setup Password-less SSH to the Cluster

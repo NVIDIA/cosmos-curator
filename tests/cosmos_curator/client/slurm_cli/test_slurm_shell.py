@@ -132,6 +132,7 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     srun_cmd = mock_call.call_args[0][0]
     subprocess_env = mock_call.call_args.kwargs["env"]
     assert srun_cmd[:2] == ["srun", "--pty"]
+    assert "--propagate=NONE" in srun_cmd
     assert "--mpi=none" not in srun_cmd
     assert "--overlap" not in srun_cmd
     assert not any(arg.startswith("--nodes=") for arg in srun_cmd)
@@ -529,6 +530,7 @@ def test_slurm_shell_remote_login_node_runs_srun_through_ssh() -> None:
     assert ssh_command[:3] == ["ssh", "-t", "cluster-user@remote-login"]
     assert "env COSMOS_CURATOR_RAY_SLURM_JOB=True" in remote_command
     assert "srun --pty" in remote_command
+    assert "--propagate=NONE" in shlex.split(remote_command)
     assert "--mpi=none" not in remote_command
     assert "--container-image cosmos-curator+1.0.0-slim" in remote_command
     assert f"{repo}:/src/cosmos-curator:rw" in remote_command
@@ -879,6 +881,7 @@ def test_import_image_uses_enroot_defaults(tmp_path: Path, monkeypatch: MonkeyPa
     assert srun_cmd[0] == "srun"
     assert "--nodes=1" in srun_cmd
     assert "--ntasks=1" in srun_cmd
+    assert "--propagate=NONE" in srun_cmd
     assert "--export=HOME,PATH,ENROOT_CACHE_PATH,ENROOT_DATA_PATH,ENROOT_TEMP_PATH" in srun_cmd
     assert "--export=ALL" not in srun_cmd
     assert "--account=env_account" in srun_cmd
@@ -974,6 +977,7 @@ def test_import_image_remote_login_expands_default_output_dir_with_cluster_usern
     ssh_cmd = mock_call.call_args.args[0]
     assert ssh_cmd[:3] == ["ssh", "-t", "cluster_user@login.example.com"]
     remote_command = ssh_cmd[-1]
+    assert "--propagate=NONE" in shlex.split(remote_command)
     assert "HOME=/home/cluster_user" in remote_command
     assert "ENROOT_CACHE_PATH=/home/cluster_user/container_images/.enroot-cache" in remote_command
     assert "ENROOT_DATA_PATH=/home/cluster_user/container_images" in remote_command

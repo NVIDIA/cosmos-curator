@@ -519,6 +519,8 @@ def _build_container_srun_argv(  # noqa: PLR0913
     srun_command.extend(slurm_args)
     srun_command.extend(
         [
+            # Login-node shell limits can be smaller than the requested Slurm allocation.
+            "--propagate=NONE",
             "--container-writable",
             "--no-container-mount-home",
             "--no-container-remap-root",

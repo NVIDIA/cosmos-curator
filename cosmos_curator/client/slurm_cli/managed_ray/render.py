@@ -308,6 +308,7 @@ def _batch_prelude(
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks=1",
         "#SBATCH --ntasks-per-node=1",
+        "#SBATCH --propagate=NONE",
     ]
 
 

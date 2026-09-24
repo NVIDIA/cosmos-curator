@@ -111,6 +111,8 @@ def test_rendered_jobs_ask_for_what_each_role_needs(tmp_path: Path) -> None:
         ("head.sbatch", head_script),
         ("worker.sbatch", worker_script),
     ]:
+        assert "#SBATCH --propagate=NONE" in script
+        assert "--propagate=NONE" in script.split("srun", maxsplit=1)[1]
         script_path = tmp_path / name
         script_path.write_text(script, encoding="utf-8")
         subprocess.run(["bash", "-n", str(script_path)], check=True)  # noqa: S603,S607

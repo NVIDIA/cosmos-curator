@@ -161,6 +161,7 @@ def test_render_sbatch_script(exclude_nodes: list[str] | None) -> None:
     )
     sbatch_script = _render_sbatch_script(job_spec)
     expected_exclude_nodes = ",".join(job_spec.exclude_nodes) if job_spec.exclude_nodes else None
+    assert "#SBATCH --propagate=NONE" in sbatch_script
     assert "test_job" in sbatch_script
     assert "test_account" in sbatch_script
     assert "test_partition" in sbatch_script

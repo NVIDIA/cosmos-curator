@@ -291,6 +291,8 @@ def _build_import_image_srun_command(  # noqa: PLR0913
             memory=memory,
         ),
         "--ntasks=1",
+        # Login-node shell limits can be smaller than the requested Slurm allocation.
+        "--propagate=NONE",
         f"--export={','.join(srun_export_keys)}",
         "bash",
         "-c",

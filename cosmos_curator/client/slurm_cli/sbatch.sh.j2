@@ -10,6 +10,7 @@
 #SBATCH --nodes={{num_nodes}}
 #SBATCH --ntasks={{num_nodes}}
 #SBATCH --ntasks-per-node=1
+#SBATCH --propagate=NONE
 #SBATCH --distribution=cyclic
 {% if exclusive %}
 #SBATCH --exclusive
