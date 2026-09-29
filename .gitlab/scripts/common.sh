@@ -111,11 +111,8 @@ get_cache_refs() {
     export CACHE_FROM_ARGS=""
     export CACHE_TO_ARG=""
 
-    # Compression knobs shared by every --cache-to. Registry cache blobs are
-    # only ever read back by BuildKit (they are never pulled as a runnable
-    # image). Switching them to zstd is safe and compresses several times
-    # faster than the default gzip. force-compression=false lets unchanged
-    # layers be reused as-is instead of being recompressed on every export.
+    # Registry caches use zstd for faster compression. Image exports force
+    # their selected compression, including for layers imported from these caches.
     local cache_compression="compression=zstd,compression-level=3,image-manifest=true,oci-mediatypes=true,force-compression=false"
 
     if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then

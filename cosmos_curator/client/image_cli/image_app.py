@@ -135,22 +135,20 @@ def build(  # noqa: PLR0913
         ),
     ] = True,
     compression: Annotated[
-        str | None,
+        str,
         Option(
             help=(
-                "Layer compression for the pushed image (e.g. 'zstd' or 'gzip'). "
-                "zstd compresses faster and produces smaller blobs than the default "
-                "gzip, but the registry and every image consumer must support zstd + "
-                "OCI media types. Only affects --push, not --load. Defaults to "
-                "BuildKit's default (gzip) when unset."
+                "Layer compression for the pushed image, including cached layers ('gzip' or 'zstd'). "
+                "Defaults to gzip for Enroot compatibility. zstd requires support from "
+                "the registry and every image consumer. Only affects --push, not --load."
             ),
             rich_help_panel="common",
         ),
-    ] = None,
+    ] = "gzip",
     compression_level: Annotated[
         int,
         Option(
-            help="Compression level used when --compression is set. Ignored otherwise.",
+            help="Compression level for pushed image layers.",
             rich_help_panel="common",
         ),
     ] = 3,

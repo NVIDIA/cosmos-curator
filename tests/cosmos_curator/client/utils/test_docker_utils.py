@@ -19,8 +19,10 @@ import shutil
 import subprocess
 from itertools import pairwise
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from typer.testing import CliRunner
 
 from cosmos_curator.client.image_cli import image_app
 from cosmos_curator.client.utils import docker_utils
@@ -361,9 +363,20 @@ def _capture_build_command(monkeypatch: pytest.MonkeyPatch, **build_kwargs: obje
     return captured["cmd"]
 
 
-def test_build_push_with_zstd_uses_explicit_output_exporter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Compression + push should replace --push with an --output image exporter."""
-    cmd = _capture_build_command(monkeypatch, push=True, load=False, compression="zstd")
+@pytest.mark.parametrize(("compression", "compression_level"), [("gzip", 6), ("zstd", 3)])
+def test_build_push_forces_requested_compression(
+    monkeypatch: pytest.MonkeyPatch,
+    compression: str,
+    compression_level: int,
+) -> None:
+    """Explicit compression applies to every pushed layer, including cached layers."""
+    cmd = _capture_build_command(
+        monkeypatch,
+        push=True,
+        load=False,
+        compression=compression,
+        compression_level=compression_level,
+    )
 
     assert "--push" not in cmd
     output_value = cmd[cmd.index("--output") + 1]
@@ -373,19 +386,51 @@ def test_build_push_with_zstd_uses_explicit_output_exporter(monkeypatch: pytest.
     assert {
         "type=image",
         "push=true",
-        "compression=zstd",
-        "compression-level=3",
-        "force-compression=false",
+        f"compression={compression}",
+        f"compression-level={compression_level}",
+        "force-compression=true",
         "oci-mediatypes=true",
     } <= attributes
 
 
-def test_build_push_without_compression_uses_push_shorthand(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without compression, the fast --push shorthand is preserved."""
-    cmd = _capture_build_command(monkeypatch, push=True, load=False)
+def test_build_push_defaults_to_gzip_with_zstd_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default image export must convert zstd cache layers to gzip for Enroot."""
+    cache_to = "type=registry,ref=reg/img:cache,compression=zstd"
+    cmd = _capture_build_command(
+        monkeypatch,
+        push=True,
+        load=False,
+        cache_from=["type=registry,ref=reg/img:cache"],
+        cache_to=cache_to,
+    )
 
-    assert "--push" in cmd
-    assert "--output" not in cmd
+    attributes = set(cmd[cmd.index("--output") + 1].split(","))
+    assert {"type=image", "push=true", "compression=gzip", "force-compression=true"} <= attributes
+    assert cmd[cmd.index("--cache-to") + 1] == cache_to
+
+
+def test_image_build_cli_defaults_to_gzip(tmp_path: Path) -> None:
+    """CLI defaults must preserve gzip enforcement when forwarding to the builder."""
+    with patch.object(docker_utils.subprocess, "check_call") as check_call:
+        result = CliRunner().invoke(
+            image_app.image_build,
+            [
+                "--curator-path",
+                str(REPO_ROOT),
+                "--dockerfile-output-path",
+                str(tmp_path / "Dockerfile"),
+                "--envs",
+                "",
+                "--push",
+                "--no-load",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    check_call.assert_called_once()
+    cmd = check_call.call_args.args[0]
+    attributes = set(cmd[cmd.index("--output") + 1].split(","))
+    assert {"compression=gzip", "force-compression=true"} <= attributes
 
 
 def test_build_compression_does_not_affect_local_load(monkeypatch: pytest.MonkeyPatch) -> None:
