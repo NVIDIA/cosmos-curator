@@ -25,7 +25,7 @@
 #
 #   di-session --session-path /path/to/clips/<uuid>
 #   di-session --session-path s3://bucket/clips/<uuid>/ --s3-profile-name my-profile --json
-#   di-session --session-path s3://hyperion8/clips/<uuid>/ --endpoint-url <endpoint-url> --limit 5
+#   di-session --session-path s3://bucket/clips/<uuid>/ --endpoint-url <endpoint-url> --limit 5
 #
 # Where a session prefix holds copies of its cameras beside the originals, name the
 # subprefixes that hold the real streams:

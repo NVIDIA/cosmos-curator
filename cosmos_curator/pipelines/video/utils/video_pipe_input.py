@@ -315,7 +315,7 @@ def format_session_videos_tree(
         A multi-line string containing the formatted tree view.
 
     Example output:
-        s3://hyperion8/samples-trimmed/
+        s3://bucket/samples-trimmed/
         ├── SplitPipeTask(0c99dbb9-646e-44b8-9583-2448310cd6a6)
         │   ├── recorder-00/
         │   │   ├── camera_front_tele_30fov.mp4

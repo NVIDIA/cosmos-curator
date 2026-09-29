@@ -101,10 +101,10 @@ The session layout is already settled, and already exercised against the target 
 directory (or cloud prefix) holding one video per camera", and its usage block gives
 `--session-path s3://<bucket>/clips/<uuid>/` as a worked example.
 
-One recording can span several recorder computers: a car with multiple Orins writes a
-`recorder-<NN>/` directory per Orin under one session uuid, and their clocks are expected
-to be synchronized. So the session is the uuid, not the recorder — splitting it per
-recorder would ask `multi_sensor_spread` and `multi_sensor_overlap` whether each Orin
+One recording can span several recorder computers: a vehicle with multiple recorders writes
+a `recorder-<NN>/` directory per recorder under one session uuid, and their clocks are
+expected to be synchronized. So the session is the uuid, not the recorder — splitting it per
+recorder would ask `multi_sensor_spread` and `multi_sensor_overlap` whether each recorder
 agrees with itself, which is not the question those metrics exist to answer.
 
 That makes `input.stream_globs` load-bearing rather than a convenience. Discovery recurses,

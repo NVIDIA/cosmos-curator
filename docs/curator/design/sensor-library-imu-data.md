@@ -55,32 +55,6 @@ sensor-specific batch model.
 
 ## Reference Models Reviewed
 
-### DriveWorks IMU
-
-Public DriveWorks 6.0.9 IMU documentation describes decode/read APIs for IMU
-frames and a public `dwIMUFrame` structure
-([DriveWorks IMU](#ref-driveworks-imu), [DriveWorks IMU types](#ref-driveworks-imu-types)).
-The `IMUTypes.h` reference also lists `dwIMUFrameNew`, but marks it deprecated
-in favor of `dwIMUFrame`; `dwIMUFrame.timestamp_us` is also deprecated in
-favor of the split `hostTimestamp` and `sensorTimestamp` fields
-([DriveWorks IMU types](#ref-driveworks-imu-types)).
-
-Across the DriveWorks fields, the reusable generic signals are:
-
-- angular rate / gyroscope vector in rad/s
-- acceleration vector in m/s^2
-- optional orientation in roll/pitch/yaw and quaternion form
-- optional heading and magnetometer fields
-- per-signal validity metadata indicating which fields are valid
-- distinct source sensor and host timestamps in the current `dwIMUFrame`
-
-This supports keeping angular velocity and linear acceleration as the required
-generic fields, treating orientation and magnetometer as optional, and
-representing validity explicitly rather than relying only on sentinel values.
-It also supports keeping `sensor_timestamps_ns` as the canonical measurement
-time and `host_timestamps_ns` as optional receive-time metadata, instead of
-building the generic API around DriveWorks-only timestamp/status fields.
-
 ### ROS IMU Conventions
 
 ROS `sensor_msgs/Imu` groups orientation, angular velocity, and linear
@@ -198,16 +172,17 @@ Before pipeline execution, smoke-test the mapping with the
 compare rows across sensors.
 
 `sensor_timestamps_ns` is the selected source measurement timestamp for each
-output row. For a DriveWorks parser, prefer a valid `dwIMUFrame.sensorTimestamp`
-when available and convert it to public `np.int64` nanoseconds. If a source API
-only exposes a single frame timestamp, the parser may map that timestamp to
-`sensor_timestamps_ns` but should document the source meaning.
+output row. When a source distinguishes measurement time from receive time, a
+parser should prefer the measurement timestamp and convert it to public
+`np.int64` nanoseconds. If a source API only exposes a single frame timestamp,
+the parser may map that timestamp to `sensor_timestamps_ns` but should document
+the source meaning.
 
-`host_timestamps_ns` is optional receive-time metadata. For DriveWorks, it maps
-to `dwIMUFrame.hostTimestamp` when that signal is valid. It should not replace
-`sensor_timestamps_ns` for alignment by default. An integration may explicitly
-choose a stable host clock when the sensor clock repeats or is unsuitable, but
-must document that policy.
+`host_timestamps_ns` is optional receive-time metadata. A parser should
+populate it from the source's receive-time timestamp when the source exposes
+one and marks it valid. It should not replace `sensor_timestamps_ns` for
+alignment by default. An integration may explicitly choose a stable host clock
+when the sensor clock repeats or is unsuitable, but must document that policy.
 
 Keep timestamp quality, time-sync status, timestamp-format enums, and the
 original units/source field names in parser-specific metadata unless multiple
@@ -247,11 +222,11 @@ and explicit per-source translations are defined. Bias-estimate timestamps are
 also deferred: a sample timestamp must not be relabeled as the estimate time of
 a bias that may have been computed earlier.
 
-This avoids overloading floating-point values with data-quality semantics and
-matches DriveWorks' explicit validity model more closely than NaN-only
-handling. It also keeps compatibility with ROS-style covariance conventions:
-unknown covariance can be represented by `None`, and known covariance by an
-explicit `(N, 3, 3)` array.
+Explicit boolean masks keep data-quality semantics out of the floating-point
+values themselves, so a consumer never has to distinguish a real measurement
+from a sentinel. It also keeps compatibility with ROS-style covariance
+conventions: unknown covariance can be represented by `None`, and known
+covariance by an explicit `(N, 3, 3)` array.
 
 ## Coordinate Frames
 
@@ -271,12 +246,10 @@ Recommended defaults:
 
 ## Validation Constraints
 
-The reviewed DriveWorks, ROS, and PX4 references support validation
-constraints, not universal physical min/max ranges. DriveWorks leaves numeric
-min/max unspecified for core IMU values, while ROS `sensor_msgs/Imu` and PX4
+The reviewed ROS and PX4 references support validation constraints, not
+universal physical min/max ranges. ROS `sensor_msgs/Imu` and PX4
 `SensorCombined` specify SI units and measurement semantics rather than hard
-bounds ([DriveWorks IMU types](#ref-driveworks-imu-types),
-[ROS Imu](#ref-ros-imu), [PX4 SensorCombined](#ref-px4-sensor-combined)).
+bounds ([ROS Imu](#ref-ros-imu), [PX4 SensorCombined](#ref-px4-sensor-combined)).
 
 Timestamp dtype and ordering constraints are covered in the required-field
 table. Non-timestamp fields should use these constraints:
@@ -469,20 +442,19 @@ The implementation includes:
    generic MCAP, and `SensorGroup` tests under
    `tests/cosmos_curator/core/sensors/`.
 
-DriveWorks 6.0.9 documentation was reviewed as part of this design. The
-implementation keeps `sensor_timestamps_ns` as the canonical selected source
-measurement timestamp, maps DriveWorks `hostTimestamp` to optional
-`host_timestamps_ns` when valid, and keeps DriveWorks quality/status,
+The implementation keeps `sensor_timestamps_ns` as the canonical selected
+source measurement timestamp, maps a source's receive-time timestamp to
+optional `host_timestamps_ns` when valid, and keeps source quality/status,
 alignment, and time-sync fields parser-specific unless a generic downstream
-consumer needs them. DriveWorks, ROS, and PX4 references support validation
-constraints, not universal physical min/max ranges; `ImuData` validates dtype,
-shape, finite-value, quaternion-norm, covariance, and validity-mask constraints
-for non-timestamp fields, but does not add generic physical min/max bounds for
-angular velocity, linear acceleration, or temperature.
+consumer needs them. Validation is constraint-based rather than range-based:
+`ImuData` validates dtype, shape, finite-value, quaternion-norm, covariance,
+and validity-mask constraints for non-timestamp fields, but does not add
+generic physical min/max bounds for angular velocity, linear acceleration, or
+temperature.
 
 ## Open Follow-Up Questions
 
-- Should parser-specific status fields such as DriveWorks quality, alignment,
+- Should parser-specific status fields such as sample quality, alignment,
   and time-sync values live in sidecar metadata, a typed optional status
   structure, or a future per-parser subclass?
 - Do downstream consumers need all decoded IMU source samples per aligned
@@ -506,12 +478,6 @@ angular velocity, linear acceleration, or temperature.
   `cosmos_curator/core/sensors/data/video.py`
 - <a id="ref-validation-helpers"></a>Sensor validation helpers:
   `cosmos_curator/core/sensors/utils/validation.py`
-- <a id="ref-driveworks-imu"></a>DriveWorks SDK Reference: IMU Sensor
-  (Drive OS 6.0.9, DriveWorks 5.16.65):
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/group__imu__group.html>
-- <a id="ref-driveworks-imu-types"></a>DriveWorks SDK Reference:
-  `IMUTypes.h` (Drive OS 6.0.9, DriveWorks 5.16.65):
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/IMUTypes_8h.html>
 - <a id="ref-ros-imu"></a>ROS 2 Jazzy `sensor_msgs/msg/Imu`:
   <https://docs.ros.org/en/jazzy/p/sensor_msgs/msg/Imu.html>
 - <a id="ref-ros-rep-103"></a>ROS REP 103: Standard Units of Measure and

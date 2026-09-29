@@ -65,35 +65,6 @@ GPS-specific batch model.
 
 ## Reference Models Reviewed
 
-### DriveWorks GPS
-
-Public DriveWorks 6.0.9 GPS documentation exposes GPS frame APIs in two forms:
-the GPS sensor group page lists `dwGPSFrameNew`, while the `GPSFrame.h`
-reference for the same release defines `dwGPSFrame` with `validityInfo` fields
-and deprecates older `dwGPSFlags` values in favor of those per-signal validity
-fields ([DriveWorks GPS](#ref-driveworks-gps),
-[DriveWorks GPS frame](#ref-driveworks-gps-frame)). Across those GPS frame
-docs, the reusable fields are latitude, longitude, WGS-84 ellipsoid altitude,
-speed, course, climb, horizontal/vertical/position dilution of precision,
-horizontal/vertical accuracy, satellite count, fix status, GPS mode, UTC time,
-timestamp quality, and per-signal validity metadata.
-DriveWorks also notes that a GPS frame can be only partially filled depending
-on sensor capabilities, with validity flags indicating which fields are valid
-([DriveWorks GPS read](#ref-driveworks-gps-read)).
-
-DriveWorks also documents raw decode APIs such as
-`dwSensorGPS_processRawDataNew`, which accept undecoded GPS bytes and enqueue
-decoded GPS frames ([DriveWorks GPS](#ref-driveworks-gps)). This supports
-keeping `GpsData` as a decoded SI-unit payload while leaving raw receiver bytes,
-protocol packets, and virtual-sensor log layouts parser-specific.
-
-DriveWorks timestamp documentation shows that GPS frame timestamps can be
-configured as host, synced, smoothed, or raw depending on sensor protocol
-([DriveWorks GPS timestamps](#ref-driveworks-gps-timestamps)). This supports
-keeping `sensor_timestamps_ns` as the generic selected source timestamp, adding
-optional host/UTC timestamp arrays, and documenting parser-specific timestamp
-meaning instead of baking one DriveWorks timestamp mode into `GpsData`.
-
 ### ROS NavSatFix and NavSatStatus
 
 ROS `sensor_msgs/NavSatFix` models a GNSS fix in WGS-84 coordinates with
@@ -225,10 +196,11 @@ Because alignment sees the whole session, a nearest `sensor_timestamps_ns`
 value can fall outside the clip span it was requested for, so it records true
 source provenance rather than a span-bounded value.
 
-`host_timestamps_ns` is optional receive-time metadata. For DriveWorks, it can
-map to host timestamp output modes when configured. It should not replace
-`sensor_timestamps_ns` for alignment unless a parser explicitly documents that
-the source has no better measurement timestamp.
+`host_timestamps_ns` is optional receive-time metadata. A parser should
+populate it from the source's receive-time timestamp when the source exposes
+one. It should not replace `sensor_timestamps_ns` for alignment unless a
+parser explicitly documents that the source has no better measurement
+timestamp.
 
 `utc_timestamps_ns` is optional GNSS/receiver UTC time. It should be present
 only when the source provides a meaningful UTC timestamp. PX4 documents `0` as
@@ -266,7 +238,7 @@ valid are required to satisfy the field's finite/nonnegative constraints.
 Keep these source-specific values out of the required `GpsData` core unless a
 consumer needs compatible cross-source semantics:
 
-- DriveWorks GPS mode, timestamp quality, and per-signal validity details
+- source-specific GNSS mode, timestamp quality, and per-signal validity details
 - ROS GNSS service bitmasks
 - PX4 jamming, spoofing, authentication, RTCM, receiver system error, and
   antenna-offset fields
@@ -275,10 +247,10 @@ consumer needs compatible cross-source semantics:
 
 ## Validation Constraints
 
-The reviewed DriveWorks, ROS, and PX4 references define units and message
-semantics more clearly than universal physical min/max ranges. `GpsData`
-enforces structural and basic geographic constraints, while avoiding arbitrary
-vehicle- or receiver-specific bounds.
+The reviewed ROS and PX4 references define units and message semantics more
+clearly than universal physical min/max ranges. `GpsData` enforces structural
+and basic geographic constraints, while avoiding arbitrary vehicle- or
+receiver-specific bounds.
 
 Timestamp dtype and ordering constraints are covered in the required-field
 table. Non-timestamp fields use these constraints:
@@ -356,18 +328,6 @@ and filtering semantics than GPS/GNSS fix rows.
   `cosmos_curator/core/sensors/data/video.py`
 - <a id="ref-validation-helpers"></a>Sensor validation helpers:
   `cosmos_curator/core/sensors/utils/validation.py`
-- <a id="ref-driveworks-gps"></a>DriveWorks SDK Reference: GPS Sensor
-  (Drive OS 6.0.9, DriveWorks 5.16.65):
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/group__gps__group.html>
-- <a id="ref-driveworks-gps-frame"></a>DriveWorks SDK Reference:
-  `GPSFrame.h` (Drive OS 6.0.9, DriveWorks 5.16.65):
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/GPSFrame_8h.html>
-- <a id="ref-driveworks-gps-read"></a>DriveWorks SDK Reference: Reading GPS
-  data from sensor:
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/gps_usecase1.html>
-- <a id="ref-driveworks-gps-timestamps"></a>DriveWorks SDK Reference:
-  Timestamp options:
-  <https://developer.nvidia.com/docs/drive/drive-os/6.0.9/public/driveworks-nvsdk/gps_usecase3.html>
 - <a id="ref-ros-navsat-fix"></a>ROS 2 Jazzy `sensor_msgs/msg/NavSatFix`:
   <https://docs.ros.org/en/jazzy/p/sensor_msgs/msg/NavSatFix.html>
 - <a id="ref-ros-navsat-status"></a>ROS 2 Jazzy
