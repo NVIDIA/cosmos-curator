@@ -36,7 +36,7 @@ import zipfile
 from collections.abc import Callable, Mapping, MutableSequence
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import Manager
-from multiprocessing.sharedctypes import Synchronized
+from multiprocessing.managers import ValueProxy
 from queue import Empty
 from typing import Any, cast
 
@@ -286,7 +286,7 @@ def _env_json_str_map(name: str) -> dict[str, str] | None:
     empty_value_keys = sorted(str(k) for k, v in parsed.items() if v in (None, ""))
     if empty_value_keys:
         logger.warning(f"Ignoring run attributes with invalid values from {name}: {', '.join(empty_value_keys)}")
-    return {str(k): str(v) for k, v in parsed.items() if isinstance(k, str) and k and v not in (None, "")}
+    return {k: str(v) for k, v in parsed.items() if isinstance(k, str) and k and v not in (None, "")}
 
 
 def _set_env_default(args: argparse.Namespace, attr_name: str, value_fn: Callable[[], object | None]) -> None:
@@ -328,7 +328,7 @@ def _apply_observability_env_defaults(args: argparse.Namespace) -> None:
 def _setup_request(
     output_dir: str,
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
-    ipc_status: Synchronized,  # type: ignore[type-arg]
+    ipc_status: ValueProxy[bool],
     req_id: str,
     logs: list[str] | MutableSequence[Any],
 ) -> tuple[threading.Thread, threading.Event]:
@@ -1239,7 +1239,7 @@ def _run_in_process(
     request_id: str,
     pipeline_args: argparse.Namespace,
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
-    ipc_status: Synchronized,  # type: ignore[type-arg]
+    ipc_status: ValueProxy[bool],
 ) -> None:
     """Run the function in a process, capturing its output.
 
@@ -1296,7 +1296,7 @@ except Exception:
 def _do_run_process(
     cmd: list[str],
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
-    ipc_status: Synchronized,  # type: ignore[type-arg]
+    ipc_status: ValueProxy[bool],
 ) -> None:
     process = subprocess.Popen(  # noqa: S603
         cmd,
@@ -1331,7 +1331,7 @@ def execute_pipeline(  # noqa: PLR0913
     request_id: str | None,
     pipeline_args: argparse.Namespace,
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
-    ipc_status: Synchronized,  # type: ignore[type-arg]
+    ipc_status: ValueProxy[bool],
 ) -> None:
     """Run the video pipeline in a separate process and capture its output."""
     if request_id is None:
@@ -1368,7 +1368,7 @@ def update_progress(  # noqa: C901, PLR0912, PLR0913, PLR0915
     output_dir: str,
     stop_event: threading.Event,
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
-    ipc_status: Synchronized,  # type: ignore[type-arg]
+    ipc_status: ValueProxy[bool],
     request_id: str,
     logs: list[str],
 ) -> None:
