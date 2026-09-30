@@ -239,7 +239,7 @@ def test_vllm_omni_is_isolated_to_style_transfer_environment() -> None:
     features = pixi_config["feature"]
 
     assert "vllm-omni" not in features["runtime"]["pypi-dependencies"]
-    assert features["vllm-omni"]["pypi-dependencies"] == {"vllm-omni": "==0.28.0"}
+    assert features["vllm-omni"]["pypi-dependencies"] == {"vllm-omni": "==0.30.0"}
     assert pixi_config["environments"]["style-transfer"] == [
         "core",
         "runtime",

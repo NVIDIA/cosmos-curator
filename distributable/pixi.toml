@@ -83,6 +83,7 @@ platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 [feature.runtime.dependencies]
 cuda-libraries-dev = "==13.0.3"
 gpustat = "*"
+huggingface_hub = ">=1.31.0"
 libgl = "*"
 pycountry = "*"
 
@@ -97,7 +98,7 @@ PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.13.0"
 torchvision = "==0.28.0"
-vllm = "==0.28.0"
+vllm = "==0.30.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/" }
 paddleocr = "==2.10.*"
 
@@ -130,10 +131,10 @@ nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
 [feature.vllm-omni.dependencies]
-transformers = "<5.15"
+transformers = ">=5.13.0,<5.15"
 
 [feature.vllm-omni.pypi-dependencies]
-vllm-omni = "==0.28.0"
+vllm-omni = "==0.30.0"
 
 [feature.cuml]
 channels = ["nvidia"]
