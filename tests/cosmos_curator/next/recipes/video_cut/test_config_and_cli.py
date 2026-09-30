@@ -11,11 +11,13 @@ import yaml
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.next.recipes.video_cut import pipeline
 from cosmos_curator.next.recipes.video_cut.config import (
     InputConfig,
     OutputConfig,
     ResolvedVideoCutConfig,
+    TransNetV2Config,
     config_template,
     resolve_config_data,
 )
@@ -179,3 +181,78 @@ def test_cli_template_render_schema_and_dispatch(
     assert "video-cut:" in captured.out
     assert captured.err == ""
     assert seen == [config]
+
+
+def test_transnetv2_resolution_and_contract(config: ResolvedVideoCutConfig) -> None:
+    """Scene cuts have their own contract, while placement and batching do not affect reuse."""
+    raw = config.model_dump(mode="json")
+    raw["split"] = {"method": "transnetv2"}
+    raw.pop("execution")
+    resolved = resolve_config_data(raw)
+    assert isinstance(resolved.split, TransNetV2Config)
+    assert resolved.split.decoder == "pyav"
+    assert resolved.execution.sources_per_checkpoint == 32
+    assert resolved.split.contract_id != config.split.contract_id
+    model = resolve_registered_model("transnetv2")
+    assert resolved.split.cutting_contract["model"] == {
+        "model_id": model.model_id,
+        "revision": model.revision,
+        "precision": model.precision,
+    }
+    tuned = resolve_config_data(
+        raw,
+        overrides=[
+            "execution.transnetv2.gpus=0.5",
+            "execution.transnetv2.cpus=4",
+            "execution.transnetv2.memory_gib=8",
+            "execution.transnetv2.inference_cpus=0.5",
+            "execution.transnetv2.inference_memory_gib=3",
+            "execution.transnetv2.window_batch_size=8",
+            "execution.sources_per_checkpoint=1",
+        ],
+    )
+    assert tuned.split.contract_id == resolved.split.contract_id
+    assert tuned.execution.sources_per_checkpoint == 1
+    assert tuned.execution.transnetv2.cpus == 4
+    assert tuned.execution.transnetv2.memory_gib == 8
+    assert tuned.execution.transnetv2.inference_cpus == 0.5
+    assert tuned.execution.transnetv2.inference_memory_gib == 3
+    assert resolve_config_data(raw, overrides=["split.threshold=0.5"]).split.contract_id != resolved.split.contract_id
+    assert resolve_config_data(resolved.model_dump(mode="json")) == resolved
+
+
+def test_nvdec_has_a_separate_cutting_contract() -> None:
+    """GPU resizing can change predictions, so it must not reuse PyAV source checkpoints."""
+    cpu = TransNetV2Config()
+    assert cpu.decoder == "pyav"
+    assert cpu.contract_id == TransNetV2Config(decoder="pyav").contract_id
+    assert cpu.cutting_contract["decode"] == "pyav-rgb24-48x27-presentation-timestamps-v1"
+    gpu = TransNetV2Config(decoder="nvdec")
+    assert gpu.decoder == "nvdec"
+    assert gpu.contract_id != cpu.contract_id
+    assert gpu.cutting_contract["model"] == cpu.cutting_contract["model"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "split.threshold=1.1",
+        "split.threshold=-0.1",
+        "split.max_duration_s=1.0",
+        "split.min_duration_s=0.0000000001",
+        "split.stride_s=10.0",
+        "execution.transnetv2.gpus=0",
+        "execution.transnetv2.cpus=0",
+        "execution.transnetv2.memory_gib=0",
+        "execution.transnetv2.inference_cpus=0",
+        "execution.transnetv2.inference_memory_gib=0",
+        "execution.transnetv2.window_batch_size=0",
+        "execution.transnetv2.weights_path=/config/models/transnetv2.pth",
+    ],
+)
+def test_invalid_transnetv2_settings(config: ResolvedVideoCutConfig, override: str) -> None:
+    """Method-specific settings reject fixed-stride options and invalid resources offline."""
+    raw = config.model_dump(mode="json")
+    raw["split"] = {"method": "transnetv2"}
+    with pytest.raises(ValidationError):
+        resolve_config_data(raw, overrides=[override])

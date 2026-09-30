@@ -20,6 +20,7 @@ from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options
+from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
 from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_progress,
     configure_ray_data_stability,
@@ -145,9 +146,7 @@ def transcode_spans(dataset: lance.LanceDataset, config: ResolvedVideoTranscodeC
         # Hash-shuffle actors retain CPU/memory reservations until the whole
         # execution ends. Sort tasks release theirs before downloads begin.
         spans.context.shuffle_strategy = ShuffleStrategy.SORT_SHUFFLE_PULL_BASED
-        # One in-flight task per actor cannot reach Ray's default 1.75 scaling
-        # threshold. Scope this to the media plan, not subsequent publication.
-        spans.context.autoscaling_config.actor_pool_util_upscaling_threshold = 1.0
+        configure_download_actor_autoscaling(spans.context)
         sources = spans.groupby("source_id").map_groups(
             group_source_spans,
             batch_format="pyarrow",

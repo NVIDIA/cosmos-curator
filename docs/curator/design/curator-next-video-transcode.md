@@ -53,6 +53,8 @@ actors and their in-flight tasks can restart after worker loss. The download cal
 not required progress or a source-payload cache. The media plan sets the actor upscaling threshold to 1.0: Ray's default
 1.75 cannot be reached with one in-flight task per actor. Pending actors count toward utilization, preventing repeated scale-up while
 the next actor waits for capacity. These settings do not change the ambient context used by publication.
+The shared download-autoscaling utility also cancels surplus pending IO actors when ready actors are idle, allowing
+Ray 2.58's normal scale-down to proceed. Ray's cooldown, minimum pool size, and future scale-up remain in effect.
 
 Uploads reserve 0.25 CPU and rely on Ray's normal backpressure. Only the transcode stage reserves
 `execution.transcode_cpus`. It also reserves `execution.transcode_memory_gib` (default: 4 GiB) per task, independently of

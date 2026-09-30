@@ -14,13 +14,49 @@
 # limitations under the License.
 """Functional tests for TransNetV2ClipExtractionStage."""
 
+from functools import partial
+from pathlib import Path
+from unittest.mock import Mock
+
+import numpy as np
 import pytest
+import torch
 
 from cosmos_curator.core.interfaces.pipeline_interface import run_pipeline
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
+from cosmos_curator.models import transnetv2
 from cosmos_curator.pipelines.video.clipping.frame_extraction_stages import VideoFrameExtractionStage
 from cosmos_curator.pipelines.video.clipping.transnetv2_extraction_stages import TransNetV2ClipExtractionStage
-from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask
+from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask, Video, VideoMetadata
+
+
+def test_stage_uses_shared_inference_with_padded_final_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy stage consumes the shared boolean mask and pads its final model input."""
+    frames = np.broadcast_to(np.arange(75, dtype=np.uint8)[:, None, None, None], (75, 27, 48, 3))
+    video = Video(
+        input_video=Path("source.mp4"),
+        frame_array=frames,
+        metadata=VideoMetadata(height=27, width=48, duration=3.0, framerate=25.0, num_frames=75, video_codec="h264"),
+    )
+    task = SplitPipeTask(session_id="test-session", video=video)
+    seen = []
+
+    def model(inputs: torch.Tensor) -> torch.Tensor:
+        assert tuple(inputs.shape) == (1, 100, 27, 48, 3)
+        seen.extend(inputs[:, :, 0, 0, 0].tolist())
+        return (inputs[:, :, 0, 0, 0] == 50).float().unsqueeze(-1)
+
+    monkeypatch.setattr(transnetv2, "predict_transitions", partial(transnetv2.predict_transitions, device="cpu"))
+    stage = TransNetV2ClipExtractionStage(
+        min_length_s=None, min_length_frames=None, max_length_s=None, crop_s=0.0, limit_clips=1
+    )
+    stage._model = Mock(side_effect=model)
+    stage.process_data([task])
+
+    assert len(seen) == 2
+    assert seen[-1][50:] == [74] * 50
+    assert [clip.span for clip in video.clips] == [(0.0, 2.0)]
+    assert not video.frame_array
 
 
 @pytest.mark.env("default")

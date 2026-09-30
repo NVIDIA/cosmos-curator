@@ -16,11 +16,12 @@
 """Tests for the Ray Data TransNetV2 splitter helpers."""
 
 import uuid
+from functools import partial
 from typing import Any
 
 import numpy as np
-import numpy.typing as npt
 import pytest
+import torch
 
 from cosmos_curator.pipelines.ray_data.video_split import _transnetv2_splitter as _splitter
 
@@ -28,24 +29,23 @@ from cosmos_curator.pipelines.ray_data.video_split import _transnetv2_splitter a
 def test_split_transnetv2_frames_outputs_clip_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     """TransNetV2 spans should match the downstream Ray Data clip-column contract."""
 
-    def fake_get_predictions(
-        _model: object,
-        frames: npt.NDArray[np.uint8],
-        _threshold: float,
-    ) -> npt.NDArray[np.uint8]:
-        predictions = np.zeros((len(frames), 1), dtype=np.uint8)
-        predictions[50] = 1
-        return predictions
+    def model(inputs: torch.Tensor) -> torch.Tensor:
+        assert tuple(inputs.shape[1:]) == (100, 27, 48, 3)
+        return (inputs[:, :, 0, 0, 0] == 50).float().unsqueeze(-1)
 
-    monkeypatch.setattr(_splitter, "_get_predictions", fake_get_predictions)
-    frames = np.zeros((100, 27, 48, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        _splitter.transnetv2,
+        "predict_transitions",
+        partial(_splitter.transnetv2.predict_transitions, device="cpu"),
+    )
+    frames = np.broadcast_to(np.arange(100, dtype=np.uint8)[:, None, None, None], (100, 27, 48, 3))
     video_path = "s3://bucket/raw/video.mp4"
 
     clip_uuids, clip_starts, clip_ends = _splitter.split_transnetv2_frames(
         frames=frames,
         video_path=video_path,
         fps=25.0,
-        model=lambda _batch: None,  # type: ignore[arg-type, return-value]
+        model=model,
         threshold=0.4,
         min_length_s=None,
         min_length_frames=None,
@@ -65,22 +65,18 @@ def test_split_transnetv2_frames_uses_full_scene_when_no_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The no-transition behavior should preserve Xenna's full-scene default."""
-
-    def fake_get_predictions(
-        _model: object,
-        frames: npt.NDArray[np.uint8],
-        _threshold: float,
-    ) -> npt.NDArray[np.uint8]:
-        return np.zeros((len(frames), 1), dtype=np.uint8)
-
-    monkeypatch.setattr(_splitter, "_get_predictions", fake_get_predictions)
+    monkeypatch.setattr(
+        _splitter.transnetv2,
+        "predict_transitions",
+        partial(_splitter.transnetv2.predict_transitions, device="cpu"),
+    )
     frames = np.zeros((80, 27, 48, 3), dtype=np.uint8)
 
     _, clip_starts, clip_ends = _splitter.split_transnetv2_frames(
         frames=frames,
         video_path="/videos/a.mp4",
         fps=20.0,
-        model=lambda _batch: None,  # type: ignore[arg-type, return-value]
+        model=lambda inputs: torch.zeros((*inputs.shape[:2], 1)),
         threshold=1.0,
         min_length_s=None,
         min_length_frames=None,

@@ -16,13 +16,11 @@
 
 import math
 import uuid
-from collections.abc import Callable, Generator
 from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
 import nvtx  # type: ignore[import-untyped]
-import torch
 from loguru import logger
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
@@ -183,7 +181,9 @@ class TransNetV2ClipExtractionStage(CuratorStage):
                 if tuple(frames.shape[1:4]) != (27, 48, 3):
                     error_msg = f"Expected frames of shape 27x48x3, got {frames.shape[1:4]}."
                     raise ValueError(error_msg)
-                predictions = _get_predictions(self._model, frames, self.threshold)
+                predictions = transnetv2.predict_transitions(
+                    self._model, frames, threshold=self.threshold, window_batch_size=1
+                )
                 scenes = _get_scenes(predictions, entire_scene_as_clip=self.entire_scene_as_clip)
                 if self._verbose:
                     logger.info(f"{video.input_video} returned {scenes.shape[0]} scenes")
@@ -223,61 +223,11 @@ class TransNetV2ClipExtractionStage(CuratorStage):
         return tasks
 
 
-def _get_batches(
-    frames: npt.NDArray[np.uint8],
-) -> Generator[npt.NDArray[np.uint8]]:
-    """We fetch 100 frames, and pad the first and last batches accordingly with the first or last frame."""
-    total_frames = len(frames)
-    twentyfive: int = 25
-    reminder = -total_frames % 50
-    for i in range(0, total_frames + reminder, 50):
-        start_idx = max(i - twentyfive, 0)
-        end_idx = min(i + 75, total_frames)
-        batch = frames[start_idx:end_idx]
-        # Add padding at the beginning if necessary
-        if i < twentyfive:
-            padding_start = [frames[0]] * (twentyfive - i)
-            batch = np.concatenate([padding_start, batch], axis=0)
-        # Add padding at the end if necessary
-        if end_idx > total_frames:
-            padding_end = [frames[-1]] * (end_idx - total_frames)
-            batch = np.concatenate([batch, padding_end], axis=0)
-        yield batch
-
-
-def _get_predictions(
-    model: Callable[[torch.Tensor], torch.Tensor],
-    frames: npt.NDArray[np.uint8],
-    threshold: float,
-) -> npt.NDArray[np.uint8]:
-    """Get predictions from the video frame array.
-
-    Args:
-        model: shot detection model.
-        frames: uint8 array of shape (# frames, height, width, 3), with RGB channels.
-        threshold: probability threshold for shot detection.
-
-    Returns:
-        0/1 prediction array of shape (# frames, 1)
-
-    """
-    fndims: int = 4
-    assert frames.ndim == fndims, "Expected frames tensor to have rank 4."
-    predictions = []
-    for batch in _get_batches(frames):
-        batch_gpu = torch.from_numpy(batch.copy()).cuda()
-        one_hot = model(batch_gpu.unsqueeze(0))
-        predictions.append(one_hot[0, 25:75])
-    predictions_ts = torch.concatenate(predictions, 0)[: len(frames)]
-    return (predictions_ts > threshold).to(torch.uint8).cpu().numpy()
-
-
-def _get_scenes(predictions: npt.NDArray[np.uint8], *, entire_scene_as_clip: bool) -> npt.NDArray[np.int32]:
+def _get_scenes(predictions: npt.NDArray[np.bool_], *, entire_scene_as_clip: bool) -> npt.NDArray[np.int32]:
     """Convert prediction array to scene array.
 
     Args:
-        predictions: array of shape [# frames, 1].
-            Values are 1 if frame is a shot transition, and 0 if it's not.
+        predictions: boolean array of shape [# frames], true for shot-transition frames.
         entire_scene_as_clip (bool):
             If there are _no_ shot transitions found, this will make a scene spanning the whole video.
 

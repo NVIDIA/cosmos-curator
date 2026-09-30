@@ -421,7 +421,7 @@ def test_resumed_workspace_cleanup_is_best_effort(
 
     monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda: None)
     monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda **_: None)
-    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda: None)
+    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda **_: None)
     monkeypatch.setattr(pipeline, "cut_sources", lambda *_: None)
     monkeypatch.setattr(
         pipeline,

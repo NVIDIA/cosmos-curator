@@ -19,12 +19,16 @@ from ray.data.checkpoint import CheckpointConfig
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource, ReadTask
 
+from cosmos_curator.core.utils import environment
+from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
+from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
 from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_progress,
     configure_ray_data_stability,
+    curator_io_resources,
     ensure_ray_initialized,
 )
-from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig
+from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig, TransNetV2Config
 from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id, span_schema
 from cosmos_curator.next.recipes.video_cut.discovery import resolve_input_uris
 from cosmos_curator.next.recipes.video_cut.processing import plan_sources
@@ -113,13 +117,16 @@ def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uri
             SourceDatasource(source_uris),
             override_num_blocks=min(len(source_uris), 256),
         )
-        planned = sources.map_batches(
-            cast("Any", plan_sources),
-            batch_size=None,
-            batch_format="pyarrow",
-            fn_kwargs={"split": config.split, "execution": config.execution},
-            num_cpus=config.execution.probe_cpus,
-        )
+        if isinstance(config.split, TransNetV2Config):
+            planned = _transnetv2_plan(sources, config)
+        else:
+            planned = sources.map_batches(
+                cast("Any", plan_sources),
+                batch_size=None,
+                batch_format="pyarrow",
+                fn_kwargs={"split": config.split, "execution": config.execution},
+                num_cpus=config.execution.probe_cpus,
+            )
         groups = planned.repartition(target_num_rows_per_block=config.execution.sources_per_checkpoint, strict=True)
         groups.write_parquet(
             workspace.results,
@@ -127,6 +134,58 @@ def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uri
             min_rows_per_file=config.execution.sources_per_checkpoint,
             max_rows_per_file=config.execution.sources_per_checkpoint,
         )
+
+
+def _transnetv2_plan(sources: ray.data.Dataset, config: ResolvedVideoCutConfig) -> ray.data.Dataset:
+    from cosmos_curator.next.recipes.video_cut.transnetv2 import (  # noqa: PLC0415
+        SourceDownloader,
+        TransNetV2Planner,
+        decode_sources,
+    )
+
+    assert isinstance(config.split, TransNetV2Config)
+    configure_download_actor_autoscaling(sources.context)
+    downloaded = sources.map(
+        cast("Any", SourceDownloader),
+        fn_constructor_kwargs={"storage_profile": config.execution.storage_profile},
+        compute=ray.data.ActorPoolStrategy(min_size=1, max_tasks_in_flight_per_actor=1),
+        num_cpus=0.25,
+        resources={environment.CURATOR_IO_RESOURCE_NAME: 1.0},
+        max_concurrency=1,
+        max_restarts=-1,
+        max_task_retries=3,
+    )
+    execution = config.execution.transnetv2
+    decoded = downloaded
+    inference_memory_gib = execution.inference_memory_gib
+    if config.split.decoder == "pyav":
+        decoded = downloaded.map_batches(
+            cast("Any", decode_sources),
+            fn_kwargs={"execution": config.execution},
+            batch_size=1,
+            batch_format="pyarrow",
+            num_cpus=execution.cpus,
+            num_gpus=0,
+            memory=int(execution.memory_gib * 1024**3),
+            max_retries=3,
+        )
+    else:
+        # NVDEC and inference share a GPU actor; account for both host-memory needs.
+        inference_memory_gib += execution.memory_gib
+    return decoded.map_batches(
+        TransNetV2Planner,
+        fn_constructor_kwargs={"split": config.split, "execution": config.execution},
+        batch_size=1,
+        batch_format="pyarrow",
+        compute=ray.data.ActorPoolStrategy(min_size=1, max_tasks_in_flight_per_actor=1),
+        num_cpus=execution.inference_cpus,
+        num_gpus=execution.gpus,
+        memory=int(inference_memory_gib * 1024**3),
+        max_concurrency=1,
+        max_restarts=-1,
+        max_task_retries=3,
+        runtime_env=ray_data_gpu_runtime_env("default"),
+    )
 
 
 def _write_error_report(outcomes: ray.data.Dataset, config: ResolvedVideoCutConfig, input_snapshot_id: str) -> str:
@@ -254,9 +313,17 @@ def _run_pending(
 ) -> tuple[lance.LanceDataset, dict[str, Any], bool]:
     """Process one finite selection of new sources and clean only its own workspace."""
     workspace = resolve_workspace(config, input_snapshot_id)
-    ensure_ray_initialized()
+    if isinstance(config.split, TransNetV2Config):
+        from cosmos_curator.next.recipes.video_cut.transnetv2 import validate_weights  # noqa: PLC0415
+
+        validate_weights()
+        ensure_ray_initialized(local_resources=curator_io_resources())
+    else:
+        ensure_ray_initialized()
     configure_ray_data_progress(progress=config.execution.progress)
-    configure_ray_data_stability()
+    # TransNetV2 downloads whole sources with concurrency bounded by curator_io.
+    # Suppress reservation warnings while retaining logical memory and backpressure.
+    configure_ray_data_stability(disable_high_memory_detector=isinstance(config.split, TransNetV2Config))
     cut_sources(config, workspace, pending)
     dataset = publish_spans(config, workspace, input_snapshot_id=input_snapshot_id, source_uris=pending)
     publication = completed_publication(dataset, input_snapshot_id)

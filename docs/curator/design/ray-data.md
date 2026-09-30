@@ -161,6 +161,13 @@ threshold (1.0 for one in-flight task and concurrency one), and do not derive a 
 resource snapshot. Actors hold slots while idle or backpressured too; task admission and payload memory budgets remain
 separate concerns.
 
+Ray 2.58 also suppresses utilization-based scale-down while an actor is pending. If idle actors hold all IO slots,
+an extra pending actor can therefore prevent the pool from shrinking. Video-cut's TransNetV2 plan and video-transcode
+use `next.core.ray_autoscaling.configure_download_actor_autoscaling` on their media dataset contexts. Its execution
+callback cancels a surplus pending IO actor only when ready actors have spare capacity and utilization reaches Ray's
+scale-down threshold. Ray still owns the cooldown, minimum pool size, retirement of idle actors, and future scale-up.
+This workaround depends on the pinned Ray executor and actor-pool interfaces; revisit it when upgrading Ray.
+
 ### S3-compatible object storage (GCS)
 
 An `s3://` location may resolve through a storage profile to Google Cloud

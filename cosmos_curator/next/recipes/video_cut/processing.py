@@ -4,6 +4,7 @@
 """Source-local probing and fixed-stride planning; no recovery decisions."""
 
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -12,21 +13,28 @@ from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
 from cosmos_curator.next.media.ffmpeg import MediaError, ProbeError, VideoMetadata, probe_video_source
-from cosmos_curator.next.media.spans import fixed_stride_spans, seconds_to_nanoseconds
-from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, FixedStrideConfig
+from cosmos_curator.next.media.spans import Span, fixed_stride_spans, seconds_to_nanoseconds
+from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, FixedStrideConfig, SplitConfig
 from cosmos_curator.next.recipes.video_cut.contracts import SOURCE_SCHEMA, make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_cut.storage import s3_client
 
 
 def source_result(uri: str, metadata: VideoMetadata, size_bytes: int, split: FixedStrideConfig) -> dict[str, Any]:
     """Build one complete source plan, including a successful empty span list."""
-    result = _envelope(uri, split)
     spans = fixed_stride_spans(
         metadata.duration_ns,
         duration_ns=seconds_to_nanoseconds(split.duration_s),
         stride_ns=seconds_to_nanoseconds(split.stride_s),
         min_duration_ns=seconds_to_nanoseconds(split.min_duration_s),
     )
+    return result_from_spans(uri, metadata, size_bytes, split, spans)
+
+
+def result_from_spans(
+    uri: str, metadata: VideoMetadata, size_bytes: int, split: SplitConfig, spans: Sequence[Span]
+) -> dict[str, Any]:
+    """Build the common source result without retaining decoded or encoded media."""
+    result = source_envelope(uri, split)
     result.update(
         source_size_bytes=size_bytes,
         source_duration_ns=metadata.duration_ns,
@@ -47,7 +55,8 @@ def source_result(uri: str, metadata: VideoMetadata, size_bytes: int, split: Fix
     return result
 
 
-def _envelope(uri: str, split: FixedStrideConfig) -> dict[str, Any]:
+def source_envelope(uri: str, split: SplitConfig) -> dict[str, Any]:
+    """Create a successful empty source plan, also used to record terminal errors."""
     return {
         "record_schema_version": 1,
         "cut_contract_id": split.contract_id,
@@ -99,7 +108,7 @@ def plan_sources(batch: pa.Table, *, split: FixedStrideConfig, execution: Execut
             if code not in {"404", "NoSuchKey", "NotFound"}:
                 raise
             results.append(
-                _envelope(uri, split)
+                source_envelope(uri, split)
                 | {
                     "status": "error",
                     "error_stage": "source-read",
@@ -108,7 +117,7 @@ def plan_sources(batch: pa.Table, *, split: FixedStrideConfig, execution: Execut
             )
         except MediaError as exc:
             results.append(
-                _envelope(uri, split)
+                source_envelope(uri, split)
                 | {
                     "status": "error",
                     "error_stage": "source-probe",

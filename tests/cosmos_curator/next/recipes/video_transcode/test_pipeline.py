@@ -8,8 +8,10 @@ from unittest.mock import Mock
 import lance
 import pytest
 from ray.data import ActorPoolStrategy
+from ray.data._internal.execution.execution_callback import ExecutionCallback
 from ray.data.context import DataContext
 
+from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
 from cosmos_curator.next.recipes.video_transcode import pipeline, processing
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.publication import resolve_workspace
@@ -25,6 +27,7 @@ def test_download_admission_is_actor_bound_and_plan_scoped(
 ) -> None:
     """Ready actors own the IO budget; neither startup capacity nor ambient settings fix the pool size."""
     context = DataContext.get_current()
+    monkeypatch.setattr(context, "custom_execution_callback_classes", [ExecutionCallback])
     monkeypatch.setattr(context.autoscaling_config, "actor_pool_util_upscaling_threshold", 1.75)
     plan = Mock()
     for method in ("groupby", "map_groups", "sort", "map", "flat_map", "map_batches", "repartition"):
@@ -59,6 +62,8 @@ def test_download_admission_is_actor_bound_and_plan_scoped(
     assert strategy.max_size == float("inf")
     assert strategy.max_tasks_in_flight_per_actor == 1
     assert plan.context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.0
+    assert plan.context.custom_execution_callback_classes == [ExecutionCallback, ReleasePendingDownloadActors]
+    assert context.custom_execution_callback_classes == [ExecutionCallback]
     assert context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.75
     assert context.checkpoint_config is None
     snapshot.assert_not_called()

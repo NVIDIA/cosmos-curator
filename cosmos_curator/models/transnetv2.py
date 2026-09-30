@@ -22,9 +22,13 @@ r"""Model for fast shot transition detection.
 }
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from itertools import batched
+from pathlib import Path
 from typing import Final
 
+import numpy as np
+import numpy.typing as npt
 import torch
 from torch import nn
 from torch.nn import functional
@@ -34,6 +38,12 @@ from cosmos_curator.core.utils.model import model_utils
 
 _TRANSNETV2_MODEL_ID: Final = "Sn4kehead/TransNetV2"
 _TRANSNETV2_MODEL_WEIGHTS: Final = "transnetv2-pytorch-weights.pth"
+_HEIGHT = 27
+_WIDTH = 48
+_WINDOW = 100
+_STRIDE = 50
+_CONTEXT = 25
+_FRAME_ARRAY_NDIM = 4
 
 
 def transnetv2_model_id_names() -> list[str]:
@@ -532,6 +542,42 @@ class ColorHistograms(nn.Module):
         return similarities
 
 
+def load_transnetv2_model(weights_path: Path) -> _TransNetV2:
+    """Load pre-staged PyTorch weights on the actor's visible CUDA device."""
+    model = _TransNetV2()
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict)
+    return model.eval().cuda()
+
+
+def frame_windows(frames: npt.NDArray[np.uint8]) -> Iterator[npt.NDArray[np.uint8]]:
+    """Yield overlapping 100-frame windows, padding both ends with the edge frame."""
+    if frames.ndim != _FRAME_ARRAY_NDIM or frames.shape[1:] != (_HEIGHT, _WIDTH, 3) or not len(frames):
+        msg = "TransNetV2 requires a nonempty array of 27x48 RGB frames"
+        raise ValueError(msg)
+    for offset in range(0, len(frames), _STRIDE):
+        indices = np.clip(np.arange(offset - _CONTEXT, offset + _WINDOW - _CONTEXT), 0, len(frames) - 1)
+        yield frames[indices]
+
+
+def predict_transitions(
+    model: Callable[[torch.Tensor], torch.Tensor],
+    frames: npt.NDArray[np.uint8],
+    *,
+    threshold: float,
+    window_batch_size: int,
+    device: str = "cuda",
+) -> npt.NDArray[np.bool_]:
+    """Return a flat boolean mask from each window's central 50 predictions, discarding end padding."""
+    predictions: list[npt.NDArray[np.float32]] = []
+    with torch.inference_mode():
+        for group in batched(frame_windows(frames), window_batch_size, strict=False):
+            inputs = torch.from_numpy(np.stack(group)).to(device)
+            probabilities = model(inputs)
+            predictions.append(probabilities[:, _CONTEXT : _CONTEXT + _STRIDE, 0].flatten().cpu().numpy())
+    return np.concatenate(predictions)[: len(frames)] > threshold
+
+
 class TransNetV2(ModelInterface):
     """Interface for TransNetV2 shot transition detection model."""
 
@@ -561,15 +607,12 @@ class TransNetV2(ModelInterface):
 
     def setup(self) -> None:
         """Set up the TransNetV2 model interface."""
-        self._model = _TransNetV2()
         model_dir = model_utils.get_local_dir_for_weights_name(_TRANSNETV2_MODEL_ID)
         model_file = model_dir / _TRANSNETV2_MODEL_WEIGHTS
         if not model_file.exists():
             error_msg = f"{model_file} not found!"
             raise FileNotFoundError(error_msg)
-        state_dict = torch.load(model_file.as_posix(), weights_only=True)
-        self._model.load_state_dict(state_dict)
-        self._model.eval().cuda()
+        self._model = load_transnetv2_model(model_file)
 
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
         """TransNetV2 model call.

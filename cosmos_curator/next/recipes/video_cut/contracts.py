@@ -7,7 +7,7 @@ import json
 
 import pyarrow as pa
 
-from cosmos_curator.next.recipes.video_cut.config import FixedStrideConfig
+from cosmos_curator.next.recipes.video_cut.config import SplitConfig
 from cosmos_curator.next.utils.identity import canonical_digest
 
 INPUT_SCHEMA = pa.schema(
@@ -59,7 +59,7 @@ def make_span_id(source_id: str, start_ns: int, end_ns: int) -> str:
     return canonical_digest({"source_id": source_id, "stream_index": 0, "start_ns": start_ns, "end_ns": end_ns})
 
 
-def span_schema(split: FixedStrideConfig, input_snapshot_id: str | None = None) -> pa.Schema:
+def span_schema(split: SplitConfig, input_snapshot_id: str | None = None) -> pa.Schema:
     """Bind the append-only table to its cutting contract, independently of each run's inputs."""
     del input_snapshot_id  # Legacy callers may supply a run snapshot; it is no longer table metadata.
     return SPAN_SCHEMA.with_metadata(

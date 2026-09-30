@@ -31,7 +31,6 @@ from cosmos_curator.models import transnetv2
 from cosmos_curator.pipelines.video.clipping.frame_extraction_stages import get_frames_from_ffmpeg
 from cosmos_curator.pipelines.video.clipping.transnetv2_extraction_stages import (
     _get_filtered_scenes,
-    _get_predictions,
     _get_scenes,
 )
 
@@ -109,7 +108,7 @@ def split_transnetv2_frames(  # noqa: PLR0913
         msg = f"Expected frames of shape 27x48x3, got {frames.shape[1:4]}."
         raise ValueError(msg)
 
-    predictions = _get_predictions(model, frames, threshold)
+    predictions = transnetv2.predict_transitions(model, frames, threshold=threshold, window_batch_size=1)
     scenes = _get_scenes(predictions, entire_scene_as_clip=entire_scene_as_clip)
     filtered_scenes = _get_filtered_scenes(
         scenes,
