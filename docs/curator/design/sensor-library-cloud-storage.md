@@ -39,6 +39,11 @@ second smart_open setup is no longer needed.
 Azure was not measured this pass. The code path is structurally identical;
 the validation gap is empirical, not architectural.
 
+**Fragmented MP4 turned request-per-seek into thousands of requests; a block
+cache now absorbs them.** See
+[Fragmented MP4 and the Block Cache](#fragmented-mp4-and-the-block-cache).
+The tables under [Results](#results) predate that cache.
+
 ## Validation Harness
 
 `benchmarks/sensors/cloud_io_benchmark.py` exposes two
@@ -128,6 +133,55 @@ captured as a follow-up. Behavior in code is well-defined: `FROM_HEADER`
 raises `HeaderIndexUnavailableError` and `make_index_and_metadata`
 silently falls back to `FULL_DEMUX` unless `allow_header_fallback=False`.
 
+### Fragmented MP4 and the Block Cache
+
+A 97.5 MiB fragmented MP4 (4155 frames, one `moof`/`mdat` fragment per
+frame) took ~1 hour to index from S3 through the data-integrity CLI and
+~120 ms locally. Two behaviours compound:
+
+- On a seekable input, libav's mov demuxer walks every top-level box at
+  open to build the full index, calling `avio_size()` ~7 times per
+  fragment. PyAV answers `AVSEEK_SIZE` with -1, so each call becomes
+  `seek(-1, SEEK_END)` plus a seek back on the Python stream: 59,000
+  seeks for ~35 MB of reads.
+- `smart_open`'s S3 reader closes its response and issues a new
+  open-ended ranged GET on every seek that is neither a no-op nor a
+  forward seek within its 128 KiB buffer.
+
+`open_storage_source` therefore wraps the `smart_open` stream in
+`BlockCacheReader` (`cosmos_curator/core/utils/storage/block_cache_reader.py`):
+`seek`/`tell` are bookkeeping only and reads are served from 64 KiB
+aligned blocks in a 16-block LRU. On a miss, the wrapped stream keeps
+reading from its open response when the block starts where it already
+is or up to 256 KiB ahead (the skipped bytes are read and dropped);
+wider forward gaps and backward jumps seek. Reading through a gap costs
+its bytes and a seek costs a round trip, so the threshold sits below the
+break-even of one RTT's worth of bandwidth (~1 MiB at 60 ms and
+19 MiB/s, the figures from this file's before/after S3 runs). The object
+size comes from a short read at EOF, or else from one
+`seek(0, SEEK_END)`, which is request-free on `smart_open`'s S3 and Azure
+readers.
+
+`CameraSensor` over the local copy of that file and three remuxes of it,
+through a stream that charges `smart_open`'s S3 cost model (one GET at
+open, one per seek outside the 128 KiB read-ahead buffer), gives an
+identical `VideoIndex` for every reader:
+
+| Layout (~97 MiB)          | `smart_open` only | 1 MiB blocks, no read-through | 64 KiB blocks + 256 KiB read-through |
+| ------------------------- | ----------------: | ----------------------------: | -----------------------------------: |
+| fMP4, 1 frame / fragment  | 59,000 GETs, 122.1 MiB |           3 GETs, 102.5 MiB |                    3 GETs, 101.8 MiB |
+| fMP4, 2 s fragments       |    897 GETs, 12.9 MiB |           30 GETs, 74.6 MiB |                    71 GETs, 12.8 MiB |
+| regular, `moov` first     |      11 GETs, 4.4 MiB |              2 GETs, 5.0 MiB |                      2 GETs, 4.2 MiB |
+| regular, `moov` at end    |      13 GETs, 4.3 MiB |              3 GETs, 5.6 MiB |                      3 GETs, 4.3 MiB |
+
+On real S3 the one-frame-per-fragment file indexes in 5.3 s, down from
+~1 hour. Its fragments (~23 KB) are smaller than any useful block, so
+most of the object is transferred whatever the reader; the read-through
+threshold is what keeps coarser fragments, whose `mdat` gaps exceed it,
+from being downloaded as well. The ~4 MiB floor on regular files is
+`AUTO`'s composition-offset probe, which demuxes up to 4 MiB of packets
+before choosing the header index.
+
 ## Limitations
 
 1. **Azure not measured this pass.** Code path is identical to S3 (same
@@ -196,8 +250,10 @@ HTTP-free because the stream is already at offset 0 when each phase starts.
 - **(M) Connection pooling / stream reuse across `seek()`s.** Empirical
   pattern is one new `GetObject` per seek (~600 ms each); pooling the
   underlying TCP connection or reusing the open stream and only doing
-  `seek()`+`read()` on it would amortise network setup. Likely the
-  highest-leverage perf work for cloud sources.
+  `seek()`+`read()` on it would amortise network setup. The block cache
+  (see [Fragmented MP4 and the Block Cache](#fragmented-mp4-and-the-block-cache))
+  removes seeks that land in cached or sequentially next blocks; the
+  remaining misses still pay a request each.
 - **(S) Verify Azure end-to-end.** Harness already supports
   `--azure-profile-name`; this is a measurement gap, not a code gap.
   Repeat the matrix against an Azure container.
@@ -230,7 +286,7 @@ def remux(out_path: str, movflags: str | None) -> None:
     options = {"movflags": movflags} if movflags else {}
     with av.open(SRC) as src, av.open(out_path, "w", options=options) as dst:
         in_streams = list(src.streams)
-        out_streams = [dst.add_stream(template=s) for s in in_streams]
+        out_streams = [dst.add_stream_from_template(s) for s in in_streams]
         mapping = {id(i): o for i, o in zip(in_streams, out_streams, strict=True)}
         for packet in src.demux():
             if packet.dts is None:
@@ -240,6 +296,7 @@ def remux(out_path: str, movflags: str | None) -> None:
 
 remux("/tmp/cloud-fixtures/faststart.mp4",    "faststart")
 remux("/tmp/cloud-fixtures/nonfaststart.mp4", None)
+remux("/tmp/cloud-fixtures/fragmented.mp4",   "frag_every_frame+empty_moov+default_base_moof")
 PY
 aws --profile <prof> s3 cp /tmp/cloud-fixtures/ \
     s3://<bucket>/cloud-validation/ --recursive

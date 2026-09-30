@@ -65,6 +65,7 @@ from cosmos_curator.core.utils import storage_cli
 from cosmos_curator.core.utils.storage import azure_client as azure_client_module
 from cosmos_curator.core.utils.storage import s3_client as s3_client_module
 from cosmos_curator.core.utils.storage.azure_client import is_azure_path
+from cosmos_curator.core.utils.storage.block_cache_reader import BlockCacheReader
 from cosmos_curator.core.utils.storage.s3_client import is_s3path, resolve_s3_endpoint_url
 from cosmos_curator.core.utils.storage.storage_client import StorageClient
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
@@ -155,10 +156,12 @@ class _FakeSmartOpen:
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.streams: list[io.BytesIO] = []
 
     def __call__(self, uri: str, mode: str, transport_params: dict[str, Any]) -> io.BytesIO:
         self.calls.append((uri, mode, transport_params))
-        return io.BytesIO(self._payload)
+        self.streams.append(io.BytesIO(self._payload))
+        return self.streams[-1]
 
 
 class _RecordingClientFactory:
@@ -1437,6 +1440,46 @@ def test_the_stream_is_closed_when_the_context_exits(monkeypatch: pytest.MonkeyP
         assert not stream.closed
 
     assert stream.closed
+
+
+def test_the_smart_open_stream_is_read_through_a_block_cache_and_closed_with_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Libav's per-fragment size probes must stop at the cache rather than reach smart_open.
+
+    Each seek smart_open's S3 reader sees outside its read-ahead buffer is a fresh
+    ``GetObject``, which made a fragmented MP4 cost one request per probe.
+    """
+    open_source, opened = _source_opener(monkeypatch, b"mp4-bytes")
+    _client_factories(monkeypatch)
+
+    with open_source("s3://bucket/root/a.mp4") as stream:
+        assert isinstance(stream, BlockCacheReader)
+        assert stream.read(3) == b"mp4"
+        assert stream.seek(-1, io.SEEK_END) == len(b"mp4-bytes") - 1
+        assert opened.streams[0].tell() == len(b"mp4-bytes")
+
+    assert opened.streams[0].closed
+
+
+def test_an_object_that_cannot_be_opened_raises_smart_opens_error_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Callers tell a 404 from a 403 by walking ``backend_error`` / ``__cause__`` on this very error."""
+    error = OSError("unable to access bucket: 'bucket' key: 'root/missing.mp4'")
+    error.backend_error = RuntimeError("NoSuchKey")  # type: ignore[attr-defined]
+
+    def _fail(*_args: object, **_kwargs: object) -> io.BytesIO:
+        raise error
+
+    monkeypatch.setattr(storage_cli.smart_open, "open", _fail)
+    _client_factories(monkeypatch)
+
+    with (
+        pytest.raises(OSError, match="unable to access bucket") as excinfo,
+        storage_cli.open_storage_source("s3://bucket/root/missing.mp4"),
+    ):
+        pass
+
+    assert excinfo.value is error
 
 
 # --------------------------------------------------------------------------------------

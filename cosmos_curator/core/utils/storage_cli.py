@@ -47,7 +47,7 @@ import os
 import pathlib
 from collections.abc import Generator
 from contextlib import contextmanager
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 import smart_open  # type: ignore[import-untyped]
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ProfileNotFound
@@ -60,6 +60,7 @@ from cosmos_curator.core.utils.storage.azure_client import (
     is_azure_path,
     make_azure_client_config,
 )
+from cosmos_curator.core.utils.storage.block_cache_reader import BlockCacheReader
 from cosmos_curator.core.utils.storage.s3_client import (
     S3Client,
     S3ClientConfig,
@@ -382,11 +383,16 @@ def open_storage_source(
             supplied. Ignored for Azure, whose endpoint is baked into the account URL.
 
     Yields:
-        A seekable :class:`BinaryIO` opened in binary read mode via ``smart_open``.
-        Ownership stays with this context manager; the caller must not close it.
+        A seekable :class:`BinaryIO` over the ``smart_open`` stream, behind a
+        :class:`~cosmos_curator.core.utils.storage.block_cache_reader.BlockCacheReader`
+        so that libav's seek-heavy access pattern costs a bounded number of requests
+        rather than one per seek. Ownership stays with this context manager; the
+        caller must not close it.
 
     Raises:
         StorageCliError: If ``source`` is not a supported storage URI.
+        OSError: From ``smart_open`` when the object cannot be opened -- a missing
+            object on S3 or Azure raises here, before anything is yielded.
 
     """
     if not is_remote_path(source):
@@ -399,8 +405,11 @@ def open_storage_source(
             azure_profile_name=azure_profile_name,
             endpoint_url=endpoint_url,
         )
-    with smart_open.open(source, "rb", **get_smart_open_client_params(client)) as stream:
-        yield stream
+    with (
+        smart_open.open(source, "rb", **get_smart_open_client_params(client)) as stream,
+        BlockCacheReader(stream) as reader,
+    ):
+        yield cast("BinaryIO", reader)
 
 
 def list_storage_objects(  # noqa: PLR0913 -- a prefix, two backends' credentials, and two listing controls
