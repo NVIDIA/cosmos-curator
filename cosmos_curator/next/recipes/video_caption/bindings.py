@@ -15,7 +15,10 @@ BatchProjector = Callable[[pa.Table], pa.Table]
 BaseSchemaValidator = Callable[[lance.LanceDataset], None]
 TerminalRowBuilder = Callable[..., dict[str, Any]]
 TerminalRowValidator = Callable[[dict[str, Any]], None]
-TerminalValueValidator = Callable[[str | None, dict[str, Any] | None], None]
+TerminalValueValidator = Callable[[object, dict[str, Any] | None], None]
+TerminalBatchValidator = Callable[[pa.Table], None]
+StagedRowReconciler = Callable[[pa.Table, pa.Table, int, int], pa.Table]
+ResultValueFingerprint = Callable[[pa.Table], str]
 CompleteFragmentValidator = Callable[[LanceFragment], None]
 
 
@@ -61,6 +64,9 @@ class CaptionResultBindings:
     validate_terminal_value: TerminalValueValidator
     validate_staged_row: TerminalRowValidator
     carried_result_columns: tuple[str, ...] = ()
+    validate_terminal_batch: TerminalBatchValidator | None = None
+    reconcile_staged_rows: StagedRowReconciler | None = None
+    fingerprint_result_values: ResultValueFingerprint | None = None
 
 
 @dataclass(frozen=True)
@@ -95,7 +101,12 @@ class CaptionInferenceBindings:
 
 @dataclass(frozen=True)
 class CaptionRunBindings:
-    """The complete private binding value supplied by one public caption recipe."""
+    """Shared input, result, and publication bindings for caption and embedding recipes.
+
+    ``prompt_template``, ``inference``, and ``context_stage`` are consumed only by
+    caption execution. Embedding recipes use an empty prompt and leave the
+    caption inference defaults unused.
+    """
 
     input: CaptionInputBindings
     result: CaptionResultBindings

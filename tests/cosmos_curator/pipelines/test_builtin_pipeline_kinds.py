@@ -21,6 +21,7 @@ def test_registered_kind_names_are_derived_from_concrete_objects() -> None:
         "embeddings",
         "mp4-index",
         "multimodal-caption",
+        "multimodal-embedding",
         "multimodal-split",
         "robot-action-caption",
         "robot-action-split",

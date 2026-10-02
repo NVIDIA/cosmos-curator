@@ -123,7 +123,7 @@ def capture_attempt(
     )
 
 
-def classify_fragment(
+def classify_fragment(  # noqa: C901, PLR0912 -- shared per-row and batch validation paths preserve compatibility
     fragment: LanceFragment,
     *,
     bindings: CaptionRunBindings,
@@ -135,21 +135,39 @@ def classify_fragment(
     result_columns = [result.caption_field_name, result.metadata_field_name]
     for raw_batch in fragment.scanner(columns=result_columns).to_batches():
         batch = pa.Table.from_batches([raw_batch])
-        for row in batch.to_pylist():
-            caption = row[result.caption_field_name]
-            metadata = row[result.metadata_field_name]
-            if caption is None and metadata is None:
-                saw_pending = True
-            else:
-                saw_complete = True
-                try:
-                    result.validate_terminal_value(caption, metadata)
-                except (TypeError, ValueError) as exc:
-                    msg = f"Fragment {fragment.fragment_id} has incompatible or corrupt caption state: {exc}"
-                    raise ValueError(msg) from exc
+        if result.validate_terminal_batch is None:
+            for row in batch.to_pylist():
+                caption = row[result.caption_field_name]
+                metadata = row[result.metadata_field_name]
+                if caption is None and metadata is None:
+                    saw_pending = True
+                else:
+                    saw_complete = True
+                    try:
+                        result.validate_terminal_value(caption, metadata)
+                    except (TypeError, ValueError) as exc:
+                        msg = f"Fragment {fragment.fragment_id} has incompatible or corrupt caption state: {exc}"
+                        raise ValueError(msg) from exc
+                if saw_pending and saw_complete:
+                    msg = f"Fragment {fragment.fragment_id} mixes pending and terminal caption rows"
+                    raise ValueError(msg)
+        else:
+            metadata = batch[result.metadata_field_name]
+            result_values = batch[result.caption_field_name]
+            pending = metadata.is_null().to_numpy(zero_copy_only=False) & result_values.is_null().to_numpy(
+                zero_copy_only=False
+            )
+            saw_pending |= bool(pending.any())
+            saw_complete |= bool((~pending).any())
             if saw_pending and saw_complete:
                 msg = f"Fragment {fragment.fragment_id} mixes pending and terminal caption rows"
                 raise ValueError(msg)
+            if saw_complete:
+                try:
+                    result.validate_terminal_batch(batch)
+                except (TypeError, ValueError) as exc:
+                    msg = f"Fragment {fragment.fragment_id} has incompatible or corrupt caption state: {exc}"
+                    raise ValueError(msg) from exc
     # Lance does not normally retain empty fragments. Treat one as complete: it
     # contains no pending work and update_columns must never be invoked for it.
     if saw_pending:
@@ -181,12 +199,25 @@ def protected_binding_fingerprint(metadata: FragmentMetadata, protected_field_id
         msg = "FragmentMetadata.to_json() returned a non-object value"
         raise TypeError(msg)
     protected_files = []
-    for raw_file in raw.get("files", []):
-        if not isinstance(raw_file, dict):
+    for file_entry in raw.get("files", []):
+        if not isinstance(file_entry, dict):
             continue
-        fields = {int(value) for value in raw_file.get("fields", [])}
-        if fields & protected_field_ids:
-            protected_files.append(raw_file)
+        fields = file_entry.get("fields", [])
+        columns = file_entry.get("column_indices", [])
+        if len(fields) != len(columns):
+            msg = "Fragment data file has mismatched field and column index counts"
+            raise ValueError(msg)
+        selected = [
+            (field, column) for field, column in zip(fields, columns, strict=True) if int(field) in protected_field_ids
+        ]
+        if selected:
+            protected_files.append(
+                {
+                    **file_entry,
+                    "fields": [field for field, _ in selected],
+                    "column_indices": [column for _, column in selected],
+                }
+            )
     identity = {
         "id": raw.get("id"),
         "physical_rows": raw.get("physical_rows"),

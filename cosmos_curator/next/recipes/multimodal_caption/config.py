@@ -7,7 +7,6 @@ import copy
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from re import fullmatch
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
@@ -15,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.recipes.result_keys import RESULT_KEY_PATTERN, is_valid_result_key
 from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
@@ -25,8 +25,6 @@ MultimodalCaptionKind = Literal["multimodal-caption"]
 ContextVariant = Literal["video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses"]
 ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"]
 PromptMode = Literal["default", "custom"]
-
-_RESULT_KEY_PATTERN = r"^[a-z][a-z0-9_]{0,47}$"
 
 
 def _normalize_location(location: str, *, label: str) -> str:
@@ -171,7 +169,7 @@ class MultimodalCaptionOutputConfig(BaseModel):
 
     result_key: str = Field(
         default="default",
-        pattern=_RESULT_KEY_PATTERN,
+        pattern=RESULT_KEY_PATTERN,
         description="Base result key; custom prompts require an explicit key that does not start with 'default'.",
     )
     tag_camera_key: bool = Field(
@@ -258,9 +256,9 @@ class ResolvedMultimodalCaptionConfig(BaseModel):
         if self.inference.prompt.mode == "custom" and self.output.result_key.startswith("default"):
             msg = "custom prompt mode requires an explicit output.result_key that does not start with 'default'"
             raise ValueError(msg)
-        if fullmatch(_RESULT_KEY_PATTERN, self.effective_result_key) is None:
+        if not is_valid_result_key(self.effective_result_key):
             msg = (
-                f"Invalid effective result key {self.effective_result_key!r}: must match {_RESULT_KEY_PATTERN} "
+                f"Invalid effective result key {self.effective_result_key!r}: must match {RESULT_KEY_PATTERN} "
                 "and be at most 48 characters. Turn tag_camera_key off and set an explicit valid result_key."
             )
             raise ValueError(msg)

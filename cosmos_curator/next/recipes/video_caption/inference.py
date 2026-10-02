@@ -462,7 +462,7 @@ def canonicalize_llm_batch(
     return pa.Table.from_pylist(rows, schema=bindings.result.staged_schema)
 
 
-def _caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema inputs are independently meaningful
+def caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema inputs are independently meaningful
     dataset: lance.LanceDataset,
     attempt: CaptionAttempt,
     *,
@@ -540,7 +540,7 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
     """Execute one checkpointed read-to-Parquet plan for the attempt's pending fragments."""
     if not attempt.pending_fragment_ids:
         return
-    caption_source = _caption_lance_datasource(
+    caption_source = caption_lance_datasource(
         dataset,
         attempt,
         storage_options=storage_options,

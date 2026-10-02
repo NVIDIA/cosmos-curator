@@ -44,9 +44,12 @@ def resolve_workspace(
     digest: str,
     *,
     storage_profile: str,
+    policy_namespace: str | None = None,
 ) -> CaptionWorkspace:
     """Derive the contract workspace and its credentialed Arrow filesystem."""
     root_uri = _join(staging_root_uri, caption_field_name, digest)
+    if policy_namespace is not None:
+        root_uri = _join(root_uri, policy_namespace)
     filesystem = arrow_filesystem(root_uri, storage_profile=storage_profile)
     return CaptionWorkspace(
         root_uri=root_uri,

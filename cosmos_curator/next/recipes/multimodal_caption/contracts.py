@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
-from re import fullmatch
 from types import MappingProxyType
 from typing import Any, Final, cast
 
@@ -23,6 +22,7 @@ from cosmos_curator.next.recipes.multimodal_caption.ego_context import (
 )
 from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION
 from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
+from cosmos_curator.next.recipes.result_keys import is_valid_result_key
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
@@ -57,7 +57,6 @@ EGO_CONTEXT_CADENCE_PERIOD_NS: Final = 500_000_000
 EGO_CONTEXT_MAX_NEAREST_POSE_DELTA_NS: Final = 20_000_000
 EGO_CONTEXT_MAX_EPISODE_DURATION_NS: Final = 10_000_000_000
 _SHA256_HEX_LENGTH: Final = 64
-_RESULT_KEY_PATTERN: Final = r"[a-z][a-z0-9_]{0,47}"
 
 
 class CaptionInputProfile(StrEnum):
@@ -219,7 +218,7 @@ def _model_binding(model_key: str) -> _CaptionModelBinding:
 def result_field_names(context_variant: str, result_key: str, model_key: str) -> tuple[str, str]:
     """Return one context/result/model's deterministic versioned field names."""
     resolve_context_definition(context_variant)
-    if fullmatch(_RESULT_KEY_PATTERN, result_key) is None:
+    if not is_valid_result_key(result_key):
         msg = f"Invalid caption result key: {result_key!r}"
         raise ValueError(msg)
     _model_binding(model_key)
@@ -650,7 +649,7 @@ def build_terminal_result_row(  # noqa: PLR0913 -- each argument maps to a persi
 
 
 def validate_terminal_value(  # noqa: C901, PLR0912, PLR0913 -- one validator owns terminal semantics
-    caption: str | None,
+    caption: object,
     metadata: dict[str, Any] | None,
     *,
     model: RegisteredModel,

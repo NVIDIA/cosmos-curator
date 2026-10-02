@@ -51,6 +51,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
   rows, artifact bindings, identity, and publication semantics.
 - [Multimodal AV Captioning](design/multimodal-av-captioning.md) - single-camera free-form caption enrichment of
   canonical multimodal episodes.
+- [Multimodal AV Video Embedding](design/multimodal-av-video-embedding.md) - per-episode video vectors from a selected
+  camera, published to canonical multimodal episodes.
 - [Release Versioning Design](design/release-versioning.md) - tag-derived release and package versioning.
 - [Ray Data Design](design/ray-data.md) - Ray Data direction and implementation notes.
 - [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.

@@ -307,7 +307,7 @@ def build_terminal_result_row(  # noqa: PLR0913 -- each argument maps to a persi
 
 
 def validate_terminal_value(
-    caption: str | None,
+    caption: object,
     metadata: dict[str, Any] | None,
     *,
     spec: CaptionModelSpec,
@@ -363,7 +363,7 @@ def _validate_token_counts(metadata: dict[str, Any]) -> None:
             raise ValueError(msg)
 
 
-def _validate_terminal_outcome(caption: str | None, metadata: dict[str, Any], *, status: str) -> None:
+def _validate_terminal_outcome(caption: object, metadata: dict[str, Any], *, status: str) -> None:
     error_type = metadata.get("error_type")
     error_message = metadata.get("error_message")
     if status == "error":

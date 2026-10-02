@@ -97,12 +97,13 @@ def resolve_registered_model(key: str) -> RegisteredModel:
     )
 
 
-def validate_model_directory(model_dir: Path, *, model_key: str) -> Path:
-    """Require a staged model config and at least one recognized weight file.
+def validate_model_directory(model_dir: Path, *, model_key: str, require_config_json: bool = True) -> Path:
+    """Require staged weights and, for models that ship one, a config.json.
 
     Args:
         model_dir: Model directory to validate.
         model_key: Download key to name in actionable errors.
+        require_config_json: Whether the checkpoint supplies its own config.json.
 
     Returns:
         The validated directory.
@@ -117,11 +118,10 @@ def validate_model_directory(model_dir: Path, *, model_key: str) -> Path:
         raise FileNotFoundError(msg)
     config_path = model_dir / "config.json"
     has_model_file = any(path.is_file() and path.suffix in _MODEL_WEIGHT_SUFFIXES for path in model_dir.rglob("*"))
-    if not config_path.is_file() or not has_model_file:
+    if (require_config_json and not config_path.is_file()) or not has_model_file:
+        expected = "config.json and staged model files" if require_config_json else "staged model files"
         msg = (
-            f"Model directory {model_dir} for {model_key!r} is incomplete: "
-            "expected config.json and staged model files. "
-            f"Run: {download_command}"
+            f"Model directory {model_dir} for {model_key!r} is incomplete: expected {expected}. Run: {download_command}"
         )
         raise FileNotFoundError(msg)
     return model_dir

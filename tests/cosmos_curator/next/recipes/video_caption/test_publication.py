@@ -171,8 +171,8 @@ def _run_publication_workers_in_process(
 
     monkeypatch.setattr(publication, "_validate_parquet_schemas_distributed", validate_schemas)
     monkeypatch.setattr(publication, "_prepared_publication_dataset", prepare_all)
-    monkeypatch.setattr(publication, "_iter_prepared_publications", iter_prepared)
-    monkeypatch.setattr(publication, "_reprepare_fragment_with_ray", reprepare)
+    monkeypatch.setattr(publication, "iter_prepared_publications", iter_prepared)
+    monkeypatch.setattr(publication, "reprepare_fragment_with_ray", reprepare)
 
 
 def _commit_disjoint_values(uri: str, *, field_name: str = "other_enrichment") -> None:
@@ -629,3 +629,38 @@ def test_split_append_after_attempt_waits_for_the_next_start(
     )
     row = appended_values.to_pylist()[0]
     assert row == {caption_spec.caption_field_name: None, caption_spec.metadata_field_name: None}
+
+
+def test_caption_fingerprint_keeps_default_arrow_hash(
+    caption_spec: CaptionModelSpec, caption_bindings: CaptionRunBindings
+) -> None:
+    """Caption bindings preserve their original fingerprint without any recipe callback."""
+    result = caption_bindings.result
+    assert result.fingerprint_result_values is None
+    assert result.reconcile_staged_rows is None
+    schema = pa.schema(
+        [
+            caption_bindings.input.mapped_schema.field(caption_bindings.input.row_id_column),
+            result.fields.field(result.caption_field_name),
+            result.fields.field(result.metadata_field_name),
+        ]
+    )
+    table = pa.Table.from_pylist(
+        [
+            {
+                caption_bindings.input.row_id_column: "clip-0",
+                result.caption_field_name: "A vehicle turns left.",
+                result.metadata_field_name: terminal_metadata(
+                    caption_spec,
+                    result.digest,
+                    status="success",
+                    prompt_token_count=10,
+                    generated_token_count=20,
+                    error_type=None,
+                    error_message=None,
+                ),
+            }
+        ],
+        schema=schema,
+    )
+    assert publication._caption_table_fingerprint(table, caption_bindings) == publication.arrow_table_fingerprint(table)

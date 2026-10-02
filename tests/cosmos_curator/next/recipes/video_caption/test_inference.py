@@ -143,7 +143,7 @@ def test_caption_lance_read_task_reopens_with_storage_options_without_pickling_f
         "aws_session_token": "token",
         "aws_endpoint": "https://s3.example.test",
     }
-    datasource = inference._caption_lance_datasource(
+    datasource = inference.caption_lance_datasource(
         dataset,
         attempt,
         storage_options=storage_options,

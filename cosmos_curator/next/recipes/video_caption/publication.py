@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Phase B: validate durable results and atomically publish one Lance fragment at a time."""
+"""Phase B: validate durable results and publish one Lance fragment at a time."""
 
 import json
 from collections.abc import Iterator
@@ -120,7 +120,7 @@ def publish_staged_results(  # noqa: PLR0913 -- the publication boundary keeps r
 
     # Ray Data otherwise replaces user exceptions with UserCodeException, which
     # would hide the recipe's actionable staging-contract errors at this boundary.
-    with _raise_original_map_exceptions():
+    with raise_original_map_exceptions():
         return _publish_pending_staged_results(
             uri,
             attempt,
@@ -131,16 +131,15 @@ def publish_staged_results(  # noqa: PLR0913 -- the publication boundary keeps r
         )
 
 
-def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundary keeps recovery inputs explicit
+def prepare_staged_publications(
     uri: str,
     attempt: CaptionAttempt,
     workspace: CaptionWorkspace,
     bindings: CaptionRunBindings,
     *,
     storage_options: dict[str, str] | None,
-    commit_attempts: int,
-) -> PublicationSummary:
-    """Prepare pending fragments across Ray workers and serialize their commits."""
+) -> tuple[lance.LanceDataset, dict[int, AttemptFragmentGuard], ray.data.Dataset]:
+    """Validate staging and prepare distributed fragment descriptors for a recipe publisher."""
     files = staged_result_files(workspace)
     if not files:
         msg = f"No staged caption results exist for {len(attempt.pending_fragment_ids)} pending fragment(s)"
@@ -163,12 +162,28 @@ def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundar
         storage_options=storage_options,
     )
 
+    return attempt_dataset, guards, prepared_publications
+
+
+def _publish_pending_staged_results(  # noqa: PLR0913 -- the publication boundary keeps recovery inputs explicit
+    uri: str,
+    attempt: CaptionAttempt,
+    workspace: CaptionWorkspace,
+    bindings: CaptionRunBindings,
+    *,
+    storage_options: dict[str, str] | None,
+    commit_attempts: int,
+) -> PublicationSummary:
+    """Prepare caption fragments across Ray workers and commit one fragment at a time."""
+    attempt_dataset, guards, prepared_publications = prepare_staged_publications(
+        uri, attempt, workspace, bindings, storage_options=storage_options
+    )
     published = 0
     already_committed = 0
     pending_fragment_ids = set(attempt.pending_fragment_ids)
     seen_fragment_ids: set[int] = set()
     staged_value_fingerprints: dict[int, str] = {}
-    for prepared in _iter_prepared_publications(prepared_publications):
+    for prepared in iter_prepared_publications(prepared_publications):
         fragment_id = prepared.guard.fragment_id
         if fragment_id not in pending_fragment_ids:
             msg = f"Ray prepared an unexpected caption fragment {fragment_id}"
@@ -236,19 +251,19 @@ def verify_selected_fragments(  # noqa: PLR0913 -- explicit canonical-verificati
         bindings.result.caption_field_name,
         len(attempt.selected_fragment_ids),
     )
-    _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
+    assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
     resolved_guards = guards or _capture_fragment_guards(attempt_dataset, attempt.selected_fragment_ids, bindings)
     staged_fingerprints = staged_value_fingerprints or {}
     for fragment_id in attempt.selected_fragment_ids:
-        fragment = _require_fragment(current, fragment_id)
+        fragment = require_fragment(current, fragment_id)
         guard = resolved_guards[fragment_id]
-        _assert_base_identity(current, fragment, guard, bindings)
+        assert_base_identity(current, fragment, guard, bindings)
         state = classify_fragment(fragment, bindings=bindings)
         if state is not FragmentCaptionState.COMPLETE:
             msg = f"Fragment {fragment_id} selected from attempt v{attempt.version} is still pending"
             raise PublicationError(msg)
         staged_fingerprint = staged_fingerprints.get(fragment_id)
-        if staged_fingerprint is not None and _caption_values_fingerprint(fragment, bindings) != staged_fingerprint:
+        if staged_fingerprint is not None and result_values_fingerprint(fragment, bindings) != staged_fingerprint:
             msg = f"Fragment {fragment_id} is terminal but differs from its authoritative staged result"
             raise PublicationError(msg)
     logger.info(
@@ -302,7 +317,7 @@ def prepare_fragment_update(
         modified_field_ids=tuple(sorted(int(field_id) for field_id in modified_field_ids)),
         row_count=int(fragment.count_rows()),
     )
-    _validate_descriptor(descriptor, expected_modified)
+    validate_descriptor(descriptor, expected_modified)
     return descriptor
 
 
@@ -354,11 +369,11 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
     last_commit_error: Exception | None = None
     for commit_attempt in range(1, commit_attempts + 1):
         current = lance.dataset(uri, storage_options=storage_options)
-        _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
-        fragment = _require_fragment(current, guard.fragment_id)
+        assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
+        fragment = require_fragment(current, guard.fragment_id)
         state = classify_fragment(fragment, bindings=bindings)
         if state is FragmentCaptionState.COMPLETE:
-            if _caption_values_fingerprint(fragment, bindings) == staged_values_fingerprint:
+            if result_values_fingerprint(fragment, bindings) == staged_values_fingerprint:
                 logger.info(
                     "Caption fragment {} is already canonical at Lance v{}: {} row(s), no commit needed",
                     guard.fragment_id,
@@ -369,7 +384,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             msg = f"Fragment {guard.fragment_id} has a terminal caption that differs from staged recovery data"
             raise PublicationError(msg)
 
-        _assert_pending_identity(current, fragment, guard, bindings)
+        assert_pending_identity(current, fragment, guard, bindings)
         current_fingerprint = fragment_fingerprint(fragment.metadata)
         if descriptor is None or descriptor.source_fingerprint != current_fingerprint:
             logger.info(
@@ -379,7 +394,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
                 commit_attempt,
                 commit_attempts,
             )
-            reprepared = _reprepare_fragment_with_ray(
+            reprepared = reprepare_fragment_with_ray(
                 guard.fragment_id,
                 uri=uri,
                 attempt=attempt,
@@ -393,7 +408,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             descriptor = reprepared.descriptor
             if descriptor is None:
                 continue
-        _validate_descriptor(
+        validate_descriptor(
             descriptor,
             leaf_field_ids(
                 current,
@@ -482,10 +497,10 @@ def _latest_canonical_version(
 ) -> int | None:
     """Return the latest version holding staged terminal values, rejecting a mismatch."""
     latest = lance.dataset(uri, storage_options=storage_options)
-    latest_fragment = _require_fragment(latest, guard.fragment_id)
+    latest_fragment = require_fragment(latest, guard.fragment_id)
     if classify_fragment(latest_fragment, bindings=bindings) is not FragmentCaptionState.COMPLETE:
         return None
-    if _caption_values_fingerprint(latest_fragment, bindings) == staged_values_fingerprint:
+    if result_values_fingerprint(latest_fragment, bindings) == staged_values_fingerprint:
         return int(latest.version)
     msg = f"Fragment {guard.fragment_id} committed a terminal value different from staging"
     raise PublicationError(msg)
@@ -507,7 +522,7 @@ def _capture_fragment_guards(
     )
     guards: dict[int, AttemptFragmentGuard] = {}
     for fragment_id in fragment_ids:
-        fragment = _require_fragment(dataset, fragment_id)
+        fragment = require_fragment(dataset, fragment_id)
         guards[fragment_id] = _fragment_guard(fragment, bindings=bindings, base_ids=base_ids, pending_ids=pending_ids)
     return guards
 
@@ -524,7 +539,7 @@ def _fragment_guard(
     return AttemptFragmentGuard(
         fragment_id=int(fragment.fragment_id),
         row_count=row_ids.num_rows,
-        ordered_row_ids_fingerprint=_arrow_table_fingerprint(row_ids),
+        ordered_row_ids_fingerprint=arrow_table_fingerprint(row_ids),
         base_binding_fingerprint=protected_binding_fingerprint(fragment.metadata, base_ids),
         pending_binding_fingerprint=protected_binding_fingerprint(fragment.metadata, pending_ids),
     )
@@ -548,20 +563,20 @@ def prepare_fragment_publication(
     guard = _capture_fragment_guards(attempt_dataset, (fragment_id,), bindings)[fragment_id]
 
     current = lance.dataset(uri, storage_options=storage_options)
-    _assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
-    fragment = _require_fragment(current, fragment_id)
+    assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
+    fragment = require_fragment(current, fragment_id)
     table = _validate_staged_group(staged, fragment, guard, bindings)
     staged_values_fingerprint = _caption_table_fingerprint(table, bindings)
 
     descriptor: PreparedFragmentUpdate | None = None
     state = classify_fragment(fragment, bindings=bindings)
     if state is FragmentCaptionState.COMPLETE:
-        _assert_base_identity(current, fragment, guard, bindings)
-        if _caption_values_fingerprint(fragment, bindings) != staged_values_fingerprint:
+        assert_base_identity(current, fragment, guard, bindings)
+        if result_values_fingerprint(fragment, bindings) != staged_values_fingerprint:
             msg = f"Fragment {fragment_id} has a terminal caption that differs from staged recovery data"
             raise PublicationError(msg)
     else:
-        _assert_pending_identity(current, fragment, guard, bindings)
+        assert_pending_identity(current, fragment, guard, bindings)
         descriptor = prepare_fragment_update(current, fragment, table, bindings)
 
     prepared = PreparedFragmentPublication(
@@ -609,7 +624,7 @@ def _prepared_publication_dataset(  # noqa: PLR0913 -- Ray plan inputs are indep
     )
 
 
-def _iter_prepared_publications(dataset: ray.data.Dataset) -> Iterator[PreparedFragmentPublication]:
+def iter_prepared_publications(dataset: ray.data.Dataset) -> Iterator[PreparedFragmentPublication]:
     """Stream small worker control records without fetching staged caption rows."""
     try:
         batches = dataset.iter_batches(prefetch_batches=0, batch_size=None, batch_format="pyarrow")
@@ -636,6 +651,10 @@ def _validate_staged_group(
     except (pa.ArrowException, ValueError) as exc:
         msg = f"Staged rows for fragment {guard.fragment_id} do not cast to the canonical result schema"
         raise PublicationError(msg) from exc
+    if table.num_rows > guard.row_count and bindings.result.reconcile_staged_rows is not None:
+        table = bindings.result.reconcile_staged_rows(
+            table, _current_staged_bindings(fragment, bindings), guard.fragment_id, guard.row_count
+        )
     if table.num_rows != guard.row_count:
         msg = (
             f"Staged fragment {guard.fragment_id} has {table.num_rows} row(s), expected exactly {guard.row_count}; "
@@ -653,8 +672,8 @@ def _validate_staged_group(
     staged_row_ids = table.select([row_id]).cast(row_id_schema)
     current_row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
     if (
-        _arrow_table_fingerprint(staged_row_ids) != guard.ordered_row_ids_fingerprint
-        or _arrow_table_fingerprint(current_row_ids) != guard.ordered_row_ids_fingerprint
+        arrow_table_fingerprint(staged_row_ids) != guard.ordered_row_ids_fingerprint
+        or arrow_table_fingerprint(current_row_ids) != guard.ordered_row_ids_fingerprint
     ):
         msg = f"Staged fragment {guard.fragment_id} row-ID order does not match the attempt and current fragment"
         raise PublicationError(msg)
@@ -722,13 +741,38 @@ def _validate_parquet_schema_batch(
         except (OSError, pa.ArrowException) as exc:
             msg = f"Staged caption result is not a readable Parquet file: {path}"
             raise PublicationError(msg) from exc
-        if not actual.equals(expected, check_metadata=True):
+        if not _parquet_schema_matches(actual, expected):
             msg = f"Staged caption result has an incompatible schema: {path}"
             raise PublicationError(msg)
     return batch.cast(_RESULT_PATH_SCHEMA)
 
 
-def _reprepare_fragment_with_ray(  # noqa: PLR0913 -- retry task reproduces the complete worker contract
+def _parquet_schema_matches(actual: pa.Schema, expected: pa.Schema) -> bool:
+    """Allow Parquet's list-child rename while retaining exact field contracts."""
+    if actual.names != expected.names or actual.metadata != expected.metadata:
+        return False
+    for observed, required in zip(actual, expected, strict=True):
+        if observed.equals(required, check_metadata=True):
+            continue
+        fixed_list = pa.types.is_fixed_size_list(observed.type) and pa.types.is_fixed_size_list(required.type)
+        variable_list = pa.types.is_list(observed.type) and pa.types.is_list(required.type)
+        if not (fixed_list or variable_list):
+            return False
+        if (
+            observed.nullable != required.nullable
+            or observed.metadata != required.metadata
+            or (fixed_list and observed.type.list_size != required.type.list_size)
+            or observed.type.value_type != required.type.value_type
+            or observed.type.value_field.nullable != required.type.value_field.nullable
+            or observed.type.value_field.metadata != required.type.value_field.metadata
+            or observed.type.value_field.name != "element"
+            or required.type.value_field.name != "item"
+        ):
+            return False
+    return True
+
+
+def reprepare_fragment_with_ray(  # noqa: PLR0913 -- retry task reproduces the complete worker contract
     fragment_id: int,
     *,
     uri: str,
@@ -897,7 +941,7 @@ def _payload_string(payload: dict[str, Any], key: str) -> str:
 
 
 @contextmanager
-def _raise_original_map_exceptions() -> Iterator[None]:
+def raise_original_map_exceptions() -> Iterator[None]:
     """Preserve typed publication failures across Ray Data's UDF boundary."""
     context = ray.data.DataContext.get_current()
     previous = context.raise_original_map_exception
@@ -930,7 +974,8 @@ def _find_publication_error(error: BaseException) -> PublicationError | None:
     return None
 
 
-def _caption_values_fingerprint(fragment: LanceFragment, bindings: CaptionRunBindings) -> str:
+def result_values_fingerprint(fragment: LanceFragment, bindings: CaptionRunBindings) -> str:
+    """Hash canonical result values for one fragment using its recipe bindings."""
     result = bindings.result
     table = fragment.to_table(
         columns=[bindings.input.row_id_column, result.caption_field_name, result.metadata_field_name]
@@ -948,10 +993,12 @@ def _caption_table_fingerprint(table: pa.Table, bindings: CaptionRunBindings) ->
         ]
     )
     normalized = table.select(schema.names).cast(schema)
-    return _arrow_table_fingerprint(normalized)
+    if result.fingerprint_result_values is not None:
+        return result.fingerprint_result_values(normalized)
+    return arrow_table_fingerprint(normalized)
 
 
-def _arrow_table_fingerprint(table: pa.Table) -> str:
+def arrow_table_fingerprint(table: pa.Table) -> str:
     """Hash a canonical Arrow stream in fixed row batches, independent of input chunking."""
     normalized = table.combine_chunks()
     fingerprint = sha256()
@@ -964,7 +1011,8 @@ def _arrow_table_fingerprint(table: pa.Table) -> str:
     return fingerprint.hexdigest()
 
 
-def _validate_descriptor(descriptor: PreparedFragmentUpdate, expected_modified: set[int]) -> None:
+def validate_descriptor(descriptor: PreparedFragmentUpdate, expected_modified: set[int]) -> None:
+    """Require a prepared update to preserve layout and modify only the owned fields."""
     source = FragmentMetadata.from_json(descriptor.source_metadata_json)
     updated = FragmentMetadata.from_json(descriptor.updated_metadata_json)
     source_json: Any = source.to_json()
@@ -998,13 +1046,14 @@ def _validate_descriptor(descriptor: PreparedFragmentUpdate, expected_modified: 
         raise PublicationError(msg)
 
 
-def _assert_pending_identity(
+def assert_pending_identity(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
     bindings: CaptionRunBindings,
 ) -> None:
-    _assert_base_identity(dataset, fragment, guard, bindings)
+    """Require unchanged source bindings and untouched pending result fields."""
+    assert_base_identity(dataset, fragment, guard, bindings)
     pending_ids = leaf_field_ids(
         dataset,
         (
@@ -1019,16 +1068,17 @@ def _assert_pending_identity(
         raise PublicationError(msg)
 
 
-def _assert_base_identity(
+def assert_base_identity(
     dataset: lance.LanceDataset,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
     bindings: CaptionRunBindings,
 ) -> None:
+    """Require the captured row identities and protected input files to remain unchanged."""
     row_id = bindings.input.row_id_column
     row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id)])
     row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
-    if row_ids.num_rows != guard.row_count or _arrow_table_fingerprint(row_ids) != guard.ordered_row_ids_fingerprint:
+    if row_ids.num_rows != guard.row_count or arrow_table_fingerprint(row_ids) != guard.ordered_row_ids_fingerprint:
         msg = f"Fragment {guard.fragment_id} changed row layout or canonical row identity after attempt capture"
         raise PublicationError(msg)
     base_ids = leaf_field_ids(dataset, bindings.publication.protected_field_names)
@@ -1041,7 +1091,8 @@ def _assert_base_identity(
         raise PublicationError(msg)
 
 
-def _assert_nullable_schema_extension(source: pa.Schema, current: pa.Schema) -> None:
+def assert_nullable_schema_extension(source: pa.Schema, current: pa.Schema) -> None:
+    """Allow only compatible nullable field additions to the captured schema."""
     if source.metadata != current.metadata or len(current) < len(source):
         msg = "The Lance schema changed incompatibly after caption attempt capture"
         raise PublicationError(msg)
@@ -1055,7 +1106,8 @@ def _assert_nullable_schema_extension(source: pa.Schema, current: pa.Schema) -> 
         raise PublicationError(msg)
 
 
-def _require_fragment(dataset: lance.LanceDataset, fragment_id: int) -> LanceFragment:
+def require_fragment(dataset: lance.LanceDataset, fragment_id: int) -> LanceFragment:
+    """Return a selected fragment or reject its removal from the current dataset."""
     fragment = dataset.get_fragment(fragment_id)
     if fragment is None:
         msg = f"Fragment {fragment_id} selected for captioning is absent at Lance version {dataset.version}"

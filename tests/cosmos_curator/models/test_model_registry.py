@@ -178,6 +178,18 @@ def test_a_model_directory_without_config_is_incomplete(tmp_path: pathlib.Path) 
         model_registry.validate_model_directory(model_dir, model_key="pinned")
 
 
+def test_a_model_with_code_owned_config_accepts_staged_weights_without_config_json(tmp_path: pathlib.Path) -> None:
+    """InternVideo2 ships its config in the source tree, while its download contains only a .pt file."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.pt").write_bytes(b"weights")
+
+    assert (
+        model_registry.validate_model_directory(model_dir, model_key="internvideo2_mm", require_config_json=False)
+        == model_dir
+    )
+
+
 def test_an_incomplete_model_directory_names_the_download_key(tmp_path: pathlib.Path) -> None:
     """An incomplete directory reports the command that stages its key."""
     model_dir = tmp_path / "model"
