@@ -159,9 +159,7 @@ def _stub_image_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
 
 def test_the_kind_is_registered_under_its_single_word_name() -> None:
     """The CLI resolves configs by their ``kind`` discriminator."""
-    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
-        BUILTIN_PIPELINE_KINDS,
-    )
+    from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS  # noqa: PLC0415
 
     assert BUILTIN_PIPELINE_KINDS.get("embeddings") is EMBEDDINGS_KIND
     assert "embeddings" in BUILTIN_PIPELINE_KINDS.names()

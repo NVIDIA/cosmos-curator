@@ -136,7 +136,7 @@ def test_cli_template_render_schema_and_dispatch(
 ) -> None:
     """Generic CLI and runtime select the new recipe, preserving lazy registration."""
     from cosmos_curator.client.cli import cosmos_curator  # noqa: PLC0415 - deployment CLI dependencies are dev-only
-    from cosmos_curator.client.pipeline_cli import pipeline_runtime  # noqa: PLC0415 - client is dev-only
+    from cosmos_curator.pipelines import pipeline_runtime  # noqa: PLC0415
 
     runner = CliRunner()
     template = runner.invoke(cosmos_curator, ["pipeline", "template", "video-cut"])

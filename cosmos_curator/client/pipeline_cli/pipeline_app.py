@@ -23,9 +23,9 @@ from typing import Annotated, NoReturn, cast
 import typer
 from typer import Argument, Option
 
-from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
-from cosmos_curator.client.pipeline_cli.pipeline_config import load_pipeline_kind_name
 from cosmos_curator.next.core.pipeline_kind import PipelinePreset
+from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
+from cosmos_curator.pipelines.pipeline_config import load_pipeline_kind_name
 
 
 def _complete_pipeline_kind(incomplete: str) -> list[str]:

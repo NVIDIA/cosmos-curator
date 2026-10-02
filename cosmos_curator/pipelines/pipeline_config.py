@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared loading for config-backed pipeline CLI entrypoints."""
+"""Shared config loading for the deployment CLI and packaged pipeline runtime."""
 
 import json
 from pathlib import Path

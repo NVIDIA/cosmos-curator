@@ -16,7 +16,7 @@
 """Pipeline-kind surfaces for the deprecated ``cosmos_curator.pipelines.ray_data`` recipes.
 
 These adapt ``video_split`` and ``caption_judge`` to the same ``PipelineKind``
-contract the Curator Next recipes implement, so the CLI keeps exactly one
+contract the Curator Next recipes implement, so the CLI and runtime share one
 dispatch path while both generations coexist. Keeping the adapters together
 also makes their eventual removal explicit: delete this module and its two
 registry entries along with the ``ray_data`` tree.

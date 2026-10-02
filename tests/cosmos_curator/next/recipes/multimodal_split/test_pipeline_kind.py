@@ -53,9 +53,7 @@ def _write_config(root: Path, prefix: str, *, clip: dict[str, object] | None = N
 
 def test_the_kind_is_registered_under_its_hyphenated_name() -> None:
     """The CLI resolves configs by their ``kind`` discriminator."""
-    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
-        BUILTIN_PIPELINE_KINDS,
-    )
+    from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS  # noqa: PLC0415
 
     assert BUILTIN_PIPELINE_KINDS.get("multimodal-split") is MULTIMODAL_SPLIT_KIND
     assert "multimodal-split" in BUILTIN_PIPELINE_KINDS.names()

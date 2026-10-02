@@ -2082,7 +2082,7 @@ commit and the next wave plans what the previous one did not finish.
   failed commit) raise on the driver **before** the commit, so the previous
   committed version stays current and no partial group is published.
 - Every exception a run raises reaches the operator through the generic
-  [`run-pipeline`](../../../cosmos_curator/client/pipeline_cli/pipeline_runtime.py)
+  [`run-pipeline`](../../../cosmos_curator/pipelines/pipeline_runtime.py)
   runtime: with `--json` it prints `{"ok": false, "error": "runtime", "message":
   …}` and exits **2**, and without it the exception re-raises as an ordinary
   traceback. A *config* fault surfaces from `prepare_run` before Ray starts and is

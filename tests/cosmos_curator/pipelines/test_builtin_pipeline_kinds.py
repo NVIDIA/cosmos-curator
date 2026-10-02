@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
+from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
 
 
 def test_registered_kind_names_are_derived_from_concrete_objects() -> None:
@@ -43,7 +43,7 @@ def test_importing_composition_root_pulls_in_no_third_party_dependency(repo_root
     probe = (
         "import sys;"
         "before = set(sys.modules);"
-        "from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS;"
+        "from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS;"
         "BUILTIN_PIPELINE_KINDS.names();"
         "added = {m.split('.')[0] for m in set(sys.modules) - before};"
         "print(sorted(added - sys.stdlib_module_names))"

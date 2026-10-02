@@ -22,7 +22,9 @@ from types import SimpleNamespace
 import pytest
 import typer
 
-from cosmos_curator.client.pipeline_cli import pipeline_runtime
+from cosmos_curator.next.recipes.video_transcode import pipeline as transcoding_pipeline
+from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
+from cosmos_curator.pipelines import pipeline_runtime
 from cosmos_curator.pipelines.ray_data.caption_judge import driver as caption_judge_driver
 from cosmos_curator.pipelines.ray_data.caption_judge import report_io as caption_judge_report_io
 from cosmos_curator.pipelines.ray_data.caption_judge.config import CaptionJudgePipelineConfig
@@ -127,6 +129,41 @@ def test_pipeline_runtime_hands_caption_judge_config_to_ray_data_pipeline(
     assert config.baseline_metadata == "/baseline/lance/v0"
     assert config.judge.max_output_tokens == 1024
     assert captured["report_format"] == "json"
+
+
+@pytest.mark.parametrize("json_output", [True, False])
+def test_pipeline_runtime_hands_resolved_config_to_video_transcode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    json_output: bool,
+) -> None:
+    """The packaged runner dispatches video-transcode configs with typed overrides."""
+    configs: list[ResolvedVideoTranscodeConfig] = []
+    summary: dict[str, object] = {"spans": 12, "transcoded_spans": 12}
+
+    def fake_run_config(config: ResolvedVideoTranscodeConfig) -> dict[str, object]:
+        configs.append(config)
+        return summary
+
+    monkeypatch.setattr(transcoding_pipeline, "run_config", fake_run_config)
+    config_path = tmp_path / "video-transcode.json"
+    config_path.write_text(
+        json.dumps({"schema_version": 1, "kind": "video-transcode", "input": {"media_root": "/media"}})
+    )
+
+    pipeline_runtime.main(config_path, set_overrides=["execution.transcode_cpus=2"], json_output=json_output)
+
+    assert len(configs) == 1
+    assert configs[0].input.spans_lance_uri == "/media/lance"
+    assert configs[0].execution.transcode_cpus == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        assert json.loads(captured.out) == summary
+    else:
+        assert captured.out == "video-transcode: 12 transcoded clip(s)\n"
 
 
 def test_pipeline_runtime_reports_runtime_errors_as_json(

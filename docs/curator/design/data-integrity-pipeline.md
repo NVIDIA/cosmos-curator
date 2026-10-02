@@ -138,7 +138,7 @@ produce one run. Everything it composes is public, though — see [Persistence](
 
 A recipe registers a `PipelineKind` (`cosmos_curator/next/core/pipeline_kind.py`) by adding
 it to the `BUILTIN_PIPELINE_KINDS` registry in
-[builtin_pipeline_kinds.py](../../../cosmos_curator/client/pipeline_cli/builtin_pipeline_kinds.py)
+[builtin_pipeline_kinds.py](../../../cosmos_curator/pipelines/builtin_pipeline_kinds.py)
 — one import and one tuple entry, in one file. `PipelineKindRegistry` indexes kinds by name
 and rejects duplicates, and both CLI entry points resolve a kind through it.
 
@@ -841,9 +841,9 @@ to `run_one_stream`, plus `max_attempts`, `raise_infrastructure_errors`, `Infras
 and `is_infrastructure_error`), `store_schema.py` (the `tool` comment at `:155`,
 one word), `core/utils/storage/s3_client.py` and `storage_utils.py` (the two hoisted listers),
 `next/recipes/multimodal_split/discovery.py` (repointed at them), and
-`client/pipeline_cli/builtin_pipeline_kinds.py` (one import, one tuple entry). The two
+`pipelines/builtin_pipeline_kinds.py` (one import, one tuple entry). The two
 composition-root tests that pin the registered names —
-`tests/cosmos_curator/client/pipeline_cli/test_builtin_pipeline_kinds.py` and
+`tests/cosmos_curator/pipelines/test_builtin_pipeline_kinds.py` and
 `test_pipeline_app.py`, which spells the same list into an error message — change with it.
 
 ## Relationship to `di-check` and `di-session`

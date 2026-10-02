@@ -93,7 +93,7 @@ Runnable reference recipes normally accept a versioned YAML or JSON config backe
 
 For a recipe exposed through the generic pipeline CLI, define and export its `PipelineKind` from the recipe's
 `pipeline_kind.py`, then register it in `BUILTIN_PIPELINE_KINDS` in
-`cosmos_curator/client/pipeline_cli/builtin_pipeline_kinds.py`. Use the exact config discriminator as the kind name. Keep
+`cosmos_curator/pipelines/builtin_pipeline_kinds.py`. Use the exact config discriminator as the kind name. Keep
 the adapter lightweight by deferring config, runtime, Ray, and model imports until the selected operation needs them.
 Update registration, dispatch, import-laziness, and preset tests as applicable.
 

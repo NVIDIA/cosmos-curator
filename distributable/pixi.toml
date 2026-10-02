@@ -71,7 +71,7 @@ hello-world = "python -m cosmos_curator.pipelines.examples.hello_world_pipeline"
 model-download = "python -m cosmos_curator.core.managers.model_cli download"
 model-checksums = { cmd = "python -m cosmos_curator.core.managers.model_cli checksums", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
 model-verify-ngc = { cmd = "python -m cosmos_curator.core.managers.model_cli verify-ngc", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
-run-pipeline = "python -m cosmos_curator.client.pipeline_cli.pipeline_runtime"
+run-pipeline = "python -m cosmos_curator.pipelines.pipeline_runtime"
 video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
 gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
 integration-test = "pytest -m integration tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"

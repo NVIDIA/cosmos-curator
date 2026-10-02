@@ -97,9 +97,7 @@ def _result(*, published_rows: int, error_rows: int = 3, truncated_rows: int = 4
 
 def test_the_kind_is_registered_under_its_config_discriminator() -> None:
     """The CLI resolves a config's ``kind`` field straight to this adapter."""
-    from cosmos_curator.client.pipeline_cli.builtin_pipeline_kinds import (  # noqa: PLC0415 - client is dev-only
-        BUILTIN_PIPELINE_KINDS,
-    )
+    from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS  # noqa: PLC0415
 
     assert BUILTIN_PIPELINE_KINDS.get(KIND_NAME) is ROBOT_ACTION_CAPTION_KIND
 

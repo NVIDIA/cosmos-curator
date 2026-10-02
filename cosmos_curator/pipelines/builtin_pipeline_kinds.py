@@ -18,9 +18,11 @@
 Pipeline-kind modules are lightweight adapters. They defer importing config
 models and runtime implementations until the selected operation needs them, so
 the registry can own concrete objects without eagerly loading every recipe.
+
+Both the deployment CLI and the runtime entrypoint use this registry. Keep it
+outside ``cosmos_curator.client``, which is excluded from runtime images.
 """
 
-from cosmos_curator.client.pipeline_cli.legacy_kinds import CAPTION_JUDGE_KIND, VIDEO_SPLIT_LEGACY_KIND
 from cosmos_curator.next.core.pipeline_kind import PipelineKindRegistry
 from cosmos_curator.next.recipes.curation.pipeline_kind import CURATE_KIND
 from cosmos_curator.next.recipes.data_integrity.pipeline_kind import DATA_INTEGRITY_KIND
@@ -32,6 +34,7 @@ from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_A
 from cosmos_curator.next.recipes.video_caption.pipeline_kind import VIDEO_CAPTION_KIND
 from cosmos_curator.next.recipes.video_cut.pipeline_kind import VIDEO_CUT_KIND
 from cosmos_curator.next.recipes.video_transcode.pipeline_kind import VIDEO_TRANSCODE_KIND
+from cosmos_curator.pipelines.legacy_kinds import CAPTION_JUDGE_KIND, VIDEO_SPLIT_LEGACY_KIND
 
 # Registering a kind also changes two restatements of the sorted name list in the
 # test tree: the expected tuple in test_builtin_pipeline_kinds.py, and the
