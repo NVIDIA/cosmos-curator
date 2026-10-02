@@ -80,7 +80,7 @@ model-checksums = { cmd = "python -m cosmos_curator.core.managers.model_cli chec
 model-verify-ngc = { cmd = "python -m cosmos_curator.core.managers.model_cli verify-ngc", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
 run-pipeline = "python -m cosmos_curator.pipelines.pipeline_runtime"
 video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
-gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
+gpu-test = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
 integration-test = "pytest -m integration tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
 
 [feature.tools]
@@ -149,9 +149,10 @@ types-tqdm = "*"
 
 [feature.dev.tasks]
 mypy = "mypy"
-pytest = "pytest"
+# Use suite names so pytest remains available as an executable in other environments.
+unit-test = "python -m pytest"
 # memory-bound suite; 4 workers measured optimal in CI — don't crank on a busy workstation
-pytest-fast = "pytest -n 4 --dist loadfile"
+unit-test-fast = "python -m pytest -n 4 --dist loadfile"
 
 [feature.runtime]
 channels = ["conda-forge", "nvidia"]

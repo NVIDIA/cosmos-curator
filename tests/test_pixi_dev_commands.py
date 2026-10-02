@@ -20,7 +20,7 @@ substitutes for running the commands themselves. They verify that:
 
 - Pixi separates cross-platform tools, Linux development, cluster operations,
   and runtime environments.
-- The `gputest` task is exposed on `core` so every GPU runtime env can run it.
+- The `gpu-test` task is exposed on `core` so every GPU runtime env can run it.
 - Developer and operational environments stay isolated from image defaults so
   lint tooling is not installed in production containers.
 """
@@ -147,12 +147,19 @@ def test_cluster_environment_declares_slurm_and_node_diagnostics() -> None:
 
 
 def test_dev_environment_declares_linux_cpu_test_tooling() -> None:
-    """Verify dev is Linux-only, includes cluster tools, and omits main runtime."""
+    """Verify dev provides CPU test tooling without shadowing runtime pytest."""
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
 
     dev_feature = pixi_config["feature"]["dev"]
     dev_conda_dependencies = dev_feature["dependencies"]
     dev_pypi_dependencies = dev_feature["pypi-dependencies"]
+
+    assert {"unit-test", "unit-test-fast"}.issubset(dev_feature["tasks"])
+    assert "pytest" not in pixi_config.get("tasks", {})
+    for feature_name, feature in pixi_config["feature"].items():
+        assert "pytest" not in feature.get("tasks", {}), (
+            f"The {feature_name} feature defines a pytest task that shadows environment executables."
+        )
 
     assert dev_feature["channels"] == ["conda-forge"]
     assert dev_feature["platforms"] == ["linux-64", "linux-aarch64"]
@@ -373,16 +380,16 @@ def test_model_download_environment_reuses_core() -> None:
     assert pixi_config["environments"]["model-download"] == ["linux", "core", "tracing"]
 
 
-def test_gputest_task_is_defined_on_core() -> None:
+def test_gpu_test_task_is_defined_on_core() -> None:
     """Verify the GPU/env test task lives on `core` so every runtime env has it."""
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
     core_tasks = pixi_config.get("feature", {}).get("core", {}).get("tasks")
     assert isinstance(core_tasks, dict)
 
-    gputest = core_tasks["gputest"]
-    assert isinstance(gputest, str)
-    assert "pytest -m env" in gputest
-    assert "gputest" in core_tasks
+    gpu_test = core_tasks["gpu-test"]
+    assert isinstance(gpu_test, str)
+    assert "pytest -m env" in gpu_test
+    assert "gpu-test" in core_tasks
 
 
 def test_user_facing_core_tasks_use_hyphenated_names() -> None:

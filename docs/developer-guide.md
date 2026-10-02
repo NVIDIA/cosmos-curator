@@ -142,7 +142,7 @@ Developer tools support two local workflows. Without activating a shell, use Pix
 ```bash
 pixi run ruff check
 pixi run mypy --pretty
-pixi run pytest tests/test_pixi_dev_commands.py
+pixi run unit-test tests/test_pixi_dev_commands.py
 pixi run build
 ```
 
@@ -198,7 +198,7 @@ Inside `pixi shell -e dev`, use `python -m build`.
 ## Testing
 
 Tests under the [tests/](../tests/) directory can be categorized into 3 levels:
-- Unit tests: for testing critical/complex function which are typically CPU-only and can run in the default Pixi environment.
+- Unit tests: for testing critical/complex function which are typically CPU-only and run in the `dev` Pixi environment.
 - Model/stage tests: for testing functional correctness of a model, a pipeline stage, and a combination of a few stages, which typically require GPU and should run inside the container.
 - End-to-end pipeline tests: for testing the functionality of reference pipelines.
 
@@ -208,7 +208,7 @@ Run the CPU-only pytest suite from the repository root:
 
 ```bash
 PYTEST_ADDOPTS='--junitxml=report.xml --cov=cosmos_curator --cov-report=term --cov-report=xml:unit-coverage.xml --cov-report=html:unit-htmlcov' \
-  pixi run pytest -s
+  pixi run unit-test -s
 
 ================ test session starts ================
 configfile: pytest.ini
@@ -222,17 +222,19 @@ tests/cosmos_curator/pipelines/video/utils/test_decoder_utils.py ...............
 ================ 102 passed, 6 deselected, 2 warnings in 2.98s ================
 ```
 
+Use `pixi run unit-test-fast` to run the suite with four workers. Both unit-test tasks automatically select `dev`.
+
 Inside `pixi shell -e dev`, use the same `PYTEST_ADDOPTS` value with `pytest -s`.
 
 ### Model and Stage Tests
 
-Launch the docker container locally and run the `gputest` task, which runs the
+Launch the docker container locally and run the `gpu-test` task, which runs the
 env-marked model and stage tests:
 
 ```bash
 for conda_env in default legacy-transformers; do
    cosmos-curator local launch --image-name cosmos-curator --image-tag 1.0.0 --curator-path . \
-   -- pixi run --as-is -e $conda_env gputest;
+   -- pixi run --as-is -e $conda_env gpu-test;
 done
 
 ================ test session starts ================

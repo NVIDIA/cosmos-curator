@@ -97,8 +97,6 @@ PY
         "${SEEDVR_ROOT}/projects/video_diffusion_sr/color_fix.py"
 
     echo "=== Import regression guard (seedvr env) for ${SCENARIO} ==="
-    # Invoke pytest as a module: bare `pytest` is a pixi *task* defined only in the
-    # `dev` env, so `pixi run -e seedvr pytest` fails with "task not available".
     PIXI_ENVIRONMENT_NAME=seedvr pixi run --as-is -e seedvr \
         python -m pytest -m env "${REPO_ROOT}/tests/cosmos_curator/pipelines/video/super_resolution/"
 fi

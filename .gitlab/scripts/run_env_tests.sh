@@ -18,11 +18,11 @@ WHEEL_DIR="/config/project/cosmos-xenna/target/wheels" \
     bash /config/project/.gitlab/scripts/install_local_xenna_into_pixi.sh "${ENVS[@]}"
 
 # Run tests for each environment with unique report files and coverage.
-# The `gputest` task bakes in `pytest -m env <test paths>`; the flags below are
+# The `gpu-test` task bakes in `pytest -m env <test paths>`; the flags below are
 # forwarded to pytest.
 for env in "${ENVS[@]}"; do
   echo "Running tests for $env environment"
-  pixi run --as-is -e $env gputest -n "${PYTEST_XDIST_WORKERS}" \
+  pixi run --as-is -e $env gpu-test -n "${PYTEST_XDIST_WORKERS}" \
     --junitxml="/config/project/$env-report.xml" \
     --cov=cosmos_curator \
     --cov-report=term \

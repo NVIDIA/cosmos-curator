@@ -6,9 +6,12 @@ The test suites have separate markers and execution environments:
 
 | Suite | Marker | Local command | CI job |
 | --- | --- | --- | --- |
-| Unit | Neither runtime marker | `pixi run -e dev pytest` | `unit_tests`, shell runners |
+| Unit | Neither runtime marker | `pixi run unit-test` | `unit_tests`, shell runners |
 | CPU integration | `@pytest.mark.integration` | `pixi run --as-is -e default integration-test` | `integration_tests`, Kubernetes |
-| GPU/model | `@pytest.mark.env("default")` or another required env | `pixi run --as-is -e default gputest` | `gpu_tests`, Slurm |
+| GPU/model | `@pytest.mark.env("default")` or another required env | `pixi run --as-is -e default gpu-test` | `gpu_tests`, Slurm |
+
+Use `pixi run unit-test-fast` to run unit tests with four workers. Both unit-test
+tasks automatically select the `dev` environment.
 
 Tests that start a real Ray cluster, including Ray Data operations that initialize
 Ray implicitly, must be excluded from the unit suite. Use `integration` for CPU

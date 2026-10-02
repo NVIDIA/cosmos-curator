@@ -2,6 +2,12 @@
 
 ## Latest
 
+### Changed
+
+- Rename Pixi test tasks: `pytest` to `unit-test`, `pytest-fast` to `unit-test-fast`,
+  and `gputest` to `gpu-test`. The unit tasks select `dev`; `pixi run -e <env> pytest`
+  now runs the selected environment's executable without a task-name collision.
+
 ## [2.7.0]
 
 ### Released

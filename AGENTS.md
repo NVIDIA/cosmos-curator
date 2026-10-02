@@ -21,10 +21,10 @@ pixi run ruff format && pixi run ruff check --fix && pixi run mypy
 Pre-commit hooks run ruff automatically. A submodule-check hook warns before committing cosmos-xenna changes.
 
 **Testing**:
-- CPU unit tests: `pytest` (env- and integration-marked tests are excluded by default via `pytest.ini`)
+- CPU unit tests: `pixi run unit-test` (`pixi run unit-test-fast` for four workers). Env- and integration-marked tests are excluded by default via `pytest.ini`.
 - Tests that intentionally exercise CLI usage errors or other expected stderr/stdout output must capture and assert that output with `capsys`/`capfd`; passing tests should not leak expected errors into `pytest -s` CI logs.
 - CPU integration tests: mark with `@pytest.mark.integration` and run `pixi run --as-is -e default integration-test`. CI runs these serially in the Kubernetes `integration_tests` job using the slim image; they must not require GPUs or staged model weights.
-- GPU tests: `cosmos-curator local launch --curator-path . -- pixi run --as-is -e default gputest`. Use `@pytest.mark.env("default")` (or another required env name); CI runs these in `gpu_tests` on Slurm. Requires model weights staged in the local workspace (`model_download`).
+- GPU tests: `cosmos-curator local launch --curator-path . -- pixi run --as-is -e default gpu-test`. Use `@pytest.mark.env("default")` (or another required env name); CI runs these in `gpu_tests` on Slurm. Requires model weights staged in the local workspace (`model-download`).
 - Do not add real Ray execution to `unit_tests`, including implicit cluster startup through Ray Data. CPU Ray tests belong behind `@pytest.mark.integration`; tests that also require GPUs or model weights use the GPU suite's env marker. Mocked Ray tests stay in the CPU unit suite. Mark the test, class, or module, not just its fixture; fixture markers do not select tests.
 - Both runtime test tasks collect only `tests/cosmos_curator/{pipelines,models,next}` to avoid dev-only client/benchmark dependencies. The runtime image omits `cosmos_curator.client`; import client code only inside the unit tests that need it so runtime collection works without the deployment client.
 - Place tests in `tests/` mirroring module paths. Uses `--import-mode=importlib`.
