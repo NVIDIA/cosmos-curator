@@ -152,6 +152,7 @@ def _srun_allocation_args(  # noqa: PLR0913
     qos: str | None,
     gres: str | None,
     gpus: str | None,
+    gpus_per_node: str | None,
     job_name: str,
     num_nodes: int | None,
     exclusive: bool,
@@ -169,13 +170,14 @@ def _srun_allocation_args(  # noqa: PLR0913
         msg = f"--mem must be a positive Slurm size such as 64G or 65536M, got {memory!r}"
         raise typer.BadParameter(msg)
 
-    gres, gpus = _validate_gpu_options(gres=gres, gpus=gpus)
+    gres, gpus, gpus_per_node = _validate_gpu_options(gres=gres, gpus=gpus, gpus_per_node=gpus_per_node)
     args = [f"--nodes={num_nodes}"] if num_nodes is not None else []
     optional_args = [
         ("--account", _resolve_slurm_account(account)),
         ("--partition", partition),
         ("--qos", qos),
         ("--gpus", gpus),
+        ("--gpus-per-node", gpus_per_node),
         ("--gres", gres),
         ("--time", time_limit),
         ("--job-name", job_name),
@@ -283,6 +285,7 @@ def _build_import_image_srun_command(  # noqa: PLR0913
             qos=None,
             gres=None,
             gpus=None,
+            gpus_per_node=None,
             job_name=job_name,
             num_nodes=1,
             exclusive=False,
@@ -577,7 +580,7 @@ def shell_cli(  # noqa: PLR0913
     gres: Annotated[
         str | None,
         Option(
-            help="Alternative Slurm GPU request in GRES form, e.g. 'gpu:8'. Cannot be used with --gpus.",
+            help=("GPUs per node in GRES form, e.g. 'gpu:8'. Cannot be used with --gpus or --gpus-per-node."),
             rich_help_panel="cluster",
         ),
     ] = None,
@@ -586,7 +589,17 @@ def shell_cli(  # noqa: PLR0913
         Option(
             "-G",
             "--gpus",
-            help="Common Slurm GPU request form, e.g. '8' or 'h100:8'. Cannot be used with --gres.",
+            help=("Total GPUs for the job, e.g. '8' or 'h100:8'. Cannot be used with --gres or --gpus-per-node."),
+            rich_help_panel="cluster",
+        ),
+    ] = None,
+    gpus_per_node: Annotated[
+        str | None,
+        Option(
+            help=(
+                "GPUs per node, e.g. '8' or 'h100:8'. Use on clusters that require per-node GPU requests. "
+                "Cannot be used with --gpus or --gres."
+            ),
             rich_help_panel="cluster",
         ),
     ] = None,
@@ -771,6 +784,7 @@ def shell_cli(  # noqa: PLR0913
             qos=qos,
             gres=gres,
             gpus=gpus,
+            gpus_per_node=gpus_per_node,
             job_name=job_name,
             num_nodes=num_nodes,
             exclusive=exclusive,

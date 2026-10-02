@@ -37,6 +37,9 @@
 {% if gpus %}
 #SBATCH --gpus={{gpus}}
 {% endif %}
+{% if gpus_per_node %}
+#SBATCH --gpus-per-node={{gpus_per_node}}
+{% endif %}
 {% if qos %}
 #SBATCH --qos={{qos}}
 {% endif %}

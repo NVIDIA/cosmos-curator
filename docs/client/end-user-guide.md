@@ -709,7 +709,18 @@ cosmos-curator slurm submit \
   -- pixi run --as-is hello-world
 ```
 
-Use `-G 8` for the common GPU request form. `--gres=gpu:8` is also supported; the two options are mutually exclusive.
+Use `-G 8` (or `--gpus=8`) to request eight GPUs total across the job. Use `--gpus-per-node=8` or
+`--gres=gpu:8` to request eight GPUs on each node. These three options are mutually exclusive and also accept
+GPU types, for example `--gpus-per-node=h100:8` or `--gres=gpu:h100:8`.
+
+On clusters that prohibit job-wide GPU requests, such as those with the NVL72 interim safety policy, use:
+
+```bash
+cosmos-curator slurm submit --nodes 2 --gpus-per-node=4 -- pixi run --as-is hello-world
+```
+
+This requests four GPUs on each of two nodes. Submit already sets `--ntasks-per-node=1` to run one Ray process
+per node.
 
 When submitting from outside the Slurm login host, add `--login-node` and `--username` as needed. Container mount paths
 are still validated on the cluster, so pass `--container-image`, `--workspace-path`, `--cache-path`, `--curator-path`,
@@ -868,11 +879,12 @@ Slurm login node, add `--login-node` and `--username` as needed, and pass an exp
 valid on the cluster. Credential and config mounts also use cluster-visible paths; override them with
 `--container-mounts` or disable credential mounts when your login node paths differ.
 
-Use `-G 8` for the common GPU request form. `--gres=gpu:8` is also supported; the two options are mutually exclusive.
-For example, on an 8-GPU node:
+Use `-G 8` (or `--gpus=8`) to request eight GPUs total across the job. `--gpus-per-node=8` and `--gres=gpu:8`
+request eight GPUs on each node. These three options are mutually exclusive.
+For example, request one node with eight GPUs, including on clusters that require per-node GPU requests:
 
 ```bash
-cosmos-curator slurm shell --curator-path . -G 8
+cosmos-curator slurm shell --curator-path . -N 1 --gpus-per-node=8
 ```
 
 To run a specific command instead of opening `bash`, put it after `--`:

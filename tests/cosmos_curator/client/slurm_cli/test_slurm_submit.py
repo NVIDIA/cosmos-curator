@@ -902,8 +902,19 @@ def test_submit_accepts_slurm_style_short_options(tmp_path: pathlib.Path) -> Non
     assert "#SBATCH --gpus=8" in sbatch_script
 
 
-def test_submit_dry_run_prints_sbatch_without_submitting(tmp_path: pathlib.Path) -> None:
-    """Dry-run should render the real submission script and stop before remote upload or sbatch."""
+@pytest.mark.parametrize(
+    ("gpu_option", "gpu_value", "expected_gpu_directives"),
+    [
+        ("-G", "8", ["#SBATCH --gpus=8"]),
+        ("--gpus-per-node", "4", ["#SBATCH --gpus-per-node=4"]),
+        ("--gpus-per-node", " h100:4 ", ["#SBATCH --gpus-per-node=h100:4"]),
+        ("--gpus-per-node", "   ", []),
+    ],
+)
+def test_submit_dry_run_prints_sbatch_without_submitting(
+    tmp_path: pathlib.Path, gpu_option: str, gpu_value: str, expected_gpu_directives: list[str]
+) -> None:
+    """Dry-run preserves GPU request scope and one Ray task per node without submitting."""
     with patch(f"{MODULE_NAME}.curator_submit") as mock_curator_submit:
         result = runner.invoke(
             cosmos_curator,
@@ -915,8 +926,8 @@ def test_submit_dry_run_prints_sbatch_without_submitting(tmp_path: pathlib.Path)
                 "test_account",
                 "-p",
                 "batch",
-                "-G",
-                "8",
+                gpu_option,
+                gpu_value,
                 "-J",
                 "batch_job",
                 "-N",
@@ -942,6 +953,15 @@ def test_submit_dry_run_prints_sbatch_without_submitting(tmp_path: pathlib.Path)
     assert ":/remote_files:rw" in result.output
     assert "echo hello" in result.output
     assert "Job submitted with ID" not in result.output
+    gpu_directives = [
+        line
+        for line in result.output.splitlines()
+        if line.startswith(("#SBATCH --gpus=", "#SBATCH --gpus-per-node=", "#SBATCH --gres="))
+    ]
+    assert gpu_directives == expected_gpu_directives
+    assert "#SBATCH --nodes=2" in result.output
+    assert "#SBATCH --ntasks=2" in result.output
+    assert "#SBATCH --ntasks-per-node=1" in result.output
 
 
 def test_submit_dry_run_script_is_syntactically_valid_bash(tmp_path: pathlib.Path) -> None:
@@ -1004,18 +1024,25 @@ def test_submit_dry_run_script_is_syntactically_valid_bash(tmp_path: pathlib.Pat
     )
 
 
-def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
-    """Submit should not ask Slurm for GPUs through two incompatible option styles."""
+@pytest.mark.parametrize(
+    ("gpu_args", "expected_message"),
+    [
+        (["--gres", "gpu:8", "-G", "8"], "--gres and --gpus cannot be used together"),
+        (["--gres", "gpu:8", "--gpus-per-node", "8"], "--gres and --gpus-per-node cannot be used together"),
+        (["--gpus", "8", "--gpus-per-node", "8"], "--gpus and --gpus-per-node cannot be used together"),
+    ],
+)
+def test_submit_rejects_conflicting_gpu_options(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], gpu_args: list[str], expected_message: str
+) -> None:
+    """Conflicting GPU request forms fail before uploading or submitting a job."""
     with patch(f"{MODULE_NAME}.curator_submit") as mock_curator_submit:
         result = runner.invoke(
             cosmos_curator,
             [
                 "slurm",
                 "submit",
-                "--gres",
-                "gpu:8",
-                "-G",
-                "8",
+                *gpu_args,
                 "--container-image",
                 "test_image",
                 "--workspace-path",
@@ -1031,9 +1058,11 @@ def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
             ],
         )
 
-    assert result.exit_code != 0
-    assert "--gres and --gpus cannot be used together" in result.output
+    assert result.exit_code == 2
+    assert expected_message in result.output
     mock_curator_submit.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
 
 
 @pytest.mark.parametrize(

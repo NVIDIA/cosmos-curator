@@ -257,6 +257,7 @@ class SlurmSubmitOptions:
     num_nodes: int = 1
     gres: str | None = None
     gpus: str | None = None
+    gpus_per_node: str | None = None
     qos: str | None = None
     exclusive: bool = True
     time: str | None = None
@@ -289,6 +290,7 @@ class SlurmJobSpec:
     container: ContainerSpec
     gres: str | None = None
     gpus: str | None = None
+    gpus_per_node: str | None = None
     qos: str | None = None
     time_limit: str | None = None
     stop_retries_after: int = 600
@@ -339,6 +341,7 @@ def _render_sbatch_script(spec: SlurmJobSpec) -> str:
         command=command,
         gres=spec.gres,
         gpus=spec.gpus,
+        gpus_per_node=spec.gpus_per_node,
         qos=spec.qos,
         exclusive=spec.exclusive,
         container_image=spec.container.squashfs_path,
@@ -747,7 +750,7 @@ def build_slurm_submit_job_spec(command: list[str], options: SlurmSubmitOptions 
         msg = "--ray-io-slots-per-node must be at least 1"
         raise typer.BadParameter(msg)
 
-    gres, gpus = _validate_gpu_options(gres=opts.gres, gpus=opts.gpus)
+    gres, gpus, gpus_per_node = _validate_gpu_options(gres=opts.gres, gpus=opts.gpus, gpus_per_node=opts.gpus_per_node)
     submit_runtime = _build_slurm_container_runtime(
         container_image=opts.container_image,
         curator_path=opts.curator_path,
@@ -792,6 +795,7 @@ def build_slurm_submit_job_spec(command: list[str], options: SlurmSubmitOptions 
         container=container_spec,
         gres=gres,
         gpus=gpus,
+        gpus_per_node=gpus_per_node,
         qos=_normalize_optional_slurm_directive(opts.qos),
         exclusive=opts.exclusive,
         time_limit=opts.time,
@@ -988,7 +992,7 @@ def submit_cli(  # noqa: PLR0913
     gres: Annotated[
         str | None,
         Option(
-            help="Alternative Slurm GPU request in GRES form, e.g. 'gpu:8'. Cannot be used with --gpus.",
+            help=("GPUs per node in GRES form, e.g. 'gpu:8'. Cannot be used with --gpus or --gpus-per-node."),
             rich_help_panel="cluster",
         ),
     ] = None,
@@ -997,7 +1001,17 @@ def submit_cli(  # noqa: PLR0913
         Option(
             "-G",
             "--gpus",
-            help="Common Slurm GPU request form, e.g. '8' or 'h100:8'. Cannot be used with --gres.",
+            help=("Total GPUs for the job, e.g. '8' or 'h100:8'. Cannot be used with --gres or --gpus-per-node."),
+            rich_help_panel="cluster",
+        ),
+    ] = None,
+    gpus_per_node: Annotated[
+        str | None,
+        Option(
+            help=(
+                "GPUs per node, e.g. '8' or 'h100:8'. Use on clusters that require per-node GPU requests. "
+                "Cannot be used with --gpus or --gres."
+            ),
             rich_help_panel="cluster",
         ),
     ] = None,
@@ -1117,6 +1131,7 @@ def submit_cli(  # noqa: PLR0913
             num_nodes=num_nodes,
             gres=gres,
             gpus=gpus,
+            gpus_per_node=gpus_per_node,
             qos=qos,
             exclusive=exclusive,
             time=time,

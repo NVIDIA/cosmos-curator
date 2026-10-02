@@ -319,13 +319,21 @@ def _resolve_slurm_account(account: str | None) -> str | None:
     return _normalize_optional_slurm_directive(env_account)
 
 
-def _validate_gpu_options(*, gres: str | None, gpus: str | None) -> tuple[str | None, str | None]:
+def _validate_gpu_options(
+    *, gres: str | None, gpus: str | None, gpus_per_node: str | None
+) -> tuple[str | None, str | None, str | None]:
     gres = _normalize_optional_slurm_directive(gres)
     gpus = _normalize_optional_slurm_directive(gpus)
-    if gres is not None and gpus is not None:
-        msg = "--gres and --gpus cannot be used together"
+    gpus_per_node = _normalize_optional_slurm_directive(gpus_per_node)
+    requested_options = [
+        flag
+        for flag, value in (("--gres", gres), ("--gpus", gpus), ("--gpus-per-node", gpus_per_node))
+        if value is not None
+    ]
+    if len(requested_options) > 1:
+        msg = f"{' and '.join(requested_options)} cannot be used together"
         raise BadParameter(msg)
-    return gres, gpus
+    return gres, gpus, gpus_per_node
 
 
 def _is_local_host(remote_host: str) -> bool:

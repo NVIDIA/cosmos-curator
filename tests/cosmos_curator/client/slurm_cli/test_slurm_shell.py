@@ -251,8 +251,19 @@ def test_slurm_shell_defaults_to_bash_and_uses_pty(tmp_path: Path) -> None:
     assert srun_cmd[-1:] == ["bash"]
 
 
-def test_slurm_shell_accepts_gpus_request(tmp_path: Path) -> None:
-    """The shell can request GPUs with Slurm's --gpus option."""
+@pytest.mark.parametrize(
+    ("gpu_option", "gpu_value", "expected_gpu_args"),
+    [
+        ("--gpus", "8", ["--gpus=8"]),
+        ("--gpus-per-node", "4", ["--gpus-per-node=4"]),
+        ("--gpus-per-node", " h100:4 ", ["--gpus-per-node=h100:4"]),
+        ("--gpus-per-node", "   ", []),
+    ],
+)
+def test_slurm_shell_accepts_gpu_requests(
+    tmp_path: Path, gpu_option: str, gpu_value: str, expected_gpu_args: list[str]
+) -> None:
+    """GPU requests retain their job or per-node scope when allocating multiple nodes."""
     repo = _create_repo(tmp_path)
 
     with patch(f"{SLURM_MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
@@ -268,15 +279,18 @@ def test_slurm_shell_accepts_gpus_request(tmp_path: Path) -> None:
                 "--cache-path",
                 str(tmp_path / "cache"),
                 "--no-mount-s3-creds",
-                "--gpus",
-                "8",
+                "-N",
+                "2",
+                gpu_option,
+                gpu_value,
             ],
         )
 
     assert result.exit_code == 0
     srun_cmd = mock_call.call_args[0][0]
-    assert "--gpus=8" in srun_cmd
-    assert not any(arg.startswith("--gres=") for arg in srun_cmd)
+    assert "--nodes=2" in srun_cmd
+    gpu_args = [arg for arg in srun_cmd if arg.startswith(("--gpus=", "--gpus-per-node=", "--gres="))]
+    assert gpu_args == expected_gpu_args
 
 
 def test_slurm_shell_accepts_srun_style_short_options(tmp_path: Path) -> None:
@@ -319,13 +333,24 @@ def test_slurm_shell_accepts_srun_style_short_options(tmp_path: Path) -> None:
     assert "--partition=interactive" in srun_cmd
     assert "--qos=normal" in srun_cmd
     assert "--gpus=8" in srun_cmd
+    assert not any(arg.startswith("--gpus-per-node=") for arg in srun_cmd)
     assert "--job-name=interactive_job" in srun_cmd
     assert "--nodes=2" in srun_cmd
     assert "--time=01:00:00" in srun_cmd
 
 
-def test_slurm_shell_rejects_gres_with_gpus(tmp_path: Path) -> None:
-    """The shell should not ask Slurm for GPUs through two incompatible option styles."""
+@pytest.mark.parametrize(
+    ("gpu_args", "expected_message"),
+    [
+        (["--gres", "gpu:8", "--gpus", "8"], "--gres and --gpus cannot be used together"),
+        (["--gres", "gpu:8", "--gpus-per-node", "8"], "--gres and --gpus-per-node cannot be used together"),
+        (["-G", "8", "--gpus-per-node", "8"], "--gpus and --gpus-per-node cannot be used together"),
+    ],
+)
+def test_slurm_shell_rejects_conflicting_gpu_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], gpu_args: list[str], expected_message: str
+) -> None:
+    """Conflicting GPU request forms fail before invoking srun."""
     repo = _create_repo(tmp_path)
 
     with patch(f"{SLURM_MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
@@ -341,15 +366,15 @@ def test_slurm_shell_rejects_gres_with_gpus(tmp_path: Path) -> None:
                 "--cache-path",
                 str(tmp_path / "cache"),
                 "--no-mount-s3-creds",
-                "--gres",
-                "gpu:8",
-                "--gpus",
-                "8",
+                *gpu_args,
             ],
         )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
+    assert expected_message in result.output
     mock_call.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
 
 
 def test_slurm_shell_pixi_envs_overrides_slim_warmup_envs(tmp_path: Path) -> None:
