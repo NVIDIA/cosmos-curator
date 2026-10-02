@@ -1,0 +1,19 @@
+schema_version: 1
+kind: multimodal-caption
+input:
+  episodes_lance_uri: /data/curated/full-rig/episodes.lance
+context:
+  variant: video_only
+  camera_key: front_wide
+model:
+  variant: qwen3_8_27b_fp8
+inference:
+  prompt:
+    mode: default
+output:
+  result_key: default
+  tag_camera_key: true
+execution:
+  storage_profile: default
+  # Conservative starting size for high-resolution video; tune for available memory.
+  inference_batch_size: 4

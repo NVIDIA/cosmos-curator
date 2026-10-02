@@ -9,6 +9,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 ## Guides
 
 - [Pipeline Design Guide](guides/pipeline-design.md) - build or modify curator pipelines.
+- [Multimodal AV: End-to-End Guide](guides/multimodal-av-e2e.md) - prepare recordings and model weights,
+  publish multimodal episodes, and caption selected views with optional Ego context.
 - [Curate Runbook](guides/curate-runbook.md) - run the Curate selection leg (fuse, cluster, dedup, balance).
 - [Stage Replay Guide](guides/stage-replay.md) - debug stages in isolation.
 - [Interactive Slurm Development Guide](guides/slurm-interactive.md) - iterate from an interactive Slurm allocation.

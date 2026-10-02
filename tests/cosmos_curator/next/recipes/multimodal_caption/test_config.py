@@ -16,7 +16,12 @@ from cosmos_curator.next.recipes.multimodal_caption.config import (
     config_template_payload,
     config_template_yaml,
     resolve_config_data,
+    resolved_config_to_json,
 )
+from cosmos_curator.next.recipes.multimodal_caption.config import (
+    resolve_config as resolve_caption_config,
+)
+from cosmos_curator.next.recipes.multimodal_split.config import resolve_config as resolve_split_config
 
 _OMITTED = object()
 
@@ -140,14 +145,15 @@ def test_ego_variants_require_exact_source_config(variant: str, tmp_path: Path) 
         ({"mode": "custom", "template": "exact prompt"}, _OMITTED, None),
         ({"mode": "custom", "template": "exact prompt"}, "default", None),
         ({"mode": "custom", "template": "exact prompt"}, "driving_summary_v2", "driving_summary_v2"),
-        ({"mode": "custom", "template": "exact prompt"}, "default_custom", "default_custom"),
+        ({"mode": "custom", "template": "exact prompt"}, "default_custom", None),
+        ({"mode": "custom", "template": "exact prompt"}, "defaulted", None),
         ({"mode": "custom", "template": "  \n"}, "custom", None),
     ],
 )
 def test_prompt_mode_and_result_namespace_are_strict(
     prompt: dict[str, str], result_key: object, expected: str | None, tmp_path: Path
 ) -> None:
-    """Only exact default is reserved for the default prompt; all other keys are opaque."""
+    """Custom prompts cannot claim any base key beginning with default."""
     raw = _raw(str(tmp_path / "episodes.lance"))
     raw["inference"] = {"prompt": prompt}
     if result_key is _OMITTED:
@@ -189,7 +195,7 @@ def test_generated_configuration_surfaces_are_consistent() -> None:
     assert template["inference"] == {"prompt": {"mode": "default"}}
     assert template["output"]["result_key"] == "default"  # type: ignore[index]
     annotated = config_template_yaml()
-    assert "result_key defaults to default; custom mode requires another key." in annotated
+    assert "Custom mode requires an explicit base result_key that does not start with default." in annotated
     assert "Custom Ego prompts require exactly one literal {ego_trajectory_context} sentinel." in annotated
     parsed = yaml.safe_load("\n".join(line for line in annotated.splitlines() if not line.startswith("#")))
     assert resolve_config_data(parsed).model_dump(mode="json") == resolve_config_data(template).model_dump(mode="json")
@@ -201,8 +207,81 @@ def test_generated_configuration_surfaces_are_consistent() -> None:
     output_schema = schema["$defs"]["MultimodalCaptionOutputConfig"]
     assert "result_key" not in output_schema.get("required", [])
     assert output_schema["properties"]["result_key"]["default"] == "default"
+    assert output_schema["properties"]["tag_camera_key"]["default"] is False
+    assert template["output"]["tag_camera_key"] is False
     assert "ego_trajectory_absolute_poses" in json.dumps(schema)
     assert "qwen3_8_27b_fp8" in json.dumps(schema)
+
+
+@pytest.mark.parametrize("tag", [False, True])
+@pytest.mark.parametrize("base", [_OMITTED, "default", "experiment_02", "front_wide"])
+def test_camera_tagging_preserves_reloadable_base_key(base: object, tmp_path: Path, *, tag: bool) -> None:
+    """Tagging appends exactly once, including to a camera-named base."""
+    output: dict[str, object] = {"tag_camera_key": tag}
+    if base is not _OMITTED:
+        output["result_key"] = base
+    config = resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"output": output})
+    expected_base = "default" if base is _OMITTED else base
+    assert config.output.result_key == expected_base
+    assert config.effective_result_key == (f"{expected_base}_front_wide" if tag else expected_base)
+    reloaded = resolve_config_data(json.loads(resolved_config_to_json(config)))
+    assert reloaded == config
+    assert reloaded.effective_result_key == config.effective_result_key
+
+
+def test_tagging_resolves_after_cli_overrides(tmp_path: Path) -> None:
+    """Overrides choose the camera and base before validating the effective key."""
+    config = resolve_config_data(
+        _raw(str(tmp_path / "episodes.lance")),
+        overrides=["output.tag_camera_key=true", "output.result_key=run2", "context.camera_key=rear_fisheye"],
+    )
+    assert config.effective_result_key == "run2_rear_fisheye"
+
+
+@pytest.mark.parametrize("camera", ["Front", "front.wide", "front-wide", "x" * 41])
+def test_tagging_rejects_invalid_effective_keys_with_guidance(camera: str, tmp_path: Path) -> None:
+    """Wider camera alphabets remain usable through explicit untagged keys."""
+    raw = _raw(str(tmp_path / "episodes.lance")) | {
+        "context": {"variant": "video_only", "camera_key": camera},
+        "output": {"tag_camera_key": True},
+    }
+    with pytest.raises(ValidationError, match="Turn tag_camera_key off"):
+        resolve_config_data(raw)
+    assert resolve_config_data(raw | {"output": {"result_key": "camera_run"}}).effective_result_key == "camera_run"
+
+
+def test_effective_key_length_boundary_and_staging_only_default(tmp_path: Path) -> None:
+    """The composed key accepts 48 characters; staging-only output keeps default naming."""
+    raw = _raw(str(tmp_path / "episodes.lance"))
+    config = resolve_config_data(raw | {"output": {"result_key": "a" * 37, "tag_camera_key": True}})
+    assert len(config.effective_result_key) == 48
+    with pytest.raises(ValidationError, match="48 characters"):
+        resolve_config_data(raw | {"output": {"result_key": "a" * 38, "tag_camera_key": True}})
+    config = resolve_config_data(raw | {"output": {"staging_root_uri": str(tmp_path / "stage")}})
+    assert config.effective_result_key == "default"
+
+
+@pytest.mark.parametrize("tag", [False, True])
+@pytest.mark.parametrize("base", [_OMITTED, "default", "default_front_wide", "defaulted"])
+def test_custom_prefix_is_rejected_before_tagging(base: object, tmp_path: Path, *, tag: bool) -> None:
+    """Tagging does not make a reserved custom base acceptable."""
+    output: dict[str, object] = {"tag_camera_key": tag}
+    if base is not _OMITTED:
+        output["result_key"] = base
+    raw = _raw(str(tmp_path / "episodes.lance")) | {
+        "output": output,
+        "inference": {"prompt": {"mode": "custom", "template": "Describe."}},
+    }
+    with pytest.raises(ValidationError, match="does not start with 'default'"):
+        resolve_config_data(raw)
+    config = resolve_config_data(raw | {"output": {"result_key": "custom", "tag_camera_key": tag}})
+    assert config.effective_result_key == ("custom_front_wide" if tag else "custom")
+
+
+def test_explicit_null_tag_is_rejected(tmp_path: Path) -> None:
+    """The tagging flag is a strict non-null boolean."""
+    with pytest.raises(ValidationError):
+        resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"output": {"tag_camera_key": None}})
 
 
 def test_all_three_models_are_supported(tmp_path: Path) -> None:
@@ -214,3 +293,14 @@ def test_all_three_models_are_supported(tmp_path: Path) -> None:
     } == {"qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"}
     with pytest.raises(ValidationError):
         resolve_config_data(raw | {"model": {"variant": "future_model"}})
+
+
+def test_multicamera_examples_resolve() -> None:
+    """Public examples use their recipe resolvers; runtime images may omit examples."""
+    examples = Path(__file__).resolve().parents[5] / "examples"
+    if not examples.exists():
+        pytest.skip("examples directory is not included in runtime images")
+
+    resolve_split_config(examples / "multimodal-multicamera-split.yaml")
+    for selection in ("front", "side", "rear-ego"):
+        resolve_caption_config(examples / f"multimodal-multicamera-{selection}-caption.yaml")

@@ -433,16 +433,13 @@ Concrete field names, result metadata, completion semantics, and concurrent enri
 consumer that introduces them. Base publication does not reserve placeholder columns or define a universal result
 lifecycle.
 
-`multimodal-caption` is one concrete consumer of this seam. It scans all rows for base-schema, global-identity, contract
-version, and exact-camera compatibility before registering fields, then reopens the registered table to pin its finite
-attempt version. Its two Ego context modes extend the same scan with the configured `egotrajectory` descriptor,
-sensor-source requirement, and duration limit. Caption fields follow
-`caption_{context_variant}_{result_key}_{model_key}_v1`; the selected camera remains in the consumer's normalized
-contract and terminal metadata rather than becoming a base-schema field or a field-name axis. See
-[`multimodal-av-captioning.md`](multimodal-av-captioning.md) for the independent publication and recovery contract.
-For the default prompt, that consumer may omit its output block and resolve `output.result_key` to `default`. Custom
-prompts require an explicit non-`default` key; other keys, including `default_`-prefixed labels, are opaque. This
-configuration convenience does not change the field formula or durable identity.
+`multimodal-caption` validates canonical rows before registering its own caption/metadata pair, using the effective
+result key in `caption_{context_variant}_{effective_result_key}_{model_key}_v1` and its `_metadata` sibling.
+Opt-in `output.tag_camera_key: true` appends the selected camera key to the base key; custom-prompt base keys cannot
+start with `default`.
+These consumer-owned results enrich existing episode rows without changing the base schema; the
+[captioning design](multimodal-av-captioning.md) owns their configuration, contract, provenance, publication, and
+recovery rules.
 
 ## Configuration and boundaries
 

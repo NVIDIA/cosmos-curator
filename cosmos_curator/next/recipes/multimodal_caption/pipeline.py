@@ -238,12 +238,36 @@ def _preflight_and_register(
             camera_key=config.context.camera_key,
         )
         representative_ego_uri = None
-    ensure_caption_fields(
-        uri,
-        storage_options=storage_options,
-        bindings=bindings,
-        attempts=config.execution.commit_attempts,
-    )
+    try:
+        ensure_caption_fields(
+            uri,
+            storage_options=storage_options,
+            bindings=bindings,
+            attempts=config.execution.commit_attempts,
+        )
+    except ValueError as exc:
+        # Schema metadata is the contract authority, including for still-null results.
+        try:
+            current = lance.dataset(uri, storage_options=storage_options)
+            validate_episode_table(current, uri=uri)
+            fields = bindings.result.fields
+            collision = all(field.name in current.schema.names for field in fields) and any(
+                not current.schema.field(field.name).equals(field, check_metadata=True) for field in fields
+            )
+        except Exception:  # noqa: BLE001 -- failed diagnostic checks must preserve the registration error
+            raise exc from None
+        if collision:
+            action = (
+                "Choose a new base result_key."
+                if config.output.tag_camera_key
+                else "Choose a new result_key, or set tag_camera_key: true if you are captioning another camera."
+            )
+            msg = (
+                f"{exc} This result key is bound to a different contract "
+                f"(camera, prompt, model revision, or context settings). {action}"
+            )
+            raise ValueError(msg) from exc
+        raise
     return lance.dataset(uri, storage_options=storage_options), representative_camera_uri, representative_ego_uri
 
 
@@ -330,7 +354,7 @@ def run_config(config: ResolvedMultimodalCaptionConfig) -> dict[str, object]:  #
     mapping = _load_ego_mapping() if definition.input_profile is CaptionInputProfile.EGO_TRAJECTORY else None
     model = resolve_model(config.model.variant)
     camera_key = config.context.camera_key
-    result_key = config.output.result_key
+    result_key = config.effective_result_key
     caption_field, metadata_field = result_field_names(definition.variant, result_key, model.key)
     contract = normalized_caption_contract(model, camera_key, definition, ego, prompt_template, result_key)
     digest = caption_contract_digest(model, camera_key, definition, ego, prompt_template, result_key)
@@ -500,6 +524,8 @@ def run_config(config: ResolvedMultimodalCaptionConfig) -> dict[str, object]:  #
             )
 
     summary: dict[str, object] = {
+        "base_result_key": config.output.result_key,
+        "tag_camera_key": config.output.tag_camera_key,
         "episodes_lance_uri": uri,
         "episodes_lance_version": latest_version,
         "attempt_version": attempt.version,

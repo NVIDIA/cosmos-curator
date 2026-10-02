@@ -1,0 +1,33 @@
+schema_version: 1
+kind: multimodal-caption
+input:
+  episodes_lance_uri: /data/curated/full-rig/episodes.lance
+context:
+  variant: ego_trajectory_summary
+  camera_key: rear_fisheye
+  ego:
+    sensor_key: ego_pose
+    topic: /egotrajectory
+    frame: clip_local_enu
+model:
+  variant: qwen3_8_27b_fp8
+inference:
+  prompt:
+    mode: custom
+    template: >-
+      This camera is rear-facing: its images show the scene BEHIND the camera-carrying vehicle.
+      Describe visible objects and road features using image-left, image-right, near, far, and behind the vehicle.
+      Never describe rear-visible objects, road markings, traffic, or intersections as ahead, forward,
+      or in front of the vehicle.
+      Do not infer reversing, forward travel, or approaching an intersection from apparent motion in these rear images.
+      Describe Ego motion in a separate sentence using only supported distance or speed information,
+      without assigning forward or backward direction.
+      Ego coordinates do not supply camera extrinsics or establish image directions.
+      Ego trajectory context: {ego_trajectory_context}
+output:
+  result_key: rear_view_custom_v2
+  tag_camera_key: true
+execution:
+  storage_profile: default
+  # Conservative starting size for high-resolution video; tune for available memory.
+  inference_batch_size: 4

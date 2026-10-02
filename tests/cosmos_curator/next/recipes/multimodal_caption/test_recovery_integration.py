@@ -25,6 +25,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
 )
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
 from cosmos_curator.next.recipes.video_caption import inference
+from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
 
@@ -54,17 +55,18 @@ def _fake_inference(row: dict[str, Any]) -> dict[str, object]:
 
 
 @pytest.mark.integration
-def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # noqa: PLR0915
+def test_phase_a_restart_and_distinct_camera_results_coexist(  # noqa: PLR0915
     tmp_path: Path,
     camera_factory: Callable[..., dict[str, object]],
     episode_factory: Callable[..., dict[str, object]],
     curator_io_cluster: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Durable Phase A survives interruption and publishes only front-wide evidence."""
+    """Durable Phase A, distinct camera fields, and exact reruns preserve both results."""
     del curator_io_cluster
     rows: list[dict[str, object]] = []
     expected: list[tuple[str, str, str]] = []
+    expected_left: list[tuple[str, str]] = []
     for index in range(2):
         left_payload = f"left-{index}".encode()
         wide_payload = f"wide-{index}".encode()
@@ -75,7 +77,7 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
         wide_sha = sha256(wide_payload).hexdigest()
         cameras = [
             camera_factory(
-                "front_left",
+                "left_fisheye",
                 "1",
                 location=str(left_path),
                 size=len(left_payload),
@@ -92,6 +94,7 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
         row = episode_factory(index, camera_media=cameras)
         rows.append(row)
         expected.append((str(row["episode_id"]), str(wide_path), wide_sha))
+        expected_left.append((str(row["episode_id"]), sha256(left_payload).hexdigest()))
 
     episodes_uri = str(tmp_path / "episodes.lance")
     lance.write_dataset(
@@ -105,7 +108,7 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
         "input": {"episodes_lance_uri": episodes_uri},
         "context": {"variant": "video_only", "camera_key": "front_wide"},
         "inference": {"prompt": {"mode": "default"}},
-        "output": {"result_key": "default"},
+        "output": {"tag_camera_key": True},
         "execution": {"media_batch_size": 1, "inference_batch_size": 2, "parquet_rows_per_file": 2},
     }
     config = resolve_config_data(config_data)
@@ -117,16 +120,23 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
         lambda *_args, **_kwargs: _FakeEpisodeProcessor(),
     )
     original_publish = pipeline.publish_staged_results
+    original_inference_phase = pipeline.run_inference_phase
+    original_ensure_workspace = pipeline.ensure_workspace
+    original_ensure_ray_initialized = pipeline.ensure_ray_initialized
     interrupted_workspace: CaptionWorkspace | None = None
 
     def interrupt_after_phase_a(
         _uri: str,
         _attempt: object,
         workspace: CaptionWorkspace,
-        _bindings: object,
+        _bindings: CaptionRunBindings,
         **_kwargs: object,
     ) -> object:
         nonlocal interrupted_workspace
+        properties = _bindings.publication.transaction_properties
+        assert properties["result_key"] == "default_front_wide"
+        assert "base_result_key" not in properties
+        assert "tag_camera_key" not in properties
         interrupted_workspace = workspace
         files = staged_result_files(workspace)
         assert files
@@ -161,9 +171,19 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
     model = resolve_model("qwen3_8_27b_fp8")
     definition = resolve_context_definition("video_only")
     prompt = resolve_prompt_template(definition, mode="default", custom_template=None)
-    caption_field, metadata_field = result_field_names(definition.variant, "default", model.key)
+    caption_field, metadata_field = result_field_names(definition.variant, "default_front_wide", model.key)
     published = lance.dataset(episodes_uri).to_table(columns=["episode_id", caption_field, metadata_field]).to_pylist()
     assert summary["published_fragments"] == 1
+    assert (summary["base_result_key"], summary["tag_camera_key"], summary["result_key"]) == (
+        "default",
+        True,
+        "default_front_wide",
+    )
+    assert [row[metadata_field]["result_key"] for row in published] == ["default_front_wide"] * len(rows)
+    assert all(
+        "base_result_key" not in row[metadata_field] and "tag_camera_key" not in row[metadata_field]
+        for row in published
+    )
     assert summary["terminal_counts"] == {"success": 2, "truncated": 0, "error": 0}
     assert len(published) == 2
     assert [row[caption_field] for row in published] == ["caption for episode-0", "caption for episode-1"]
@@ -172,7 +192,9 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
     assert [row[metadata_field]["materialization_digest"] for row in published] == [
         row["materialization_digest"] for row in rows
     ]
-    expected_contract_digest = caption_contract_digest(model, "front_wide", definition, None, prompt, "default")
+    expected_contract_digest = caption_contract_digest(
+        model, "front_wide", definition, None, prompt, "default_front_wide"
+    )
     assert [row[metadata_field]["contract_digest"] for row in published] == [expected_contract_digest] * len(rows)
     assert not Path(interrupted_workspace.root_uri).exists()
 
@@ -193,9 +215,89 @@ def test_phase_a_restart_publishes_one_selected_camera_result_per_episode(  # no
     assert same_camera_summary["already_committed_fragments"] == 0
     assert lance.dataset(episodes_uri).version == published_version
     assert unchanged == published
+    manual = resolve_config_data(config_data | {"output": {"result_key": "default_front_wide"}})
+    assert pipeline.run_config(manual)["published_fragments"] == 0
+    assert lance.dataset(episodes_uri).version == published_version
 
-    front_left_config = resolve_config_data(
-        config_data | {"context": {"variant": "video_only", "camera_key": "front_left"}}
+    monkeypatch.setattr(pipeline, "ensure_workspace", original_ensure_workspace)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", original_ensure_ray_initialized)
+    monkeypatch.setattr(pipeline, "run_inference_phase", original_inference_phase)
+    monkeypatch.setattr(pipeline, "validate_model_directory", lambda path, **_kwargs: path)
+    front_left_data = config_data | {
+        "context": {"variant": "video_only", "camera_key": "left_fisheye"},
+    }
+    front_left_config = resolve_config_data(front_left_data)
+    left_summary = pipeline.run_config(front_left_config)
+    left_caption_field, left_metadata_field = result_field_names(definition.variant, "default_left_fisheye", model.key)
+    together = (
+        lance.dataset(episodes_uri)
+        .to_table(columns=["episode_id", caption_field, metadata_field, left_caption_field, left_metadata_field])
+        .to_pylist()
     )
-    with pytest.raises(ValueError, match="incompatible"):
-        pipeline.run_config(front_left_config)
+    assert left_summary["published_fragments"] == 1
+    assert left_summary["terminal_counts"] == {"success": 2, "truncated": 0, "error": 0}
+    assert [row[left_caption_field] for row in together] == ["caption for episode-0", "caption for episode-1"]
+    assert [(row["episode_id"], row[left_metadata_field]["media_sha256"]) for row in together] == expected_left
+    assert [row[left_metadata_field]["camera_key"] for row in together] == ["left_fisheye"] * len(rows)
+    assert left_summary["result_key"] == "default_left_fisheye"
+    assert [row[left_metadata_field]["contract_digest"] for row in together] == [
+        caption_contract_digest(model, "left_fisheye", definition, None, prompt, "default_left_fisheye")
+    ] * len(rows)
+    assert [row[left_metadata_field]["materialization_digest"] for row in together] == [
+        row["materialization_digest"] for row in rows
+    ]
+    assert [row[caption_field] for row in together] == [row[caption_field] for row in published]
+    assert [row[metadata_field] for row in together] == [row[metadata_field] for row in published]
+
+    left_version = lance.dataset(episodes_uri).version
+    monkeypatch.setattr(
+        pipeline,
+        "ensure_workspace",
+        lambda *_args, **_kwargs: pytest.fail("second-camera rerun must not create a workspace"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "ensure_ray_initialized",
+        lambda *_args, **_kwargs: pytest.fail("second-camera rerun must not initialize Ray"),
+    )
+    left_rerun_summary = pipeline.run_config(front_left_config)
+    assert left_rerun_summary["published_fragments"] == 0
+    assert lance.dataset(episodes_uri).version == left_version
+    assert (
+        lance.dataset(episodes_uri)
+        .to_table(columns=["episode_id", caption_field, metadata_field, left_caption_field, left_metadata_field])
+        .to_pylist()
+        == together
+    )
+
+    incompatible = resolve_config_data(
+        config_data
+        | {
+            "context": {"variant": "video_only", "camera_key": "left_fisheye"},
+            "output": {"result_key": "default_front_wide"},
+        }
+    )
+    with pytest.raises(ValueError, match="set tag_camera_key: true"):
+        pipeline.run_config(incompatible)
+    assert lance.dataset(episodes_uri).version == left_version
+
+    # Omitted untagged output still binds default on this same multicamera table.
+    monkeypatch.setattr(pipeline, "ensure_workspace", original_ensure_workspace)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", original_ensure_ray_initialized)
+    untagged_data = {key: value for key, value in config_data.items() if key != "output"}
+    untagged = resolve_config_data(untagged_data)
+    assert pipeline.run_config(untagged)["published_fragments"] == 1
+    version = lance.dataset(episodes_uri).version
+    monkeypatch.setattr(pipeline, "run_inference_phase", lambda *_a, **_k: pytest.fail("rerun must skip inference"))
+    assert pipeline.run_config(untagged)["published_fragments"] == 0
+    with pytest.raises(ValueError, match="set tag_camera_key: true"):
+        pipeline.run_config(
+            resolve_config_data(
+                untagged_data
+                | {
+                    "context": {"variant": "video_only", "camera_key": "left_fisheye"},
+                }
+            )
+        )
+    assert lance.dataset(episodes_uri).version == version
+    assert lance.dataset(episodes_uri).to_table(columns=list(together[0])).to_pylist() == together

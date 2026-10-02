@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import lance
+import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.types.types import TimestampSource
@@ -24,6 +25,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     result_field_names,
     result_fields,
 )
+from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionPublicationBindings
 from cosmos_curator.next.recipes.video_caption.inference import caption_llm_preprocess
 from cosmos_curator.next.utils.identity import canonical_digest
@@ -253,8 +255,100 @@ def test_changed_prompt_cannot_reuse_null_registered_namespace(
         pipeline.run_config(config("first prompt"))  # type: ignore[arg-type]
     fields = result_field_names("video_only", "custom", "qwen3_8_27b_fp8")
     assert set(fields) <= set(lance.dataset(uri).schema.names)
-    with pytest.raises(ValueError, match="incompatible"):
+    before = lance.dataset(uri).to_table().to_pylist()
+    with pytest.raises(ValueError, match=r"incompatible.*different contract.*camera, prompt, model revision") as caught:
         pipeline.run_config(config("changed prompt"))  # type: ignore[arg-type]
+    assert "set tag_camera_key: true" in str(caught.value)
+    assert lance.dataset(uri).to_table().to_pylist() == before
+
+
+def test_ambiguous_tagged_keys_reject_incompatible_camera(
+    episode_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    episode_factory: Callable[..., dict[str, object]],
+    camera_factory: Callable[..., dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concatenations producing a_b_c cannot share a different camera contract."""
+    uri, _ = episode_dataset_factory(
+        rows=[
+            episode_factory(
+                0,
+                camera_media=[
+                    camera_factory("c", "1"),
+                    camera_factory("b_c", "2"),
+                ],
+            )
+        ]
+    )
+    raw = {
+        "schema_version": 1,
+        "kind": "multimodal-caption",
+        "input": {"episodes_lance_uri": uri},
+        "context": {"variant": "video_only", "camera_key": "c"},
+        "inference": {"prompt": {"mode": "default"}},
+        "output": {"result_key": "a_b", "tag_camera_key": True},
+    }
+
+    def stop_before_inference(*_args: object, **_kwargs: object) -> None:
+        raise InterruptedError
+
+    monkeypatch.setattr(pipeline, "ensure_workspace", stop_before_inference)
+    with pytest.raises(InterruptedError):
+        pipeline.run_config(resolve_config_data(raw))
+    version = lance.dataset(uri).version
+    other = resolve_config_data(
+        raw
+        | {
+            "context": {"variant": "video_only", "camera_key": "b_c"},
+            "output": {"result_key": "a", "tag_camera_key": True},
+        }
+    )
+    with pytest.raises(ValueError, match="Choose a new base result_key") as caught:
+        pipeline.run_config(other)
+    assert "set tag_camera_key: true" not in str(caught.value)
+    assert lance.dataset(uri).version == version
+
+
+@pytest.mark.parametrize("failure", ["partial", "base_schema", "unrelated", "reopen"])
+def test_registration_errors_without_established_collision_keep_diagnostic(
+    failure: str,
+    tmp_path: Path,
+    episode_factory: Callable[..., dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither partial fields nor invalid base schemas justify a collision hint."""
+    config = _config(tmp_path, "video_only")
+    caption_name, _ = result_field_names("video_only", "default", "qwen3_8_27b_fp8")
+    schema = EPISODE_SCHEMA
+    if failure == "partial":
+        schema = schema.append(pa.field(caption_name, pa.string()))
+    elif failure == "base_schema":
+        schema = schema.remove(schema.get_field_index("source_id"))
+        for name in result_field_names("video_only", "default", "qwen3_8_27b_fp8"):
+            schema = schema.append(pa.field(name, pa.string()))
+    lance.write_dataset(
+        pa.Table.from_pylist([episode_factory(0)], schema=schema),
+        str(tmp_path / "episodes.lance"),
+        data_storage_version="2.2",
+    )
+    monkeypatch.setattr(pipeline, "validate_episode_input", lambda *_a, **_k: None)
+    original = ValueError(f"original {failure} diagnostic")
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        if failure == "reopen":
+
+            def unavailable(*_a: object, **_k: object) -> None:
+                msg = "table temporarily unavailable"
+                raise OSError(msg)
+
+            monkeypatch.setattr(pipeline.lance, "dataset", unavailable)
+        raise original
+
+    monkeypatch.setattr(pipeline, "ensure_caption_fields", reject)
+    with pytest.raises(ValueError, match=f"original {failure} diagnostic") as caught:
+        pipeline.run_config(config)  # type: ignore[arg-type]
+    assert caught.value is original
+    assert str(caught.value) == f"original {failure} diagnostic"
 
 
 def test_combined_ego_preflight_precedes_registration(monkeypatch: pytest.MonkeyPatch) -> None:

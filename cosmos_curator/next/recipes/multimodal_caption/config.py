@@ -7,6 +7,7 @@ import copy
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from re import fullmatch
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
@@ -168,7 +169,18 @@ class MultimodalCaptionOutputConfig(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    result_key: str = Field(default="default", pattern=_RESULT_KEY_PATTERN)
+    result_key: str = Field(
+        default="default",
+        pattern=_RESULT_KEY_PATTERN,
+        description="Base result key; custom prompts require an explicit key that does not start with 'default'.",
+    )
+    tag_camera_key: bool = Field(
+        default=False,
+        description=(
+            "Append '_' and the exact camera_key to the base key. The effective key must match "
+            "^[a-z][a-z0-9_]{0,47}$, including its 48-character limit."
+        ),
+    )
     staging_root_uri: str = ""
 
     @field_validator("staging_root_uri")
@@ -243,10 +255,22 @@ class ResolvedMultimodalCaptionConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_prompt_result_namespace(self) -> "ResolvedMultimodalCaptionConfig":
-        if self.inference.prompt.mode == "custom" and self.output.result_key == "default":
-            msg = "custom prompt mode requires output.result_key other than 'default'"
+        if self.inference.prompt.mode == "custom" and self.output.result_key.startswith("default"):
+            msg = "custom prompt mode requires an explicit output.result_key that does not start with 'default'"
+            raise ValueError(msg)
+        if fullmatch(_RESULT_KEY_PATTERN, self.effective_result_key) is None:
+            msg = (
+                f"Invalid effective result key {self.effective_result_key!r}: must match {_RESULT_KEY_PATTERN} "
+                "and be at most 48 characters. Turn tag_camera_key off and set an explicit valid result_key."
+            )
             raise ValueError(msg)
         return self
+
+    @property
+    def effective_result_key(self) -> str:
+        """Resolve the field namespace without changing reloadable base-key provenance."""
+        base = self.output.result_key
+        return f"{base}_{self.context.camera_key}" if self.output.tag_camera_key else base
 
 
 _TEMPLATE_BASE: dict[str, Any] = {
@@ -256,7 +280,7 @@ _TEMPLATE_BASE: dict[str, Any] = {
     "context": {"variant": "video_only", "camera_key": "front_wide"},
     "model": {"variant": "qwen3_8_27b_fp8"},
     "inference": {"prompt": {"mode": "default"}},
-    "output": {"result_key": "default"},
+    "output": {"result_key": "default", "tag_camera_key": False},
     "execution": {"storage_profile": "default"},
 }
 _TEMPLATE = ResolvedMultimodalCaptionConfig.model_validate(_TEMPLATE_BASE).model_dump(mode="json", exclude_none=True)
@@ -265,7 +289,11 @@ _TEMPLATE_PREAMBLE = """\
 # See the generated schema and multimodal AV captioning guide for alternative context and prompt shapes.
 # staging_root_uri defaults beside episodes.lance under staging/multimodal-caption.
 # camera_key is required; front_wide is only an example value, not a default camera policy.
-# Every run explicitly selects prompt mode. result_key defaults to default; custom mode requires another key.
+# Every run explicitly selects prompt mode. result_key defaults to default.
+# Custom mode requires an explicit base result_key that does not start with default.
+# tag_camera_key defaults to false; enable it to append _<camera_key> to the base result_key.
+# The effective key must match ^[a-z][a-z0-9_]{0,47}$ (48 characters maximum), without camera renaming.
+# For other camera alphabets or longer names, turn tagging off and supply an explicit valid result_key.
 # Custom prompt strings are preserved exactly; YAML folding, indentation, and chomping therefore affect identity.
 # video_only custom prompts require zero literal {ego_trajectory_context} sentinels.
 # Custom Ego prompts require exactly one literal {ego_trajectory_context} sentinel.
