@@ -19,6 +19,7 @@ def test_registered_kind_names_are_derived_from_concrete_objects() -> None:
         "curate",
         "data-integrity",
         "embeddings",
+        "mp4-index",
         "multimodal-caption",
         "multimodal-split",
         "robot-action-caption",

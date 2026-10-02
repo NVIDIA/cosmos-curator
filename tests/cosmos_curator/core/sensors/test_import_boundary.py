@@ -16,7 +16,7 @@
 """Enforce the sensors library self-containment rule.
 
 No module under cosmos_curator.core.sensors may import from outside that package.
-See the design rule documented in cosmos_curator/core/sensors/__init__.py.
+See the design rule documented in cosmos_curator/core/sensors/AGENTS.md.
 """
 
 import ast

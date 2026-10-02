@@ -43,6 +43,7 @@ _RECIPES_ROOT = REPO_ROOT / "cosmos_curator" / "next" / "recipes"
 # Ray unless it runs a pipeline.
 _DRIVERS = {
     "data_integrity": frozenset({"pipeline.py"}),
+    "mp4_index": frozenset({"pipeline.py"}),
     "multimodal_split": frozenset({"pipeline.py"}),
 }
 
