@@ -181,7 +181,7 @@ def remove_prefix(uri: str, *, storage_profile: str = "default") -> None:
 
     Removes a whole staging directory / object-store prefix: a recursive object
     delete under ``uri`` for remote stores, a directory ``rmtree`` for a local
-    path.
+    path. S3 objects are deleted in batches.
 
     Args:
         uri: Local path or remote (``s3://`` / ``az://``) prefix to remove.
@@ -197,15 +197,18 @@ def remove_prefix(uri: str, *, storage_profile: str = "default") -> None:
         if client is None:
             msg = f"no storage client available to remove remote prefix {uri}"
             raise ValueError(msg)
-        deleted = 0
-        for obj in client.list_recursive_directory(path_to_prefix(uri)):
-            try:
-                client.delete_object(obj)
-            except Exception as e:
-                if is_missing_object_error(e):
-                    continue
-                raise
-            deleted += 1
+        if isinstance(client, S3Client):
+            deleted = client.delete_prefix(path_to_prefix(uri))
+        else:
+            deleted = 0
+            for obj in client.list_recursive_directory(path_to_prefix(uri)):
+                try:
+                    client.delete_object(obj)
+                except Exception as e:
+                    if is_missing_object_error(e):
+                        continue
+                    raise
+                deleted += 1
         logger.info(f"Removed remote prefix {uri} ({deleted} object(s)).")
         return
 

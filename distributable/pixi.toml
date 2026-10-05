@@ -187,12 +187,16 @@ av = "==17.0.0"
 opencv-python-headless = "*"
 cython = "<3.3"
 
+[feature.legacy-transformers]
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
 [feature.legacy-transformers.dependencies]
 einops = "*"
 transformers = "==4.55.4"
 
 [feature.legacy-transformers.pypi-dependencies]
 cuda-bindings = "==13.0.*"
+PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.11.0"
 torchvision = "==0.26.0"
@@ -230,7 +234,7 @@ transformers = ">=5.6.0,<6.0.0"
 [environments]
 cuml = ["core", "cuml", "tracing"]
 default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
-legacy-transformers = ["linux", "core", "media", "legacy-transformers", "tracing", "profiling"]
+legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
 seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]

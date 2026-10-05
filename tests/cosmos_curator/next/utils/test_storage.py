@@ -32,12 +32,13 @@ separately in ``test_media_reader``.
 """
 
 import pathlib
+from unittest.mock import Mock, call
 
 import pytest
 from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.azure_client import AzurePrefix
-from cosmos_curator.core.utils.storage.s3_client import S3Prefix
+from cosmos_curator.core.utils.storage.s3_client import S3Client
 from cosmos_curator.core.utils.storage.storage_client import StoragePrefix
 from cosmos_curator.next.utils import storage
 
@@ -152,16 +153,37 @@ def test_remove_prefix_propagates_non_absence_local_failure(
         storage.remove_prefix(str(root))
 
 
-def test_remove_prefix_remote_deletes_every_listed_object(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The remote branch lists exactly the prefix named and deletes each entry under it."""
-    listing: list[StoragePrefix] = [S3Prefix("s3://bucket/run/a"), S3Prefix("s3://bucket/run/b")]
-    client = _FakeDeleteClient(listing)
-    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_remove_prefix_s3_batches_deletes_and_reports_failures(
+    monkeypatch: pytest.MonkeyPatch, *, partial_failure: bool
+) -> None:
+    """Use bulk requests for every page and propagate failures inside a successful response."""
+    client = object.__new__(S3Client)
+    client.can_delete = True
+    client.s3 = backend = Mock()
+    keys = [{"Key": f"run/{index}"} for index in range(1_073)]
+    pages = [keys[:1_000], keys[1_000:]]
+    backend.get_paginator.return_value.paginate.return_value = [{"Contents": page} for page in pages]
+    backend.delete_objects.side_effect = [
+        {},
+        {"Errors": [{"Key": "run/1000", "Message": "AccessDenied"}]} if partial_failure else {},
+    ]
+    get_client = Mock(return_value=client)
+    monkeypatch.setattr(storage, "get_storage_client", get_client)
 
-    storage.remove_prefix("s3://bucket/run")
+    if partial_failure:
+        with pytest.raises(OSError, match="AccessDenied"):
+            storage.remove_prefix("s3://bucket/run", storage_profile="test-profile")
+    else:
+        storage.remove_prefix("s3://bucket/run", storage_profile="test-profile")
 
-    assert client.listed == [S3Prefix("s3://bucket/run")]
-    assert client.deleted == listing
+    get_client.assert_called_once_with("s3://bucket/run", profile_name="test-profile", can_delete=True)
+    backend.get_paginator.assert_called_once_with("list_objects_v2")
+    backend.get_paginator.return_value.paginate.assert_called_once_with(Bucket="bucket", Prefix="run/")
+    assert backend.delete_objects.call_args_list == [
+        call(Bucket="bucket", Delete={"Objects": page, "Quiet": True}) for page in pages
+    ]
+    backend.delete_object.assert_not_called()
 
 
 def test_remove_prefix_remote_ignores_per_object_missing_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,9 +195,9 @@ def test_remove_prefix_remote_ignores_per_object_missing_errors(monkeypatch: pyt
     from aborting on it.
     """
     listing: list[StoragePrefix] = [
-        S3Prefix("s3://bucket/run/a"),
-        S3Prefix("s3://bucket/run/b"),
-        S3Prefix("s3://bucket/run/c"),
+        AzurePrefix("az://container/run/a"),
+        AzurePrefix("az://container/run/b"),
+        AzurePrefix("az://container/run/c"),
     ]
 
     class _ClientMissingOnSecond(_FakeDeleteClient):
@@ -187,7 +209,7 @@ def test_remove_prefix_remote_ignores_per_object_missing_errors(monkeypatch: pyt
     client = _ClientMissingOnSecond(listing)
     monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
 
-    storage.remove_prefix("s3://bucket/run")
+    storage.remove_prefix("az://container/run")
 
     assert client.deleted == [listing[0], listing[2]]
 

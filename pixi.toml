@@ -281,6 +281,10 @@ libopencv = { version = "*", build = "headless_*" }
 opencv = { version = "*", build = "headless_*" }
 py-opencv = { version = "*", build = "headless_*" }
 
+[feature.legacy-transformers]
+# NVDEC's aarch64 wheel requires glibc >= 2.34.
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
 [feature.legacy-transformers.dependencies]
 einops = "*"
 transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require older transformers
@@ -288,6 +292,7 @@ transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require 
 [feature.legacy-transformers.pypi-dependencies]
 # Legacy models pull torch directly; keep torch's CUDA bindings on the 13.0 line.
 cuda-bindings = "==13.0.*"
+PyNvVideoCodec = ">=2.0.4,<2.1" # video-embed keeps decode, preprocessing, and inference on the GPU
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"
@@ -347,7 +352,7 @@ cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
 default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
 dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev"]
-legacy-transformers = ["linux", "core", "media", "legacy-transformers", "tracing", "profiling"]
+legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
 seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]

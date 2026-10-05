@@ -275,7 +275,6 @@ def test_legacy_transformers_environment_is_model_specific_runtime() -> None:
     assert "transformers-cosmos3" not in legacy_pypi_dependencies
     assert "vllm" not in legacy_pypi_dependencies
     assert pixi_config["environments"]["legacy-transformers"] == [
-        "linux",
         "core",
         "media",
         "legacy-transformers",
