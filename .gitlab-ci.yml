@@ -1299,6 +1299,9 @@ nvcf-helm:
     - *configure_nvcf_cli
     - .gitlab/scripts/nvcf_helm_deploy.sh
   after_script:
+    # Separate shell from before_script, so reload Vault before configure_nvcf_cli.
+    # Otherwise delete authenticates with a stale or empty NVCF_KEY.
+    - source .gitlab/vault/vault-auth.sh
     - *setup_ci_builder_env
     - *setup_curator_cli
     - *configure_nvcf_cli
