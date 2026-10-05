@@ -15,7 +15,7 @@
 """MCAP utilities for the sensor library."""
 
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +115,31 @@ def schema_for_channel(summary: Summary, channel: Channel, topic: str) -> Schema
         msg = f"MCAP channel for topic {topic!r} references missing schema_id {channel.schema_id}"
         raise ValueError(msg)
     return schema
+
+
+def channel_metadata_for_topic(reader: McapReader, topic: str) -> Mapping[str, str]:
+    """Return the channel-level metadata map for one MCAP topic.
+
+    Channel metadata is a general string-keyed side-channel for per-clip
+    context (for example, sensor model or calibration data) that applies to
+    every message on the channel and so does not need to be repeated per
+    message. It is independent of whether the channel has a schema; it is
+    the only place for this kind of context on a schemaless channel, since
+    those have no per-message fields at all.
+
+    Raises:
+        ValueError: if the reader has no summary, or *topic* has no channel.
+
+    """
+    summary = reader.get_summary()
+    if summary is None:
+        msg = f"cannot read channel metadata for topic {topic!r} without an MCAP summary"
+        raise ValueError(msg)
+    channel = channel_for_topic(summary, topic)
+    if channel is None:
+        msg = f"no MCAP channel found for topic {topic!r}"
+        raise ValueError(msg)
+    return channel.metadata
 
 
 def load_start_end_ns(reader: McapReader, topic: str) -> tuple[int, int]:
@@ -225,7 +250,7 @@ class McapTopicAccessor:
 
     @property
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
-        """Message times in nanoseconds from raw MCAP ``log_time`` values."""
+        """Message times in nanoseconds from MCAP's own ``log_time`` values."""
         return self._ensure_timeline_cached()
 
     def _ensure_start_end_ns_cached(self) -> None:
@@ -323,6 +348,7 @@ class ProtobufFieldSpec:
     name: str
     number: int
     field_type: int
+    label: int = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
 
 
 @dataclass(frozen=True)
@@ -358,12 +384,42 @@ class McapSchemaSpec:
 
 @dataclass(frozen=True)
 class McapStreamSpec:
-    """One MCAP output stream with a single topic and schema."""
+    """One MCAP output stream with a single topic.
+
+    Two modes:
+
+    * **Schema-backed** (IMU / GPS convention): pass ``schema`` (an
+      :class:`McapSchemaSpec`).  The writer registers the schema and
+      binds the channel to it.  ``message_encoding`` and
+      ``schema.message_encoding`` come from the same source.
+    * **Schemaless** (undecoded vendor wire-format payloads, e.g. a sensor's
+      UDP packets): leave ``schema`` as ``None`` and set
+      ``message_encoding`` explicitly to a wire-format tag (e.g.
+      ``"vendor.sensor.udp"``). The channel is bound to ``schema_id=0`` —
+      MCAP's "no schema"
+      sentinel — and consumers rely on ``message_encoding`` and
+      ``channel_metadata`` to interpret payloads.
+
+    Exactly one of ``schema`` or ``message_encoding`` must be set;
+    setting both or neither raises ``ValueError`` at construction.
+    """
 
     topic: str
-    schema: McapSchemaSpec
     library: str
+    schema: McapSchemaSpec | None = None
+    message_encoding: str | None = None
+    channel_metadata: Mapping[str, str] | None = None
+    metadata: Mapping[str, Mapping[str, str]] | None = None
     overwrite: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate schema / message_encoding are mutually exclusive but one is required."""
+        if self.schema is None and self.message_encoding is None:
+            msg = "McapStreamSpec requires either schema or message_encoding"
+            raise ValueError(msg)
+        if self.schema is not None and self.message_encoding is not None:
+            msg = "McapStreamSpec cannot set both schema and message_encoding"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -387,9 +443,15 @@ class McapWriteStats:
     end_publish_time_ns: int | None
 
 
-def protobuf_field(name: str, number: int, field_type: int) -> ProtobufFieldSpec:
+def protobuf_field(
+    name: str,
+    number: int,
+    field_type: int,
+    *,
+    label: int = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+) -> ProtobufFieldSpec:
     """Create one dynamic protobuf field spec."""
-    return ProtobufFieldSpec(name=name, number=number, field_type=field_type)
+    return ProtobufFieldSpec(name=name, number=number, field_type=field_type, label=label)
 
 
 def protobuf_file_descriptor_proto(schema: ProtobufMessageSchema) -> descriptor_pb2.FileDescriptorProto:
@@ -406,7 +468,7 @@ def protobuf_file_descriptor_proto(schema: ProtobufMessageSchema) -> descriptor_
         field = message_descriptor.field.add()
         field.name = field_spec.name
         field.number = field_spec.number
-        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        field.label = field_spec.label
         field.type = field_spec.field_type
 
     return file_descriptor
@@ -472,15 +534,25 @@ def write_mcap_messages(
         with temp_path.open("xb") as out_file:
             writer = Writer(out_file, compression=CompressionType.ZSTD)
             writer.start(library=stream.library)
-            schema_id = writer.register_schema(
-                name=stream.schema.name,
-                encoding=stream.schema.encoding,
-                data=stream.schema.data,
-            )
+            if stream.schema is not None:
+                schema_id = writer.register_schema(
+                    name=stream.schema.name,
+                    encoding=stream.schema.encoding,
+                    data=stream.schema.data,
+                )
+                message_encoding = stream.schema.message_encoding
+            else:
+                # Schemaless channel: MCAP's schema_id=0 sentinel.  message_encoding is
+                # required (validated by McapStreamSpec.__post_init__); the assert below
+                # is for mypy.
+                schema_id = 0
+                assert stream.message_encoding is not None
+                message_encoding = stream.message_encoding
             channel_id = writer.register_channel(
-                schema_id=schema_id,
                 topic=stream.topic,
-                message_encoding=stream.schema.message_encoding,
+                message_encoding=message_encoding,
+                schema_id=schema_id,
+                metadata=dict(stream.channel_metadata) if stream.channel_metadata else {},
             )
 
             for record in records:
@@ -492,6 +564,10 @@ def write_mcap_messages(
                     publish_time=record.publish_time_ns,
                     sequence=record.sequence,
                 )
+
+            if stream.metadata:
+                for metadata_name, metadata_values in stream.metadata.items():
+                    writer.add_metadata(metadata_name, dict(metadata_values))
 
             try:
                 writer.finish()  # type: ignore[no-untyped-call]

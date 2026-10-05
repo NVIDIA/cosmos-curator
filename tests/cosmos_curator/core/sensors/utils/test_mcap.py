@@ -16,11 +16,13 @@
 
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 from google.protobuf import descriptor_pb2
 from google.protobuf.message import Message
@@ -34,6 +36,7 @@ from cosmos_curator.core.sensors.utils.mcap import (
     McapProtobufMessageResolver,
     McapTopicAccessor,
     channel_for_topic,
+    channel_metadata_for_topic,
     get_metadata_record,
     iter_messages_log_time_ns,
     load_start_end_ns,
@@ -227,6 +230,23 @@ def test_channel_for_topic_raises_on_duplicate_topic() -> None:
         channel_for_topic(summary, "/camera/rgb")
 
 
+def test_channel_metadata_for_topic_rejects_missing_summary() -> None:
+    """channel_metadata_for_topic should reject a reader with no MCAP summary."""
+    reader = SimpleNamespace(get_summary=lambda: None)
+
+    with pytest.raises(ValueError, match="without an MCAP summary"):
+        channel_metadata_for_topic(reader, "/camera/rgb")
+
+
+def test_channel_metadata_for_topic_rejects_missing_channel() -> None:
+    """channel_metadata_for_topic should reject a topic with no matching channel."""
+    summary = SimpleNamespace(channels={1: SimpleNamespace(topic="/camera/depth")})
+    reader = SimpleNamespace(get_summary=lambda: summary)
+
+    with pytest.raises(ValueError, match="no MCAP channel found for topic '/camera/rgb'"):
+        channel_metadata_for_topic(reader, "/camera/rgb")
+
+
 def test_get_metadata_record_returns_unique_match() -> None:
     """get_metadata_record should return the single matching metadata payload."""
     reader = SimpleNamespace(
@@ -286,6 +306,29 @@ def test_load_start_end_ns_raises_if_latest_lookup_fails_after_earliest() -> Non
         load_start_end_ns(_FakeReader(), "/camera/rgb")
 
 
+def test_iter_messages_log_time_ns_forwards_to_reader_iter_messages() -> None:
+    """iter_messages_log_time_ns should forward the expected bounds to reader.iter_messages."""
+    calls: list[tuple[str, int, int, bool]] = []
+    expected = [(None, None, SimpleNamespace(log_time=123))]
+
+    class _FakeReader:
+        def iter_messages(
+            self,
+            *,
+            topics: str,
+            start_time: int,
+            end_time: int,
+            log_time_order: bool,
+        ) -> Iterator[tuple[Any, Any, Any]]:
+            calls.append((topics, start_time, end_time, log_time_order))
+            return iter(expected)
+
+    got = list(iter_messages_log_time_ns(_FakeReader(), "/camera/rgb", 100, 200, log_time_order=False))
+
+    assert got == expected
+    assert calls == [("/camera/rgb", 100, 200, False)]
+
+
 def test_iter_messages_log_time_ns_excludes_end_ns_exclusive_with_real_mcap(tmp_path: Path) -> None:
     """iter_messages_log_time_ns should exclude messages whose log_time equals end_ns_exclusive."""
     path = tmp_path / "exclusive_end.mcap"
@@ -305,6 +348,90 @@ def test_iter_messages_log_time_ns_excludes_end_ns_exclusive_with_real_mcap(tmp_
         ]
 
     assert got == [100]
+
+
+def test_mcap_topic_accessor_start_end_can_load_without_full_timeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """McapTopicAccessor should load bounds without materializing the full timeline."""
+    timeline_calls = 0
+    start_end_calls = 0
+
+    @contextmanager
+    def fake_open_data_source(source: object, mode: str = "rb") -> Iterator[object]:
+        del source, mode
+        yield object()
+
+    def fake_make_reader(stream: object) -> object:
+        del stream
+        return object()
+
+    def fake_load_timeline(reader: object, topic: str) -> npt.NDArray[np.int64]:
+        nonlocal timeline_calls
+        del reader, topic
+        timeline_calls += 1
+        return np.array([100, 200, 300], dtype=np.int64)
+
+    def fake_load_start_end_ns(reader: object, topic: str) -> tuple[int, int]:
+        nonlocal start_end_calls
+        del reader, topic
+        start_end_calls += 1
+        return 100, 300
+
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.open_data_source", fake_open_data_source)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.mcap_make_reader", fake_make_reader)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_timeline", fake_load_timeline)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_start_end_ns", fake_load_start_end_ns)
+
+    accessor = McapTopicAccessor(b"not-used", "/camera/rgb")
+
+    assert accessor.start_ns == 100
+    assert accessor.end_ns == 300
+    assert start_end_calls == 1
+    assert timeline_calls == 0
+
+
+def test_mcap_topic_accessor_timestamps_cache_populates_start_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """McapTopicAccessor should cache a read-only timeline and reuse it for bounds."""
+    timeline_calls = 0
+    start_end_calls = 0
+    timeline = np.array([100, 200, 300], dtype=np.int64)
+    timeline.flags.writeable = False
+
+    @contextmanager
+    def fake_open_data_source(source: object, mode: str = "rb") -> Iterator[object]:
+        del source, mode
+        yield object()
+
+    def fake_make_reader(stream: object) -> object:
+        del stream
+        return object()
+
+    def fake_load_timeline(reader: object, topic: str) -> npt.NDArray[np.int64]:
+        nonlocal timeline_calls
+        del reader, topic
+        timeline_calls += 1
+        return timeline
+
+    def fake_load_start_end_ns(reader: object, topic: str) -> tuple[int, int]:
+        nonlocal start_end_calls
+        del reader, topic
+        start_end_calls += 1
+        return 0, 0
+
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.open_data_source", fake_open_data_source)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.mcap_make_reader", fake_make_reader)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_timeline", fake_load_timeline)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_start_end_ns", fake_load_start_end_ns)
+
+    accessor = McapTopicAccessor(b"not-used", "/camera/rgb")
+
+    np.testing.assert_array_equal(accessor.timestamps_ns, timeline)
+    np.testing.assert_array_equal(accessor.timestamps_ns, timeline)
+    assert not accessor.timestamps_ns.flags.writeable
+    assert accessor.start_ns == 100
+    assert accessor.end_ns == 300
+    assert accessor.max_gap_ns == 0
+    assert timeline_calls == 1
+    assert start_end_calls == 0
 
 
 def test_mcap_topic_accessor_raises_on_missing_topic(tmp_path: Path) -> None:
@@ -487,6 +614,12 @@ def _other_sample_schema() -> sensor_mcap.ProtobufMessageSchema:
             sensor_mcap.protobuf_field("timestamp_ns", 1, _FIELD_DESCRIPTOR_PROTO.TYPE_UINT64),
             sensor_mcap.protobuf_field("value", 2, _FIELD_DESCRIPTOR_PROTO.TYPE_DOUBLE),
             sensor_mcap.protobuf_field("valid", 3, _FIELD_DESCRIPTOR_PROTO.TYPE_BOOL),
+            sensor_mcap.protobuf_field(
+                "tags",
+                4,
+                _FIELD_DESCRIPTOR_PROTO.TYPE_STRING,
+                label=_FIELD_DESCRIPTOR_PROTO.LABEL_REPEATED,
+            ),
         ),
     )
 
@@ -504,6 +637,9 @@ def test_protobuf_schema_helpers_build_dynamic_message_class() -> None:
 
     assert descriptor_set.file[0].name == schema.proto_file_name
     assert descriptor_set.file[0].package == schema.package
+    tags_field = descriptor_set.file[0].message_type[0].field[3]
+    assert tags_field.name == "tags"
+    assert tags_field.label == _FIELD_DESCRIPTOR_PROTO.LABEL_REPEATED
     assert message.SerializeToString()
 
 
@@ -677,6 +813,35 @@ def test_write_mcap_messages_preserves_schema_channel_and_message_metadata(tmp_p
     assert [message.sequence for _schema, _channel, message in decoded] == [1, 2]
 
 
+def test_write_mcap_messages_writes_optional_metadata_records(tmp_path: Path) -> None:
+    """Optional stream metadata should land as named MCAP metadata records."""
+    output_path = tmp_path / "with_metadata.mcap"
+    schema = sensor_mcap.McapSchemaSpec(
+        name="example.generic.Sample",
+        encoding="example-schema",
+        data=b"schema-bytes",
+        message_encoding="example-bytes",
+    )
+
+    sensor_mcap.write_mcap_messages(
+        output_path,
+        stream=sensor_mcap.McapStreamSpec(
+            topic="/example",
+            schema=schema,
+            library="test writer",
+            metadata={"example.meta.v1": {"version": "1.0.0", "kind": "test"}},
+        ),
+        records=[sensor_mcap.McapMessageRecord(data=b"payload", log_time_ns=1, publish_time_ns=1, sequence=1)],
+    )
+
+    with output_path.open("rb") as stream:
+        reader = mcap_make_reader(stream)  # type: ignore[no-untyped-call]
+        assert sensor_mcap.get_metadata_record(reader, "example.meta.v1") == {
+            "version": "1.0.0",
+            "kind": "test",
+        }
+
+
 def test_write_mcap_messages_rejects_existing_output_without_overwrite(tmp_path: Path) -> None:
     """Existing output files should be protected unless overwrite is requested."""
     output_path = tmp_path / "exists.mcap"
@@ -718,3 +883,99 @@ def test_write_mcap_messages_removes_temporary_file_on_record_failure(tmp_path: 
 
     assert not output_path.exists()
     assert not list(tmp_path.glob(".broken.mcap.*.tmp"))
+
+
+def test_mcap_stream_spec_rejects_missing_schema_and_message_encoding() -> None:
+    """Construction requires at least one of schema or message_encoding."""
+    with pytest.raises(ValueError, match="requires either schema or message_encoding"):
+        sensor_mcap.McapStreamSpec(topic="/x", library="test")
+
+
+def test_mcap_stream_spec_rejects_both_schema_and_message_encoding() -> None:
+    """Setting both schema and message_encoding is ambiguous and rejected."""
+    schema = sensor_mcap.McapSchemaSpec("n", "protobuf", b"", "protobuf")
+    with pytest.raises(ValueError, match="cannot set both schema and message_encoding"):
+        sensor_mcap.McapStreamSpec(
+            topic="/x",
+            library="test",
+            schema=schema,
+            message_encoding="other",
+        )
+
+
+def test_write_schemaless_mcap_uses_schema_id_zero_and_channel_metadata(tmp_path: Path) -> None:
+    """A schemaless stream should register no schema and expose the caller's channel metadata."""
+    output_path = tmp_path / "schemaless.mcap"
+    records = [
+        sensor_mcap.McapMessageRecord(data=b"packet0", log_time_ns=10, publish_time_ns=10, sequence=1),
+        sensor_mcap.McapMessageRecord(data=b"packet1", log_time_ns=20, publish_time_ns=20, sequence=2),
+    ]
+
+    stats = sensor_mcap.write_mcap_messages(
+        output_path,
+        stream=sensor_mcap.McapStreamSpec(
+            topic="/lidar/top",
+            library="test schemaless writer",
+            message_encoding="vendor.sensor.udp",
+            channel_metadata={
+                "sensor_model": "GENERIC_SENSOR_V1",
+                "return_mode": "last_and_strongest",
+            },
+        ),
+        records=records,
+    )
+
+    assert stats.message_count == 2
+    assert stats.start_log_time_ns == 10
+    assert stats.end_log_time_ns == 20
+
+    with output_path.open("rb") as stream:
+        reader = mcap_make_reader(stream)  # type: ignore[no-untyped-call]
+        summary = reader.get_summary()
+
+    assert summary is not None
+    # No schemas registered for the schemaless channel.
+    assert not summary.schemas, f"expected no schemas, got {list(summary.schemas.values())}"
+
+    channels = list(summary.channels.values())
+    assert len(channels) == 1
+    channel = channels[0]
+    assert channel.topic == "/lidar/top"
+    assert channel.schema_id == 0
+    assert channel.message_encoding == "vendor.sensor.udp"
+    assert dict(channel.metadata) == {
+        "sensor_model": "GENERIC_SENSOR_V1",
+        "return_mode": "last_and_strongest",
+    }
+
+    with output_path.open("rb") as stream:
+        reader = mcap_make_reader(stream)  # type: ignore[no-untyped-call]
+        payloads = [record.data for _schema, _channel, record in reader.iter_messages(log_time_order=False)]
+
+    assert payloads == [b"packet0", b"packet1"]
+
+
+def test_write_schemaless_mcap_defaults_channel_metadata_to_empty(tmp_path: Path) -> None:
+    """A schemaless stream without channel_metadata should still produce a valid empty-metadata channel."""
+    output_path = tmp_path / "schemaless_no_meta.mcap"
+    records = [sensor_mcap.McapMessageRecord(data=b"payload", log_time_ns=1, publish_time_ns=1, sequence=1)]
+
+    sensor_mcap.write_mcap_messages(
+        output_path,
+        stream=sensor_mcap.McapStreamSpec(
+            topic="/schemaless",
+            library="test schemaless writer",
+            message_encoding="application/octet-stream",
+        ),
+        records=records,
+    )
+
+    with output_path.open("rb") as stream:
+        reader = mcap_make_reader(stream)  # type: ignore[no-untyped-call]
+        summary = reader.get_summary()
+
+    assert summary is not None
+    channels = list(summary.channels.values())
+    assert len(channels) == 1
+    assert channels[0].schema_id == 0
+    assert dict(channels[0].metadata) == {}
