@@ -2,11 +2,74 @@
 
 ## Latest
 
+## [2.8.0]
+
+### Released
+
+- 2026-10-05
+
+### Breaking Changes
+
+- Reserve all `default`-prefixed `multimodal-caption` result keys for default prompts. Custom
+  prompts must use an explicit `output.result_key` that does not start with `default`; existing
+  results remain readable, but affected configs need a new key for further runs.
+- Move the config-backed pipeline runtime, registry, and configuration modules from
+  `cosmos_curator.client.pipeline_cli` to `cosmos_curator.pipelines` so they are available in
+  runtime images. Update direct imports and `python -m` invocations; the `run-pipeline` Pixi task
+  already uses `cosmos_curator.pipelines.pipeline_runtime`.
+- Change `McapStreamSpec` constructor ordering to support optional schemas. Update positional
+  callers to use keyword arguments for `topic`, `library`, `schema`, and `overwrite`.
+
+### Added
+
+- Add the checkpointed Curator Next `video-embed` recipe to enrich completed `video-transcode`
+  clips with Cosmos-Embed1 vectors at 224p, 336p, or 448p. Use NVDEC decoding and GPU preprocessing,
+  then publish selected results in one Lance transaction; captioning can run independently.
+- Add `multimodal-embedding` to embed one selected camera per episode from `episodes.lance`
+  with Cosmos-Embed1, including resumable inference, separate result keys for different cameras,
+  and atomic publication of selected embedding results alongside existing captions.
+- Add TransNetV2 scene cutting to `video-cut`, with configurable scene-duration limits,
+  source-level checkpoints, PyAV decoding by default, and opt-in NVDEC GPU preprocessing.
+  Changing the cutting method or decoder requires a separate output location.
+- Add `mp4-index` for local and S3 videos, with reusable sensor-library MP4 parsing, Arrow
+  frame-index and metadata sidecars, raw `moov`/`moof` artifacts, and a resumable Lance manifest.
+  Declare the fragmented or nonfragmented container layout explicitly for each run.
+- Add MCAP-backed `LidarSensor` with caller-supplied packet decoders, whole-sweep reads, and
+  per-point timestamp window sampling. Support schemaless MCAP output and channel/file metadata.
+- Add opt-in `output.tag_camera_key` to `multimodal-caption` so separate camera runs can retain
+  distinct caption columns in the same episode table, with clearer result-key collision errors.
+- Add `--gpus-per-node` to `slurm shell` and `slurm submit` for clusters requiring per-node GPU
+  requests. It is mutually exclusive with `--gpus` and `--gres`.
+
+### Fixed
+
+- Stop Slurm image imports, shells, submitted jobs, and managed Ray clusters from inheriting
+  restrictive login-node shell resource limits; compute-node limits and Slurm allocations apply.
+- Default pushed image layers to gzip and recompress imported cache layers, preventing Enroot
+  import failures when a build reuses zstd-compressed layers.
+- Pad final TransNetV2 inference windows by repeating the last frame in the legacy splitters,
+  correcting missing end padding. Scene predictions near the end of a source may change.
+
 ### Changed
 
+- Cache cloud stream reads in aligned blocks to reduce repeated range requests during sensor
+  indexing and data-integrity checks, especially for fragmented MP4 inputs.
+- Upgrade vLLM and vLLM-Omni to 0.30.0, and add PyNvVideoCodec to `legacy-transformers` for
+  GPU video embedding.
 - Rename Pixi test tasks: `pytest` to `unit-test`, `pytest-fast` to `unit-test-fast`,
   and `gputest` to `gpu-test`. The unit tasks select `dev`; `pixi run -e <env> pytest`
   now runs the selected environment's executable without a task-name collision.
+- Validate expected clip counts and output artifacts in Kubernetes GPU CI jobs, with per-job
+  output paths to prevent stale artifacts from satisfying checks.
+
+### Documentation
+
+- Document video and multimodal embedding, MP4 indexing, and TransNetV2 cutting, including
+  configuration, recovery, publication, and model-staging requirements.
+- Add a multicamera AV split-and-caption guide and example configs for front, side, and rear
+  camera selections, including ego-trajectory context and camera-tagged results.
+- Document sensor-library MP4 parsing, cloud-read caching, and the LiDAR motion-compensation
+  transform derivation; clarify Slurm GPU requests and resource-limit behavior.
 
 ## [2.7.0]
 
