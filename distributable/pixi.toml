@@ -61,7 +61,7 @@ ngcsdk = "*"
 pillow = ">=12.2.0"
 pyasn1 = ">=0.6.3"
 pybase64 = ">=1.5.0"
-pylance = ">=0.39.0"
+pylance = ">=12.0.0,<13.0.0"
 pulp = "*"
 ray = { version = "==2.59.0", extras = ["default", "data"] }
 webdataset = "*"
@@ -160,7 +160,7 @@ tqdm = "*"
 [feature.cuml.pypi-dependencies]
 ngcsdk = "*"
 pyasn1 = ">=0.6.3"
-pylance = ">=0.39.0"
+pylance = ">=12.0.0,<13.0.0"
 
 [feature.transformers.dependencies]
 transformers = ">=5.11.0,<6.0.0"

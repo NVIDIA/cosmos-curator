@@ -203,7 +203,7 @@ def count_rows(uri: str, *, storage_profile: str = "default") -> int:
 
 
 # Lance's own default for ``write_dataset(max_rows_per_group=...)``, measured 1024 at
-# both pylance 10.0.0 (the lock) and 11.0.0; the threshold tracks Lance's figure, not
+# pylance 10.0.0, 11.0.0, and 12.0.0; the threshold tracks Lance's figure, not
 # this literal, so re-measure if that default ever moves.
 #
 # Do NOT read it as a physical unit and do NOT retune it to whatever the writer's
