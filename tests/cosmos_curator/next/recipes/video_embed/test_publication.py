@@ -4,6 +4,7 @@
 """Atomic enrichment, concurrent captions, and durable recovery boundaries."""
 
 import json
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -188,15 +189,21 @@ def test_caption_race_reprepares_only_column_files(
         monkeypatch.setattr(lance.LanceDataset, "commit", race)
     else:
         _write_caption(dataset.uri, commit)
-    published = publication.commit_fragments(
-        candidates,
-        config=config,
-        spec=spec,
-        dataset=dataset,
-        workspace=workspace,
-        pending=pending,
-        reprepare=reprepare,
-    )
+    # Other tests can remove Loguru's default sinks. Bind this test's captured
+    # stderr explicitly so the retry assertion does not depend on test order.
+    sink = pipeline.logger.add(sys.stderr, level="WARNING")
+    try:
+        published = publication.commit_fragments(
+            candidates,
+            config=config,
+            spec=spec,
+            dataset=dataset,
+            workspace=workspace,
+            pending=pending,
+            reprepare=reprepare,
+        )
+    finally:
+        pipeline.logger.remove(sink)
     assert len(versions) == 1
     assert state.resolve_workspace(config, published, spec) == workspace
     assert published.to_table(columns=[caption_spec("qwen3_8_27b_fp8").caption_field_name]).column(0).to_pylist() == [

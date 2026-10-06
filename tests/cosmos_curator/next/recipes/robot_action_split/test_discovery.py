@@ -37,6 +37,8 @@ without -- a label contract must never be reported green while skipped.
 """
 
 import json
+import subprocess
+import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -46,7 +48,6 @@ import pyarrow.parquet as pq
 import pytest
 from loguru import logger
 
-from cosmos_curator.next.recipes.robot_action_split import discovery
 from cosmos_curator.next.recipes.robot_action_split.config import (
     ResolvedRobotActionSplitConfig,
     SpanFilterConfig,
@@ -840,19 +841,33 @@ def test_chunk_limit_selects_the_same_chunks_on_every_run(tmp_path: Path) -> Non
     assert selections[0] == selections[1] == selections[2], f"chunk_limit selected different chunks: {selections}"
 
 
-def test_warning_capture_survives_a_loguru_reconfigure_inside_the_task() -> None:
+def test_warning_capture_survives_a_loguru_reconfigure_inside_the_task(repo_root: Path) -> None:
     """A task that wipes loguru's handler table must still finish.
 
     Any import inside a discovery worker can reconfigure loguru --
     ``cosmos_xenna.utils.python_log`` calls ``logger.remove()`` at import time -- which drops the capture sink.
     Tearing down by handler id then raised ValueError from a ``finally`` and killed the whole discovery run.
     """
-    with discovery._captured_warnings() as captured:
-        logger.warning("kept")
-        logger.remove()
-        logger.warning("lost after the wipe, but must not raise")
-
-    assert captured == ["kept"]
+    # The deliberate reset must not discard sinks belonging to the pytest worker.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from loguru import logger\n"
+            "from cosmos_curator.next.recipes.robot_action_split import discovery\n"
+            "with discovery._captured_warnings() as captured:\n"
+            "    logger.warning('kept')\n"
+            "    logger.remove()\n"
+            "    logger.warning('lost after the wipe, but must not raise')\n"
+            "assert captured == ['kept'], captured\n",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_listing_a_root_and_listing_its_shards_give_the_same_clip_ids(tmp_path: Path) -> None:
