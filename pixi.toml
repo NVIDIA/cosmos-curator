@@ -68,7 +68,7 @@ pyasn1 = ">=0.6.3" # CVE remediation: require 0.6.3+ (fixes vs vulnerable 0.6.2 
 pybase64 = ">=1.5.0" # SIMD base64 for bulk per-row data-URL encode; matches the version vllm already pins
 pylance = ">=0.39.0" # conda-forge package is too old
 pulp = "*" # conda-forge package is too old
-ray = { version = "==2.58.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
+ray = { version = "==2.59.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
 webdataset = "*" # conda-forge package pulls in pytorch
 
 [feature.core.tasks]

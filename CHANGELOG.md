@@ -2,6 +2,10 @@
 
 ## Latest
 
+### Changed
+
+- Upgrade Ray to 2.59.0. Local clusters started with `ray.init()` now enable token authentication by default.
+
 ## [2.8.0]
 
 ### Released

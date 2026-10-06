@@ -194,7 +194,7 @@ class ProcessorStage(Protocol):
 
     Structural stand-in for the ``StatefulStage`` model that
     ``ray.data.llm.Processor.get_stage_by_name`` returns, as pinned at Ray
-    2.58.0. Ray keeps that class internal to
+    2.59.0. Ray keeps that class internal to
     ``ray.llm._internal.batch.stages.base``, so re-verify this shape on an
     upgrade rather than trusting it to have survived.
     """
@@ -205,7 +205,7 @@ class ProcessorStage(Protocol):
 class StagedProcessor(Protocol):
     """A processor whose stages can be enumerated and re-configured by name.
 
-    Structural stand-in for ``ray.data.llm.Processor`` as pinned at Ray 2.58.0.
+    Structural stand-in for ``ray.data.llm.Processor`` as pinned at Ray 2.59.0.
     Declared rather than imported so this module costs nothing to import; both
     accessors are public there, so re-verify them on an upgrade.
     """
