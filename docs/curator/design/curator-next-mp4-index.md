@@ -14,10 +14,12 @@ extraction orchestration, and publication only.
   fragmented walk over a non-fragmented file buffers unboundedly past `mdat`. Per-file detection is
   tracked separately; an earlier attempt against real corpus data surfaced complications needing
   dedicated investigation, not a quick fix folded into this recipe.
-- **Two independent identities, not one.** `video_id` (location-derived) names `moov`/`moof` sidecars
-  and stays stable so they're never orphaned by a location change. `session_camera_id`
-  (session/camera-derived) names `frame_index`/`metadata` sidecars instead, so a relocated file for the
-  same (session, camera) still resolves to the same sidecar.
+- **Video payloads are keyed by source identity.** `video_id` (location-derived) names the
+  raw `moov`/`moof` extraction caches. `session_camera_id` remains a queryable logical key;
+  this recipe continues to refuse ambiguous ownership of one session/camera across videos.
+- **Metadata and frame indexes are canonical Lance fields.** One video row contains
+  `metadata: struct<…>` and `frames: large_list<struct<…>>`, published together with identity
+  and provenance. There is no derived metadata/index sidecar.
 - **Extraction-affecting settings are hashed into one contract id**, stamped on every manifest row and
   checked whole-table before reconciliation starts -- refusing a run against a stale-contract table
   rather than silently skipping or reprocessing it.
@@ -39,32 +41,48 @@ falls back to a single full listing.
 | Identity | Meaning |
 | --- | --- |
 | `video_id` | Hash of the normalized `media_location`. Deliberately stable: changing it would orphan every already-extracted `moov`/`moof` sidecar on disk. |
-| `session_camera_id` | Hash of `(source_session_id, camera_key)`, derived from `media_location`'s path `execution.session_id_path_depth` directories up (default 2). Two distinct `video_id`s deriving the same `session_camera_id` refuse the whole run upfront (`SessionCameraIdCollisionError`), before any Ray dispatch. A consumer holding only `source_session_id`/`camera_key` can compute the exact sidecar path a producer wrote, with no Lance query required. |
+| `session_camera_id` | Hash of `(source_session_id, camera_key)`, derived from `media_location`'s path `execution.session_id_path_depth` directories up (default 2). Two distinct `video_id`s deriving the same `session_camera_id` refuse the whole run upfront (`SessionCameraIdCollisionError`), before any Ray dispatch. Consumers can query this logical key in Lance. |
 | `extraction_contract_id` | Hash of `{extraction_version, container_kind, session_id_path_depth}` -- see "Reconciliation" below. |
 
 One row per video in `manifest.lance`
-([`VIDEO_IDENTITY_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
+([`VIDEO_MANIFEST_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
 
 | Field | Nullable | Notes |
 | --- | --- | --- |
 | `video_id`, `media_location`, `media_size_bytes` | no | |
 | `source_session_id`, `camera_key` | no | |
-| `frame_index_location`, `metadata_location` | no | Per-video Arrow IPC sidecars, named by `session_camera_id`. |
+| `source_width`, `source_height`, `source_frame_rate`, `source_frame_count`, `source_duration_ns`, `source_video_codec` | no | Summary fields derived from the same metadata object, named to match `video_cut`. Queries can project these columns without loading frame arrays. |
+| `metadata` | no | Struct containing every `VIDEO_METADATA_SCHEMA` field, including extradata and edit-list bytes. |
+| `frames` | no | Large list of non-null `FRAME_INDEX_SCHEMA` structs, in decode order. Composition offsets may be all null when absent from the source. |
 | `moov_location` | no | Raw `moov` bytes, named by `video_id`. |
 | `moof_table_location` | yes | Raw `moof` bytes, one row per fragment; null for a nonfragmented video. |
 | `container_kind` | no | `"fragmented"`/`"nonfragmented"`, this video's own declared run shape. |
 | `record_schema_version`, `extraction_contract_id` | no | See "Reconciliation" below. |
 
-`video_id` presence is the single source of truth for "already indexed." A producer must write both
-`frame_index`/`metadata` sidecars before committing the row: the Lance commit is the completion marker,
-since only it is atomic.
+`video_id` presence is the single source of truth for "already indexed." Workers stage complete
+video records as Lance fragments; the driver receives only fragment descriptors, counts, and
+failures, and appends each fragment atomically. Metadata, frame index, summaries, and provenance
+become visible under the same Lance commit. Uncommitted work can be recomputed from the raw-box
+caches without fetching the source again.
 
-Two per-video Arrow IPC sidecars hold what the `moov` box states about the stream --
-[`FRAME_INDEX_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py) (one row per
-sample) and `VIDEO_METADATA_SCHEMA` (one row). Both are always read wholesale for one already-identified
-video, never queried across videos, so a single-video read needs only `pyarrow`, never `lance`. Failures
-append to `errors.lance` (`ERROR_SCHEMA`): `video_id`, `media_location`, `error_type`, `error_message`,
-`attempted_at`.
+Extraction actors construct frame columns directly from NumPy arrays and return typed Arrow
+batches. No Python dictionary per frame or nested IPC schema-metadata blob is created. Publication
+batches retain the existing default of 1,000 videos; tune
+`execution.videos_per_fragment` and actor memory for the corpus. This is a row-count bound, not a
+hard byte bound: exceptionally long recordings may require smaller batches, and one complete
+video index must fit in memory.
+
+A consumer can project summaries for selection, then read selected `metadata`/`frames` fields
+in distributed input workers. `read_video_record(table, row_index=…)` unwraps the nested frame
+list into an ordinary frame table while reusing Arrow value buffers. `Mp4Metadata.from_row` and
+`Mp4FrameIndex.from_frame_index_table` remain independent of Lance. Arrow unwrapping does not
+eliminate allocations for subsequent NumPy conversion or derived timestamp calculations.
+
+Raw `moof` Arrow caches are still fetched wholesale before IPC parsing; they are extraction caches,
+not the canonical metadata/index output. Source media remains in its original storage.
+
+Failures append to `errors.lance` (`ERROR_SCHEMA`): `video_id`, `media_location`, `error_type`,
+`error_message`, `attempted_at`.
 
 ## Reconciliation, caching, and failure policy
 
@@ -96,8 +114,8 @@ run never attempts it automatically.
 Before fetching/walking a video's `moov`/`moof` (`execution.skip_existing_sidecars`, default on), the
 deterministic sidecar path is checked first and read back instead of refetched, atomically on both
 local and `s3://` backends. A cache entry that writes completely but fails to parse retries once with
-caching off, treated as a cache miss rather than a video failure. `frame_index`/`metadata` are always
-rebuilt regardless -- cheap once `moov`/`moof` bytes are in hand. **Known gap**: the guard trusts a
+caching off, treated as a cache miss rather than a video failure. For uncommitted videos, the metadata/index record is always
+rebuilt -- cheap once `moov`/`moof` bytes are in hand. **Known gap**: the guard trusts a
 sidecar's mere existence, not whether `media_location`'s content still matches what produced it -- a
 source file replaced in place between two runs would read back stale bytes.
 
@@ -131,5 +149,9 @@ output:
   path: s3://example-bucket/mp4-index/
 ```
 
-`manifest.lance`, `errors.lance`, `frames/`, `metadata/`, `moov/`, and `moof/` are all written under
+`manifest.lance`, `errors.lance`, `moov/`, and `moof/` are all written under
 `output.path`. Local/shared paths are supported in place of S3, visible to every Ray worker.
+
+The complete-record layout uses `record_schema_version: 5`. Older manifests must be recreated
+or explicitly backfilled before rerunning; changing storage shape does not change the extraction
+contract. Existing raw-box caches remain reusable. No standalone Arrow export is included.

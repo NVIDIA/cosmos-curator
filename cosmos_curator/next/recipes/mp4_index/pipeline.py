@@ -71,8 +71,8 @@ def _check_no_session_camera_id_collisions(
             msg = (
                 f"{log_prefix}: media_location {owner[1]!r} and {row['media_location']!r} both derive "
                 f"source_session_id={source_session_id!r}, camera_key={camera_key!r} -- each would publish "
-                "a distinct manifest row pointing at the same frame_index/metadata sidecar pair, second "
-                "write silently winning. Adjust execution.session_id_path_depth, or the input corpus's "
+                "a distinct manifest row with ambiguous session/camera ownership. "
+                "Adjust execution.session_id_path_depth, or the input corpus's "
                 "own layout, so each session appears once."
             )
             raise SessionCameraIdCollisionError(msg)
@@ -178,8 +178,10 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
     configure_ray_data_stability()
     ray.data.DataContext.get_current().execution_no_progress_timeout_s = config.execution.no_progress_timeout_s
 
-    results = ray.data.from_items(new_rows, override_num_blocks=len(new_rows)).map(
+    results = ray.data.from_items(new_rows, override_num_blocks=len(new_rows)).map_batches(
         cast("Any", _ProcessOneVideo),
+        batch_format="pyarrow",
+        batch_size=1,
         compute=ray.data.ActorPoolStrategy(min_size=config.execution.min_actors, max_size=config.execution.max_actors),
         # Left unset, Ray Data reserves ~2.4 GiB per CPU a task asks for.
         memory=(

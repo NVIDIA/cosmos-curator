@@ -29,7 +29,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 from loguru import logger  # type: ignore[import-untyped]
 
 from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options
-from cosmos_curator.next.recipes.mp4_index.contracts import ERROR_SCHEMA, RECORD_SCHEMA_VERSION, VIDEO_IDENTITY_SCHEMA
+from cosmos_curator.next.recipes.mp4_index.contracts import ERROR_SCHEMA, RECORD_SCHEMA_VERSION, VIDEO_MANIFEST_SCHEMA
 from cosmos_curator.next.utils import lance_fragment_recovery
 from cosmos_curator.next.utils.lance_utils import (
     LANCE_DATA_STORAGE_VERSION,
@@ -70,7 +70,7 @@ def open_or_create_manifest_table(*, uri: str, storage_profile: str) -> lance.La
     return lance_fragment_recovery.open_or_create_table(
         uri=uri,
         storage_profile=storage_profile,
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
         kind=_KIND,
     )
@@ -174,12 +174,12 @@ def stage_manifest_batch(batch: pa.Table, *, uri: str, storage_profile: str) -> 
 
     rows: list[dict[str, Any]] = []
     if successes.num_rows:
-        manifest_table = successes.select(VIDEO_IDENTITY_SCHEMA.names).cast(VIDEO_IDENTITY_SCHEMA)
+        manifest_table = successes.select(VIDEO_MANIFEST_SCHEMA.names).cast(VIDEO_MANIFEST_SCHEMA)
         candidate = lance_fragment_recovery.write_row_fragment(
             manifest_table,
             uri=uri,
             storage_profile=storage_profile,
-            schema=VIDEO_IDENTITY_SCHEMA,
+            schema=VIDEO_MANIFEST_SCHEMA,
             id_column="video_id",
             data_storage_version=LANCE_DATA_STORAGE_VERSION,
         )
@@ -216,7 +216,7 @@ def append_manifest_fragment(candidate_json: str, *, uri: str, storage_profile: 
         candidate_json,
         uri=uri,
         storage_profile=storage_profile,
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
         id_column="video_id",
         kind=_KIND,
         operation=_APPEND_OPERATION,

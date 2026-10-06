@@ -85,15 +85,13 @@ def test_resolves_a_minimal_path_prefix_config(tmp_path: pathlib.Path) -> None:
     assert resolved.input.limit is None
 
 
-def test_output_derives_frames_metadata_moov_moof_and_error_locations(tmp_path: pathlib.Path) -> None:
+def test_output_derives_frames_moov_moof_and_error_locations(tmp_path: pathlib.Path) -> None:
     """All fixed output locations derive from output.path -- not separately configured."""
     path = _write(tmp_path, _MINIMAL_URIS_CONFIG)
 
     resolved = config.resolve_config(path)
 
     assert resolved.output.manifest_lance_uri == "s3://bucket/mp4-index/manifest.lance"
-    assert resolved.output.frame_index_root == "s3://bucket/mp4-index/frames"
-    assert resolved.output.metadata_root == "s3://bucket/mp4-index/metadata"
     assert resolved.output.moov_sidecar_root == "s3://bucket/mp4-index/moov"
     assert resolved.output.moof_table_root == "s3://bucket/mp4-index/moof"
     assert resolved.output.errors_lance_uri == "s3://bucket/mp4-index/errors.lance"
@@ -107,8 +105,6 @@ def test_output_derivation_works_for_a_local_path(tmp_path: pathlib.Path) -> Non
     resolved = config.resolve_config(path)
 
     assert resolved.output.manifest_lance_uri == "/data/mp4-index/manifest.lance"
-    assert resolved.output.frame_index_root == "/data/mp4-index/frames"
-    assert resolved.output.metadata_root == "/data/mp4-index/metadata"
     assert resolved.output.moov_sidecar_root == "/data/mp4-index/moov"
     assert resolved.output.moof_table_root == "/data/mp4-index/moof"
     assert resolved.output.errors_lance_uri == "/data/mp4-index/errors.lance"

@@ -25,16 +25,17 @@ from cosmos_curator.next.recipes.mp4_index import lance_sink
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     ERROR_SCHEMA,
     RECORD_SCHEMA_VERSION,
-    VIDEO_IDENTITY_SCHEMA,
+    VIDEO_MANIFEST_SCHEMA,
     make_session_camera_id,
 )
 from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
+from tests.cosmos_curator.next.recipes.mp4_index._record_fixtures import _FRAME_ROWS, _METADATA_ROW
 
 _CURRENT_CONTRACT_ID = "contract-v1"
 
 
 def _publish_manifest_row(uri: str, *, video_id: str, record_schema_version: int, extraction_contract_id: str) -> None:
-    """Stage one VIDEO_IDENTITY_SCHEMA row directly, skipping process_one_video entirely."""
+    """Stage one VIDEO_MANIFEST_SCHEMA row directly, skipping process_one_video entirely."""
     table = pa.Table.from_pylist(
         [
             {
@@ -44,8 +45,14 @@ def _publish_manifest_row(uri: str, *, video_id: str, record_schema_version: int
                 "session_camera_id": make_session_camera_id("sess-a", "camera"),
                 "media_location": f"s3://unused/{video_id}.mp4",
                 "media_size_bytes": 1,
-                "frame_index_location": "s3://unused/frames.arrow",
-                "metadata_location": "s3://unused/metadata.arrow",
+                "source_width": 640,
+                "source_height": 480,
+                "source_frame_rate": 30.0,
+                "source_frame_count": 1,
+                "source_duration_ns": 1_000_000_000,
+                "source_video_codec": "h264",
+                "metadata": _METADATA_ROW,
+                "frames": _FRAME_ROWS,
                 "moov_location": f"s3://unused/{video_id}.moov",
                 "moof_table_location": None,
                 "container_kind": "nonfragmented",
@@ -53,7 +60,7 @@ def _publish_manifest_row(uri: str, *, video_id: str, record_schema_version: int
                 "extraction_contract_id": extraction_contract_id,
             }
         ],
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
     )
     lance.write_dataset(table, uri, mode="create", data_storage_version=LANCE_DATA_STORAGE_VERSION)
 
@@ -210,3 +217,35 @@ def test_validate_committed_versions_raises_on_a_mismatched_extraction_contract_
 
     with pytest.raises(ValueError, match=r"1 row.*extraction_contract_id"):
         lance_sink.validate_committed_versions(dataset, extraction_contract_id=_CURRENT_CONTRACT_ID)
+
+
+def test_complete_video_fragment_is_visible_only_after_commit_and_replay_is_idempotent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Staging and replay publish exactly one complete nested record, with metadata projections intact."""
+    from cosmos_curator.next.recipes.mp4_index.contracts import read_video_record  # noqa: PLC0415
+    from cosmos_curator.next.recipes.mp4_index.processing import result_table  # noqa: PLC0415
+
+    uri = str(tmp_path / "manifest.lance")
+    _publish_manifest_row(
+        uri,
+        video_id="seed",
+        record_schema_version=RECORD_SCHEMA_VERSION,
+        extraction_contract_id=_CURRENT_CONTRACT_ID,
+    )
+    record = lance.dataset(uri).to_table().to_pylist()[0]
+    record.update(video_id="new-video", source_frame_count=3, status="success", error_type=None, error_message=None)
+    control = lance_sink.stage_manifest_batch(result_table(record), uri=uri, storage_profile="default")
+    assert lance.dataset(uri).count_rows() == 1
+    candidate = control["candidate_json"][0].as_py()
+    first_version = lance_sink.append_manifest_fragment(candidate, uri=uri, storage_profile="default")
+    assert lance_sink.append_manifest_fragment(candidate, uri=uri, storage_profile="default") == first_version
+    dataset = lance.dataset(uri)
+    assert dataset.count_rows() == 2
+    summary = dataset.to_table(columns=["video_id", "source_frame_count"], filter="video_id = 'new-video'")
+    assert summary.to_pylist() == [{"video_id": "new-video", "source_frame_count": 3}]
+    frames, metadata = read_video_record(
+        dataset.to_table(columns=["metadata", "frames"], filter="video_id = 'new-video'")
+    )
+    assert frames.to_pylist() == _FRAME_ROWS
+    assert metadata == _METADATA_ROW

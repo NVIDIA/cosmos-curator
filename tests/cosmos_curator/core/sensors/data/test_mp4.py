@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Construct Mp4FrameIndex/Mp4Metadata from real FRAME_INDEX_SCHEMA/VIDEO_METADATA_SCHEMA rows and VideoTracks."""
+"""Construct Mp4FrameIndex/Mp4Metadata from real FRAME_INDEX_SCHEMA/VIDEO_METADATA_SCHEMA rows, VideoTracks."""
 
 import pathlib
 from fractions import Fraction
@@ -78,6 +78,7 @@ _METADATA_ROW = {
     "avg_frame_rate_num": 30,
     "avg_frame_rate_den": 1,
     "bit_rate_bps": 1000,
+    "duration_ns": 1_000_000_000,
     "encoder_tag": None,
 }
 
@@ -267,6 +268,18 @@ def test_mp4_metadata_from_video_track_matches_the_real_box_fields() -> None:
     assert metadata.width == 640
     assert metadata.height == 480
     assert metadata.avc_profile_idc == 0x42
+    assert metadata.duration_ns == 125_000_000  # 3 samples * 512 ticks each, at timescale=12288
+
+
+def test_mp4_metadata_from_video_track_tolerates_a_zero_timescale_with_duration_ns_zero() -> None:
+    """A malformed/zero mdhd timescale returns duration_ns=0 instead of raising."""
+    moov = bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None, timescale=0)
+    video_track = parse_video_track(moov)
+
+    metadata = Mp4Metadata.from_video_track(video_track)
+
+    assert metadata.duration_ns == 0
+    assert metadata.avg_frame_rate_num == 0
 
 
 def test_mp4_metadata_from_video_track_maps_non_avc_fourcc_to_hevc() -> None:

@@ -60,6 +60,7 @@ def pack_moof(traf_content: bytes | None = None, *, siblings: bytes = b"") -> by
 _TFHD_DEFAULT_SAMPLE_DURATION_PRESENT = 0x000008
 _TFHD_DEFAULT_BASE_IS_MOOF = 0x020000
 _TRUN_DATA_OFFSET_PRESENT = 0x000001
+_TRUN_SAMPLE_DURATION_PRESENT = 0x000100
 _TRUN_SAMPLE_SIZE_PRESENT = 0x000200
 _TRUN_SAMPLE_FLAGS_PRESENT = 0x000400
 _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT = 0x000800
@@ -94,11 +95,15 @@ def real_trun(
     is_keyframe: bool = True,
     sample_count: int = 1,
     composition_offset: int | None = None,
+    sample_duration: int | None = None,
 ) -> bytes:
     """Pack a ``trun`` matching the flags observed against a real corpus (``0x000601``, see ``fragment_table.py``)."""
     flags = _TRUN_DATA_OFFSET_PRESENT | _TRUN_SAMPLE_SIZE_PRESENT | _TRUN_SAMPLE_FLAGS_PRESENT
     sample_flags = 0 if is_keyframe else _SAMPLE_IS_NON_SYNC_SAMPLE_BIT
     content = struct.pack(">I", sample_count) + struct.pack(">i", data_offset)
+    if sample_duration is not None:
+        flags |= _TRUN_SAMPLE_DURATION_PRESENT
+        content += struct.pack(">I", sample_duration)
     content += struct.pack(">I", sample_size) + struct.pack(">I", sample_flags)
     if composition_offset is not None:
         flags |= _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT
@@ -116,8 +121,14 @@ def real_traf(
     default_base_is_moof: bool = True,
     sample_count: int = 1,
     composition_offset: int | None = None,
+    trun_sample_duration: int | None = None,
 ) -> bytes:
-    """Pack a real, byte-accurate ``traf`` -- the shape :mod:`fragment_table` actually parses."""
+    """Pack a real, byte-accurate ``traf`` -- the shape :mod:`fragment_table` actually parses.
+
+    *default_sample_duration* is ``tfhd``'s own fallback; *trun_sample_duration* is this one
+    sample's own ``trun``-level override -- named separately since real files can carry either,
+    both, or neither, and :mod:`fragment_table` resolves them with different precedence.
+    """
     return pack_box(
         "traf",
         real_tfhd(default_sample_duration=default_sample_duration, default_base_is_moof=default_base_is_moof)
@@ -128,13 +139,14 @@ def real_traf(
             is_keyframe=is_keyframe,
             sample_count=sample_count,
             composition_offset=composition_offset,
+            sample_duration=trun_sample_duration,
         ),
     )
 
 
-def trex_box(*, default_sample_size: int = 0, default_sample_flags: int = 0) -> bytes:
+def trex_box(*, default_sample_duration: int = 0, default_sample_size: int = 0, default_sample_flags: int = 0) -> bytes:
     """Pack a minimal ``mvex/trex`` box -- this recipe's own fallback-defaults source."""
-    trex_content = struct.pack(">5I", 1, 1, 0, default_sample_size, default_sample_flags)
+    trex_content = struct.pack(">5I", 1, 1, default_sample_duration, default_sample_size, default_sample_flags)
     return pack_box("mvex", pack_full_box("trex", 0, trex_content))
 
 
@@ -148,6 +160,7 @@ def synthetic_fragmented_moov(
     tkhd_version: int = 0,
     include_elst: bool = False,
     include_trex: bool = True,
+    trex_sample_duration: int = 0,
 ) -> bytes:
     """Pack a full, real, minimal fragmented ``moov`` box -- real ``stsd``, empty ``stbl`` around it.
 
@@ -169,7 +182,7 @@ def synthetic_fragmented_moov(
     edts = pack_box("edts", elst_box()) if include_elst else b""
     trak = pack_box("trak", tkhd + mdia + edts)
     mvhd = mvhd_box(version=mvhd_version)
-    mvex = trex_box() if include_trex else b""
+    mvex = trex_box(default_sample_duration=trex_sample_duration) if include_trex else b""
     return pack_box("moov", mvhd + trak + mvex)
 
 

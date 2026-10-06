@@ -13,9 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Curator Next ``mp4-index`` reference recipe.
-
-Discovers, extracts, and indexes video files in a single pass, publishing the
-``VIDEO_IDENTITY_SCHEMA``/``FRAME_INDEX_SCHEMA``/``VIDEO_METADATA_SCHEMA`` sidecar shape regardless of
-container kind.
-"""
+"""Index MP4 metadata and frame byte ranges in Lance, caching raw moov/moof boxes."""

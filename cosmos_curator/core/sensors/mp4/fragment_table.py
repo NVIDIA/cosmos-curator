@@ -48,9 +48,6 @@ _TFHD_DEFAULT_BASE_IS_MOOF = 0x020000
 # trun flags (ISO/IEC 14496-12 §8.8.8)
 _TRUN_DATA_OFFSET_PRESENT = 0x000001
 _TRUN_FIRST_SAMPLE_FLAGS_PRESENT = 0x000004
-#: Read but unused -- dts_ticks comes from each fragment's own tfdt, not accumulated trun
-#: durations. Still named and checked, to advance past this field correctly for whatever
-#: follows it when the flag is set.
 _TRUN_SAMPLE_DURATION_PRESENT = 0x000100
 _TRUN_SAMPLE_SIZE_PRESENT = 0x000200
 _TRUN_SAMPLE_FLAGS_PRESENT = 0x000400
@@ -58,6 +55,9 @@ _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT = 0x000800
 
 #: Within a sample_flags word, whether this sample is *not* a sync sample (i.e. not a keyframe).
 _SAMPLE_IS_NON_SYNC_SAMPLE_BIT = 0x00010000
+
+#: Fewer samples than this leaves no decode-time interval to derive a duration span from.
+_MIN_SAMPLES_FOR_A_DURATION_SPAN = 2
 
 
 class FragmentLayoutUnsupportedError(UnindexableVideoError):
@@ -130,7 +130,9 @@ def _parse_trun(buf: bytes, start: int) -> dict[str, int | None]:
     if flags & _TRUN_FIRST_SAMPLE_FLAGS_PRESENT:
         first_sample_flags = struct.unpack_from(">I", buf, pos)[0]
         pos += 4
+    sample_duration = None
     if flags & _TRUN_SAMPLE_DURATION_PRESENT:
+        sample_duration = struct.unpack_from(">I", buf, pos)[0]
         pos += 4
     sample_size = None
     if flags & _TRUN_SAMPLE_SIZE_PRESENT:
@@ -146,6 +148,7 @@ def _parse_trun(buf: bytes, start: int) -> dict[str, int | None]:
         pos += 4
     return {
         "data_offset": data_offset,
+        "sample_duration": sample_duration,
         "sample_size": sample_size,
         "sample_flags": first_sample_flags if first_sample_flags is not None else sample_flags,
         "sample_composition_offset": sample_composition_offset,
@@ -157,15 +160,15 @@ def _parse_trex_defaults(moov_buf: bytes, moov_content_start: int, moov_content_
     try:
         trex_start, _trex_end = find_box(moov_buf, ("mvex", "trex"), moov_content_start, moov_content_end)
     except BoxNotFoundError:
-        return {"default_sample_size": None, "default_sample_flags": None}
-    _track_id, _description_index, _duration, size, flags = struct.unpack_from(">5I", moov_buf, trex_start + 4)
-    return {"default_sample_size": size, "default_sample_flags": flags}
+        return {"default_sample_duration": None, "default_sample_size": None, "default_sample_flags": None}
+    _track_id, _description_index, duration, size, flags = struct.unpack_from(">5I", moov_buf, trex_start + 4)
+    return {"default_sample_duration": duration or None, "default_sample_size": size, "default_sample_flags": flags}
 
 
 def _parse_fragment(
     moof_start: int, moof_bytes: bytes, trex_defaults: dict[str, int | None]
-) -> tuple[int, int, bool, int]:
-    """Parse one ``moof``'s single sample into ``(offset, size, is_keyframe, decode_time)``.
+) -> tuple[int, int, bool, int, int | None]:
+    """Parse one ``moof``'s single sample into ``(offset, size, is_keyframe, decode_time, sample_duration)``.
 
     Args:
         moof_start: the ``moof`` box's absolute offset in the source file.
@@ -210,7 +213,12 @@ def _parse_fragment(
 
     is_keyframe = not bool(sample_flags & _SAMPLE_IS_NON_SYNC_SAMPLE_BIT)
     absolute_offset = moof_start + trun["data_offset"]
-    return absolute_offset, sample_size, is_keyframe, decode_time
+    sample_duration = (
+        trun["sample_duration"] if trun["sample_duration"] is not None else tfhd["default_sample_duration"]
+    )
+    if sample_duration is None:
+        sample_duration = trex_defaults["default_sample_duration"]
+    return absolute_offset, sample_size, is_keyframe, decode_time, sample_duration
 
 
 def parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) -> VideoTrack:
@@ -234,6 +242,20 @@ def parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) 
     except (struct.error, IndexError) as exc:
         msg = f"moov/moof buffer ran out mid-parse -- truncated or corrupt: {exc}"
         raise MalformedBoxHeaderError(msg) from exc
+
+
+def _duration_from_decode_times(decode_times: list[int], sample_durations: list[int | None]) -> int:
+    """Return the decode span plus the last sample's duration, in track timescale ticks.
+
+    Fragmented files may have a stale ``mdhd.duration``. Use the last sample's explicit
+    duration when available; otherwise estimate it from the mean decode interval.
+    With fewer than two samples, return the available sample duration or zero.
+    """
+    if len(decode_times) < _MIN_SAMPLES_FOR_A_DURATION_SPAN:
+        return (sample_durations[-1] if sample_durations else None) or 0
+    span = decode_times[-1] - decode_times[0]
+    last_interval = sample_durations[-1] if sample_durations[-1] is not None else span // (len(decode_times) - 1)
+    return span + last_interval
 
 
 def _parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) -> VideoTrack:
@@ -270,16 +292,18 @@ def _parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]])
     sizes: list[int] = []
     is_keyframe: list[bool] = []
     decode_times: list[int] = []
+    sample_durations: list[int | None] = []
     for moof_start, moof_bytes in moof_rows:
-        offset, size, keyframe, decode_time = _parse_fragment(moof_start, moof_bytes, trex_defaults)
+        offset, size, keyframe, decode_time, sample_duration = _parse_fragment(moof_start, moof_bytes, trex_defaults)
         offsets.append(offset)
         sizes.append(size)
         is_keyframe.append(keyframe)
         decode_times.append(decode_time)
+        sample_durations.append(sample_duration)
 
     return VideoTrack(
         timescale=media_header.timescale,
-        duration=media_header.duration,
+        duration=_duration_from_decode_times(decode_times, sample_durations),
         sample_description=sample_description,
         movie_header=movie_header,
         track_header=track_header,

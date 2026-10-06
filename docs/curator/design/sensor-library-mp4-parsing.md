@@ -107,10 +107,10 @@ A recipe-specific error (e.g. an unavailable sof/moe join) subclasses
 - **Storage/transport.** `FetchRange` is a contract a caller builds over `smart_open`, a
   presigned URL, or a local file; `moof_walk.py` takes an already-open file-like handle
   directly, owned and closed by its caller. This package picks no transport library.
-- **Sidecar I/O and schemas.** `FRAME_INDEX_SCHEMA`/`VIDEO_METADATA_SCHEMA` and every
+- **Publication I/O and schemas.** `FRAME_INDEX_SCHEMA`/`VIDEO_METADATA_SCHEMA` and every
   read/write sidecar function live in `cosmos_curator.next.recipes.mp4_index.contracts`
   — the producer-owned contract. This package holds only the typed reader views
-  (`Mp4FrameIndex`/`Mp4Metadata`) those sidecars round-trip through.
+  (`Mp4FrameIndex`/`Mp4Metadata`) that consume Arrow arrays and metadata rows.
 - **Friendly codec names, presentation-timestamp policy, keyframe-absence policy.** All
   resolved one layer up, by whatever reads a `VideoTrack` or an already-published sidecar
   next — see "Design principle" above.

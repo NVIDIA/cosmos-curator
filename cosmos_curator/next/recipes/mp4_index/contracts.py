@@ -24,8 +24,8 @@ import os
 import pathlib
 import posixpath
 import uuid
-from collections.abc import Iterator, Mapping
-from typing import IO, Any, cast
+from collections.abc import Iterator
+from typing import IO, Any
 from urllib.parse import urlsplit
 
 import pyarrow as pa
@@ -40,8 +40,8 @@ KIND = "mp4-index"
 CONTAINER_KIND_FRAGMENTED = "fragmented"
 CONTAINER_KIND_NONFRAGMENTED = "nonfragmented"
 
-#: VIDEO_IDENTITY_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
-RECORD_SCHEMA_VERSION = 2
+#: VIDEO_MANIFEST_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
+RECORD_SCHEMA_VERSION = 5
 
 
 def make_video_id(media_location: str) -> str:
@@ -58,7 +58,7 @@ class UnresolvableMediaLocationError(ValueError):
 
 
 def make_session_camera_id(source_session_id: str, camera_key: str) -> str:
-    """Identify a video's own sidecar pair by (session, camera), not by where the file lives."""
+    """Identify a logical session/camera for manifest lookups."""
     return canonical_digest([source_session_id, camera_key])
 
 
@@ -68,7 +68,7 @@ def derive_session_and_camera(media_location: str, *, session_id_path_depth: int
     ``camera_key`` is everything after ``source_session_id`` -- every remaining directory
     component plus the filename stem, not the stem alone: two videos can share a session and
     filename stem while differing only by an intermediate directory (``unit-00``/``unit-01``,
-    a real independently-discovered pair), and the stem alone would collide their sidecars.
+    a real independently-discovered pair), and the stem alone would conflate their logical identities.
     """
     path = urlsplit(media_location).path if "://" in media_location else media_location
     parts = [part for part in path.split("/") if part]
@@ -131,13 +131,9 @@ def _open_sidecar_for_write(path: str, *, transport_params: dict[str, Any] | Non
         yield handle
 
 
-#: One row per sample, within one video's sidecar file. ``dts_ticks``/``composition_offset_ticks``
-#: are undecoded ticks in the stream's own ``time_base`` (``VIDEO_METADATA_SCHEMA.time_base_num``/
-#: ``time_base_den``). ``composition_offset_ticks`` is null when the track carries no
-#: composition-offset box, else signed (including a nominally-zero offset); ``elst_bytes`` isn't
-#: decoded here, so these ticks never reflect an edit-list remap. No sensor-level camera timing is
-#: part of this schema -- a producer with a real clock source publishes that as its own separate,
-#: optional sidecar.
+#: One struct per sample, in decode order. Ticks use the video's metadata time base,
+#: without edit-list shifts or sensor-clock timing. Composition offsets are null
+#: when absent; explicit offsets, including zero, remain signed integers.
 FRAME_INDEX_SCHEMA = pa.schema(
     [
         pa.field("dts_ticks", pa.int64(), nullable=False),
@@ -149,28 +145,7 @@ FRAME_INDEX_SCHEMA = pa.schema(
 )
 
 
-#: One row per video stream -- who it is and where its bytes live.
-VIDEO_IDENTITY_SCHEMA = pa.schema(
-    [
-        pa.field("video_id", pa.string(), nullable=False),
-        pa.field("source_session_id", pa.large_string(), nullable=False),
-        pa.field("camera_key", pa.string(), nullable=False),
-        # Hash of (source_session_id, camera_key) -- stored so a scan can filter on it via a BTREE index.
-        pa.field("session_camera_id", pa.string(), nullable=False),
-        pa.field("media_location", pa.large_string(), nullable=False),
-        pa.field("media_size_bytes", pa.int64(), nullable=False),
-        pa.field("frame_index_location", pa.large_string(), nullable=False),
-        pa.field("metadata_location", pa.large_string(), nullable=False),
-        pa.field("moov_location", pa.large_string(), nullable=False),
-        pa.field("moof_table_location", pa.large_string(), nullable=True),
-        pa.field("container_kind", pa.string(), nullable=False),
-        pa.field("record_schema_version", pa.int32(), nullable=False),
-        pa.field("extraction_contract_id", pa.large_string(), nullable=False),
-    ]
-)
-
-
-#: One row, always exactly one, per video -- see :func:`write_video_metadata`.
+#: Box metadata embedded as a struct in each canonical video record.
 VIDEO_METADATA_SCHEMA = pa.schema(
     [
         pa.field("codec_name", pa.string(), nullable=False),
@@ -209,14 +184,44 @@ VIDEO_METADATA_SCHEMA = pa.schema(
         pa.field("avg_frame_rate_num", pa.int32(), nullable=False),
         pa.field("avg_frame_rate_den", pa.int32(), nullable=False),
         pa.field("bit_rate_bps", pa.int64(), nullable=False),
+        pa.field("duration_ns", pa.int64(), nullable=False),
         pa.field("encoder_tag", pa.string(), nullable=True),
     ]
 )
 
 
-#: One row per failed attempt -- keyed by the same video_id as VIDEO_IDENTITY_SCHEMA but never
+#: One complete video record: source identity, provenance, metadata, and frame index.
+VIDEO_MANIFEST_SCHEMA = pa.schema(
+    [
+        pa.field("video_id", pa.string(), nullable=False),
+        pa.field("source_session_id", pa.large_string(), nullable=False),
+        pa.field("camera_key", pa.string(), nullable=False),
+        # Hash of (source_session_id, camera_key) -- stored so a scan can filter on it via a BTREE index.
+        pa.field("session_camera_id", pa.string(), nullable=False),
+        pa.field("media_location", pa.large_string(), nullable=False),
+        pa.field("media_size_bytes", pa.int64(), nullable=False),
+        pa.field("source_width", pa.int32(), nullable=False),
+        pa.field("source_height", pa.int32(), nullable=False),
+        pa.field("source_frame_rate", pa.float64(), nullable=False),
+        pa.field("source_frame_count", pa.int64(), nullable=False),
+        pa.field("source_duration_ns", pa.int64(), nullable=False),
+        pa.field("source_video_codec", pa.string(), nullable=False),
+        pa.field("metadata", pa.struct(VIDEO_METADATA_SCHEMA), nullable=False),
+        pa.field(
+            "frames", pa.large_list(pa.field("item", pa.struct(FRAME_INDEX_SCHEMA), nullable=False)), nullable=False
+        ),
+        pa.field("moov_location", pa.large_string(), nullable=False),
+        pa.field("moof_table_location", pa.large_string(), nullable=True),
+        pa.field("container_kind", pa.string(), nullable=False),
+        pa.field("record_schema_version", pa.int32(), nullable=False),
+        pa.field("extraction_contract_id", pa.large_string(), nullable=False),
+    ]
+)
+
+
+#: One row per failed attempt -- keyed by the same video_id as VIDEO_MANIFEST_SCHEMA but never
 #: unique, since a video can be retried across runs. Append-only, so failure history stays
-#: queryable across runs without log-scraping. No reconciliation with VIDEO_IDENTITY_SCHEMA: a row
+#: queryable across runs without log-scraping. No reconciliation with VIDEO_MANIFEST_SCHEMA: a row
 #: here records one failed attempt, not the video's current status.
 ERROR_SCHEMA = pa.schema(
     [
@@ -245,10 +250,9 @@ def write_arrow_sidecar(
 
 def read_arrow_sidecar(path: str, *, transport_params: dict[str, Any] | None = None) -> pa.Table:
     """Read one Arrow IPC sidecar back from *path*, whole -- these files are never scanned partially."""
-    with (
-        smart_open.open(path, "rb", transport_params=transport_params) as handle,
-        ipc.open_file(handle) as reader,
-    ):
+    with smart_open.open(path, "rb", transport_params=transport_params) as handle:
+        data = handle.read()
+    with ipc.open_file(pa.BufferReader(data)) as reader:
         return reader.read_all()
 
 
@@ -264,26 +268,26 @@ def read_bytes_sidecar(path: str, *, transport_params: dict[str, Any] | None = N
         return handle.read()
 
 
-def write_frame_index(
-    frame_rows: list[dict[str, object]], path: str, *, transport_params: dict[str, Any] | None = None
-) -> None:
-    """Write one video's frame rows to *path* as a single Arrow IPC file, local or ``s3://``."""
-    write_arrow_sidecar(frame_rows, FRAME_INDEX_SCHEMA, path, transport_params=transport_params)
+def read_video_record(table: pa.Table, *, row_index: int = 0) -> tuple[pa.Table, dict[str, Any]]:
+    """Unwrap one video record's frame columns without copying their Arrow value buffers.
 
-
-def read_frame_index(path: str, *, transport_params: dict[str, Any] | None = None) -> pa.Table:
-    """Read one video's frame index back from *path*, whole -- these files are never scanned partially."""
-    return read_arrow_sidecar(path, transport_params=transport_params)
-
-
-def write_video_metadata(
-    row: Mapping[str, object], path: str, *, transport_params: dict[str, Any] | None = None
-) -> None:
-    """Write one video's box metadata to *path* as a single-row Arrow IPC file, local or ``s3://``."""
-    write_arrow_sidecar([dict(row)], VIDEO_METADATA_SCHEMA, path, transport_params=transport_params)
-
-
-def read_video_metadata(path: str, *, transport_params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Read one video's box metadata back from *path*, whole -- always exactly one row."""
-    table = read_arrow_sidecar(path, transport_params=transport_params)
-    return cast("dict[str, Any]", table.to_pylist()[0])
+    Accepts projected or chunked Arrow tables, including slices of a Lance scan.
+    Metadata alone is converted to Python; frame values remain Arrow-native.
+    """
+    metadata = table.column("metadata")[row_index]
+    frames = table.column("frames")[row_index]
+    if not metadata.is_valid or not frames.is_valid:
+        msg = "Video metadata and frames must be present"
+        raise ValueError(msg)
+    values = frames.values
+    if values.null_count:
+        msg = "Frame records must not be null"
+        raise ValueError(msg)
+    frame_table = pa.Table.from_arrays(
+        [values.field(field.name) for field in FRAME_INDEX_SCHEMA], schema=FRAME_INDEX_SCHEMA
+    )
+    metadata_row = metadata.as_py()
+    if len(frame_table) != metadata_row["frame_count"]:
+        msg = "Frame count disagrees with video metadata"
+        raise ValueError(msg)
+    return frame_table, metadata_row

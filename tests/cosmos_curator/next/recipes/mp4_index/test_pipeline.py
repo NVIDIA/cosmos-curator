@@ -41,22 +41,20 @@ from cosmos_curator.next.recipes.mp4_index import config, pipeline
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     ERROR_SCHEMA,
     RECORD_SCHEMA_VERSION,
-    VIDEO_IDENTITY_SCHEMA,
+    VIDEO_MANIFEST_SCHEMA,
     VIDEO_METADATA_SCHEMA,
     derive_session_and_camera,
     make_session_camera_id,
     make_video_id,
     read_arrow_sidecar,
     read_bytes_sidecar,
-    read_frame_index,
-    read_video_metadata,
-    write_arrow_sidecar,
+    read_video_record,
     write_bytes_sidecar,
-    write_frame_index,
 )
 from cosmos_curator.next.utils import lance_fragment_recovery
 from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
+from tests.cosmos_curator.next.recipes.mp4_index._record_fixtures import _FRAME_ROWS, _METADATA_ROW
 
 
 def _write_synthetic_nonfragmented_mp4(path: pathlib.Path) -> None:
@@ -78,11 +76,12 @@ def _write_synthetic_fragmented_mp4(path: pathlib.Path) -> None:
 
 def _publish_manifest_row(manifest_row: dict[str, object], manifest_lance_uri: str) -> None:
     """Stage and commit one manifest row directly, bypassing Ray entirely -- pre-seeds a table."""
-    table = pa.Table.from_pylist([manifest_row], schema=VIDEO_IDENTITY_SCHEMA)
+    manifest_row = {**manifest_row, "metadata": _METADATA_ROW, "frames": _FRAME_ROWS}
+    table = pa.Table.from_pylist([manifest_row], schema=VIDEO_MANIFEST_SCHEMA)
     lance_fragment_recovery.open_or_create_table(
         uri=manifest_lance_uri,
         storage_profile="default",
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
         kind="mp4-index",
     )
@@ -90,7 +89,7 @@ def _publish_manifest_row(manifest_row: dict[str, object], manifest_lance_uri: s
         table,
         uri=manifest_lance_uri,
         storage_profile="default",
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
         id_column="video_id",
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
     )
@@ -99,7 +98,7 @@ def _publish_manifest_row(manifest_row: dict[str, object], manifest_lance_uri: s
         candidate,
         uri=manifest_lance_uri,
         storage_profile="default",
-        schema=VIDEO_IDENTITY_SCHEMA,
+        schema=VIDEO_MANIFEST_SCHEMA,
         id_column="video_id",
         kind="mp4-index",
         operation="append-video",
@@ -182,8 +181,13 @@ def test_run_config_skips_already_committed_videos_without_starting_ray(
             "session_camera_id": make_session_camera_id(source_session_id, camera_key),
             "media_location": str(media_path),
             "media_size_bytes": media_path.stat().st_size,
-            "frame_index_location": str(tmp_path / "output" / "frames" / "unused.arrow"),
-            "metadata_location": str(tmp_path / "output" / "metadata" / "unused.arrow"),
+            "source_width": 640,
+            "source_height": 480,
+            "source_frame_rate": 30.0,
+            "source_frame_count": 1,
+            "source_duration_ns": 1_000_000_000,
+            "source_video_codec": "h264",
+            "video_sidecar_location": str(tmp_path / "output" / "frames" / "unused.arrow"),
             "moov_location": str(tmp_path / "output" / "moov" / "unused.moov"),
             "moof_table_location": None,
             "container_kind": "nonfragmented",
@@ -376,10 +380,11 @@ def test_run_config_end_to_end_over_a_real_local_ray_data_run_nonfragmented(
     row = lance.dataset(summary["manifest_lance_uri"]).to_table().to_pylist()[0]
     assert row["video_id"] == make_video_id(str(media_path))
     assert row["container_kind"] == "nonfragmented"
-    frame_table = read_frame_index(row["frame_index_location"])
+    frame_table, metadata_row = read_video_record(lance.dataset(summary["manifest_lance_uri"]).to_table())
     assert frame_table.num_rows == 1
-    metadata_row = read_video_metadata(row["metadata_location"])
     assert set(VIDEO_METADATA_SCHEMA.names) <= set(metadata_row)
+    assert row["source_width"] == metadata_row["width"]
+    assert row["source_video_codec"] == metadata_row["codec_name"]
     assert read_bytes_sidecar(row["moov_location"])
     assert row["moof_table_location"] is None
 
@@ -479,18 +484,8 @@ def test_run_config_reuses_already_extracted_sidecars_via_the_caching_guard(
 
     cfg = _resolved_config(tmp_path)
     video_id = make_video_id(str(media_path))
-    source_session_id, camera_key = derive_session_and_camera(str(media_path), session_id_path_depth=2)
-    session_camera_id = make_session_camera_id(source_session_id, camera_key)
-
     moov_box = bf.synthetic_moov(frame_count=5, keyframe_index=0, ctts_offset=None)
     write_bytes_sidecar(moov_box, str(tmp_path / "output" / "moov" / f"{video_id}.moov"))
-    write_frame_index([], str(tmp_path / "output" / "frames" / f"{session_camera_id}.arrow"))
-    write_arrow_sidecar(
-        [dict.fromkeys(VIDEO_METADATA_SCHEMA.names)],
-        VIDEO_METADATA_SCHEMA,
-        str(tmp_path / "output" / "metadata" / f"{session_camera_id}.arrow"),
-    )
-
     # Corrupt the media file after its sidecars are pre-populated -- a real refetch would fail.
     media_path.write_bytes(bf.pack_box("ftyp", b"isom") + bf.pack_box("mdat", b"data"))
 
@@ -501,8 +496,9 @@ def test_run_config_reuses_already_extracted_sidecars_via_the_caching_guard(
     assert summary["videos_failed"] == 0
     row = lance.dataset(summary["manifest_lance_uri"]).to_table().to_pylist()[0]
     assert row["video_id"] == video_id
-    assert row["frame_index_location"] == str(tmp_path / "output" / "frames" / f"{session_camera_id}.arrow")
-    assert row["metadata_location"] == str(tmp_path / "output" / "metadata" / f"{session_camera_id}.arrow")
+    assert len(row["frames"]) == 5
+    assert row["metadata"]["frame_count"] == 5
+    assert not (tmp_path / "output" / "frames").exists()
 
 
 def test_empty_summary_shape() -> None:
@@ -547,7 +543,9 @@ class _CapturingDataset:
     def repartition(self, *_args: Any, **_kwargs: Any) -> Self:  # noqa: ANN401
         return self
 
-    def map_batches(self, *_args: Any, **_kwargs: Any) -> Self:  # noqa: ANN401
+    def map_batches(self, *_args: Any, **kwargs: Any) -> Self:  # noqa: ANN401
+        if "resources" in kwargs:
+            self.map_kwargs = kwargs
         return self
 
     def iter_batches(self, *_args: Any, **_kwargs: Any) -> list[Any]:  # noqa: ANN401

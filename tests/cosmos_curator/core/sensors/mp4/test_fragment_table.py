@@ -22,6 +22,7 @@ already, since this module reuses those parsers verbatim.
 
 import pytest
 
+from cosmos_curator.core.sensors.data.mp4 import Mp4Metadata
 from cosmos_curator.core.sensors.mp4 import fragment_table as ft
 from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, MalformedBoxHeaderError
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
@@ -38,6 +39,7 @@ def _moof(
     default_base_is_moof: bool = True,
     sample_count: int = 1,
     composition_offset: int | None = None,
+    trun_sample_duration: int | None = None,
 ) -> tuple[int, bytes]:
     traf = bf.real_traf(
         decode_time=decode_time,
@@ -48,6 +50,7 @@ def _moof(
         default_base_is_moof=default_base_is_moof,
         sample_count=sample_count,
         composition_offset=composition_offset,
+        trun_sample_duration=trun_sample_duration,
     )
     return moof_start, bf.pack_moof(traf)
 
@@ -56,15 +59,38 @@ def test_parse_fragment_table_end_to_end() -> None:
     """A fully synthetic fragmented moov + moof rows decode into the expected SoA shape."""
     moov = bf.synthetic_fragmented_moov(timescale=30, duration=90)
     moof_rows = [
-        _moof(moof_start=1000, decode_time=0, data_offset=32, sample_size=500, is_keyframe=True),
-        _moof(moof_start=1600, decode_time=1, data_offset=32, sample_size=400, is_keyframe=False),
-        _moof(moof_start=2100, decode_time=2, data_offset=32, sample_size=420, is_keyframe=False),
+        _moof(
+            moof_start=1000,
+            decode_time=0,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=1600,
+            decode_time=1,
+            data_offset=32,
+            sample_size=400,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=2100,
+            decode_time=2,
+            data_offset=32,
+            sample_size=420,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
     ]
 
     table = ft.parse_fragment_table(moov, moof_rows)
 
     assert table.timescale == 30
-    assert table.duration == 90
+    # Derived from the fragments' own tfdt span (0..2), not mdhd's stale 90 -- see
+    # test_parse_fragment_table_duration_is_derived_from_fragment_decode_times.
+    assert table.duration == 3
     assert table.sample_description.fourcc == "avc1"
     assert table.sample_description.width == 640
     assert table.sample_description.height == 480
@@ -74,6 +100,198 @@ def test_parse_fragment_table_end_to_end() -> None:
     assert table.is_keyframe is not None
     assert table.is_keyframe.tolist() == [True, False, False]
     assert table.composition_offsets is None
+
+
+def test_parse_fragment_table_duration_is_derived_from_fragment_decode_times() -> None:
+    """Fragment decode times determine duration when ``mdhd.duration`` is zero or stale."""
+    moov = bf.synthetic_fragmented_moov(timescale=30, duration=0)
+    moof_rows = [
+        _moof(
+            moof_start=1000,
+            decode_time=0,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=1600,
+            decode_time=10,
+            data_offset=32,
+            sample_size=400,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=2100,
+            decode_time=20,
+            data_offset=32,
+            sample_size=420,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=2600,
+            decode_time=30,
+            data_offset=32,
+            sample_size=410,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
+    ]
+
+    table = ft.parse_fragment_table(moov, moof_rows)
+
+    # span (30-0=30) + one average interval (30/3=10) -- the span between 4 samples covers only
+    # 3 intervals; the 4th sample's own screen time extends one interval past the last decode time.
+    # No fragment states its own default_sample_duration here, so there's no real value to prefer
+    # over this estimate -- see test_parse_fragment_table_duration_prefers_the_last_fragments_own_sample_duration.
+    assert table.duration == 40
+
+
+def test_parse_fragment_table_duration_prefers_the_last_fragments_own_sample_duration() -> None:
+    """The last sample's explicit duration takes precedence over the mean decode interval."""
+    moov = bf.synthetic_fragmented_moov(timescale=30, duration=0)
+    moof_rows = [
+        _moof(
+            moof_start=1000,
+            decode_time=0,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=1600,
+            decode_time=10,
+            data_offset=32,
+            sample_size=400,
+            is_keyframe=False,
+            default_sample_duration=None,
+        ),
+        _moof(
+            moof_start=2600,
+            decode_time=30,
+            data_offset=32,
+            sample_size=410,
+            is_keyframe=False,
+            default_sample_duration=12,
+        ),
+    ]
+
+    table = ft.parse_fragment_table(moov, moof_rows)
+
+    # span (30-0=30) + the last fragment's own stated duration (12), not the averaged interval (15).
+    assert table.duration == 42
+
+
+def test_parse_fragment_table_duration_uses_the_fragments_own_sample_duration_for_a_single_fragment() -> None:
+    """A single sample uses its ``tfhd`` duration even without a decode interval."""
+    moov = bf.synthetic_fragmented_moov(timescale=30, duration=12345)
+    moof_rows = [
+        _moof(
+            moof_start=1000,
+            decode_time=7,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=3000,
+        )
+    ]
+
+    table = ft.parse_fragment_table(moov, moof_rows)
+
+    assert table.duration == 3000
+
+
+def test_parse_fragment_table_duration_is_zero_for_a_single_fragment_with_no_known_sample_duration() -> None:
+    """A single sample with no decode-time span and no tfhd default_sample_duration -- 0, not mdhd's stale value."""
+    moov = bf.synthetic_fragmented_moov(timescale=30, duration=12345)
+    moof_rows = [
+        _moof(
+            moof_start=1000,
+            decode_time=7,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=None,
+        )
+    ]
+
+    table = ft.parse_fragment_table(moov, moof_rows)
+
+    assert table.duration == 0
+
+
+def test_parse_fragment_table_duration_prefers_truns_own_sample_duration_over_tfhds_default() -> None:
+    """A ``trun`` sample duration overrides the ``tfhd`` default and works when that default is absent."""
+    moov = bf.synthetic_fragmented_moov(timescale=30, duration=12345)
+    moof_rows = [
+        _moof(
+            moof_start=1000,
+            decode_time=7,
+            data_offset=32,
+            sample_size=500,
+            is_keyframe=True,
+            default_sample_duration=None,
+            trun_sample_duration=3500,
+        )
+    ]
+
+    table = ft.parse_fragment_table(moov, moof_rows)
+
+    assert table.duration == 3500
+
+
+def test_parse_fragment_table_duration_uses_trex_for_a_single_fragment() -> None:
+    """A trex-only sample duration produces nonzero duration and frame rate."""
+    moov = bf.synthetic_fragmented_moov(timescale=90_000, trex_sample_duration=3000)
+    moof = _moof(moof_start=1000, decode_time=0, data_offset=32, sample_size=500, default_sample_duration=None)
+
+    track = ft.parse_fragment_table(moov, [moof])
+    metadata = Mp4Metadata.from_video_track(track)
+
+    assert track.duration == 3000
+    assert metadata.duration_ns == 33_333_333
+    assert (metadata.avg_frame_rate_num, metadata.avg_frame_rate_den) == (30, 1)
+
+
+def test_parse_fragment_table_duration_prefers_trex_over_the_mean_decode_interval() -> None:
+    """Use the trex duration for the last sample rather than estimating its interval."""
+    moov = bf.synthetic_fragmented_moov(timescale=90_000, trex_sample_duration=3000)
+    moofs = [
+        _moof(
+            moof_start=1000 + index * 1000,
+            decode_time=decode_time,
+            data_offset=32,
+            sample_size=500,
+            default_sample_duration=None,
+        )
+        for index, decode_time in enumerate((0, 4000))
+    ]
+
+    assert ft.parse_fragment_table(moov, moofs).duration == 7000
+
+
+@pytest.mark.parametrize(
+    ("trun_duration", "tfhd_duration", "expected"),
+    [(None, 2000, 2000), (1000, None, 1000), (1000, 2000, 1000), (0, 2000, 0), (None, 0, 0)],
+)
+def test_parse_fragment_table_duration_preserves_trun_and_tfhd_precedence(
+    trun_duration: int | None, tfhd_duration: int | None, expected: int
+) -> None:
+    """Trun and tfhd durations override trex, including explicit zero values."""
+    moov = bf.synthetic_fragmented_moov(timescale=90_000, trex_sample_duration=3000)
+    moof = _moof(
+        moof_start=1000,
+        decode_time=0,
+        data_offset=32,
+        sample_size=500,
+        default_sample_duration=tfhd_duration,
+        trun_sample_duration=trun_duration,
+    )
+
+    assert ft.parse_fragment_table(moov, [moof]).duration == expected
 
 
 def test_parse_fragment_table_raises_malformed_box_header_error_on_truncated_moov() -> None:

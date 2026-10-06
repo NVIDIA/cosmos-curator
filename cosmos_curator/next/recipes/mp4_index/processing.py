@@ -43,8 +43,10 @@ from cosmos_curator.core.utils.storage.storage_utils import (
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     CONTAINER_KIND_FRAGMENTED,
+    FRAME_INDEX_SCHEMA,
     RECORD_SCHEMA_VERSION,
-    VIDEO_IDENTITY_SCHEMA,
+    VIDEO_MANIFEST_SCHEMA,
+    VIDEO_METADATA_SCHEMA,
     UnresolvableMediaLocationError,
     derive_session_and_camera,
     make_session_camera_id,
@@ -52,12 +54,10 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     read_bytes_sidecar,
     write_arrow_sidecar,
     write_bytes_sidecar,
-    write_frame_index,
-    write_video_metadata,
 )
 
-#: Every VIDEO_IDENTITY_SCHEMA field a failed video carries as None.
-_VIDEO_ONLY_FIELDS = tuple(set(VIDEO_IDENTITY_SCHEMA.names) - {"video_id", "media_location"})
+#: Every VIDEO_MANIFEST_SCHEMA field a failed video carries as None.
+_VIDEO_ONLY_FIELDS = tuple(set(VIDEO_MANIFEST_SCHEMA.names) - {"video_id", "media_location"})
 
 
 def _file_size(media_location: str, storage_client: StorageClient | None) -> int:
@@ -71,31 +71,42 @@ def _file_size(media_location: str, storage_client: StorageClient | None) -> int
     return pathlib.Path(media_location).stat().st_size
 
 
-def _frame_index_rows(video_track: VideoTrack) -> list[dict[str, object]]:
-    """Serialize a ``VideoTrack`` into ``FRAME_INDEX_SCHEMA`` row dicts, one per sample.
-
-    Built from :func:`video_track_sample_arrays` directly, not through
-    ``Mp4FrameIndex.from_video_track`` -- nothing here depends on ``pts_ns`` or the edit list,
-    so extraction should not fail over an ``elst`` shape only a later sidecar reader needs.
-    """
-    dts_ticks, composition_offset_ticks_array, is_keyframe_array = video_track_sample_arrays(video_track)
-    dts_ticks = dts_ticks.tolist()
-    composition_offset_ticks = (
-        [None] * len(dts_ticks) if composition_offset_ticks_array is None else composition_offset_ticks_array.tolist()
+def _frame_index_array(video_track: VideoTrack) -> pa.LargeListArray:
+    """Build one video list from column arrays, without interpreting ticks or edit lists."""
+    dts, composition_offsets, keyframes = video_track_sample_arrays(video_track)
+    values = pa.StructArray.from_arrays(
+        [
+            pa.array(dts, type=pa.int64()),
+            pa.nulls(len(dts), type=pa.int64()) if composition_offsets is None else pa.array(composition_offsets),
+            pa.array(keyframes),
+            pa.array(video_track.offset),
+            pa.array(video_track.size),
+        ],
+        fields=list(FRAME_INDEX_SCHEMA),
     )
-    is_keyframe = is_keyframe_array.tolist()
-    offset = video_track.offset.tolist()
-    size = video_track.size.tolist()
-    return [
-        {
-            "dts_ticks": dts_ticks[i],
-            "composition_offset_ticks": composition_offset_ticks[i],
-            "is_keyframe": is_keyframe[i],
-            "offset": offset[i],
-            "size": size[i],
-        }
-        for i in range(len(dts_ticks))
-    ]
+    return pa.LargeListArray.from_arrays(
+        pa.array([0, len(dts)], type=pa.int64()), values, type=VIDEO_MANIFEST_SCHEMA.field("frames").type
+    )
+
+
+# Failure rows have absent derived fields; canonical successful rows retain their non-null schema.
+_PROCESS_RESULT_SCHEMA = pa.schema(
+    [pa.field(field.name, field.type) for field in VIDEO_MANIFEST_SCHEMA]
+    + [pa.field(name, pa.string()) for name in ("status", "error_type", "error_message")]
+)
+
+
+def result_table(result: dict[str, Any]) -> pa.Table:
+    """Wrap an extraction result, retaining its nested Arrow arrays."""
+    return pa.Table.from_arrays(
+        [
+            result[field.name]
+            if isinstance(result.get(field.name), pa.Array)
+            else pa.array([result.get(field.name)], type=field.type)
+            for field in _PROCESS_RESULT_SCHEMA
+        ],
+        schema=_PROCESS_RESULT_SCHEMA,
+    )
 
 
 def _moof_rows(moof_table_location: str, *, transport_params: dict[str, Any] | None) -> list[tuple[int, bytes]]:
@@ -248,28 +259,24 @@ def process_one_video(
     input_storage_client: StorageClient | None = None,
     output_storage_client: StorageClient | None = None,
 ) -> dict[str, Any]:
-    """Discover, extract (with caching), and index one video, publishing its frame-index + metadata sidecars.
+    """Extract or reuse raw-box caches and build one complete video record.
 
-    Returns every ``VIDEO_IDENTITY_SCHEMA`` field on success (``None`` on failure) plus
-    ``status``/``error_type``/``error_message`` bookkeeping.
+    Returns manifest fields plus ``status``, ``error_type``, and ``error_message``.
+    ``metadata`` and ``frames`` are single-row Arrow arrays whose buffers are retained
+    by ``result_table``. On failure, video-specific manifest fields are ``None``.
 
     Args:
-        row: ``{"video_id": ..., "media_location": ...}`` -- ``video_id`` is read back here, not
-            recomputed; ``pipeline.py``'s own ``discover_rows`` computes it once, upfront.
-        config: the run's own resolved config.
-        input_storage_client: used for every read of *media_location*. ``None`` treats it as local.
-        output_storage_client: used for every sidecar existence check/read/write. ``None`` treats
-            every sidecar location as local.
+        row: Discovered ``video_id`` and ``media_location``.
+        config: Resolved recipe configuration.
+        input_storage_client: Source-video reads; ``None`` for local files.
+        output_storage_client: Raw-box cache reads and writes; ``None`` for local files.
 
-    Known per-video errors are caught into a ``"failed"`` result rather than failing the whole
-    Ray Data task; anything else propagates.
+    Known per-video errors produce a ``"failed"`` result; unexpected errors propagate.
 
     """
     container_kind = config.input.container_kind
     chunk_bytes = config.execution.chunk_bytes
     session_id_path_depth = config.execution.session_id_path_depth
-    frame_index_root = config.output.frame_index_root
-    metadata_root = config.output.metadata_root
     moov_sidecar_root = config.output.moov_sidecar_root
     moof_table_root = config.output.moof_table_root
     skip_existing_sidecars = config.execution.skip_existing_sidecars
@@ -293,8 +300,6 @@ def process_one_video(
             media_location, session_id_path_depth=session_id_path_depth
         )
         session_camera_id = make_session_camera_id(source_session_id, camera_key)
-        frame_index_location = f"{frame_index_root.rstrip('/')}/{session_camera_id}.arrow"
-        metadata_location = f"{metadata_root.rstrip('/')}/{session_camera_id}.arrow"
 
         file_size = _file_size(media_location, input_storage_client)
         moov_sidecar_location = f"{moov_sidecar_root.rstrip('/')}/{video_id}.moov"
@@ -313,9 +318,8 @@ def process_one_video(
         )
         metadata = Mp4Metadata.from_video_track(video_track)
 
-        frame_rows = _frame_index_rows(video_track)
-        write_frame_index(frame_rows, frame_index_location, transport_params=output_transport_params)
-        write_video_metadata(attrs.asdict(metadata), metadata_location, transport_params=output_transport_params)
+        frames = _frame_index_array(video_track)
+        metadata_array = pa.array([attrs.asdict(metadata)], type=pa.struct(VIDEO_METADATA_SCHEMA))
     except (
         UnindexableVideoError,
         UnresolvableMediaLocationError,
@@ -341,8 +345,14 @@ def process_one_video(
         "camera_key": camera_key,
         "session_camera_id": session_camera_id,
         "media_size_bytes": file_size,
-        "frame_index_location": frame_index_location,
-        "metadata_location": metadata_location,
+        "source_width": metadata.width,
+        "source_height": metadata.height,
+        "source_frame_rate": metadata.avg_frame_rate_num / metadata.avg_frame_rate_den,
+        "source_frame_count": metadata.frame_count,
+        "source_duration_ns": metadata.duration_ns,
+        "source_video_codec": metadata.codec_name,
+        "metadata": metadata_array,
+        "frames": frames,
         "moov_location": moov_sidecar_location,
         "moof_table_location": moof_table_location if container_kind == CONTAINER_KIND_FRAGMENTED else None,
         "container_kind": container_kind,
@@ -372,10 +382,17 @@ class _ProcessOneVideo:
             )
         return self._storage_clients[scheme]
 
-    def __call__(self, row: dict[str, Any]) -> dict[str, Any]:
-        return process_one_video(
-            row,
-            config=self._config,
-            input_storage_client=self._client_for(row["media_location"]),
-            output_storage_client=self._client_for(self._config.output.moov_sidecar_root),
-        )
+    def __call__(self, batch: pa.Table) -> pa.Table:
+        # Input contains only source references; never materialize output frame lists in Python.
+        results = [
+            result_table(
+                process_one_video(
+                    row,
+                    config=self._config,
+                    input_storage_client=self._client_for(row["media_location"]),
+                    output_storage_client=self._client_for(self._config.output.moov_sidecar_root),
+                )
+            )
+            for row in batch.to_pylist()
+        ]
+        return pa.concat_tables(results)

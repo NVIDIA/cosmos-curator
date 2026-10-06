@@ -13,21 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MP4-specific decode-relevant typed views: ``Mp4FrameIndex``/``Mp4Metadata``.
-
-``Mp4FrameIndex``/``Mp4Metadata`` are genuinely MP4-only (built from
-ISO-BMFF box parsing), unlike this package's own ``data.video.VideoIndex``/
-``VideoMetadata``, which are acquisition-path agnostic. The ``Mp4`` prefix
-states that plainly; sitting next to ``data/video.py`` without it would
-read as a close variant of those two, which would be backwards.
-
-``Mp4FrameIndex``/``Mp4Metadata`` can be built two ways: from an
-already-published sidecar table (``from_frame_index_table``/``from_row``),
-or directly from a real ``cosmos_curator.core.sensors.mp4.moov_track.VideoTrack``
-(``from_video_track``). ``processing.py`` calls ``Mp4Metadata.from_video_track``
-the same way, but builds frame-index rows from :func:`video_track_sample_arrays`
-directly instead of ``Mp4FrameIndex.from_video_track``.
-"""
+"""MP4 frame indexes and metadata built from parsed tracks or published Arrow records."""
 
 import struct
 from fractions import Fraction
@@ -48,14 +34,11 @@ _NS_PER_SECOND = 1_000_000_000
 def video_track_sample_arrays(
     video_track: VideoTrack,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64] | None, npt.NDArray[np.bool_]]:
-    """Return ``(dts_ticks, composition_offset_ticks, is_keyframe)`` -- elst/ns-independent, decode order.
+    """Return ``(dts_ticks, composition_offset_ticks, is_keyframe)`` in decode order.
 
-    Shared by :meth:`Mp4FrameIndex.from_video_track` and ``processing.py``'s own frame-row
-    construction, so the ``ctts``-expansion/``is_keyframe``-default logic has one copy, not two.
-
-    ``composition_offset_ticks`` is expanded from ``ctts``'s run-length pairs via ``np.repeat``
-    when present, ``None`` otherwise. ``is_keyframe`` defaults to "every sample is a keyframe"
-    (the spec-sanctioned inference) when ``stbl`` carries no ``stss`` at all.
+    Expand ``ctts`` runs into per-sample offsets, or return ``None`` when absent.
+    Without ``stss``, every sample is a keyframe. No edit-list shift or time-base
+    conversion is applied.
     """
     frame_count = len(video_track.dts_ticks)
     composition_offsets = video_track.composition_offsets
@@ -186,29 +169,14 @@ def _stream_rate_stats(
 
 @attrs.define(frozen=True)
 class Mp4FrameIndex:
-    """Struct-of-arrays copy of one video's ``FRAME_INDEX_SCHEMA`` rows, decode order (by ``dts_ticks``).
+    """Struct-of-arrays frame index in decode order.
 
-    Read once, sliced/searched many times -- a consumer wanting a bounded
-    sample range or a keyframe lookup works against an already-loaded
-    ``numpy`` array, not a re-read of the sidecar.
+    Timestamps, presentation order, and keyframe indices are computed at construction.
+    The track's time base converts ticks to nanoseconds; a supported ``edts/elst`` edit
+    shifts ``pts_ns`` but leaves ``dts_ns`` unchanged.
 
-    ``dts_ns``/``composition_offset_ns``/``pts_ns``/``pts_sort_order``/``keyframe_indices`` are
-    all computed once here, at construction, from ``dts_ticks``/``composition_offset_ticks`` plus
-    the stream's own ``time_base``. ``pts_ns`` also applies the track's own ``edts/elst`` edit
-    list, when the one supported shape is present -- ``dts_ns`` does not, staying the
-    container's own undecoded decode timeline.
-
-    Arrays stay in decode order throughout, never reordered into
-    presentation order the way the sensor library's own ``VideoIndex``
-    reorders its arrays -- decoding is fundamentally a decode-order
-    operation (every consumer of ``offset``/``size``/``is_keyframe`` needs
-    decode order, never presentation order), and reordering everything
-    would mean carrying a second, un-reordered view alongside the
-    reordered one. ``pts_sort_order`` is the *only* thing a
-    presentation-order search needs: ``pts_ns[pts_sort_order]`` is a
-    presentation-order view with no extra copy, and ``pts_sort_order[rank]``
-    *is* the decode-order sample index -- no reverse mapping to derive
-    separately.
+    ``pts_sort_order[rank]`` maps a presentation-order rank to a decode-order sample
+    index, without reordering the frame arrays.
     """
 
     dts_ticks: npt.NDArray[np.int64]
@@ -277,22 +245,16 @@ class Mp4FrameIndex:
     def from_frame_index_table(
         cls, table: pa.Table, *, time_base_num: int, time_base_den: int, elst_bytes: bytes | None = None
     ) -> Self:
-        """Build from a real ``FRAME_INDEX_SCHEMA`` table (e.g. ``read_frame_index``'s own return).
+        """Build from a ``FRAME_INDEX_SCHEMA`` table and the video's accompanying metadata.
 
-        *time_base_num*/*time_base_den*/*elst_bytes* come from the same video's paired
-        ``Mp4Metadata`` (``VIDEO_METADATA_SCHEMA.time_base_num``/``time_base_den``/
-        ``elst_bytes``) -- converting ticks to nanoseconds, and applying an edit list to
-        ``pts_ns``, both need data that lives in that other sidecar, not this table.
+        Pass ``time_base_num``, ``time_base_den``, and ``elst_bytes`` from ``Mp4Metadata``
+        to convert ticks and apply the presentation-time shift.
 
         Raises:
-            ValueError: ``composition_offset_ticks`` is null on some rows but not others.
-                Expected all-null (no ``ctts``) or fully populated (``ctts`` present) for
-                one video -- a partial mix would otherwise reach
-                :func:`pyarrow.Array.to_numpy`, which silently upcasts a partially-null
-                int64 column to ``float64`` with ``NaN``.
-            UnsupportedEditListError: *elst_bytes* is present but not the one shape this
-                reader knows how to apply.
-            InvalidTimeBaseError: *time_base_den* is 0.
+            ValueError: Composition offsets contain a mix of null and non-null values;
+                each video's column must be all-null or fully populated.
+            UnsupportedEditListError: The edit list has an unsupported shape.
+            InvalidTimeBaseError: ``time_base_den`` is zero.
 
         """
         dts_ticks = table.column("dts_ticks").to_numpy()
@@ -376,11 +338,12 @@ class Mp4Metadata:
     avg_frame_rate_num: int
     avg_frame_rate_den: int
     bit_rate_bps: int
+    duration_ns: int
     encoder_tag: str | None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> Self:
-        """Build from one real ``VIDEO_METADATA_SCHEMA`` row (e.g. read back from ``read_video_metadata``)."""
+        """Build from one real ``VIDEO_METADATA_SCHEMA`` row (e.g. ``read_video_record``'s metadata row)."""
         return cls(**{field.name: row[field.name] for field in attrs.fields(cls)})
 
     @classmethod
@@ -392,6 +355,12 @@ class Mp4Metadata:
         sd = video_track.sample_description
         avg_frame_rate, bit_rate_bps = _stream_rate_stats(
             len(video_track.dts_ticks), video_track.size, video_track.duration, video_track.timescale
+        )
+        # Treat a zero timescale as unknown duration, matching the rate statistics.
+        duration_ns = (
+            0
+            if video_track.timescale == 0
+            else int(_ticks_to_ns(np.array([video_track.duration], dtype=np.int64), 1, video_track.timescale)[0])
         )
         return cls(
             codec_name=VIDEO_FOURCC_CODEC_NAMES[sd.fourcc],
@@ -428,5 +397,6 @@ class Mp4Metadata:
             avg_frame_rate_num=avg_frame_rate.numerator,
             avg_frame_rate_den=avg_frame_rate.denominator,
             bit_rate_bps=bit_rate_bps,
+            duration_ns=duration_ns,
             encoder_tag=None,
         )

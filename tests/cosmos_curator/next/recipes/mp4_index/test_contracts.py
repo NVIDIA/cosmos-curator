@@ -30,12 +30,7 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     derive_session_and_camera,
     make_session_camera_id,
 )
-
-_FRAME_ROWS: list[dict[str, Any]] = [
-    {"dts_ticks": 12, "composition_offset_ticks": None, "is_keyframe": True, "offset": 0, "size": 100},
-    {"dts_ticks": 422, "composition_offset_ticks": 6, "is_keyframe": False, "offset": 100, "size": 50},
-    {"dts_ticks": 832, "composition_offset_ticks": None, "is_keyframe": False, "offset": 150, "size": 42},
-]
+from tests.cosmos_curator.next.recipes.mp4_index._record_fixtures import _FRAME_ROWS, _METADATA_ROW
 
 
 def test_make_session_camera_id_is_deterministic() -> None:
@@ -115,35 +110,61 @@ def test_derive_session_and_camera_raises_on_no_path_components() -> None:
 
 
 def test_video_identity_and_mp4_metadata_schemas_are_disjoint() -> None:
-    """The two schemas share no column names -- VIDEO_METADATA_SCHEMA is a sidecar, not joined by video_id."""
-    identity_fields = set(contracts.VIDEO_IDENTITY_SCHEMA.names)
+    """The two schemas share no column names -- metadata is nested in the manifest."""
+    identity_fields = set(contracts.VIDEO_MANIFEST_SCHEMA.names)
     metadata_fields = {field.name for field in attrs.fields(Mp4Metadata)}
 
     assert metadata_fields == set(contracts.VIDEO_METADATA_SCHEMA.names)
     assert identity_fields.isdisjoint(metadata_fields)
 
 
-def test_write_then_read_back_matches_what_was_built(tmp_path: pathlib.Path) -> None:
-    """Every field survives a real write/read round trip through a local file, nulls included."""
-    path = str(tmp_path / "frames" / "video-1.arrow")
+@pytest.mark.parametrize("composition_offsets", [None, 0, 6])
+def test_nested_video_record_round_trips_in_lance(tmp_path: pathlib.Path, composition_offsets: int | None) -> None:
+    """Lance preserves nested fields and nulls; a projected scan feeds the existing decoder."""
+    import lance  # noqa: PLC0415
 
-    contracts.write_frame_index(_FRAME_ROWS, path)
-    table = contracts.read_frame_index(path)
+    from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex  # noqa: PLC0415
+    from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION  # noqa: PLC0415
 
-    assert table.to_pylist() == _FRAME_ROWS
+    frame_rows = [{**row, "composition_offset_ticks": composition_offsets} for row in _FRAME_ROWS]
+    schema = pa.schema([contracts.VIDEO_MANIFEST_SCHEMA.field(name) for name in ("metadata", "frames")])
+    table = pa.Table.from_pylist([{"metadata": _METADATA_ROW, "frames": frame_rows}], schema=schema)
+    uri = str(tmp_path / "index.lance")
+    lance.write_dataset(table, uri, data_storage_version=LANCE_DATA_STORAGE_VERSION)
+    restored = lance.dataset(uri).to_table(columns=["metadata", "frames"])
+    frame_table, metadata_row = contracts.read_video_record(restored)
+    assert frame_table.to_pylist() == frame_rows
+    assert metadata_row == _METADATA_ROW
+    metadata = Mp4Metadata.from_row(metadata_row)
+    index = Mp4FrameIndex.from_frame_index_table(
+        frame_table, time_base_num=metadata.time_base_num, time_base_den=metadata.time_base_den
+    )
+    assert index.offset.tolist() == [0, 100, 150]
+    assert (index.composition_offset_ticks is None) == (composition_offsets is None)
 
 
-def test_write_creates_parent_directories(tmp_path: pathlib.Path) -> None:
-    """The caller doesn't need to mkdir first."""
-    path = str(tmp_path / "a" / "b" / "c" / "video-1.arrow")
+def test_read_video_record_handles_chunked_sliced_lists_without_copying() -> None:
+    """Nonzero list offsets and chunk boundaries preserve the selected video and its buffers."""
+    schema = pa.schema([contracts.VIDEO_MANIFEST_SCHEMA.field(name) for name in ("metadata", "frames")])
+    table = pa.Table.from_pylist([{"metadata": _METADATA_ROW, "frames": _FRAME_ROWS}] * 3, schema=schema)
+    chunked = pa.concat_tables([table.slice(0, 1), table.slice(1, 2)]).slice(1)
+    frames, metadata = contracts.read_video_record(chunked, row_index=1)
+    assert frames.to_pylist() == _FRAME_ROWS
+    assert metadata == _METADATA_ROW
+    original = table["frames"].chunk(0).values.field("offset")
+    assert frames["offset"].chunk(0).buffers()[1].address == original.buffers()[1].address
 
-    contracts.write_frame_index(_FRAME_ROWS, path)
 
-    assert pathlib.Path(path).exists()
+def test_read_video_record_refuses_a_mismatched_frame_count() -> None:
+    """A structurally valid record with mismatched metadata must fail before decoding."""
+    schema = pa.schema([contracts.VIDEO_MANIFEST_SCHEMA.field(name) for name in ("metadata", "frames")])
+    table = pa.Table.from_pylist([{"metadata": _METADATA_ROW, "frames": []}], schema=schema)
+    with pytest.raises(ValueError, match="Frame count"):
+        contracts.read_video_record(table)
 
 
 def test_write_arrow_sidecar_is_schema_agnostic(tmp_path: pathlib.Path) -> None:
-    """write_frame_index/read_frame_index are thin FRAME_INDEX_SCHEMA wrappers -- any schema round-trips."""
+    """write_arrow_sidecar/read_arrow_sidecar round-trip any schema, not just this recipe's own ones."""
     schema = pa.schema([pa.field("session_uuid", pa.string(), nullable=False), pa.field("count", pa.int64())])
     rows: list[dict[str, object]] = [{"session_uuid": "abc", "count": 3}, {"session_uuid": "def", "count": None}]
     path = str(tmp_path / "sidecar.arrow")
@@ -302,8 +323,8 @@ def test_write_then_read_back_over_an_s3_uri(tmp_path: pathlib.Path, monkeypatch
     monkeypatch.setattr(smart_open, "open", _redirect_to_local)
 
     path = "s3://example-bucket/index/_test/test_video_index_s3_roundtrip.arrow"
-    contracts.write_frame_index(_FRAME_ROWS, path)
-    table = contracts.read_frame_index(path)
+    contracts.write_arrow_sidecar(_FRAME_ROWS, contracts.FRAME_INDEX_SCHEMA, path)
+    frame_table = contracts.read_arrow_sidecar(path)
 
-    assert table.to_pylist() == _FRAME_ROWS
+    assert frame_table.to_pylist() == _FRAME_ROWS
     assert seen_paths == [path, path]

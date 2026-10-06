@@ -114,28 +114,18 @@ class Mp4IndexInputConfig(BaseModel):
 
 
 class Mp4IndexOutputConfig(BaseModel):
-    """Output root and its four fixed sub-paths."""
+    """Canonical datasets and raw-box cache paths under one output root."""
 
     model_config = _MODEL_CONFIG
 
     path: str = Field(
-        min_length=1, description="Root that will contain manifest.lance, frames/, metadata/, and errors.lance."
+        min_length=1, description="Root that will contain manifest.lance, errors.lance, and raw moov/moof caches."
     )
 
     @property
     def manifest_lance_uri(self) -> str:
         """``{path}/manifest.lance``."""
         return _join(self.path, "manifest.lance")
-
-    @property
-    def frame_index_root(self) -> str:
-        """``{path}/frames``."""
-        return _join(self.path, "frames")
-
-    @property
-    def metadata_root(self) -> str:
-        """``{path}/metadata``."""
-        return _join(self.path, "metadata")
 
     @property
     def moov_sidecar_root(self) -> str:
@@ -222,7 +212,7 @@ class Mp4IndexExecutionConfig(BaseModel):
         default=True,
         description=(
             "Caching guard for moov/moof sidecars. Off forces a full re-extraction of every "
-            "candidate; frame-index/metadata are always rebuilt regardless."
+            "candidate; metadata and frame indexes are rebuilt into Lance records for uncommitted videos."
         ),
     )
     chunk_bytes: int = Field(
@@ -354,7 +344,7 @@ def config_template_payload() -> dict[str, Any]:
     return {
         "kind": KIND,
         "description": (
-            "Discover source video files and build per-video Mp4FrameIndex/Mp4Metadata sidecars for "
+            "Discover source video files and build complete per-video metadata/frame-index Lance records for "
             "either fragmented or non-fragmented MP4s, extracting moov/moof directly (with a "
             "caching guard that skips already-extracted videos)."
         ),

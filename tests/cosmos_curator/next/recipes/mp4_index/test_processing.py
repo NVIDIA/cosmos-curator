@@ -41,13 +41,10 @@ from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     CONTAINER_KIND_FRAGMENTED,
     CONTAINER_KIND_NONFRAGMENTED,
-    VIDEO_IDENTITY_SCHEMA,
+    VIDEO_MANIFEST_SCHEMA,
     VIDEO_METADATA_SCHEMA,
-    derive_session_and_camera,
-    make_session_camera_id,
     make_video_id,
-    read_frame_index,
-    read_video_metadata,
+    read_video_record,
     write_bytes_sidecar,
 )
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
@@ -205,13 +202,50 @@ def test_process_one_video_nonfragmented_extracts_and_indexes_on_a_cache_miss(tm
     assert result["status"] == "success"
     assert result["video_id"] == make_video_id(str(media_path))
     assert result["container_kind"] == "nonfragmented"
-    assert set(VIDEO_IDENTITY_SCHEMA.names) <= set(result)
+    assert set(VIDEO_MANIFEST_SCHEMA.names) <= set(result)
+    assert "video_sidecar_location" not in result
+    assert not (tmp_path / "frames").exists()
 
-    frame_table = read_frame_index(str(result["frame_index_location"]))
+    frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.num_rows == 1
-    metadata_row = read_video_metadata(str(result["metadata_location"]))
     assert set(VIDEO_METADATA_SCHEMA.names) <= set(metadata_row)
     assert (tmp_path / "moov" / f"{result['video_id']}.moov").exists()
+
+
+def test_process_one_video_manifest_summary_columns_match_nested_metadata(tmp_path: pathlib.Path) -> None:
+    """Manifest summaries agree with known source values and nested metadata."""
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(media_path, frame_count=1, keyframe_index=0)
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+
+    assert result["status"] == "success"
+    assert result["source_width"] == 640
+    assert result["source_height"] == 480
+    assert result["source_frame_rate"] == 24.0
+    assert result["source_frame_count"] == 1
+    assert result["source_duration_ns"] == 41_666_666  # 1 sample * 512 ticks, 1e9 // 12288 ticks/sec
+    assert result["source_video_codec"] == "h264"
+
+    _frame_table, metadata_row = read_video_record(processing.result_table(result))
+    assert result["source_width"] == metadata_row["width"]
+    assert result["source_height"] == metadata_row["height"]
+    assert result["source_frame_rate"] == metadata_row["avg_frame_rate_num"] / metadata_row["avg_frame_rate_den"]
+    assert result["source_frame_count"] == metadata_row["frame_count"]
+    assert result["source_duration_ns"] == metadata_row["duration_ns"]
+    assert result["source_video_codec"] == metadata_row["codec_name"]
+
+
+def test_process_one_video_tolerates_a_zero_timescale_with_zero_rate_and_duration(tmp_path: pathlib.Path) -> None:
+    """A malformed zero mdhd timescale still indexes successfully, matching Mp4Metadata's own tolerance."""
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(media_path, frame_count=1, keyframe_index=0, timescale=0)
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+
+    assert result["status"] == "success"
+    assert result["source_frame_rate"] == 0.0
+    assert result["source_duration_ns"] == 0
 
 
 def test_process_one_video_indexes_a_real_unsigned_32_bit_timescale(tmp_path: pathlib.Path) -> None:
@@ -226,7 +260,7 @@ def test_process_one_video_indexes_a_real_unsigned_32_bit_timescale(tmp_path: pa
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "success"
-    metadata_row = read_video_metadata(str(result["metadata_location"]))
+    _frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert metadata_row["time_base_den"] == 0x90000000
 
 
@@ -242,7 +276,7 @@ def test_process_one_video_indexes_a_real_unsigned_32_bit_tkhd_display_size(tmp_
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "success"
-    metadata_row = read_video_metadata(str(result["metadata_location"]))
+    _frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert metadata_row["track_display_width"] == 0x90000000
     assert metadata_row["track_display_height"] == 0x90000000
 
@@ -275,7 +309,7 @@ def test_process_one_video_fragmented_extracts_and_indexes_on_a_cache_miss(tmp_p
 
     assert result["status"] == "success"
     assert result["container_kind"] == "fragmented"
-    frame_table = read_frame_index(str(result["frame_index_location"]))
+    frame_table, _metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.column("dts_ticks").to_pylist() == [0, 1]
     assert frame_table.column("size").to_pylist() == [500, 400]
     assert (tmp_path / "moof" / f"{result['video_id']}.arrow").exists()
@@ -331,7 +365,7 @@ def test_process_one_video_moof_cache_hit_never_rewalks(
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
 
     assert result["status"] == "success"
-    frame_table = read_frame_index(str(result["frame_index_location"]))
+    frame_table, _metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.column("dts_ticks").to_pylist() == [0, 1]
 
 
@@ -364,7 +398,7 @@ def test_process_one_video_reuses_cached_moov_without_touching_the_source_file(
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "success"
-    frame_table = read_frame_index(str(result["frame_index_location"]))
+    frame_table, _metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.num_rows == 3  # from the real, cached moov -- not the garbage media file
 
 
@@ -387,7 +421,7 @@ def test_process_one_video_refetches_when_the_cached_moov_fails_to_parse(tmp_pat
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "success"
-    frame_table = read_frame_index(str(result["frame_index_location"]))
+    frame_table, _metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.num_rows == 3  # refetched from the real source, not the corrupt cache
     with smart_open.open(moov_sidecar_location, "rb") as handle:
         assert handle.read() == real_moov_bytes  # the corrupt cache entry was overwritten too
@@ -448,51 +482,25 @@ def test_process_one_video_does_not_retry_a_fresh_parse_failure_with_caching_sti
 def test_process_one_video_always_rebuilds_frame_index_and_metadata_even_when_already_present(
     tmp_path: pathlib.Path,
 ) -> None:
-    """frame_index/metadata are never trusted by existence alone -- cheap to redo, so always redone.
-
-    Regression test for the real bug this closes: frame_index/metadata used to gate an early
-    return that skipped rebuilding them (and moov/moof) entirely once both existed, so a stale
-    pair left over from an earlier, different attempt at the same session_camera_id would be
-    published unchanged. Seeds genuinely wrong content at both locations first, then proves the
-    real call overwrites them with what the real moov actually says.
-    """
+    """Legacy metadata/index sidecars do not affect the new Lance record."""
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     _write_synthetic_nonfragmented_mp4(media_path, frame_count=3, keyframe_index=0)
 
-    source_session_id, camera_key = derive_session_and_camera(str(media_path), session_id_path_depth=2)
-    session_camera_id = make_session_camera_id(source_session_id, camera_key)
-    from cosmos_curator.next.recipes.mp4_index.contracts import (  # noqa: PLC0415
-        write_arrow_sidecar,
-        write_frame_index,
-    )
-
-    # Wrong on purpose: 0 rows, not 3, and a metadata row full of nulls -- both must be
-    # overwritten, not trusted, even though both already exist (the old fast path's own trigger).
-    write_frame_index([], str(tmp_path / "frames" / f"{session_camera_id}.arrow"))
-    write_arrow_sidecar(
-        [dict.fromkeys(VIDEO_METADATA_SCHEMA.names)],
-        VIDEO_METADATA_SCHEMA,
-        str(tmp_path / "metadata" / f"{session_camera_id}.arrow"),
-    )
+    # Legacy derived sidecars must not influence newly extracted canonical records.
+    legacy = tmp_path / "frames" / "legacy.arrow"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"stale index")
 
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "success"
-    frame_table = read_frame_index(str(result["frame_index_location"]))
-    assert frame_table.num_rows == 3  # rebuilt from the real moov, not the stale 0-row sidecar
-    metadata_row = read_video_metadata(str(result["metadata_location"]))
-    assert metadata_row["codec_name"] is not None  # rebuilt, not the stale all-null row
+    frame_table, metadata_row = read_video_record(processing.result_table(result))
+    assert frame_table.num_rows == 3
+    assert metadata_row["codec_name"] is not None
 
 
 def test_process_one_video_sibling_unit_dirs_do_not_share_sidecars(tmp_path: pathlib.Path) -> None:
-    """Two real videos under sibling unit directories, same filename, must not share a sidecar.
-
-    Reproduces the real collision derive_session_and_camera's own fix addresses: same session
-    (session-a), same filename stem (video), different unit-NN directory -- previously
-    discarded entirely (neither part of source_session_id nor camera_key at depth=2), so both
-    videos derived the identical session_camera_id and the second run's write silently
-    overwrote the first's sidecars.
-    """
+    """Videos with the same filename in sibling unit directories retain distinct identities and indexes."""
     media_path_a = tmp_path / "session-a" / "unit-00" / "video.mp4"
     media_path_b = tmp_path / "session-a" / "unit-01" / "video.mp4"
     _write_synthetic_nonfragmented_mp4(media_path_a, frame_count=1, keyframe_index=0, ctts_offset=None)
@@ -503,12 +511,11 @@ def test_process_one_video_sibling_unit_dirs_do_not_share_sidecars(tmp_path: pat
 
     assert result_a["status"] == "success"
     assert result_b["status"] == "success"
-    assert result_a["frame_index_location"] != result_b["frame_index_location"]
-    assert result_a["metadata_location"] != result_b["metadata_location"]
+    assert result_a["video_id"] != result_b["video_id"]
 
     # The first video's own frame index is still exactly its own -- not clobbered by the second.
-    frame_table_a = read_frame_index(str(result_a["frame_index_location"]))
-    frame_table_b = read_frame_index(str(result_b["frame_index_location"]))
+    frame_table_a, _metadata_row_a = read_video_record(processing.result_table(result_a))
+    frame_table_b, _metadata_row_b = read_video_record(processing.result_table(result_b))
     assert frame_table_a.num_rows == 1
     assert frame_table_b.num_rows == 2
 
@@ -541,7 +548,7 @@ def test_process_one_video_skip_existing_sidecars_false_forces_a_full_rebuild(
     second = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, skip_existing_sidecars=False)
 
     assert second["status"] == "success"
-    assert second["frame_index_location"] == first["frame_index_location"]
+    assert second["video_id"] == first["video_id"]
     assert calls == [1]  # moov was genuinely refetched, not read back from its own cached sidecar
 
 
@@ -563,7 +570,7 @@ def test_process_one_video_nonfragmented_ambiguous_track_fails(tmp_path: pathlib
 
     assert result["status"] == "failed"
     assert result["error_type"] == AmbiguousVideoTrackError.__name__
-    assert set(VIDEO_IDENTITY_SCHEMA.names) <= set(result)
+    assert set(VIDEO_MANIFEST_SCHEMA.names) <= set(result)
 
 
 def test_process_one_video_fragmented_unproven_shape_fails(tmp_path: pathlib.Path) -> None:
@@ -601,15 +608,10 @@ def test_process_one_video_metadata_construction_failure_is_a_failed_row_not_a_c
     assert result["error_type"] == InvalidTimeBaseError.__name__
 
 
-def test_process_one_video_metadata_sidecar_write_failure_is_a_failed_row_not_a_crash(
+def test_process_one_video_arrow_construction_failure_is_a_failed_row_not_a_crash(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A VideoTrack that parses fine but fails to write as a metadata sidecar is one failed row, not a crash.
-
-    Real failure shape: a value outside what VIDEO_METADATA_SCHEMA's own column types can hold
-    raises pyarrow.ArrowInvalid from inside write_video_metadata, after extraction has already
-    succeeded.
-    """
+    """Arrow construction errors become per-video failures after successful parsing."""
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     _write_synthetic_nonfragmented_mp4(media_path)
 
@@ -617,7 +619,7 @@ def test_process_one_video_metadata_sidecar_write_failure_is_a_failed_row_not_a_
         msg = "Value too large to fit in C integer type"
         raise pa.ArrowInvalid(msg)
 
-    monkeypatch.setattr(processing, "write_video_metadata", _raise_arrow_invalid)
+    monkeypatch.setattr(processing, "_frame_index_array", _raise_arrow_invalid)
 
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
@@ -659,7 +661,7 @@ def test_process_one_video_nonfragmented_zero_samples_fails(tmp_path: pathlib.Pa
 
     assert result["status"] == "failed"
     assert result["error_type"] == EmptySampleTableError.__name__
-    assert set(VIDEO_IDENTITY_SCHEMA.names) <= set(result)
+    assert set(VIDEO_MANIFEST_SCHEMA.names) <= set(result)
 
 
 def test_process_one_video_fragmented_zero_samples_fails(tmp_path: pathlib.Path) -> None:
@@ -691,8 +693,12 @@ def test_process_one_video_instance_lazily_builds_and_caches_a_local_client(
     _write_synthetic_nonfragmented_mp4(media_path_b)
 
     instance = processing._ProcessOneVideo(config=_config_stub(tmp_path))
-    result_a = instance({"video_id": make_video_id(str(media_path_a)), "media_location": str(media_path_a)})
-    result_b = instance({"video_id": make_video_id(str(media_path_b)), "media_location": str(media_path_b)})
+    result_a = instance(
+        pa.Table.from_pylist([{"video_id": make_video_id(str(media_path_a)), "media_location": str(media_path_a)}])
+    ).to_pylist()[0]
+    result_b = instance(
+        pa.Table.from_pylist([{"video_id": make_video_id(str(media_path_b)), "media_location": str(media_path_b)}])
+    ).to_pylist()[0]
 
     assert result_a["status"] == "success"
     assert result_b["status"] == "success"
@@ -737,9 +743,9 @@ def test_process_one_video_instance_resolves_a_separate_client_per_storage_backe
         }
     )
     instance = processing._ProcessOneVideo(config=config_stub)
-    instance({"video_id": "a", "media_location": "/local/a.mp4"})
-    instance({"video_id": "b", "media_location": "s3://bucket/b.mp4"})
-    instance({"video_id": "c", "media_location": "/local/c.mp4"})
+    instance(pa.Table.from_pylist([{"video_id": "a", "media_location": "/local/a.mp4"}])).to_pylist()[0]
+    instance(pa.Table.from_pylist([{"video_id": "b", "media_location": "s3://bucket/b.mp4"}])).to_pylist()[0]
+    instance(pa.Table.from_pylist([{"video_id": "c", "media_location": "/local/c.mp4"}])).to_pylist()[0]
 
     # One resolution per scheme, not per row -- the local moov_sidecar_root shares the local
     # media_locations' own scheme, so it's a cache hit and never triggers its own resolution.
@@ -795,7 +801,7 @@ def test_process_one_video_instance_resolves_a_separate_output_client_from_the_i
         }
     )
     instance = processing._ProcessOneVideo(config=config_stub)
-    instance({"video_id": "a", "media_location": "s3://bucket/a.mp4"})
+    instance(pa.Table.from_pylist([{"video_id": "a", "media_location": "s3://bucket/a.mp4"}])).to_pylist()[0]
 
     assert seen["input_storage_client"] is resolved["s3://bucket/a.mp4"]
     assert seen["input_storage_client"] is not None
