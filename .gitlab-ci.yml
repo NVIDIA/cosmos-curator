@@ -57,10 +57,10 @@ variables:
   # GPU type/instance/cluster info
   NVCF_GPU_TYPE:
     description: "GPU type for NVCF testing (e.g., L40S, H100)"
-    value: "H100"
+    value: "H200"
   NVCF_INSTANCE_TYPE:
-    description: "Instance type for NVCF testing (e.g., OCI.GPU.H100_1x, OCI.GPU.H100_4x)"
-    value: "OCI.GPU.H100_4x"
+    description: "Instance type for NVCF testing (e.g., OCI.GPU.H200_1x, OCI.GPU.H200_4x)"
+    value: "OCI.GPU.H200_4x"
   NVCF_CUSTOM_BACKEND:
     description: "Custom NVCF backend for testing (overrides default GitLab CI/CD variable)"
     value: "$NVCF_BACKEND"  # instead of $PERF_NVCF_BACKEND
