@@ -26,14 +26,18 @@ import ray
 from ray.data import ActorPoolStrategy
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
 from cosmos_curator.next.recipes.multimodal_embedding import inference
 from cosmos_curator.next.recipes.multimodal_embedding.config import resolve_config_data
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     embedding_contract_digest,
     resolve_model,
-    result_field_names,
 )
-from cosmos_curator.next.recipes.multimodal_embedding.episode_input import EPISODE_MAPPED_INPUT_SCHEMA
+from cosmos_curator.next.recipes.multimodal_embedding.episode_input import (
+    CAMERA_MAPPED_INPUT_SCHEMA,
+    CAMERA_WORK_ID,
+    camera_work_id,
+)
 from cosmos_curator.next.recipes.multimodal_embedding.video_media import decode_selected_frames, inspect_video
 from cosmos_curator.next.recipes.multimodal_split.cpu_video_encode import encode_frames_to_path
 from cosmos_curator.next.utils.media_reader import MediaObjectReader, MediaSystemicError, MediaTransportError
@@ -60,6 +64,7 @@ def _source(path: Path, *, episode_id: str, duration_ns: int = 1_000_000_000) ->
         "fragment_id": 0,
         "row_offset": 0,
         "episode_id": episode_id,
+        CAMERA_WORK_ID: camera_work_id(episode_id, "front_wide"),
         "materialization_digest": "materialization",
         "start_ns": 0,
         "exclusive_end_ns": duration_ns,
@@ -72,7 +77,7 @@ def _source(path: Path, *, episode_id: str, duration_ns: int = 1_000_000_000) ->
 
 def _download_actor() -> inference.VideoDownloadActor:
     return inference.VideoDownloadActor(
-        camera_key="front_wide",
+        camera_keys=("front_wide",),
         max_episode_duration_s=60.0,
         storage_profile="default",
         media_attempts=1,
@@ -81,7 +86,7 @@ def _download_actor() -> inference.VideoDownloadActor:
 
 def _media_actor(*, model_key: str = "cosmos_embed1_336p", decode_cpus: int = 1) -> inference.VideoPreparationActor:
     return inference.VideoPreparationActor(
-        model=resolve_model(model_key), camera_key="front_wide", decode_cpus=decode_cpus
+        model=resolve_model(model_key), camera_keys=("front_wide",), decode_cpus=decode_cpus
     )
 
 
@@ -93,11 +98,76 @@ def _gpu_actor(*, model_key: str = "cosmos_embed1_336p") -> inference.VideoEmbed
     model = resolve_model(model_key)
     return inference.VideoEmbeddingBatchActor(
         model=model,
-        camera_key="front_wide",
-        result_key="default",
-        digest=embedding_contract_digest(model, camera_key="front_wide", result_key="default"),
+        camera_keys=("front_wide",),
+        camera_results={
+            "front_wide": (
+                "default_front_wide",
+                embedding_contract_digest(model, camera_key="front_wide", result_key="default_front_wide"),
+            )
+        },
         max_episode_duration_s=60.0,
     )
+
+
+def test_multi_camera_batch_shares_encoder_and_preserves_item_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two camera videos share one model call; failed and over-limit items retain their own provenance."""
+    video = tmp_path / "video.mp4"
+    _video(video)
+    model = resolve_model("cosmos_embed1_336p")
+    keys = ("front_wide", "rear")
+    bindings = {key: (key, embedding_contract_digest(model, camera_key=key, result_key=key)) for key in keys}
+    front = _source(video, episode_id="episode")
+    rear = {**front, "camera_key": "rear"}
+    missing = {**_source(tmp_path / "missing.mp4", episode_id="missing"), "camera_key": "rear"}
+    long = _source(tmp_path / "not_fetched.mp4", episode_id="long", duration_ns=120_000_000_000)
+    rows = [
+        {**row, CAMERA_WORK_ID: camera_work_id(row["episode_id"], row["camera_key"])}
+        for row in [front, rear, missing, long]
+    ]
+    downloaded = inference.VideoDownloadActor(
+        camera_keys=keys, max_episode_duration_s=60.0, storage_profile="default", media_attempts=1
+    )(pa.Table.from_pylist(rows, schema=CAMERA_MAPPED_INPUT_SCHEMA))
+    prepared = _CPUPreparationActor(model=model, camera_keys=keys)(downloaded)
+    calls = []
+    loaded = []
+
+    class Encoder:
+        def encode_batch(self, videos: np.ndarray) -> np.ndarray:
+            calls.append(len(videos))
+            vectors = np.zeros((len(videos), model.vector_dimension), dtype=np.float32)
+            vectors[:, 0] = 1.0
+            return vectors
+
+    def load(_model: object) -> Encoder:
+        loaded.append(_model)
+        return Encoder()
+
+    monkeypatch.setattr(inference, "load_video_encoder", load)
+    actor = inference.VideoEmbeddingBatchActor(
+        model=model,
+        camera_keys=keys,
+        max_episode_duration_s=60.0,
+        camera_results=bindings,
+    )
+    result = actor(prepared).to_pylist()
+    actor(prepared)
+    assert calls == [2, 2]
+    assert len(loaded) == 1
+    assert [row["embedding_metadata"]["status"] for row in result] == [
+        "success",
+        "success",
+        "error",
+        "unsupported_duration",
+    ]
+    assert len({row[CAMERA_WORK_ID] for row in result}) == 4
+    assert result[2]["embedding_metadata"]["error_code"] == "media_object_error"
+    for row in result:
+        metadata = row["embedding_metadata"]
+        assert metadata["episode_id"] == row["episode_id"]
+        assert metadata["camera_key"] == row["camera_key"]
+        assert metadata["contract_digest"] == bindings[row["camera_key"]][1]
 
 
 def _fake_preprocessor(frame_count: int) -> object:
@@ -143,7 +213,7 @@ def test_stage_boundary_preserves_selected_frames_and_tensor(
     video = tmp_path / "video.mp4"
     _video(video)
     model = resolve_model(model_key)
-    source = pa.Table.from_pylist([_source(video, episode_id="a")], schema=EPISODE_MAPPED_INPUT_SCHEMA)
+    source = pa.Table.from_pylist([_source(video, episode_id="a")], schema=CAMERA_MAPPED_INPUT_SCHEMA)
 
     class FrameProcessor:
         def preprocess(self, frames: tuple[np.ndarray, ...]) -> np.ndarray:
@@ -178,7 +248,7 @@ def test_unsupported_duration_skips_download(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr(MediaObjectReader, "read", unexpected)
     monkeypatch.setattr(inference, "load_video_preprocessor", unexpected)
     source = _source(tmp_path / "absent.mp4", episode_id="long", duration_ns=120_000_000_000)
-    prepared = _prepare(pa.Table.from_pylist([source], schema=EPISODE_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
+    prepared = _prepare(pa.Table.from_pylist([source], schema=CAMERA_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
     assert prepared["preparation_status"] == "unsupported_duration"
     assert prepared["prepared_video"] is None
 
@@ -194,7 +264,7 @@ def test_oversized_media_is_refused_before_download(tmp_path: Path, monkeypatch:
         pytest.fail("Oversized media must be refused from metadata without downloading")
 
     monkeypatch.setattr(MediaObjectReader, "_download", unexpected)
-    row = _download_actor()(pa.Table.from_pylist([source], schema=EPISODE_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
+    row = _download_actor()(pa.Table.from_pylist([source], schema=CAMERA_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
     assert row["download_error_code"] == "media_object_error"
     assert row["media_bytes"] is None
 
@@ -209,7 +279,7 @@ def test_download_checks_exact_media_identity(mismatch: str, tmp_path: Path) -> 
         source["media_size_bytes"] += 1
     else:
         source["media_sha256"] = "0" * 64
-    row = _download_actor()(pa.Table.from_pylist([source], schema=EPISODE_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
+    row = _download_actor()(pa.Table.from_pylist([source], schema=CAMERA_MAPPED_INPUT_SCHEMA)).to_pylist()[0]
     assert row["download_error_code"] == f"{mismatch}_mismatch"
     assert row["media_bytes"] is None
 
@@ -231,7 +301,7 @@ def test_media_stage_carries_success_error_and_unsupported_rows(
     monkeypatch.setattr(inference, "load_video_preprocessor", load)
     rows = [_source(video, episode_id="success"), _source(missing, episode_id="missing")]
     rows.append(_source(video, episode_id="unsupported", duration_ns=120_000_000_000))
-    prepared = _prepare(pa.Table.from_pylist(rows, schema=EPISODE_MAPPED_INPUT_SCHEMA)).to_pylist()
+    prepared = _prepare(pa.Table.from_pylist(rows, schema=CAMERA_MAPPED_INPUT_SCHEMA)).to_pylist()
     assert [row["episode_id"] for row in prepared] == ["success", "missing", "unsupported"]
     assert [row["preparation_status"] for row in prepared] == ["ready", "error", "unsupported_duration"]
     assert prepared[0]["prepared_shape"] == [8, 3, 8, 8]
@@ -256,7 +326,7 @@ def test_gpu_stage_batches_ready_rows_and_passes_other_rows_through(
         _source(video, episode_id="b"),
         _source(video, episode_id="long", duration_ns=120_000_000_000),
     ]
-    prepared = _prepare(pa.Table.from_pylist(sources, schema=EPISODE_MAPPED_INPUT_SCHEMA))
+    prepared = _prepare(pa.Table.from_pylist(sources, schema=CAMERA_MAPPED_INPUT_SCHEMA))
     calls: list[tuple[int, ...]] = []
 
     class FakeEncoder:
@@ -266,8 +336,7 @@ def test_gpu_stage_batches_ready_rows_and_passes_other_rows_through(
 
     monkeypatch.setattr(inference, "load_video_encoder", lambda _model: FakeEncoder())
     result = _gpu_actor()(prepared).to_pylist()
-    model = resolve_model("cosmos_embed1_336p")
-    vector_name, metadata_name = result_field_names("default", model_key=model.key)
+    vector_name, metadata_name = "embedding", "embedding_metadata"
     assert calls == [(2, 8, 3, 8, 8)]
     assert [row["episode_id"] for row in result] == ["a", "missing", "b", "long"]
     assert [row[metadata_name]["status"] for row in result] == ["success", "error", "success", "unsupported_duration"]
@@ -283,7 +352,7 @@ def test_one_invalid_projection_is_an_item_error(tmp_path: Path, monkeypatch: py
     _video(video)
     monkeypatch.setattr(inference, "load_video_preprocessor", lambda _model, **_kwargs: _fake_preprocessor(8))
     sources = [_source(video, episode_id="good"), _source(video, episode_id="bad")]
-    prepared = _prepare(pa.Table.from_pylist(sources, schema=EPISODE_MAPPED_INPUT_SCHEMA))
+    prepared = _prepare(pa.Table.from_pylist(sources, schema=CAMERA_MAPPED_INPUT_SCHEMA))
 
     class FakeEncoder:
         def encode_batch(self, videos: np.ndarray) -> np.ndarray:
@@ -294,7 +363,7 @@ def test_one_invalid_projection_is_an_item_error(tmp_path: Path, monkeypatch: py
 
     monkeypatch.setattr(inference, "load_video_encoder", lambda _model: FakeEncoder())
     rows = _gpu_actor()(prepared).to_pylist()
-    metadata_name = result_field_names("default", model_key="cosmos_embed1_336p")[1]
+    metadata_name = "embedding_metadata"
     assert [row[metadata_name]["status"] for row in rows] == ["success", "error"]
     assert rows[1][metadata_name]["error_code"] == "invalid_vector"
 
@@ -304,7 +373,7 @@ def test_whole_batch_gpu_failure_aborts(tmp_path: Path, monkeypatch: pytest.Monk
     video = tmp_path / "video.mp4"
     _video(video)
     monkeypatch.setattr(inference, "load_video_preprocessor", lambda _model, **_kwargs: _fake_preprocessor(8))
-    source = pa.Table.from_pylist([_source(video, episode_id="a")], schema=EPISODE_MAPPED_INPUT_SCHEMA)
+    source = pa.Table.from_pylist([_source(video, episode_id="a")], schema=CAMERA_MAPPED_INPUT_SCHEMA)
     prepared = _prepare(source)
 
     class FailingEncoder:
@@ -331,7 +400,7 @@ def test_shared_media_outage_aborts_before_gpu(
 
     monkeypatch.setattr(MediaObjectReader, "read", unavailable)
     with pytest.raises(error_type, match="storage unavailable"):
-        _download_actor()(pa.Table.from_pylist([_source(video, episode_id="a")], schema=EPISODE_MAPPED_INPUT_SCHEMA))
+        _download_actor()(pa.Table.from_pylist([_source(video, episode_id="a")], schema=CAMERA_MAPPED_INPUT_SCHEMA))
 
 
 @pytest.mark.parametrize(
@@ -353,7 +422,7 @@ def test_ray_mapping_separates_io_and_gpu_resources(
             "schema_version": 1,
             "kind": "multimodal-embedding",
             "input": {"episodes_lance_uri": str(tmp_path / "episodes.lance")},
-            "video": {"camera_key": "front_wide"},
+            "video": {"camera_keys": ["front_wide"]},
             "execution": {
                 "media_concurrency": media_concurrency,
                 "decode_concurrency": decode_concurrency,
@@ -375,9 +444,18 @@ def test_ray_mapping_separates_io_and_gpu_resources(
             return self
 
     source: Any = FakeDataset()
-    assert inference.map_video_embeddings(source, config, num_input_rows=num_input_rows) is source
+    assert (
+        inference.map_video_embeddings(
+            source,
+            config,
+            num_input_rows=num_input_rows,
+            camera_results={"front_wide": ("default_front_wide", "digest")},
+        )
+        is source
+    )
     assert source.context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.0
     assert source.context.autoscaling_config.actor_pool_max_upscaling_delta == 1
+    assert ReleasePendingDownloadActors in source.context.custom_execution_callback_classes
     assert [actor for actor, _kwargs in calls] == [
         inference.VideoDownloadActor,
         inference.VideoPreparationActor,
@@ -418,11 +496,11 @@ def test_ray_actor_boundary_preserves_unsupported_rows(curator_io_cluster: None,
     """Ray Data passes an over-limit row through three actors without media or a model."""
     model = resolve_model("cosmos_embed1_336p")
     source = _source(tmp_path / "absent.mp4", episode_id="long", duration_ns=120_000_000_000)
-    rows = ray.data.from_arrow(pa.Table.from_pylist([source], schema=EPISODE_MAPPED_INPUT_SCHEMA))
+    rows = ray.data.from_arrow(pa.Table.from_pylist([source], schema=CAMERA_MAPPED_INPUT_SCHEMA))
     downloaded = rows.map_batches(
         inference.VideoDownloadActor,
         fn_constructor_kwargs={
-            "camera_key": "front_wide",
+            "camera_keys": ("front_wide",),
             "max_episode_duration_s": 60.0,
             "storage_profile": "default",
             "media_attempts": 1,
@@ -436,7 +514,7 @@ def test_ray_actor_boundary_preserves_unsupported_rows(curator_io_cluster: None,
     )
     prepared = downloaded.map_batches(
         _CPUPreparationActor,
-        fn_constructor_kwargs={"model": model, "camera_key": "front_wide"},
+        fn_constructor_kwargs={"model": model, "camera_keys": ("front_wide",)},
         batch_format="pyarrow",
         batch_size=1,
         compute=ActorPoolStrategy(min_size=1, max_size=1, max_tasks_in_flight_per_actor=1),
@@ -448,9 +526,13 @@ def test_ray_actor_boundary_preserves_unsupported_rows(curator_io_cluster: None,
         inference.VideoEmbeddingBatchActor,
         fn_constructor_kwargs={
             "model": model,
-            "camera_key": "front_wide",
-            "result_key": "default",
-            "digest": embedding_contract_digest(model, camera_key="front_wide", result_key="default"),
+            "camera_keys": ("front_wide",),
+            "camera_results": {
+                "front_wide": (
+                    "default_front_wide",
+                    embedding_contract_digest(model, camera_key="front_wide", result_key="default_front_wide"),
+                )
+            },
             "max_episode_duration_s": 60.0,
         },
         batch_format="pyarrow",
@@ -459,7 +541,7 @@ def test_ray_actor_boundary_preserves_unsupported_rows(curator_io_cluster: None,
         num_cpus=1.0,
     )
     result = embedded.take_all()
-    vector_name, metadata_name = result_field_names("default", model_key=model.key)
+    vector_name, metadata_name = "embedding", "embedding_metadata"
     assert len(result) == 1
     assert result[0]["episode_id"] == "long"
     assert result[0][vector_name] is None
@@ -487,7 +569,7 @@ def test_ray_production_plan_preserves_episode_vectors(
             "schema_version": 1,
             "kind": "multimodal-embedding",
             "input": {"episodes_lance_uri": str(tmp_path / "episodes.lance")},
-            "video": {"camera_key": "front_wide"},
+            "video": {"camera_keys": ["front_wide"]},
             "execution": {
                 "media_concurrency": 1,
                 "decode_concurrency": 1,
@@ -504,9 +586,21 @@ def test_ray_production_plan_preserves_episode_vectors(
     monkeypatch.setattr(inference, "VideoEmbeddingBatchActor", _CPUEmbeddingActor)
     monkeypatch.setattr(inference, "PixiRuntimeEnv", lambda _environment: {})
     monkeypatch.setattr(inference, "ray_data_gpu_runtime_env", lambda _environment: {})
-    rows = ray.data.from_arrow(pa.Table.from_pylist(sources, schema=EPISODE_MAPPED_INPUT_SCHEMA))
-    result = inference.map_video_embeddings(rows, config, num_input_rows=len(sources)).take_all()
-    vector_name, metadata_name = result_field_names("default", model_key=config.model.variant)
+    rows = ray.data.from_arrow(pa.Table.from_pylist(sources, schema=CAMERA_MAPPED_INPUT_SCHEMA))
+    result = inference.map_video_embeddings(
+        rows,
+        config,
+        num_input_rows=len(sources),
+        camera_results={
+            "front_wide": (
+                "default_front_wide",
+                embedding_contract_digest(
+                    resolve_model(config.model.variant), camera_key="front_wide", result_key="default_front_wide"
+                ),
+            )
+        },
+    ).take_all()
+    vector_name, metadata_name = "embedding", "embedding_metadata"
     by_id = {row["episode_id"]: row for row in result}
     assert len(result) == len(by_id) == len(sources)
     expected = np.eye(768, dtype=np.float32)

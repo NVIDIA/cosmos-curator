@@ -24,3 +24,18 @@ RESULT_KEY_PATTERN: Final = r"^[a-z][a-z0-9_]{0,47}$"
 def is_valid_result_key(value: str) -> bool:
     """Return whether a result key is one safe deterministic field-name segment."""
     return fullmatch(RESULT_KEY_PATTERN, value) is not None
+
+
+def camera_result_key(result_key: str, camera_key: str) -> str:
+    """Append the exact camera key, rejecting unsafe or overlong effective namespaces."""
+    if not is_valid_result_key(result_key):
+        msg = f"Invalid base result key {result_key!r}: must match {RESULT_KEY_PATTERN}"
+        raise ValueError(msg)
+    effective = f"{result_key}_{camera_key}"
+    if not camera_key or not is_valid_result_key(effective):
+        msg = (
+            f"Invalid effective result key {effective!r}: must match {RESULT_KEY_PATTERN} "
+            "and be at most 48 characters. Use a shorter base result_key or a camera name compatible with this rule."
+        )
+        raise ValueError(msg)
+    return effective

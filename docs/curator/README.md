@@ -10,7 +10,7 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 
 - [Pipeline Design Guide](guides/pipeline-design.md) - build or modify curator pipelines.
 - [Multimodal AV: End-to-End Guide](guides/multimodal-av-e2e.md) - prepare recordings and model weights,
-  publish multimodal episodes, and caption selected views with optional Ego context.
+  publish multimodal episodes, caption selected views with optional Ego context, and embed camera videos.
 - [Curate Runbook](guides/curate-runbook.md) - run the Curate selection leg (fuse, cluster, dedup, balance).
 - [Stage Replay Guide](guides/stage-replay.md) - debug stages in isolation.
 - [Interactive Slurm Development Guide](guides/slurm-interactive.md) - iterate from an interactive Slurm allocation.
@@ -53,8 +53,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
   rows, artifact bindings, identity, and publication semantics.
 - [Multimodal AV Captioning](design/multimodal-av-captioning.md) - single-camera free-form caption enrichment of
   canonical multimodal episodes.
-- [Multimodal AV Video Embedding](design/multimodal-av-video-embedding.md) - per-episode video vectors from a selected
-  camera, published to canonical multimodal episodes.
+- [Multimodal AV Video Embedding](design/multimodal-av-video-embedding.md) - independent video vectors for selected
+  cameras, published together to canonical multimodal episodes.
 - [Release Versioning Design](design/release-versioning.md) - tag-derived release and package versioning.
 - [Ray Data Design](design/ray-data.md) - Ray Data direction and implementation notes.
 - [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.

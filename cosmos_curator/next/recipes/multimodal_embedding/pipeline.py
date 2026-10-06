@@ -18,7 +18,6 @@
 import argparse
 import logging
 from collections.abc import Sequence
-from functools import partial
 from typing import Any
 
 import lance
@@ -31,45 +30,33 @@ from cosmos_curator.next.core.ray_runtime import (
     curator_io_resources,
     ensure_ray_initialized,
 )
-from cosmos_curator.next.recipes.multimodal_embedding.config import ResolvedMultimodalEmbeddingConfig, resolve_config
+from cosmos_curator.next.recipes.multimodal_embedding.config import (
+    ResolvedMultimodalEmbeddingConfig,
+    resolve_config,
+)
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
-    VideoEmbeddingModelSpec,
-    build_terminal_result_row,
-    embedding_contract_digest,
+    CameraEmbeddingPlan,
+    EmbeddingRunPlan,
     normalized_embedding_contract,
     resolve_model,
-    result_field_names,
-    result_fields,
-    staged_result_schema,
     validate_cosmos_model_directory,
-    validate_terminal_batch,
-    validate_terminal_row,
 )
 from cosmos_curator.next.recipes.multimodal_embedding.episode_input import (
-    EPISODE_MAPPED_INPUT_SCHEMA,
-    EPISODE_SOURCE_COLUMNS,
-    EPISODE_SOURCE_SCHEMA,
-    EPISODE_STAGED_BINDING_COLUMNS,
-    project_episode_camera,
-    validate_complete_fragment,
-    validate_episode_input,
+    validate_episode_cameras,
 )
-from cosmos_curator.next.recipes.multimodal_embedding.inference import run_inference_phase
+from cosmos_curator.next.recipes.multimodal_embedding.inference import (
+    run_inference_phase,
+)
 from cosmos_curator.next.recipes.multimodal_embedding.publication import (
-    embedding_result_fingerprint,
+    camera_bindings,
     publish_atomic_staged_results,
-    reconcile_embedding_replays,
-)
-from cosmos_curator.next.recipes.multimodal_split.lance_sink import validate_episode_table
-from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInputBindings,
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
 )
 from cosmos_curator.next.recipes.video_caption.contracts import CHECKPOINT_ADAPTER_VERSION, WORKSPACE_SCHEMA_VERSION
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
+from cosmos_curator.next.recipes.video_caption.lance_state import (
+    CaptionAttempt,
+    capture_attempt,
+    ensure_caption_fields,
+)
 from cosmos_curator.next.recipes.video_caption.workspace import (
     cleanup_workspace,
     ensure_workspace,
@@ -79,113 +66,6 @@ from cosmos_curator.next.recipes.video_caption.workspace import (
 )
 from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 from cosmos_curator.next.utils.identity import canonical_digest
-
-
-def _bindings(config: ResolvedMultimodalEmbeddingConfig, model: VideoEmbeddingModelSpec) -> CaptionRunBindings:
-    uri = config.input.episodes_lance_uri
-    camera_key = config.video.camera_key
-    result_key = config.output.result_key
-    digest = embedding_contract_digest(model, camera_key=camera_key, result_key=result_key)
-    vector_field, metadata_field = result_field_names(result_key, model_key=model.key)
-    return CaptionRunBindings(
-        input=CaptionInputBindings(
-            source_columns=EPISODE_SOURCE_COLUMNS,
-            source_schema=EPISODE_SOURCE_SCHEMA,
-            mapped_schema=EPISODE_MAPPED_INPUT_SCHEMA,
-            project_batch=partial(project_episode_camera, camera_key=camera_key),
-            row_id_column="episode_id",
-            media_uri_column="media_location",
-            media_size_column="media_size_bytes",
-            media_sha256_column="media_sha256",
-            staged_binding_columns=EPISODE_STAGED_BINDING_COLUMNS,
-        ),
-        result=CaptionResultBindings(
-            caption_field_name=vector_field,
-            metadata_field_name=metadata_field,
-            fields=result_fields(result_key, model_key=model.key, digest=digest),
-            staged_schema=staged_result_schema(result_key, model_key=model.key, digest=digest),
-            digest=digest,
-            build_terminal_row=partial(
-                build_terminal_result_row,
-                model=model,
-                result_key=result_key,
-                digest=digest,
-            ),
-            validate_terminal_value=lambda vector, metadata: validate_terminal_row(
-                {vector_field: vector, metadata_field: metadata},
-                model=model,
-                camera_key=camera_key,
-                result_key=result_key,
-                digest=digest,
-            ),
-            validate_staged_row=partial(
-                validate_terminal_row,
-                model=model,
-                camera_key=camera_key,
-                result_key=result_key,
-                digest=digest,
-            ),
-            validate_terminal_batch=partial(
-                validate_terminal_batch,
-                model=model,
-                camera_key=camera_key,
-                result_key=result_key,
-                digest=digest,
-            ),
-            reconcile_staged_rows=partial(
-                reconcile_embedding_replays,
-                metadata_field_name=metadata_field,
-                validate_staged_row=partial(
-                    validate_terminal_row,
-                    model=model,
-                    camera_key=camera_key,
-                    result_key=result_key,
-                    digest=digest,
-                ),
-            ),
-            fingerprint_result_values=partial(
-                embedding_result_fingerprint, vector_field_name=vector_field, metadata_field_name=metadata_field
-            ),
-        ),
-        publication=CaptionPublicationBindings(
-            validate_base_schema=partial(validate_episode_table, uri=uri),
-            protected_field_names=tuple(EPISODE_SCHEMA.names),
-            base_field_owner="multimodal-split",
-            transaction_properties={
-                "kind": "multimodal-embedding",
-                "result_key": result_key,
-                "model_key": model.key,
-                "embedding_contract_digest": digest,
-            },
-            validate_complete_fragment=partial(
-                validate_complete_fragment,
-                camera_key=camera_key,
-                metadata_field_name=metadata_field,
-            ),
-        ),
-        # Required by the shared binding type; embedding execution does not consume caption settings.
-        prompt_template="",
-    )
-
-
-def _workspace_manifest(
-    config: ResolvedMultimodalEmbeddingConfig,
-    model: VideoEmbeddingModelSpec,
-    bindings: CaptionRunBindings,
-) -> dict[str, object]:
-    return {
-        "workspace_schema_version": WORKSPACE_SCHEMA_VERSION,
-        "episodes_lance_uri": config.input.episodes_lance_uri,
-        "embedding_field": bindings.result.caption_field_name,
-        "metadata_field": bindings.result.metadata_field_name,
-        "embedding_contract": normalized_embedding_contract(
-            model, camera_key=config.video.camera_key, result_key=config.output.result_key
-        ),
-        "embedding_contract_digest": bindings.result.digest,
-        "selection": config.selection.model_dump(mode="json"),
-        "checkpoint_adapter_version": CHECKPOINT_ADAPTER_VERSION,
-        "staging_vector_layout": "nullable_list_v1",
-    }
 
 
 def _terminal_counts(dataset: lance.LanceDataset, attempt: CaptionAttempt, metadata_field: str) -> dict[str, object]:
@@ -210,47 +90,96 @@ def _terminal_counts(dataset: lance.LanceDataset, attempt: CaptionAttempt, metad
     return {"terminal_counts": counts, "error_codes": errors}
 
 
-def run_config(config: ResolvedMultimodalEmbeddingConfig) -> dict[str, Any]:
-    """Run one finite embedding attempt and publish canonical episode results."""
+def run_config(config: ResolvedMultimodalEmbeddingConfig) -> dict[str, Any]:  # noqa: C901 -- finite selection, staging and publication
+    """Embed selected camera videos with one pipeline and one result commit."""
     if config.selection.retry_errors:
         msg = "selection.retry_errors is not supported yet. To recompute published errors, use a new output.result_key."
         raise ValueError(msg)
-    uri = config.input.episodes_lance_uri
-    profile = config.execution.storage_profile
+    uri, profile = config.input.episodes_lance_uri, config.execution.storage_profile
     storage_options = get_lance_storage_options(uri, profile_name=profile)
+    dataset = lance.dataset(uri, storage_options=storage_options)
+    keys = tuple(validate_episode_cameras(dataset, uri=uri, selection=config.video.camera_keys))
     model = resolve_model(config.model.variant)
-    bindings = _bindings(config, model)
+    if not keys:
+        # An empty snapshot has no camera namespaces to register or work to stage.
+        return {
+            "episodes_lance_uri": uri,
+            "episodes_lance_version": int(dataset.version),
+            "camera_keys": [],
+            "selected_fragments": 0,
+            "pending_fragments": 0,
+            "skipped_complete_fragments": 0,
+            "published_fragments": 0,
+            "already_committed_fragments": 0,
+            "cameras": {},
+            "result_key": config.output.result_key,
+            "base_result_key": config.output.result_key,
+            "tag_camera_key": config.output.tag_camera_key,
+            "model_key": model.key,
+            "embedding_contract_digest": canonical_digest({"multi_camera_version": 1, "cameras": {}}),
+            "cleanup_complete": True,
+        }
+    result_keys = {key: config.result_key_for_camera(key) for key in keys}
+    cameras = {key: CameraEmbeddingPlan.resolve(model, camera_key=key, result_key=result_keys[key]) for key in keys}
+    camera_guards = {key: camera_bindings(camera, model, uri=uri) for key, camera in cameras.items()}
+    for binding in camera_guards.values():
+        ensure_caption_fields(
+            uri, storage_options=storage_options, bindings=binding, attempts=config.execution.commit_attempts
+        )
     dataset = lance.dataset(uri, storage_options=storage_options)
-    validate_episode_input(dataset, uri=uri, camera_key=config.video.camera_key)
-    ensure_caption_fields(
-        uri, storage_options=storage_options, bindings=bindings, attempts=config.execution.commit_attempts
+    media_locations = validate_episode_cameras(dataset, uri=uri, selection=config.video.camera_keys)
+    if tuple(media_locations) != keys:
+        msg = "Selected camera set changed during field registration; rerun to resolve the current input snapshot"
+        raise ValueError(msg)
+    camera_attempts = {key: capture_attempt(dataset, bindings=binding) for key, binding in camera_guards.items()}
+    pending_fragment_sets = {key: set(attempt.pending_fragment_ids) for key, attempt in camera_attempts.items()}
+    fragment_ids = tuple(int(fragment.fragment_id) for fragment in dataset.get_fragments())
+    pending_cameras = {
+        fragment_id: tuple(key for key, pending_ids in pending_fragment_sets.items() if fragment_id in pending_ids)
+        for fragment_id in fragment_ids
+    }
+    pending_cameras = {fragment_id: selected for fragment_id, selected in pending_cameras.items() if selected}
+    plan = EmbeddingRunPlan(uri, config.output.result_key, model, tuple(cameras.values()), pending_cameras)
+    # Every camera was validated on this pinned snapshot. Combine its captured
+    # state without scanning and validating the same result columns again.
+    attempt = CaptionAttempt(
+        version=int(dataset.version),
+        pending_fragment_ids=tuple(pending_cameras),
+        complete_fragment_ids=tuple(fragment_id for fragment_id in fragment_ids if fragment_id not in pending_cameras),
     )
-    dataset = lance.dataset(uri, storage_options=storage_options)
-    # Registration can race with producer appends. Validate the exact immutable
-    # snapshot used for selection, including both pending and completed rows.
-    representative_media = validate_episode_input(dataset, uri=uri, camera_key=config.video.camera_key)
-    attempt = capture_attempt(dataset, bindings=bindings)
-    policy_namespace = canonical_digest(config.selection.model_dump(mode="json"))
     workspace = resolve_workspace(
         config.output.staging_root_uri,
-        bindings.result.caption_field_name,
-        bindings.result.digest,
+        plan.workspace_field,
+        plan.digest,
         storage_profile=profile,
-        policy_namespace=policy_namespace,
+        policy_namespace=canonical_digest(config.selection.model_dump(mode="json")),
     )
-    manifest = _workspace_manifest(config, model, bindings)
-    workspace_preexisting = workspace_manifest_exists(workspace)
-    if attempt.pending_fragment_ids:
+    manifest = {
+        "workspace_schema_version": WORKSPACE_SCHEMA_VERSION,
+        "episodes_lance_uri": uri,
+        "camera_contracts": {
+            key: normalized_embedding_contract(model, camera_key=key, result_key=result_key)
+            for key, result_key in result_keys.items()
+        },
+        "selection": config.selection.model_dump(mode="json"),
+        "checkpoint_adapter_version": CHECKPOINT_ADAPTER_VERSION,
+        "staging_vector_layout": "episode_camera_rows_v1",
+    }
+    preexisting = workspace_manifest_exists(workspace)
+    if attempt.pending_fragment_ids or preexisting:
         ensure_workspace(workspace, storage_profile=profile, manifest=manifest)
-        complete = phase_a_completion_covers(workspace, attempt, bindings.result.digest)
+    if attempt.pending_fragment_ids:
+        complete = phase_a_completion_covers(workspace, attempt, plan.digest)
         if not complete:
             validate_cosmos_model_directory(model)
-        locations = [uri, workspace.root_uri]
-        if representative_media is not None:
-            locations.append(representative_media)
         ensure_ray_initialized(
             local_resources=curator_io_resources(),
-            runtime_env_vars=s3_compatibility_env_vars(*locations, storage_profile=profile),
+            runtime_env_vars=s3_compatibility_env_vars(
+                uri,
+                workspace.root_uri,
+                *[location for location in media_locations.values() if location is not None],
+                storage_profile=profile,
+            ),
         )
         configure_ray_data_progress(progress=config.execution.progress)
         configure_ray_data_stability(disable_high_memory_detector=True)
@@ -260,44 +189,54 @@ def run_config(config: ResolvedMultimodalEmbeddingConfig) -> dict[str, Any]:
                 attempt,
                 config,
                 workspace,
-                digest=bindings.result.digest,
+                camera_results={key: (result_key, cameras[key].digest) for key, result_key in result_keys.items()},
+                pending_cameras=pending_cameras,
+                digest=plan.digest,
                 storage_options=storage_options,
             )
-    elif workspace_preexisting:
-        ensure_workspace(workspace, storage_profile=profile, manifest=manifest)
     publication = publish_atomic_staged_results(
         uri,
         attempt,
         workspace,
-        bindings,
+        plan,
         storage_options=storage_options,
         commit_attempts=config.execution.commit_attempts,
     )
     latest = lance.dataset(uri, storage_options=storage_options)
-    terminal = _terminal_counts(latest, attempt, bindings.result.metadata_field_name)
     cleanup_complete = True
-    if attempt.pending_fragment_ids or workspace_preexisting:
+    if attempt.pending_fragment_ids or preexisting:
         try:
             cleanup_workspace(workspace, storage_profile=profile)
-        except Exception as exc:  # noqa: BLE001 -- published Lance rows remain canonical
+        except Exception as exc:  # noqa: BLE001 -- published rows remain canonical
             cleanup_complete = False
-            logger.warning("Embedding publication committed, but workspace cleanup failed: {!r}", exc)
+            logger.warning("Camera results committed, but workspace cleanup failed: {!r}", exc)
+    summaries = {
+        key: {
+            "embedding_field": camera.vector_field,
+            "metadata_field": camera.metadata_field,
+            "result_key": result_keys[key],
+            "effective_result_key": result_keys[key],
+            "base_result_key": config.output.result_key,
+            "tag_camera_key": config.output.tag_camera_key,
+            **_terminal_counts(latest, attempt, camera.metadata_field),
+        }
+        for key, camera in cameras.items()
+    }
     return {
         "episodes_lance_uri": uri,
         "episodes_lance_version": int(latest.version),
-        "attempt_version": attempt.version,
+        "camera_keys": list(keys),
         "selected_fragments": len(attempt.selected_fragment_ids),
         "pending_fragments": len(attempt.pending_fragment_ids),
         "skipped_complete_fragments": len(attempt.complete_fragment_ids),
         "published_fragments": publication.published_fragments,
         "already_committed_fragments": publication.already_committed_fragments,
-        **terminal,
-        "embedding_field": bindings.result.caption_field_name,
-        "metadata_field": bindings.result.metadata_field_name,
+        "cameras": summaries,
         "result_key": config.output.result_key,
-        "camera_key": config.video.camera_key,
+        "base_result_key": config.output.result_key,
+        "tag_camera_key": config.output.tag_camera_key,
         "model_key": model.key,
-        "embedding_contract_digest": bindings.result.digest,
+        "embedding_contract_digest": plan.digest,
         "cleanup_complete": cleanup_complete,
     }
 

@@ -19,6 +19,7 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Final
 
@@ -29,7 +30,10 @@ from numpy.typing import NDArray
 from cosmos_curator.core.utils import environment
 from cosmos_curator.models.registry import resolve_registered_model, validate_model_directory
 from cosmos_curator.next.recipes.multimodal_embedding.config import ResolvedMultimodalEmbeddingConfig
-from cosmos_curator.next.recipes.multimodal_embedding.episode_input import EPISODE_MAPPED_INPUT_SCHEMA
+from cosmos_curator.next.recipes.multimodal_embedding.episode_input import (
+    EPISODE_MAPPED_INPUT_SCHEMA,
+    EPISODE_PUBLICATION_SCHEMA,
+)
 from cosmos_curator.next.recipes.result_keys import is_valid_result_key
 from cosmos_curator.next.utils.identity import canonical_digest
 
@@ -117,6 +121,90 @@ class VideoEmbeddingModelSpec:
     def runtime_model_dir(self) -> Path:
         """Return the identically mounted model path expected by every worker."""
         return environment.CONTAINER_PATHS_MODEL_WEIGHT_CACHE_DIR / self.model_id
+
+
+@dataclass(frozen=True)
+class CameraEmbeddingPlan:
+    """One camera's explicit field ownership and immutable vector contract."""
+
+    camera_key: str
+    result_key: str
+    digest: str
+    vector_field: str
+    metadata_field: str
+    fields: pa.Schema
+    staged_schema: pa.Schema
+
+    @classmethod
+    def resolve(cls, model: VideoEmbeddingModelSpec, *, camera_key: str, result_key: str) -> "CameraEmbeddingPlan":
+        """Resolve one camera without inspecting table history or caption bindings."""
+        digest = embedding_contract_digest(model, camera_key=camera_key, result_key=result_key)
+        vector, metadata = result_field_names(result_key, model_key=model.key)
+        return cls(
+            camera_key,
+            result_key,
+            digest,
+            vector,
+            metadata,
+            result_fields(result_key, model_key=model.key, digest=digest),
+            staged_result_schema(result_key, model_key=model.key, digest=digest),
+        )
+
+
+@dataclass(frozen=True)
+class EmbeddingRunPlan:
+    """Shared episode publication state, with independently contracted camera plans."""
+
+    episodes_lance_uri: str
+    base_result_key: str
+    model: VideoEmbeddingModelSpec
+    cameras: tuple[CameraEmbeddingPlan, ...]
+    pending_cameras: dict[int, tuple[str, ...]]
+
+    def __post_init__(self) -> None:
+        """Canonicalize camera order and reject colliding ownership before execution."""
+        cameras = tuple(sorted(self.cameras, key=lambda camera: camera.camera_key))
+        if not cameras or len({camera.camera_key for camera in cameras}) != len(cameras):
+            msg = "An embedding run requires distinct camera plans"
+            raise ValueError(msg)
+        names = [name for camera in cameras for name in camera.fields.names]
+        if len(set(names)) != len(names):
+            msg = "Camera plans cannot own overlapping embedding fields"
+            raise ValueError(msg)
+        if any(set(keys) - {camera.camera_key for camera in cameras} for keys in self.pending_cameras.values()):
+            msg = "Pending camera work is outside the selected run plan"
+            raise ValueError(msg)
+        object.__setattr__(self, "cameras", cameras)
+        object.__setattr__(self, "pending_cameras", dict(self.pending_cameras))
+
+    @cached_property
+    def digest(self) -> str:
+        """Keep the existing combined recovery identity, independent of pending work."""
+        return canonical_digest({"multi_camera_version": 1, "cameras": {c.camera_key: c.digest for c in self.cameras}})
+
+    @cached_property
+    def fields(self) -> pa.Schema:
+        """Own every selected camera field, without a primary camera's result state."""
+        return pa.schema([field for camera in self.cameras for field in camera.fields])
+
+    @cached_property
+    def staged_schema(self) -> pa.Schema:
+        """Assemble camera results beside camera-independent episode identities."""
+        return pa.schema(
+            [
+                *EPISODE_PUBLICATION_SCHEMA,
+                *[
+                    field
+                    for camera in self.cameras
+                    for field in list(camera.staged_schema)[len(EPISODE_MAPPED_INPUT_SCHEMA) :]
+                ],
+            ]
+        )
+
+    @property
+    def workspace_field(self) -> str:
+        """Retain the existing deterministic workspace anchor; it carries no camera state."""
+        return self.cameras[0].vector_field
 
 
 @dataclass(frozen=True)
@@ -284,10 +372,10 @@ def embedding_contract_digest(model: VideoEmbeddingModelSpec, *, camera_key: str
     return canonical_digest(normalized_embedding_contract(model, camera_key=camera_key, result_key=result_key))
 
 
-def embedding_contract_digest_from_config(config: ResolvedMultimodalEmbeddingConfig) -> str:
+def embedding_contract_digest_from_config(config: ResolvedMultimodalEmbeddingConfig, *, camera_key: str) -> str:
     """Resolve the vector contract from one public config, ignoring selection and resources."""
     model = resolve_model(config.model.variant)
-    return embedding_contract_digest(model, camera_key=config.video.camera_key, result_key=config.output.result_key)
+    return embedding_contract_digest(model, camera_key=camera_key, result_key=config.result_key_for_camera(camera_key))
 
 
 def result_fields(result_key: str, *, model_key: str, digest: str) -> pa.Schema:

@@ -284,23 +284,19 @@ def prepare_fragment_update(
     """Write uncommitted caption column files and return their constrained descriptor."""
     source_metadata = fragment.metadata
     result = bindings.result
-    expected_modified = leaf_field_ids(dataset, (result.caption_field_name, result.metadata_field_name))
+    expected_modified = leaf_field_ids(dataset, tuple(result.fields.names))
     pending_fields = (
         *bindings.publication.protected_field_names,
-        result.caption_field_name,
-        result.metadata_field_name,
+        *result.fields.names,
     )
     pending_ids = leaf_field_ids(dataset, pending_fields)
     update_schema = pa.schema(
         [
             bindings.input.mapped_schema.field(bindings.input.row_id_column),
-            result.fields.field(result.caption_field_name),
-            result.fields.field(result.metadata_field_name),
+            *result.fields,
         ]
     )
-    update_table = staged.select(
-        [bindings.input.row_id_column, result.caption_field_name, result.metadata_field_name]
-    ).cast(update_schema)
+    update_table = staged.select([bindings.input.row_id_column, *result.fields.names]).cast(update_schema)
     reader = pa.RecordBatchReader.from_batches(update_schema, update_table.to_batches())
     updated_metadata, modified_field_ids = fragment.update_columns(
         reader,
@@ -412,7 +408,7 @@ def _publish_one_fragment(  # noqa: C901, PLR0913 -- reconciliation state is del
             descriptor,
             leaf_field_ids(
                 current,
-                (bindings.result.caption_field_name, bindings.result.metadata_field_name),
+                tuple(bindings.result.fields.names),
             ),
         )
         if not attempt.version <= descriptor.source_version <= int(current.version):
@@ -516,8 +512,7 @@ def _capture_fragment_guards(
         dataset,
         (
             *bindings.publication.protected_field_names,
-            bindings.result.caption_field_name,
-            bindings.result.metadata_field_name,
+            *bindings.result.fields.names,
         ),
     )
     guards: dict[int, AttemptFragmentGuard] = {}
@@ -565,6 +560,8 @@ def prepare_fragment_publication(
     current = lance.dataset(uri, storage_options=storage_options)
     assert_nullable_schema_extension(attempt_dataset.schema, current.schema)
     fragment = require_fragment(current, fragment_id)
+    if bindings.result.prepare_staged_rows is not None:
+        staged = bindings.result.prepare_staged_rows(staged, fragment)
     table = _validate_staged_group(staged, fragment, guard, bindings)
     staged_values_fingerprint = _caption_table_fingerprint(table, bindings)
 
@@ -602,7 +599,7 @@ def _prepared_publication_dataset(  # noqa: PLR0913 -- Ray plan inputs are indep
     staged = ray.data.read_parquet(
         list(files),
         filesystem=workspace.filesystem,
-        schema=bindings.result.staged_schema,
+        schema=bindings.result.staged_storage_schema or bindings.result.staged_schema,
         override_num_blocks=max(len(files), len(attempt.pending_fragment_ids)),
     )
     pending = staged.filter(expr=col("fragment_id").is_in(list(attempt.pending_fragment_ids)))
@@ -707,7 +704,7 @@ def _validate_parquet_schemas_distributed(
     bindings: CaptionRunBindings,
 ) -> None:
     """Validate result footers across Ray workers instead of serially on the driver."""
-    expected = bindings.result.staged_schema
+    expected = bindings.result.staged_storage_schema or bindings.result.staged_schema
     paths = ray.data.from_items(
         [{"path": path} for path in files],
         override_num_blocks=len(files),
@@ -977,9 +974,7 @@ def _find_publication_error(error: BaseException) -> PublicationError | None:
 def result_values_fingerprint(fragment: LanceFragment, bindings: CaptionRunBindings) -> str:
     """Hash canonical result values for one fragment using its recipe bindings."""
     result = bindings.result
-    table = fragment.to_table(
-        columns=[bindings.input.row_id_column, result.caption_field_name, result.metadata_field_name]
-    )
+    table = fragment.to_table(columns=[bindings.input.row_id_column, *result.fields.names])
     return _caption_table_fingerprint(table, bindings)
 
 
@@ -988,8 +983,7 @@ def _caption_table_fingerprint(table: pa.Table, bindings: CaptionRunBindings) ->
     schema = pa.schema(
         [
             bindings.input.mapped_schema.field(bindings.input.row_id_column),
-            result.fields.field(result.caption_field_name),
-            result.fields.field(result.metadata_field_name),
+            *result.fields,
         ]
     )
     normalized = table.select(schema.names).cast(schema)
@@ -1058,8 +1052,7 @@ def assert_pending_identity(
         dataset,
         (
             *bindings.publication.protected_field_names,
-            bindings.result.caption_field_name,
-            bindings.result.metadata_field_name,
+            *bindings.result.fields.names,
         ),
     )
     current = protected_binding_fingerprint(fragment.metadata, pending_ids)

@@ -15,6 +15,8 @@
 
 """Canonical episode validation and selected-camera projection for video vectors."""
 
+from collections import Counter
+
 import lance
 import pyarrow as pa
 from lance.fragment import LanceFragment
@@ -26,6 +28,7 @@ from cosmos_curator.next.recipes.multimodal_split.records import (
     RECORD_SCHEMA_VERSION,
     resolve_camera_media,
 )
+from cosmos_curator.next.utils.identity import canonical_digest
 
 _ROW_ADDRESS_FRAGMENT_SHIFT = 32
 _ROW_ADDRESS_OFFSET_MASK = (1 << _ROW_ADDRESS_FRAGMENT_SHIFT) - 1
@@ -62,6 +65,84 @@ EPISODE_STAGED_BINDING_COLUMNS = (
     "start_ns",
     "exclusive_end_ns",
 )
+EPISODE_PUBLICATION_SCHEMA = pa.schema(
+    [
+        EPISODE_MAPPED_INPUT_SCHEMA.field(name)
+        for name in (
+            "fragment_id",
+            "row_offset",
+            "episode_id",
+            "materialization_digest",
+            "start_ns",
+            "exclusive_end_ns",
+        )
+    ]
+)
+CAMERA_WORK_ID = "camera_work_id"
+CAMERA_MAPPED_INPUT_SCHEMA = pa.schema(
+    [*EPISODE_MAPPED_INPUT_SCHEMA, pa.field(CAMERA_WORK_ID, pa.string(), nullable=False)]
+)
+
+
+def validate_episode_cameras(  # noqa: C901 -- one scan checks identity, camera presence, durations, and media locations
+    dataset: lance.LanceDataset, *, uri: str, selection: list[str] | str
+) -> dict[str, str | None]:
+    """Validate all selected cameras in one scan and return their first S3 locations.
+
+    For ``all``, every episode must have the first episode's camera set. A later
+    additional camera would be missing from that first episode, so heterogeneous
+    sets can be rejected without another discovery or validation scan.
+    """
+    validate_episode_table(dataset, uri=uri)
+    _validate_episode_identity(dataset, uri=uri)
+    media_locations: dict[str, str | None] = dict.fromkeys(sorted(selection)) if selection != "all" else {}
+    first_episode_id: str | None = None
+    for batch in dataset.scanner(columns=list(EPISODE_SOURCE_COLUMNS)).to_batches():
+        for row in batch.to_pylist():
+            start_ns, end_ns = row["start_ns"], row["exclusive_end_ns"]
+            if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns <= start_ns:
+                msg = f"Episode {row['episode_id']!r} must have positive start_ns/exclusive_end_ns duration"
+                raise ValueError(msg)
+            camera_counts = Counter(str(camera["camera_key"]) for camera in row["camera_media"])
+            if first_episode_id is None:
+                first_episode_id = str(row["episode_id"])
+                if selection == "all":
+                    media_locations = dict.fromkeys(sorted(camera_counts))
+            elif selection == "all" and (added := camera_counts.keys() - media_locations.keys()):
+                msg = f"Episode {first_episode_id!r} has 0 camera descriptors for {min(added)!r}"
+                raise ValueError(msg)
+            for camera_key in media_locations:
+                if camera_counts[camera_key] != 1:
+                    msg = (
+                        f"Episode {row['episode_id']!r} has {camera_counts[camera_key]} camera descriptors "
+                        f"for {camera_key!r}"
+                    )
+                    raise ValueError(msg)
+            for camera in row["camera_media"]:
+                camera_key = str(camera["camera_key"])
+                if camera_key in media_locations and media_locations[camera_key] is None:
+                    location = str(camera["media_location"])
+                    if location.lower().startswith("s3://"):
+                        media_locations[camera_key] = location
+    if first_episode_id is not None and not media_locations:
+        msg = "No camera videos are available for the requested embedding selection"
+        raise ValueError(msg)
+    return media_locations
+
+
+def camera_work_id(episode_id: str, camera_key: str) -> str:
+    """Encode the stable episode/camera pair without delimiter collisions."""
+    return canonical_digest({"episode_id": episode_id, "camera_key": camera_key})
+
+
+def project_camera_work(batch: pa.Table, *, camera_keys: tuple[str, ...]) -> pa.Table:
+    """Expand lightweight episode rows before media fetching and checkpoint filtering."""
+    tables = []
+    for camera_key in camera_keys:
+        table = project_episode_camera(batch, camera_key=camera_key)
+        identities = [camera_work_id(value, camera_key) for value in table["episode_id"].to_pylist()]
+        tables.append(table.append_column(CAMERA_WORK_ID, pa.array(identities, type=pa.string())))
+    return pa.concat_tables(tables) if tables else pa.Table.from_batches([], schema=CAMERA_MAPPED_INPUT_SCHEMA)
 
 
 def _validate_episode_identity(dataset: lance.LanceDataset, *, uri: str) -> None:
@@ -107,24 +188,17 @@ def _validate_episode_identity(dataset: lance.LanceDataset, *, uri: str) -> None
         raise ValueError(msg)
 
 
-def validate_episode_input(dataset: lance.LanceDataset, *, uri: str, camera_key: str) -> str | None:
-    """Validate the canonical table and every selected camera before registration."""
-    validate_episode_table(dataset, uri=uri)
-    _validate_episode_identity(dataset, uri=uri)
-    representative_s3_uri: str | None = None
-    scanner = dataset.scanner(columns=list(EPISODE_SOURCE_COLUMNS))
-    for batch in scanner.to_batches():
-        for row in batch.to_pylist():
-            start_ns = row["start_ns"]
-            end_ns = row["exclusive_end_ns"]
-            if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns <= start_ns:
-                msg = f"Episode {row['episode_id']!r} must have positive start_ns/exclusive_end_ns duration"
-                raise ValueError(msg)
-            selected = resolve_camera_media(row, camera_key)
-            location = str(selected["media_location"])
-            if representative_s3_uri is None and location.lower().startswith("s3://"):
-                representative_s3_uri = location
-    return representative_s3_uri
+def project_episode_publication(batch: pa.Table) -> pa.Table:
+    """Project camera-independent episode identity for aggregate publication guards."""
+    addresses = batch["_rowaddr"].to_pylist()
+    return pa.Table.from_arrays(
+        [
+            pa.array([int(address) >> _ROW_ADDRESS_FRAGMENT_SHIFT for address in addresses], type=pa.int64()),
+            pa.array([int(address) & _ROW_ADDRESS_OFFSET_MASK for address in addresses], type=pa.int64()),
+            *[batch[name] for name in EPISODE_PUBLICATION_SCHEMA.names[2:]],
+        ],
+        schema=EPISODE_PUBLICATION_SCHEMA,
+    )
 
 
 def project_episode_camera(batch: pa.Table, *, camera_key: str) -> pa.Table:

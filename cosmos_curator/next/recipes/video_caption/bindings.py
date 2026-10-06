@@ -67,6 +67,9 @@ class CaptionResultBindings:
     validate_terminal_batch: TerminalBatchValidator | None = None
     reconcile_staged_rows: StagedRowReconciler | None = None
     fingerprint_result_values: ResultValueFingerprint | None = None
+    fragment_has_pending: Callable[[LanceFragment], bool] | None = None
+    staged_storage_schema: pa.Schema | None = None
+    prepare_staged_rows: Callable[[pa.Table, LanceFragment], pa.Table] | None = None
 
 
 @dataclass(frozen=True)

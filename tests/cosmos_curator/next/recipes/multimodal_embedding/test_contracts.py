@@ -41,6 +41,32 @@ from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     validate_terminal_batch,
     validate_terminal_row,
 )
+from cosmos_curator.next.recipes.result_keys import camera_result_key
+
+
+def test_camera_namespaces_are_bounded_and_distinct() -> None:
+    """Effective keys preserve the camera spelling used by multimodal caption tagging."""
+    assert camera_result_key("default", "front_wide") == "default_front_wide"
+    assert camera_result_key("default", "left_fisheye") == "default_left_fisheye"
+    assert camera_result_key("a" * 42, "front") == "a" * 42 + "_front"
+
+
+@pytest.mark.parametrize("camera", ["", "Front-Wide", "front wide", "front-wide", "rear/left", "x" * 41])
+def test_camera_namespaces_reject_unsafe_or_overlong_effective_keys(camera: str) -> None:
+    """Camera identities are never silently renamed, hashed, or truncated."""
+    with pytest.raises(ValueError, match="Invalid effective result key"):
+        camera_result_key("default", camera)
+
+
+def test_camera_contract_disambiguates_concatenated_namespaces() -> None:
+    """The exact spelling can coincide across base keys; the camera contract still differs."""
+    model = resolve_model("cosmos_embed1_336p")
+    first = camera_result_key("a_b", "c")
+    second = camera_result_key("a", "b_c")
+    assert first == second
+    assert embedding_contract_digest(model, camera_key="c", result_key=first) != embedding_contract_digest(
+        model, camera_key="b_c", result_key=second
+    )
 
 
 def _source() -> dict[str, object]:
@@ -130,7 +156,7 @@ def test_vector_contract_excludes_duration_and_retry_policy(tmp_path: Path) -> N
         "schema_version": 1,
         "kind": "multimodal-embedding",
         "input": {"episodes_lance_uri": str(tmp_path / "episodes.lance")},
-        "video": {"camera_key": "front_wide"},
+        "video": {"camera_keys": ["front_wide"]},
     }
     baseline = resolve_config_data(config_payload)
     adjusted = deepcopy(config_payload)
@@ -145,15 +171,15 @@ def test_vector_contract_excludes_duration_and_retry_policy(tmp_path: Path) -> N
         "decode_memory_gib": 8.0,
         "lance_read_batch_size": 32,
     }
-    assert embedding_contract_digest_from_config(baseline) == embedding_contract_digest_from_config(
-        resolve_config_data(adjusted)
-    )
+    assert embedding_contract_digest_from_config(
+        baseline, camera_key="front_wide"
+    ) == embedding_contract_digest_from_config(resolve_config_data(adjusted), camera_key="front_wide")
 
     changed_camera = deepcopy(config_payload)
-    changed_camera["video"] = {"camera_key": "front_left"}
-    assert embedding_contract_digest_from_config(baseline) != embedding_contract_digest_from_config(
-        resolve_config_data(changed_camera)
-    )
+    changed_camera["video"] = {"camera_keys": ["front_left"]}
+    assert embedding_contract_digest_from_config(
+        baseline, camera_key="front_wide"
+    ) != embedding_contract_digest_from_config(resolve_config_data(changed_camera), camera_key="front_left")
     contract = normalized_embedding_contract(
         resolve_model(baseline.model.variant), camera_key="front_wide", result_key="default"
     )

@@ -441,6 +441,12 @@ These consumer-owned results enrich existing episode rows without changing the b
 [captioning design](multimodal-av-captioning.md) owns their configuration, contract, provenance, publication, and
 recovery rules.
 
+`multimodal-embedding` independently reads selected camera MP4s from these same rows and adds a vector/metadata pair
+per camera. One run can select a camera list or `all`; the selected pending results become visible together in one
+Lance result update. Captions are not required for video embedding. The
+[embedding design](multimodal-av-video-embedding.md) owns its result and recovery contracts, and the
+[end-to-end guide](../guides/multimodal-av-e2e.md) connects the split, caption, and embedding examples.
+
 ## Configuration and boundaries
 
 Canonical publication does not bump the configuration schema. It is an unconditional completion step of version 1:

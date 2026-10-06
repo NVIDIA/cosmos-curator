@@ -16,8 +16,6 @@ from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBinding
 from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_table
 from cosmos_curator.next.utils.identity import canonical_digest
 
-_OWNED_FIELD_COUNT = 2
-
 
 class FragmentCaptionState(StrEnum):
     """The only two compatible states; every other shape raises."""
@@ -130,6 +128,8 @@ def classify_fragment(  # noqa: C901, PLR0912 -- shared per-row and batch valida
 ) -> FragmentCaptionState:
     """Return pending/complete or reject mixed, stale, and corrupt values."""
     result = bindings.result
+    if result.fragment_has_pending is not None:
+        return FragmentCaptionState.PENDING if result.fragment_has_pending(fragment) else FragmentCaptionState.COMPLETE
     saw_pending = False
     saw_complete = False
     result_columns = [result.caption_field_name, result.metadata_field_name]
@@ -252,10 +252,10 @@ def _leaf_ids(field: Any) -> set[int]:  # noqa: ANN401 -- pylance's LanceField i
 def _field_set_presence(dataset: lance.LanceDataset, bindings: CaptionRunBindings) -> str:
     result = bindings.result
     names = set(dataset.schema.names)
-    found = sum(name in names for name in (result.caption_field_name, result.metadata_field_name))
+    found = sum(name in names for name in result.fields.names)
     if found == 0:
         return "absent"
-    if found == _OWNED_FIELD_COUNT:
+    if found == len(result.fields):
         _assert_present_fields_match(dataset, bindings)
         return "present"
     return "partial"

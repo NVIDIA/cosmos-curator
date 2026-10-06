@@ -25,7 +25,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
-from cosmos_curator.next.recipes.result_keys import RESULT_KEY_PATTERN
+from cosmos_curator.next.recipes.result_keys import RESULT_KEY_PATTERN, camera_result_key
 from cosmos_curator.next.utils.uris import normalize_location
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
@@ -57,18 +57,28 @@ class MultimodalEmbeddingInputConfig(BaseModel):
 
 
 class VideoEmbeddingConfig(BaseModel):
-    """The one complete-camera MP4 represented by every result row."""
+    """Select a nonempty camera list, or discover all cameras from the input table."""
 
     model_config = _MODEL_CONFIG
 
-    camera_key: str = Field(min_length=1)
+    camera_keys: list[str] | Literal["all"] = "all"
 
-    @field_validator("camera_key")
+    @model_validator(mode="before")
     @classmethod
-    def _validate_camera_key(cls, value: str) -> str:
-        if value != value.strip():
-            msg = "video.camera_key cannot have surrounding whitespace"
-            raise ValueError(msg)
+    def _default_selection(cls, value: object) -> object:
+        return {} if value is None else value
+
+    @field_validator("camera_keys")
+    @classmethod
+    def _validate_camera_keys(cls, value: list[str] | Literal["all"]) -> list[str] | Literal["all"]:
+        if isinstance(value, list):
+            if not value or len(value) != len(set(value)):
+                msg = "video.camera_keys must be a nonempty list of distinct cameras or 'all'"
+                raise ValueError(msg)
+            if any(not key or key != key.strip() for key in value):
+                msg = "video.camera_keys cannot contain empty names or surrounding whitespace"
+                raise ValueError(msg)
+            return sorted(value)
         return value
 
 
@@ -86,6 +96,10 @@ class MultimodalEmbeddingOutputConfig(BaseModel):
     model_config = _MODEL_CONFIG
 
     result_key: str = Field(default="default", pattern=RESULT_KEY_PATTERN)
+    tag_camera_key: bool = Field(
+        default=True,
+        description="Append '_' and the exact camera key. Disabling tagging requires an explicit one-camera list.",
+    )
     staging_root_uri: str = ""
 
     @field_validator("staging_root_uri")
@@ -140,7 +154,7 @@ class ResolvedMultimodalEmbeddingConfig(BaseModel):
     schema_version: SchemaVersion
     kind: MultimodalEmbeddingKind
     input: MultimodalEmbeddingInputConfig
-    video: VideoEmbeddingConfig
+    video: VideoEmbeddingConfig = Field(default_factory=VideoEmbeddingConfig)
     model: MultimodalEmbeddingModelConfig = Field(default_factory=MultimodalEmbeddingModelConfig)
     output: MultimodalEmbeddingOutputConfig = Field(default_factory=MultimodalEmbeddingOutputConfig)
     selection: EmbeddingSelectionConfig = Field(default_factory=EmbeddingSelectionConfig)
@@ -149,9 +163,18 @@ class ResolvedMultimodalEmbeddingConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _derive_staging_root(cls, value: object) -> object:
+        """Resolve output defaults for mappings and typed nested config objects alike."""
         if not isinstance(value, Mapping):
             return value
         resolved = copy.deepcopy(dict(value))
+        for section, config_type in (
+            ("input", MultimodalEmbeddingInputConfig),
+            ("video", VideoEmbeddingConfig),
+            ("output", MultimodalEmbeddingOutputConfig),
+        ):
+            nested = resolved.get(section)
+            if isinstance(nested, config_type):
+                resolved[section] = nested.model_dump(exclude_unset=True)
         input_mapping = resolved.get("input")
         if not isinstance(input_mapping, Mapping):
             return resolved
@@ -167,12 +190,32 @@ class ResolvedMultimodalEmbeddingConfig(BaseModel):
         resolved["output"] = output
         return resolved
 
+    @model_validator(mode="after")
+    def _validate_result_namespace(self) -> "ResolvedMultimodalEmbeddingConfig":
+        if not self.output.tag_camera_key and (
+            not isinstance(self.video.camera_keys, list) or len(self.video.camera_keys) != 1
+        ):
+            msg = "output.tag_camera_key: false requires an explicit one-camera video.camera_keys list"
+            raise ValueError(msg)
+        if isinstance(self.video.camera_keys, list):
+            for camera_key in self.video.camera_keys:
+                self.result_key_for_camera(camera_key)
+        return self
+
+    def result_key_for_camera(self, camera_key: str) -> str:
+        """Derive the namespace from config and camera identity, never table history."""
+        return (
+            camera_result_key(self.output.result_key, camera_key)
+            if self.output.tag_camera_key
+            else self.output.result_key
+        )
+
 
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
     "kind": "multimodal-embedding",
     "input": {"episodes_lance_uri": "s3://example-bucket/curated/multimodal-split/episodes.lance"},
-    "video": {"camera_key": "front_wide"},
+    "video": {"camera_keys": "all"},
     "model": {"variant": "cosmos_embed1_336p"},
     "output": {"result_key": "default"},
     "selection": {"max_episode_duration_s": 60.0},
@@ -182,7 +225,12 @@ _TEMPLATE = ResolvedMultimodalEmbeddingConfig.model_validate(_TEMPLATE_BASE).mod
     mode="json", exclude_none=True, exclude={"output": {"staging_root_uri"}}
 )
 _TEMPLATE_PREAMBLE = """\
-# Embed one explicitly selected complete camera MP4 per canonical episode.
+# Embed every camera MP4 per canonical episode by default.
+# Set video.camera_keys: [front_wide, rear] to limit the selected views.
+# Select one camera with video.camera_keys: [front_wide].
+# tag_camera_key defaults to true: <base_result_key>_<exact_camera_key>.
+# Disable tagging only with an explicit one-camera list and a valid result_key.
+# Tagged result keys must match ^[a-z][a-z0-9_]{0,47}$; cameras are never renamed or truncated.
 # staging_root_uri defaults beside episodes.lance under staging/multimodal-embedding.
 # max_episode_duration_s decides which rows are eligible; it does not change eligible vector values.
 # A new maximum scopes staging; completed rows are reconsidered in the planned rewrite phase.
@@ -252,7 +300,7 @@ def config_template_payload() -> dict[str, Any]:
     """Return structured template metadata for the generic CLI."""
     return {
         "kind": "multimodal-embedding",
-        "description": "Embed one explicitly selected complete camera MP4 per canonical episode.",
+        "description": "Embed all camera MP4s per canonical episode, with optional camera selection.",
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-embedding"},
@@ -260,7 +308,6 @@ def config_template_payload() -> dict[str, Any]:
                 "path": "input.episodes_lance_uri",
                 "example": "s3://example-bucket/curated/multimodal-split/episodes.lance",
             },
-            {"path": "video.camera_key", "example": "front_wide"},
         ],
         "config": config_template(),
     }

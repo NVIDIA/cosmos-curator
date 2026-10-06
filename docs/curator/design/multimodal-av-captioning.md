@@ -7,6 +7,11 @@
 captioning selects one explicitly configured camera from each complete episode row and never rediscovers sessions or
 reassembles camera sets.
 
+The separate [`multimodal-embedding` recipe](multimodal-av-video-embedding.md) adds Cosmos-Embed1 video vectors to the
+same episode table for selected cameras or all cameras in one run. It reads camera MP4s directly, so caption results
+and Ego prompt context are not inputs to those vectors. See the
+[end-to-end guide](../guides/multimodal-av-e2e.md) for the combined workflow and example configs.
+
 Each invocation selects a model, context, prompt, and result identity. Model compatibility is the fixed product of
 three model bindings and three context modes, for nine supported execution combinations:
 

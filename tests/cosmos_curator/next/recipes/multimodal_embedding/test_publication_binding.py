@@ -21,8 +21,11 @@ from typing import Any
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
+    CameraEmbeddingPlan,
+    EmbeddingRunPlan,
     EmbeddingTerminalResult,
     build_terminal_result_row,
     embedding_contract_digest,
@@ -31,6 +34,7 @@ from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     result_fields,
     validate_terminal_row,
 )
+from cosmos_curator.next.recipes.multimodal_embedding.publication import publication_bindings
 from cosmos_curator.next.recipes.video_caption.bindings import (
     CaptionInputBindings,
     CaptionPublicationBindings,
@@ -39,6 +43,71 @@ from cosmos_curator.next.recipes.video_caption.bindings import (
 )
 from cosmos_curator.next.recipes.video_caption.lance_state import FragmentCaptionState, classify_fragment
 from cosmos_curator.next.recipes.video_caption.publication import commit_prepared_update, prepare_fragment_update
+from cosmos_curator.next.utils.identity import canonical_digest
+
+
+def test_explicit_run_plan_preserves_identity_and_validates_every_camera(tmp_path: Path) -> None:
+    """Aggregate guards have episode identity and cannot silently validate only their workspace anchor."""
+    model = resolve_model("cosmos_embed1_336p")
+    cameras = tuple(
+        CameraEmbeddingPlan.resolve(model, camera_key=key, result_key=f"default_{key}")
+        for key in ("rear", "front_wide")
+    )
+    uri = str(tmp_path / "episodes.lance")
+    plan = EmbeddingRunPlan(uri, "default", model, cameras, {0: ("rear",)})
+    assert plan.digest == canonical_digest(
+        {"multi_camera_version": 1, "cameras": {camera.camera_key: camera.digest for camera in cameras}}
+    )
+    reordered = EmbeddingRunPlan(uri, "default", model, tuple(reversed(cameras)), {})
+    assert reordered.digest == plan.digest
+    assert reordered.workspace_field == plan.workspace_field
+    assert plan.fields.names == [name for camera in plan.cameras for name in camera.fields.names]
+    bindings = publication_bindings(plan)
+    assert not {"camera_key", "media_location", "media_sha256"} & set(bindings.input.mapped_schema.names)
+    with pytest.raises(TypeError, match="requires per-camera terminal rows"):
+        bindings.result.validate_terminal_value(None, None)
+    row = {}
+    for camera in cameras:
+        source = {
+            "episode_id": "episode-1",
+            "materialization_digest": "materialization",
+            "camera_key": camera.camera_key,
+            "media_sha256": "a" * 64,
+            "start_ns": 0,
+            "exclusive_end_ns": 1_000_000_000,
+        }
+        row.update(
+            build_terminal_result_row(
+                source,
+                model=model,
+                result_key=camera.result_key,
+                digest=camera.digest,
+                result=EmbeddingTerminalResult(
+                    status="success",
+                    vector=np.eye(1, model.vector_dimension, dtype=np.float32)[0],
+                    max_episode_duration_s=60.0,
+                    error_code=None,
+                    error_message=None,
+                ),
+            )
+        )
+    batch = pa.Table.from_pylist([row], schema=plan.fields)
+    assert bindings.result.validate_terminal_batch is not None
+    bindings.result.validate_terminal_batch(batch)
+    rear = next(camera for camera in cameras if camera.camera_key == "rear")
+    row[rear.metadata_field]["contract_digest"] = "wrong-rear-contract"
+    with pytest.raises(ValueError, match="contract_digest"):
+        bindings.result.validate_terminal_batch(pa.Table.from_pylist([row], schema=plan.fields))
+
+
+def test_run_plan_rejects_colliding_camera_fields(tmp_path: Path) -> None:
+    """An aggregate plan cannot accidentally give two cameras the same namespace."""
+    model = resolve_model("cosmos_embed1_336p")
+    cameras = tuple(
+        CameraEmbeddingPlan.resolve(model, camera_key=key, result_key="default") for key in ("front", "rear")
+    )
+    with pytest.raises(ValueError, match="overlapping embedding fields"):
+        EmbeddingRunPlan(str(tmp_path / "episodes.lance"), "default", model, cameras, {})
 
 
 def test_fixed_size_vector_passes_through_fragment_update_and_classification(tmp_path: Path) -> None:

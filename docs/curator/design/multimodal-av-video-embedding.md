@@ -20,8 +20,9 @@ limitations under the License.
 ## Summary
 
 `multimodal-embedding` reads canonical `episodes.lance` rows from
-[`multimodal-split`](multimodal-av-episode-publication.md). It embeds one configured camera MP4 per episode and writes
-the result to the same Lance table. `episode_id` is the stable work identity. Cosmos-Embed1 is supported at 224p,
+[`multimodal-split`](multimodal-av-episode-publication.md). It embeds selected camera MP4s per episode and writes
+the results to the same Lance table. Every run checkpoints an unambiguous work identity derived from
+`(episode_id, camera_key)`, including runs selecting one camera. Cosmos-Embed1 is supported at 224p,
 336p (default), and 448p. Stage the selected model assets under `/config/models` on the driver and all nodes that
 may run recipe actors. GPU inference needs checkpoint weights; CPU preparation needs checkpoint processor files.
 Preflight checks that weights are present and that model and processor config values (frames, resolution, dimension)
@@ -29,16 +30,86 @@ match the pinned contract; it does not verify artifact revision. The model and p
 identify the intended contract, not an independently verified revision of the staged files. A shared model-cache mount
 can make the assets available to both CPU and GPU workers.
 
+## Camera selection
+
+Embed all cameras by default. Omitting `video`, leaving it empty, or leaving both selectors unset resolves to
+`video.camera_keys: all`. Limit a run to selected views with:
+
+```yaml
+video:
+  camera_keys: [front_wide, left_fisheye]
+```
+
+The generated template makes the default explicit:
+
+```yaml
+video:
+  camera_keys: all
+```
+
+Select one camera with `video.camera_keys: [front_wide]`. Lists must be nonempty with distinct names and resolve
+in deterministic order. `all` discovers the camera names from the input table and resolves to a list before execution;
+every selected camera must be present in every episode. Missing cameras and heterogeneous camera sets fail preflight.
+
+Each selected camera gets its own vector and metadata fields. `output.tag_camera_key` defaults to `true` and uses the
+exact camera-tagging rule from multimodal captioning: `<base_result_key>_<camera_key>`. For base `default`, camera
+`front_wide` publishes
+`embedding_video_default_front_wide_ce1_336p_v1`, and `left_fisheye` publishes
+`embedding_video_default_left_fisheye_ce1_336p_v1`. The config retains `output.result_key: default`;
+metadata and field contracts use the effective key. Rendering and reloading a config does not append a second suffix.
+
+Effective keys must match `^[a-z][a-z0-9_]{0,47}$`. Camera names are never renamed, hashed, or truncated.
+Invalid or overlong tagged keys fail before output registration; use a shorter base key, or select exactly one camera
+and set `output.tag_camera_key: false` with an explicit valid `output.result_key`. Disabling tagging uses the base key
+unchanged, matching captioning's naming opt-out. Multi-camera lists and `all` require tagging to prevent collisions.
+Namespaces depend only on the configuration and camera identity, never on which fields are already registered.
+The scalar `video.camera_key` option is not supported. There is no fallback to earlier untagged embedding fields and
+no migration of episode-only staging/checkpoints; all selections use episode/camera work identities.
+
+The run summary reports the base key, effective keys, and field names for each camera. Adding another camera computes
+only its missing results; list order and execution tuning do not change individual camera contracts.
+One-camera lists and larger selections share the same execution, staging, and publication path.
+
+Internally, each `CameraEmbeddingPlan` owns its camera identity, effective key, fields, and contract digest.
+An `EmbeddingRunPlan` collects those plans and the shared episode publication state. Publication builds a narrow
+adapter for the existing Lance guard helpers explicitly; it does not inherit a first camera's state or callbacks.
+Aggregate guards project episode identity only, while each camera's staged media bindings are validated separately.
+The deterministic workspace field anchor and contract digests are preserved across this internal representation change.
+
+An empty table does no media, staging, Ray, or model work. Explicit-list selectors still register missing output fields,
+which can create new Lance versions. With `all`, no output fields are registered; the table stays unchanged and the
+summary contains no cameras.
+
+See [the multi-camera embedding example](../../../examples/multimodal-multicamera-embedding.yaml) for the
+`front_wide`/`left_fisheye` selection used by the caption examples and
+[end-to-end guide](../guides/multimodal-av-e2e.md#embed-selected-cameras-together).
+
+One pipeline batches videos from different cameras through shared model actors. Inference batch size counts videos,
+not episodes. Durable camera rows are validated and assembled into episode rows before one atomic result commit across
+all selected cameras and fragments. Already completed camera columns are carried through unchanged. Restart under the
+same selection reuses camera checkpoints; unpublished staging for a different selection is isolated by its workspace
+contract. Published camera results remain reusable across selections. Use one active writer per selected result-field set.
+Runs for disjoint camera fields and unrelated caption updates can share the table: publication rebuilds stale descriptors
+from durable staging and preserves those unrelated changes. A competing write to any selected embedding field is
+rejected, even if it contains identical vectors; this recipe does not adopt a live competing writer's results or take
+an execution lock. A rerun after that writer finishes captures a fresh snapshot and reuses its completed results.
+Only this run's publication receipt, together with matching canonical values, reconciles its own ambiguous commit.
+Any pending results still become visible in one atomic update without repeating completed inference.
+If another selection publishes a camera while a run is interrupted, recovery validates the old staged row's source
+binding and the canonical terminal result, then carries the published result through unchanged. Staged cameras outside
+the run's selection or rows with changed episode/media bindings remain errors.
+
 ## Result contract and eligibility
 
 The recipe writes a nullable fixed-size float32 vector field and a metadata sibling. The selected camera key, model
 and processor revisions, frame sampling rule, vector shape, and metadata schema determine the result contract. Both
 fields carry its digest, so an existing result key cannot be reused with an incompatible contract.
 
-Vector fields are named `embedding_video_{result_key}_{model_field_key}_v1`, with a `_metadata` sibling. The model
-field key is `ce1_224p`, `ce1_336p`, or `ce1_448p`. Field names omit the camera; camera identity is recorded in metadata
-and protected by the contract digest. Separate runs for different cameras with the same model must use distinct
-`output.result_key` values. Reusing the same key for another camera is refused before inference.
+Vector fields are named `embedding_video_{effective_result_key}_{model_field_key}_v1`, with a `_metadata` sibling.
+The model field key is `ce1_224p`, `ce1_336p`, or `ce1_448p`. Camera-tagged effective keys distinguish selected views;
+camera identity is also recorded in metadata and protected by the contract digest. All camera selections use these
+fields by default. An explicit one-camera list with tagging disabled uses the base key, while retaining the same
+camera provenance, contract checks, and recovery path.
 
 All variants take eight endpoint-inclusive frames selected with `np.linspace(0, frame_count - 1, 8, dtype=np.int64)`
 in decoded presentation order, matching the Cosmos model-card example.
@@ -86,13 +157,13 @@ The recipe currently accepts local paths and `s3://` locations. Backend status i
   filesystem or shared mount used in a deployment.
 - **Custom S3-compatible endpoints:** require confirmation that the deployed service, bucket configuration, and
   any intervening gateway enforce the conditional-write operation used by Lance. S3 API compatibility alone does
-  not establish this guarantee; these endpoints have not been qualified by this MR.
+  not establish this guarantee; these endpoints have not been qualified for this recipe's atomic publication.
 - **Shared filesystem mounts, including NFS:** require deployment-specific verification of atomic manifest creation
   and read visibility across writers. A local-looking path is not evidence of these guarantees; these mounts have
-  not been qualified by this MR.
+  not been qualified for this recipe's atomic publication.
 
-No named production `execution.storage_profile` is qualified by this MR. Profiles select credentials and connection
-settings; names such as `default` do not identify verified storage capabilities. These are deployment requirements;
+No named production `execution.storage_profile` is qualified for this recipe's atomic publication. Profiles select
+credentials and connection settings; names such as `default` do not identify verified storage capabilities. These are deployment requirements;
 the recipe does not probe or enforce them during preflight. Azure and GCS URI schemes are not accepted by this
 recipe's current location configuration.
 
@@ -164,13 +235,16 @@ media files. They reserve `execution.decode_cpus`
 scheduling reservation, not a hard limit. PyAV decoder and Torch preprocessing threads are each limited to
 `decode_cpus` on every actor incarnation, including the fallback frame-count pass. CPU preparation emits only a compact tensor and releases the MP4 payload;
 GPU actors batch eligible tensors without holding IO slots. Neither MP4 bytes nor prepared tensors are durable
-checkpoint outputs; the final result rows retain the existing episode-level checkpoint and publication contract.
+checkpoint outputs; the final result rows are checkpointed by episode/camera identity before atomic publication.
 
 Before downloading, projected episode metadata is repartitioned into blocks of at most
 `execution.lance_read_batch_size` rows. This exposes large Lance fragments as multiple work blocks without
 partitioning downloaded MP4 payloads. Episode IDs and physical row addresses are preserved for checkpointing and publication.
 
 All three actor pools can use workers that join after the run starts. Download and CPU preparation pools autoscale
+using Ray's normal controls. The shared `configure_download_actor_autoscaling` callback releases surplus pending
+download actors when ready actors have spare capacity, allowing idle actors to scale down and release their IO slots.
+The callback targets only pools reserving `curator_io`. Both download and preparation scale
 without a fixed maximum derived from startup resources. `execution.media_concurrency` and
 `execution.decode_concurrency` default to `auto`; a positive integer caps the corresponding actor pool to limit
 storage traffic or preparation memory demand. The GPU pool ceiling is the pending row count for
