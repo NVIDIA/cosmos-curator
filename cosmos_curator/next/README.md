@@ -1,19 +1,18 @@
 # Curator Next
 
-`cosmos_curator.next` is the temporary incubation namespace for the Cosmos Curator Next programming model.
+Curator Next is the starting point for new physical AI data curation workflows. It combines
+maintained reference recipes with a shared toolkit, using Ray Data for execution and Lance for canonical tabular outputs.
 
-New Curator Next components and reference recipes develop here without committing to their eventual public package
-layout. Existing code, including current Ray Data work, moves here only through explicit transition work. The underlying
-execution, storage, and model ecosystems remain visible rather than being hidden behind a Curator-specific runtime.
+Explore the [recipes](recipes/) and use `cosmos-curator pipeline --help` for config tooling. The
+[pipeline kind registry](../pipelines/builtin_pipeline_kinds.py) lists the recipes exposed through the generic CLI,
+alongside explicitly marked legacy entries.
 
-The package layout and import paths are provisional. Once components are proven across multiple workflows, they graduate
-into namespaces named for durable responsibilities through an explicit transition plan.
-
-Existing pipelines remain available during the transition. The Xenna stage model is not the Curator Next programming
-model.
+`cosmos_curator.next` is an incubation namespace: schemas, identities, configs, and import paths can change without a
+backward-compatibility guarantee. Once components are proven across workflows, they graduate into namespaces named for
+durable responsibilities through an explicit transition plan.
 
 Coding agents and contributors starting a new recipe should first read the
-[Curator Next agent guidelines](AGENTS.md). They capture the current recipe-first working agreement, implementation
-constraints, and managed-Ray qualification criteria while the longer-term design remains in flux.
+[Curator Next agent guidelines](AGENTS.md). They cover shared component adoption, recipe contracts, and managed Ray
+qualification criteria.
 
 See [Cosmos Curator Next](../../docs/curator/design/curator-next.md) for the design direction.

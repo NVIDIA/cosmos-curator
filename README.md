@@ -6,7 +6,7 @@
 
 # Cosmos Curator
 
-A powerful video curation system that processes, analyzes, and organizes video content using advanced AI models and distributed computing.
+A toolkit for curating physical AI training data.
 
 ## Important
 
@@ -15,16 +15,19 @@ We updated the URL for `cosmos-xenna` submodule on 08/04/2025.
 
 ## Overview
 
-Cosmos Curator is a comprehensive solution for video processing and curation using state-of-the-art AI models,
-which powers the training data generation for [Cosmos](https://www.nvidia.com/en-us/ai/cosmos/) at NVIDIA.
-It is built on top of a framework optimized for GPU-accelerated streaming pipeline,
-which is now open-sourced independently as [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna).
+Cosmos Curator helps teams build physical AI data curation workflows from reusable components and reference recipes.
+It supports training data preparation for [Cosmos](https://www.nvidia.com/en-us/ai/cosmos/) at NVIDIA.
+
+Start new workflows with [Curator Next](cosmos_curator/next/README.md), which combines Ray Data recipes, shared curation
+components, and Lance datasets. Its APIs and data contracts are evolving during incubation. Existing Xenna and legacy
+Ray Data pipelines remain available while their workflows transition to Next; the goal is to retire both implementations
+after that transition.
 
 ## Features
 
 - **Video Processing**: Efficient video splitting, annotation, filtering, deduplication, and dataset generation
 - **AI-Powered Analysis**: Advanced video analysis using multiple model families
-- **Distributed Computing**: Scalable processing using [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna) built on top of [Ray](https://www.anyscale.com/product/open-source/ray)
+- **Distributed Computing**: Scalable processing with Ray Data; existing pipelines also use [Cosmos-Xenna](https://github.com/nvidia-cosmos/cosmos-xenna)
 - **Cloud Integration**: Support for various platforms
 - **Pipeline System**: Modular and extensible pipeline architecture
 
@@ -33,6 +36,8 @@ which is now open-sourced independently as [Cosmos-Xenna](https://github.com/nvi
 Comprehensive documentation is available under [docs/](docs/README.md) directory.
 
 ### User Documentation
+
+- [Curator Next](cosmos_curator/next/README.md) - start new workflows with reference recipes and shared components
 - [End User Guide](docs/client/end-user-guide.md) - instructions to setup environment and run data pipelines
 - [Reference Video Pipelines Guide](docs/curator/reference/video-pipelines.md) - details for general and multi-camera video processing pipelines
 - [NVCF Guide](docs/client/nvcf-guide.md) - deployment instruction on [Nvidia Cloud Functions](https://docs.nvidia.com/cloud-functions/user-guide/latest/cloud-function/overview.html)
@@ -40,7 +45,7 @@ Comprehensive documentation is available under [docs/](docs/README.md) directory
 ### Developer Documentation
 - [Developer Guide](docs/developer-guide.md) - information for contributors
 - [Architecture Guide](docs/curator/reference/architecture.md) - diagrams and description to help understand core architecture
-- [Pipeline Design Guide](docs/curator/guides/pipeline-design.md) - detailed walk-through of the hello-world pipeline and performance optimization points
+- [Xenna Pipeline Design Guide](docs/curator/guides/pipeline-design.md) - maintain existing Xenna pipelines, with a hello-world example and performance guidance
 - [Observability Guide](docs/curator/guides/observability.md) - instructions to setup and understand monitoring dashboard
 
 ### AI Agent Context Files
@@ -48,33 +53,36 @@ Comprehensive documentation is available under [docs/](docs/README.md) directory
 
 ## Directory Structure
 
-```bash
+Key directories:
+
+```text
 cosmos-curator/
 ├── cosmos_curator/         # Curator implementation
-│   ├── client              # CLI to run locally
-│       ├── image_cli       # Docker image management
-│       ├── local_cli       # Launch pipelines by running local container
-│       ├── nvcf_cli        # Launch pipelines on NVIDIA cloud function
-│       ├── slurm_cli       # Launch pipelines on Slurm cluster
-│       ├── utils           # Common utilities for various CLI apps
-│   ├── core/               # Core functionality
-│       ├── cf              # Service entry point for a cloud function deployment
-│       ├── interfaces      # Core base class to integrate model and define new pipelines
-│       ├── managers        # CLIs to run inside the container to manage models, databases, etc.
-│       ├── utils           # Common utilities for pipelines
-│   ├── models/             # AI model inference implementations
-│   ├── pipelines/          # Pipeline implementations
-│       ├── examples/       # Minimal example pipelines to help understand the framework
-│       ├── video/          # Reference pipelines for video curation
-│   ├── scripts/            # Startup scripts in various deployment environments
-├── cosmos-xenna            # Git submodule for https://github.com/nvidia-cosmos/cosmos-xenna
-├── packages                # Dockerfiles and scripts related to packaging
-│   ├── cosmos_curator       # Dockerfile template and Pixi environment post-install scripts
-├── tests                   # Tests for testing
-│   ├── cosmos_curator
-│       ├── pipelines       # Tests for models and pipeline stages for cosmos_curator
-│       ├── client          # Tests for client CLIs
-├── examples                # Example configuration files and scripts
+│   ├── next/               # Starting point for new curation workflows
+│   │   ├── recipes/        # Reference recipes
+│   │   ├── core/           # Shared config, registration, and Ray execution support
+│   │   ├── embeddings/     # Shared embedding components and schemas
+│   │   ├── media/          # Shared media processing
+│   │   └── utils/          # Shared storage, identity, and publication utilities
+│   ├── client/             # Deployment CLIs and pipeline config tooling
+│   ├── core/               # Interfaces, managers, and common utilities
+│   │   └── sensors/        # Self-contained sensor library
+│   ├── models/             # Model inference implementations
+│   ├── configs/            # Model artifact registry
+│   ├── pipelines/          # Existing pipelines and shared pipeline CLI runtime
+│   │   ├── image/          # Existing Xenna image pipelines
+│   │   ├── video/          # Existing Xenna video pipelines
+│   │   └── ray_data/       # Deprecated Ray Data pipelines
+│   └── scripts/            # Deployment startup scripts
+├── tests/                  # Unit, integration, and GPU tests mirroring source paths
+├── docs/                   # Guides, references, and design notes
+├── examples/               # Example configs and scripts
+├── package/                # Dockerfile templates and image setup scripts
+├── distributable/          # Generated Pixi manifest and lockfile for redistributable images
+├── charts/                 # Kubernetes Helm charts
+├── benchmarks/             # Performance benchmarks and analysis
+├── tools/                  # Repository maintenance tools
+└── cosmos-xenna/           # Git submodule supporting existing Xenna pipelines
 ```
 
 Note: To initialize and update the `cosmos-xenna` submodule, run:

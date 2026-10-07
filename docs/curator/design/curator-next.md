@@ -117,8 +117,9 @@ recipe benchmarks.
 `cosmos_curator.next` is the temporary incubation namespace for the Curator Next programming model. It isolates new work
 during the transition; it is not a commitment to the long-term public package layout or stable import paths.
 
-New Curator Next components and reference recipes develop here. Existing code, including current Ray Data work, moves
-here only through explicit transition work. Code and tests define current behavior during incubation.
+Start new curation workflows, components, and reference recipes here. The goal is to converge on maintained Next recipes
+and a shared toolkit, then remove Xenna and the legacy Ray Data pipelines as their workflows transition. Existing code
+moves here only through explicit transition work. Code and tests define current behavior during incubation.
 
 Incubation carries two assumptions that shape day-to-day decisions:
 
@@ -131,10 +132,10 @@ Incubation carries two assumptions that shape day-to-day decisions:
   import paths change when a better answer appears; rerunning is preferred to writing a migration. This is what makes it
   cheap to correct a design early, and it stops being true at graduation.
 
-Because recipes are maintained starting points rather than independent products, they are expected to converge. The
-first recipe to settle a shared concern — execution shape, publication protocol, failure accounting — establishes the
-pattern, and later recipes adopt it rather than inventing a second one. Recipes may well be developed in parallel;
-divergence between them is a signal that the pattern belongs in the shared toolkit, not that each recipe needs its own.
+Current workstreams include video, robot action, and AV/multimodal. They intentionally developed independently, accepting
+some duplication while learning their contracts. These groupings can change as recipes and requirements evolve.
+The current phase extracts shared components and reconciles accidental implementation differences, retaining differences
+justified by data contracts or measured performance. Recipes adopt shared contracts through explicit migration work.
 
 Once components are proven across multiple workflows, they graduate into namespaces named for durable responsibilities.
 Graduation includes an explicit transition plan for code and users.

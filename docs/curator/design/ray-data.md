@@ -142,9 +142,9 @@ optimization to unlock.
 
 ## Building Ray Data Pipelines
 
-New Ray Data pipelines are built one at a time, starting with simple examples and progressing to production workloads.
-For pipelines that already have a Xenna implementation, the Ray Data version can be validated against it. Where Ray
-Data proves to be the better fit, it may replace the Xenna version; where Xenna works better, it stays.
+Start new Ray Data workflows in [Curator Next](curator-next.md), building small working recipes before scaling them.
+Existing Xenna implementations can serve as comparison references during explicit transition work. The goal is to
+converge on Next recipes and shared components, then retire Xenna and the legacy `pipelines.ray_data` implementations.
 
 ### Large source downloads and `curator_io`
 
