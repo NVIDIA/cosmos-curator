@@ -37,7 +37,10 @@ from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, wri
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
-from cosmos_curator.next.recipes.multimodal_split.gps_streams import GpsClipWriter
+from cosmos_curator.next.recipes.multimodal_split.gps_streams import (
+    GpsClipWriter,
+    _describe_mismatch,
+)
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans, sampling_grid_ns
 from cosmos_curator.next.recipes.multimodal_split.plan import MCAP_PLAN, PLANNING_RESULT_SCHEMA, span_planner
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri, sensor_error_uri
@@ -1814,6 +1817,28 @@ def test_an_unreadable_gps_source_fails_every_span_and_says_so(
     assert all(outcome["media_location"] is None for outcome in outcomes)
     report = json.loads(Path(sensor_error_uri(config.output.path, "session-000", "gps")).read_bytes())
     assert report["failures"][0]["stage"] == "open_sensor"
+
+
+@pytest.mark.parametrize(
+    "actual_label", [FieldDescriptor.LABEL_OPTIONAL, FieldDescriptor.LABEL_REQUIRED, FieldDescriptor.LABEL_REPEATED]
+)
+@pytest.mark.parametrize(
+    "expected_label", [FieldDescriptor.LABEL_OPTIONAL, FieldDescriptor.LABEL_REQUIRED, FieldDescriptor.LABEL_REPEATED]
+)
+def test_schema_validation_distinguishes_every_field_label(actual_label: int, expected_label: int) -> None:
+    """Required singular fields must not be mistaken for optional singular fields."""
+    schema = descriptor_pb2.FileDescriptorProto(name="labels.proto", syntax="proto2")
+    message = schema.message_type.add(name="Fix")
+    message.field.add(name="latitude", number=1, type=FieldDescriptor.TYPE_DOUBLE, label=actual_label)
+    descriptor = descriptor_pool.DescriptorPool().Add(schema).message_types_by_name["Fix"]
+
+    reason = _describe_mismatch(descriptor, ("latitude", FieldDescriptor.TYPE_DOUBLE, expected_label, ()))
+
+    if actual_label == expected_label:
+        assert reason is None
+    else:
+        cardinality = "repeated" if expected_label == FieldDescriptor.LABEL_REPEATED else "singular"
+        assert reason == f"has latitude where a {cardinality} one is needed"
 
 
 def test_a_source_message_without_the_fields_gps_rows_need_is_refused_once(

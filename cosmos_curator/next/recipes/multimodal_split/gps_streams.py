@@ -78,7 +78,13 @@ def _describe_mismatch(descriptor: Descriptor, required: tuple[str, int, int, tu
         return f"carries no {name} field"
     if field.type != field_type:
         return f"has {name} as type {field.type}, which cannot hold what a row needs"
-    if field.label != label:
+    if field.is_repeated:
+        actual_label = FieldDescriptor.LABEL_REPEATED
+    elif field.is_required:
+        actual_label = FieldDescriptor.LABEL_REQUIRED
+    else:
+        actual_label = FieldDescriptor.LABEL_OPTIONAL
+    if actual_label != label:
         plural = "repeated" if label == FieldDescriptor.LABEL_REPEATED else "singular"
         return f"has {name} where a {plural} one is needed"
     missing = [child for child in children if child not in field.message_type.fields_by_name]
