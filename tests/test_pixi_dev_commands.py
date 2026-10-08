@@ -181,6 +181,7 @@ def test_dev_environment_declares_linux_cpu_test_tooling() -> None:
         "tracing",
         "profiling",
         "dev",
+        "sensors",
     ]
     assert "runtime" not in pixi_config["environments"]["dev"]
 
@@ -237,6 +238,7 @@ def test_runtime_features_are_separated_from_core() -> None:
         "transformers",
         "tracing",
         "profiling",
+        "sensors",
     ]
 
 

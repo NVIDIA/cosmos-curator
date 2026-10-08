@@ -190,6 +190,9 @@ module = [
     "google.protobuf.*",
     "foxglove_schemas_protobuf",
     "foxglove_schemas_protobuf.*",
+    "hydra4",
+    "hydra4.*",
+    "pypcd4",
 ]
 ignore_missing_imports = true
 

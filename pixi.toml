@@ -346,12 +346,16 @@ memray = ">=1.14"
 kernels = "==0.14.1"
 transformers = ">=5.6.0,<6.0.0"
 
+[feature.sensors.pypi-dependencies]
+hydra4 = "==0.2.0" # Hesai Pandar UDP decoder; alpha upstream, pin exactly
+pypcd4 = "*" # direct import in hesai_lidar_parser; declare, don't inherit
+
 [environments]
 tools = ["tools"]
 cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
-default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
-dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev"]
+default = ["core", "runtime", "media", "transformers", "tracing", "profiling", "sensors"]
+dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev", "sensors"]
 legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]

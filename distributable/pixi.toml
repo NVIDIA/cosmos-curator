@@ -231,9 +231,13 @@ memray = ">=1.14"
 kernels = "==0.14.1"
 transformers = ">=5.6.0,<6.0.0"
 
+[feature.sensors.pypi-dependencies]
+hydra4 = "==0.2.0"
+pypcd4 = "*"
+
 [environments]
 cuml = ["core", "cuml", "tracing"]
-default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
+default = ["core", "runtime", "media", "transformers", "tracing", "profiling", "sensors"]
 legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
