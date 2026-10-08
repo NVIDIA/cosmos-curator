@@ -55,7 +55,8 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 import attrs
@@ -77,8 +78,10 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
 from prometheus_client.parser import text_string_to_metric_families
 
+from cosmos_curator.core.utils.environment import OTLP_METRICS_PUSH_INTERVAL_ENV_VAR, env_int
 from cosmos_curator.core.utils.infra.run_attributes import (
     collect_run_attributes,
+    otlp_run_attributes_enabled,
     set_otlp_run_attributes_enabled,
     short_host_label,
 )
@@ -93,6 +96,9 @@ _ENV_OTLP_METRICS_ENDPOINT = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
 # used by the tracing backend; kept in sync so traces and metrics
 # share a service.name in the backend.
 _ENV_SERVICE_NAME = "OTEL_SERVICE_NAME"
+
+# Env override for the drop regex used by otlp_push_scope; "" disables filtering.
+_ENV_DROP_REGEX = "COSMOS_CURATOR_OTLP_METRICS_PUSH_DROP_REGEX"
 
 # Default scrape interval and per-node HTTP timeout (seconds).
 DEFAULT_INTERVAL_SECONDS = 30
@@ -132,6 +138,7 @@ def _log_otlp_push_failure(*, failures: int, detail: str) -> None:
 # backends interpret a moving ``start_time_unix_nano`` as a counter
 # reset).
 SeriesStartTimeFn = Callable[[str, tuple[tuple[str, str], ...]], int]
+
 
 # PUSH-SIDE drop list applied by the driver-side metrics scraper
 # (this module) before handing metrics to the OTLP exporter.
@@ -1163,7 +1170,7 @@ def enable_metrics_push(
     config: MetricsPushConfig,
     *,
     cli_otlp_endpoint: str = "",
-) -> None:
+) -> bool:
     """Start the driver-side metrics scraper.
 
     Args:
@@ -1174,6 +1181,11 @@ def enable_metrics_push(
             We intentionally do not overwrite the generic
             ``OTEL_EXPORTER_OTLP_ENDPOINT`` here because tracing may
             have already pinned a different endpoint.
+
+    Returns:
+        True only when this call started a backend; False when it was a
+        no-op (disabled, no endpoint, a backend already active, or start
+        failed).
 
     Note:
         No-op when ``config.enabled`` is ``False`` or the resolved OTLP
@@ -1203,7 +1215,7 @@ def enable_metrics_push(
     resolved = config.resolved(cli_otlp_endpoint=cli_otlp_endpoint)
 
     if not resolved.enabled:
-        return
+        return False
 
     if not resolved.otlp_endpoint:
         logger.info(
@@ -1211,17 +1223,19 @@ def enable_metrics_push(
             "endpoint resolved (set --otlp-metrics-push-endpoint or "
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT/OTEL_EXPORTER_OTLP_ENDPOINT)",
         )
-        return
+        return False
 
     # Re-entrancy guard.  enable_metrics_push() must be idempotent
     # because profiling_scope() and some test fixtures may call it
     # more than once on the driver.
     with _backend_lock:
         if _current_backend is not None:
-            return
+            return False
         backend = MetricsPushBackend(resolved)
-        if backend.start():
-            _current_backend = backend
+        if not backend.start():
+            return False
+        _current_backend = backend
+        return True
 
 
 def disable_metrics_push(join_timeout: float = 5.0) -> None:
@@ -1253,6 +1267,46 @@ def flush_metrics_push() -> None:
     backend.flush()
 
 
+@contextmanager
+def otlp_push_scope() -> Iterator[None]:
+    """Run a pipeline under the env-driven driver-side OTLP metrics push.
+
+    Interval and drop list come from ``COSMOS_CURATOR_OTLP_METRICS_PUSH_INTERVAL``
+    and ``COSMOS_CURATOR_OTLP_METRICS_PUSH_DROP_REGEX``; the endpoint is
+    resolved from the standard ``OTEL_*`` env vars. A misconfiguration warns
+    and runs without the push; it never fails the run. Only a backend this
+    scope started is stopped, and the final flush precedes the stop so
+    terminal counter values are exported. Run attributes honor
+    ``COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES``; the scope forwards it, never overrides.
+    """
+    interval = env_int(OTLP_METRICS_PUSH_INTERVAL_ENV_VAR, minimum=1) or DEFAULT_INTERVAL_SECONDS
+    drop_regex = os.environ.get(_ENV_DROP_REGEX, DEFAULT_DROP_METRIC_NAMES_REGEX)
+    started = False
+    try:
+        started = enable_metrics_push(
+            MetricsPushConfig(
+                enabled=True,
+                interval_seconds=interval,
+                drop_regex=drop_regex,
+                include_run_attributes=otlp_run_attributes_enabled(),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.opt(exception=True).warning(f"[otel-metrics] Failed to start metrics push: {exc}")
+    try:
+        yield
+    finally:
+        if started:
+            try:
+                flush_metrics_push()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[otel-metrics] Failed to flush metrics push: {exc}")
+            try:
+                disable_metrics_push()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[otel-metrics] Failed to disable metrics push: {exc}")
+
+
 __all__: Sequence[str] = (
     "DEFAULT_DROP_METRIC_NAMES_REGEX",
     "DEFAULT_INTERVAL_SECONDS",
@@ -1263,4 +1317,5 @@ __all__: Sequence[str] = (
     "enable_metrics_push",
     "flush_metrics_push",
     "get_otlp_metrics_endpoint",
+    "otlp_push_scope",
 )

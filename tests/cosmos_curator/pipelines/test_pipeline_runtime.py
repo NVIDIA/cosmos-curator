@@ -16,12 +16,16 @@
 """Tests for the run-only pipeline runtime entrypoint."""
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import typer
 
+from cosmos_curator.core.utils import environment
+from cosmos_curator.core.utils.infra import metrics_push
 from cosmos_curator.next.recipes.video_transcode import pipeline as transcoding_pipeline
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.pipelines import pipeline_runtime
@@ -210,3 +214,106 @@ def test_pipeline_runtime_reraises_runtime_errors_without_json(
 
     with pytest.raises(RuntimeError, match="runtime boom"):
         pipeline_runtime.main(config_path, set_overrides=None, json_output=False)
+
+
+@pytest.fixture
+def metrics_push_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Enable the push via env and record the enable/flush/disable calls, in order."""
+    calls: list[str] = []
+
+    def fake_enable(config: object) -> bool:
+        del config
+        calls.append("enable")
+        return True
+
+    monkeypatch.setenv(environment.OTLP_METRICS_PUSH_ENV_VAR, "true")
+    monkeypatch.setattr(metrics_push, "enable_metrics_push", fake_enable)
+    monkeypatch.setattr(metrics_push, "flush_metrics_push", lambda: calls.append("flush"))
+    monkeypatch.setattr(metrics_push, "disable_metrics_push", lambda: calls.append("disable"))
+    return calls
+
+
+def test_pipeline_runtime_wraps_the_run_in_the_metrics_push_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    metrics_push_calls: list[str],
+) -> None:
+    """The run is bracketed by enable and flush -> disable."""
+
+    def fake_run_config(config: ResolvedVideoSplitConfig) -> int:
+        del config
+        metrics_push_calls.append("run")
+        return 3
+
+    monkeypatch.setattr(splitting_pipeline, "run_config", fake_run_config)
+
+    pipeline_runtime.main(_write_config(tmp_path / "split.yaml"), set_overrides=None, json_output=True)
+
+    assert metrics_push_calls == ["enable", "run", "flush", "disable"]
+    assert json.loads(capsys.readouterr().out) == {"clips_written": 3}
+
+
+def test_pipeline_runtime_still_flushes_the_metrics_push_when_the_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    metrics_push_calls: list[str],
+) -> None:
+    """A failed run exports the metrics it produced before the fault."""
+
+    def fake_run_config(config: ResolvedVideoSplitConfig) -> int:
+        del config
+        msg = "runtime boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(splitting_pipeline, "run_config", fake_run_config)
+
+    with pytest.raises(RuntimeError, match="runtime boom"):
+        pipeline_runtime.main(_write_config(tmp_path / "split.yaml"), set_overrides=None, json_output=False)
+
+    assert metrics_push_calls == ["enable", "flush", "disable"]
+
+
+@pytest.mark.parametrize("value", [None, "false", "enabled"])
+def test_metrics_push_is_not_enabled_without_a_truthy_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str | None,
+) -> None:
+    """Unset, false, or an invalid value (warned, not fatal) leaves the run plain."""
+
+    def fake_run_config(config: ResolvedVideoSplitConfig) -> int:
+        del config
+        return 0
+
+    if value is None:
+        monkeypatch.delenv(environment.OTLP_METRICS_PUSH_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(environment.OTLP_METRICS_PUSH_ENV_VAR, value)
+    monkeypatch.setattr(splitting_pipeline, "run_config", fake_run_config)
+    enable = Mock()
+    monkeypatch.setattr(metrics_push, "enable_metrics_push", enable)
+
+    pipeline_runtime.main(_write_config(tmp_path / "split.yaml"), set_overrides=None, json_output=True)
+
+    enable.assert_not_called()
+
+
+def test_a_broken_metrics_push_install_degrades_to_a_plain_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed import of the pusher warns instead of failing the run."""
+
+    def fake_run_config(config: ResolvedVideoSplitConfig) -> int:
+        del config
+        return 7
+
+    monkeypatch.setattr(splitting_pipeline, "run_config", fake_run_config)
+    monkeypatch.setenv(environment.OTLP_METRICS_PUSH_ENV_VAR, "true")
+    monkeypatch.setitem(sys.modules, "cosmos_curator.core.utils.infra.metrics_push", None)
+
+    pipeline_runtime.main(_write_config(tmp_path / "split.yaml"), set_overrides=None, json_output=True)
+
+    assert json.loads(capsys.readouterr().out) == {"clips_written": 7}

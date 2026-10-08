@@ -29,16 +29,23 @@ A kind that published its work but still owes more therefore reports it by
 raising, which costs the summary: under --json the error object REPLACES the
 payload rather than joining it, so stdout stays empty. The two cannot both be had
 without a third outcome here, which no caller has yet needed.
+
+When ``COSMOS_CURATOR_OTLP_METRICS_PUSH`` is truthy the run is wrapped in
+``metrics_push.otlp_push_scope``; a broken observability stack warns and
+degrades to a plain run, and a plain run never imports the pusher.
 """
 
 import json
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
+from loguru import logger
 from pydantic import ValidationError
 from typer import Argument, Option
 
+from cosmos_curator.core.utils.environment import OTLP_METRICS_PUSH_ENV_VAR, env_bool
 from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS
 from cosmos_curator.pipelines.pipeline_config import load_pipeline_kind_name
 
@@ -60,7 +67,8 @@ def main(
         _fail("invalid", exc, json_output=json_output)
 
     try:
-        output = run_pipeline()
+        with _metrics_push_scope():
+            output = run_pipeline()
     except Exception as exc:
         if json_output:
             _fail("runtime", exc, json_output=True)
@@ -70,6 +78,19 @@ def main(
         typer.echo(json.dumps(output.json_payload, indent=2))
     else:
         typer.echo(output.message)
+
+
+def _metrics_push_scope() -> "AbstractContextManager[None]":
+    """Return the OTLP push scope when enabled by env, else a no-op context."""
+    if env_bool(OTLP_METRICS_PUSH_ENV_VAR) is not True:
+        return nullcontext()
+    try:
+        # Deferred: a plain run must not pay for (or break on) the OTel imports.
+        from cosmos_curator.core.utils.infra.metrics_push import otlp_push_scope  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[otel-metrics] Failed to import metrics push hooks: {exc}")
+        return nullcontext()
+    return otlp_push_scope()
 
 
 def _fail(code: str, exc: Exception, *, json_output: bool) -> NoReturn:

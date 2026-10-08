@@ -17,12 +17,20 @@
 See README.md for more info.
 """
 
+import math
 import os
 import pathlib
+
+from loguru import logger
 
 # Environment variable to tell b/w local and cloud job.
 LOCAL_DOCKER_ENV_VAR_NAME = "COSMOS_CURATOR_LOCAL_DOCKER_JOB"
 SLURM_RAY_ENV_VAR_NAME = "COSMOS_CURATOR_RAY_SLURM_JOB"
+
+# Driver-side OTLP metrics push: opt-in switch and scrape/push interval (seconds).
+# Shared by the NVCF deployment defaults and the run-pipeline entrypoint.
+OTLP_METRICS_PUSH_ENV_VAR = "COSMOS_CURATOR_OTLP_METRICS_PUSH"
+OTLP_METRICS_PUSH_INTERVAL_ENV_VAR = "COSMOS_CURATOR_OTLP_METRICS_PUSH_INTERVAL"
 
 # Each large-source download reserves one slot to cap concurrency per node
 # independently of CPU reservations; capacity follows elastic workers.
@@ -74,3 +82,57 @@ LOCAL_AZURE_CREDENTIALS_FILE = pathlib.Path("~/.azure/credentials").expanduser()
 
 # Environment variable for the pixi environment name.
 PIXI_ENVIRONMENT_NAME_VAR_NAME = "PIXI_ENVIRONMENT_NAME"
+
+
+# Lenient env-var readers: a bad value warns and yields None so the caller
+# falls back to its default; a typo in the environment must not fail the run.
+def env_bool(name: str) -> bool | None:
+    """Parse a boolean env var leniently; an invalid value warns and yields None."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized == "":
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(f"Ignoring invalid boolean env var {name}={raw_value!r}")
+    return None
+
+
+def env_int(name: str, *, minimum: int | None = None) -> int | None:
+    """Parse an integer env var leniently; invalid or out-of-range values warn and yield None."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(f"Ignoring invalid integer env var {name}={raw_value!r}")
+        return None
+    if minimum is not None and value < minimum:
+        logger.warning(f"Ignoring out-of-range integer env var {name}={raw_value!r}")
+        return None
+    return value
+
+
+def env_float(name: str, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
+    """Parse a float env var leniently; invalid or out-of-bounds values warn and yield None."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning(f"Ignoring invalid float env var {name}={raw_value!r}")
+        return None
+    if (
+        not math.isfinite(value)
+        or (minimum is not None and value < minimum)
+        or (maximum is not None and value > maximum)
+    ):
+        logger.warning(f"Ignoring out-of-range float env var {name}={raw_value!r}")
+        return None
+    return value

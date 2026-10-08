@@ -855,3 +855,92 @@ def test_no_dangling_thread_after_test_run() -> None:
     """Sanity check: this test suite leaves no metrics-push thread behind."""
     names = {t.name for t in threading.enumerate()}
     assert "cosmos-curator-metrics-push" not in names
+
+
+class TestOtlpPushScope:
+    """otlp_push_scope: the env-driven run boundary used by run-pipeline."""
+
+    @staticmethod
+    def _record(monkeypatch: pytest.MonkeyPatch, calls: list[str], *, started: bool) -> None:
+        def fake_enable(config: object) -> bool:
+            del config
+            calls.append("enable")
+            return started
+
+        monkeypatch.setattr(_mp_module, "enable_metrics_push", fake_enable)
+        monkeypatch.setattr(_mp_module, "flush_metrics_push", lambda: calls.append("flush"))
+        monkeypatch.setattr(_mp_module, "disable_metrics_push", lambda: calls.append("disable"))
+
+    def test_stop_happens_after_the_body_when_the_scope_started_the_push(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Enable -> body -> flush -> disable."""
+        calls: list[str] = []
+        self._record(monkeypatch, calls, started=True)
+        with _mp_module.otlp_push_scope():
+            calls.append("run")
+        assert calls == ["enable", "run", "flush", "disable"]
+
+    def test_does_not_stop_a_backend_it_did_not_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A backend already active (profiling scope, fixture) is left running."""
+        calls: list[str] = []
+        self._record(monkeypatch, calls, started=False)
+        with _mp_module.otlp_push_scope():
+            pass
+        assert calls == ["enable"]
+
+    def test_body_still_runs_when_enable_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed enable warns; the body runs and nothing is stopped."""
+        calls: list[str] = []
+        self._record(monkeypatch, calls, started=True)
+
+        def boom(config: object) -> bool:
+            del config
+            msg = "otel exploded {'nested braces'}"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(_mp_module, "enable_metrics_push", boom)
+        with _mp_module.otlp_push_scope():
+            calls.append("run")
+        assert calls == ["run"]
+
+    def test_run_attributes_env_opt_out_reaches_the_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES=0 is forwarded, not overridden to True."""
+        monkeypatch.setenv("COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES", "0")
+        calls: list[str] = []
+        monkeypatch.setattr(_mp_module, "flush_metrics_push", lambda: calls.append("flush"))
+        monkeypatch.setattr(_mp_module, "disable_metrics_push", lambda: calls.append("disable"))
+        seen: list[bool] = []
+
+        def capture(config: _mp_module.MetricsPushConfig) -> bool:
+            seen.append(config.include_run_attributes)
+            return True
+
+        monkeypatch.setattr(_mp_module, "enable_metrics_push", capture)
+        with _mp_module.otlp_push_scope():
+            pass
+        assert seen == [False]
+
+    @pytest.mark.parametrize(
+        ("interval_env", "expected_interval"),
+        [("45", 45), ("abc", _mp_module.DEFAULT_INTERVAL_SECONDS), ("0", _mp_module.DEFAULT_INTERVAL_SECONDS)],
+    )
+    def test_env_feeds_the_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        interval_env: str,
+        expected_interval: int,
+    ) -> None:
+        """Interval and drop regex come from env; an invalid interval falls back to the default."""
+        captured: list[MetricsPushConfig] = []
+
+        def fake_enable(config: MetricsPushConfig) -> bool:
+            captured.append(config)
+            return False
+
+        monkeypatch.setattr(_mp_module, "enable_metrics_push", fake_enable)
+        monkeypatch.setenv(_mp_module.OTLP_METRICS_PUSH_INTERVAL_ENV_VAR, interval_env)
+        monkeypatch.setenv(_mp_module._ENV_DROP_REGEX, "custom_.*")
+        with _mp_module.otlp_push_scope():
+            pass
+        (config,) = captured
+        assert config.interval_seconds == expected_interval
+        assert config.drop_regex == "custom_.*"

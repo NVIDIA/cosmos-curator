@@ -18,7 +18,6 @@ import argparse
 import ctypes
 import io
 import json
-import math
 import multiprocessing
 import os
 import pathlib
@@ -58,7 +57,16 @@ from cosmos_curator.core.cf.nvcf_utils import (
     is_nvcf_helm_deployment,
     remove_s3_profile,
 )
-from cosmos_curator.core.utils.environment import CONTAINER_PATHS_CODE_DIR
+from cosmos_curator.core.utils.environment import (
+    CONTAINER_PATHS_CODE_DIR,
+    OTLP_METRICS_PUSH_ENV_VAR,
+    OTLP_METRICS_PUSH_INTERVAL_ENV_VAR,
+    env_bool,
+    env_float,
+    env_int,
+)
+from cosmos_curator.core.utils.infra.run_attributes import ENV_OTLP_RUN_ATTRIBUTES_VALUES
+from cosmos_curator.core.utils.infra.tracing import ENV_PROFILE_TRACING
 from cosmos_curator.core.utils.misc.file_lock import file_lock
 from cosmos_curator.core.utils.storage.presigned_s3_zip import (
     cleanup_server_input_workspace,
@@ -220,55 +228,6 @@ def _header_bool(headers: Mapping[str, str], name: str, *, default: bool) -> boo
     return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _env_bool(name: str) -> bool | None:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return None
-    normalized = raw_value.strip().lower()
-    if normalized == "":
-        return None
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    logger.warning(f"Ignoring invalid boolean env var {name}={raw_value!r}")
-    return None
-
-
-def _env_int(name: str, *, minimum: int | None = None) -> int | None:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return None
-    try:
-        value = int(raw_value)
-    except ValueError:
-        logger.warning(f"Ignoring invalid integer env var {name}={raw_value!r}")
-        return None
-    if minimum is not None and value < minimum:
-        logger.warning(f"Ignoring out-of-range integer env var {name}={raw_value!r}")
-        return None
-    return value
-
-
-def _env_float(name: str, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return None
-    try:
-        value = float(raw_value)
-    except ValueError:
-        logger.warning(f"Ignoring invalid float env var {name}={raw_value!r}")
-        return None
-    if (
-        not math.isfinite(value)
-        or (minimum is not None and value < minimum)
-        or (maximum is not None and value > maximum)
-    ):
-        logger.warning(f"Ignoring out-of-range float env var {name}={raw_value!r}")
-        return None
-    return value
-
-
 def _env_json_str_map(name: str) -> dict[str, str] | None:
     raw_value = os.environ.get(name)
     if raw_value is None:
@@ -303,25 +262,21 @@ def _apply_observability_env_defaults(args: argparse.Namespace) -> None:
     ``profiling._apply_profiling_config`` uses the marker to distinguish an
     explicit NVCF ``profile_tracing=False`` from an ordinary CLI parser default.
     """
-    env_otlp_metrics_push = "COSMOS_CURATOR_OTLP_METRICS_PUSH"
-    env_otlp_metrics_push_interval = "COSMOS_CURATOR_OTLP_METRICS_PUSH_INTERVAL"
-    env_profile_tracing = "COSMOS_CURATOR_PROFILE_TRACING"
     env_profile_tracing_sampling = "COSMOS_CURATOR_PROFILE_TRACING_SAMPLING"
-    env_otlp_run_attributes_values = "COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES_VALUES"
 
-    _set_env_default(args, "otlp_metrics_push", lambda: _env_bool(env_otlp_metrics_push))
+    _set_env_default(args, "otlp_metrics_push", lambda: env_bool(OTLP_METRICS_PUSH_ENV_VAR))
     _set_env_default(
         args,
         "otlp_metrics_push_interval",
-        lambda: _env_int(env_otlp_metrics_push_interval, minimum=1),
+        lambda: env_int(OTLP_METRICS_PUSH_INTERVAL_ENV_VAR, minimum=1),
     )
-    _set_env_default(args, "profile_tracing", lambda: _env_bool(env_profile_tracing))
+    _set_env_default(args, "profile_tracing", lambda: env_bool(ENV_PROFILE_TRACING))
     _set_env_default(
         args,
         "profile_tracing_sampling",
-        lambda: _env_float(env_profile_tracing_sampling, minimum=0.0, maximum=1.0),
+        lambda: env_float(env_profile_tracing_sampling, minimum=0.0, maximum=1.0),
     )
-    _set_env_default(args, "otlp_run_attributes_map", lambda: _env_json_str_map(env_otlp_run_attributes_values))
+    _set_env_default(args, "otlp_run_attributes_map", lambda: _env_json_str_map(ENV_OTLP_RUN_ATTRIBUTES_VALUES))
     args.observability_env_defaults_applied = True
 
 
