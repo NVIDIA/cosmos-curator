@@ -62,6 +62,9 @@ them with `--check`.
 - Config: `pyproject.toml` (Python 3.13, 120 chars)
 - Do NOT add `from __future__ import annotations` — use native Python 3.13 type hints instead. The one exception is `cosmos_curator/client/slurm_cli/managed_ray/onnode/`, which targets Python 3.8 because those modules are uploaded into a Slurm run directory and run by a node's own `python3`; see that package's docstring
 - `cosmos-xenna/` is excluded from ruff (via exclude list) and mypy (via `files = ["cosmos_curator"]`) — do not lint or fix code there
+- Prefer names that make the relevant representation or processing state clear, such as `response_bytes` or
+  `unnormalized_scores`. Avoid vague names such as `raw` when a more specific name improves understanding. Preserve
+  established technical terminology and compatibility, and avoid unrelated renames.
 
 ## Existing Xenna Pipelines
 
