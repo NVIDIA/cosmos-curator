@@ -220,6 +220,10 @@ The config covers:
 - common container image, source, mounts, credentials, environment, and Pixi settings
 - optional node-local Ray storage
 
+The container image is normally a host path to a squashfs. A registry reference such as
+`registry.example.com#org/repository:tag` or `registry.example.com#org/repository:sha256:<digest>` is also accepted:
+the node runtime imports it at job start.
+
 Both walltimes are always stated and must be finite. The head's walltime is the run's lifetime, and the ratio of the
 two decides how many allocations a lane renews through, so neither is left to a partition default the launcher cannot
 see; a config that omits one gets the launcher's own default rather than the site's.

@@ -29,6 +29,7 @@ from cosmos_curator.client.slurm_cli.managed_ray.config import (
     SlurmRayConfigError,
     SlurmRayMount,
     expand_host_path,
+    resolve_container_image,
     startup_timeout_seconds,
     validate_state_dir,
 )
@@ -155,7 +156,7 @@ def resolve_runtime_paths(  # noqa: PLR0913
 
     return {
         "run_dir": str(directory),
-        "container_image": str(expand_host_path(runtime.container_image, home)),
+        "container_image": resolve_container_image(runtime.container_image, home),
         "mounts": mount_payloads,
         "prepare_directories": list(dict.fromkeys(prepare_directories)),
         "forwarded_environment_keys": forwarded_environment_keys,

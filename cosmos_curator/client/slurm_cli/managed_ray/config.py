@@ -38,6 +38,7 @@ _CONFIG_MODEL = ConfigDict(extra="forbid", frozen=True, strict=True)
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _JOB_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _STARTUP_TIMEOUT_PATTERN = re.compile(r"^(?P<value>[1-9][0-9]*)(?P<unit>[smhd])$")
+
 # The six walltime spellings sbatch accepts. A leading ``D-`` makes the first field days; otherwise the number of
 # colons decides, so `30` is minutes, `30:00` is minutes:seconds, and `4:00:00` is hours:minutes:seconds.
 _SLURM_TIME_PATTERN = re.compile(r"^(?:(?P<days>\d+)-)?(?P<first>\d+)(?::(?P<second>\d+))?(?::(?P<third>\d+))?$")
@@ -74,6 +75,17 @@ def expand_host_path(value: str, home: Path) -> Path:
     if value.startswith("~/"):
         return home / value[2:]
     return Path(value)
+
+
+def resolve_container_image(value: str, home: Path) -> str:
+    """Resolve the container image reference for the node runtime.
+
+    Host paths follow the normal expansion rules; registry references (anything else) pass through
+    untouched for the node runtime to pull.
+    """
+    if value.startswith(("~/", "/")):
+        return str(expand_host_path(value, home))
+    return value
 
 
 def _host_path(value: str, *, field_name: str) -> str:
@@ -267,6 +279,16 @@ class SlurmRayWorkerConfig(SlurmRayAllocationConfig):
             "GPUs per node (--gpus-per-node). Use on clusters that prohibit job-scoped GPU requests (e.g. NVL72)."
         ),
     )
+    max_lane_allocations: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Cap on the worker lane array size; null derives it from the head/worker walltime ratio. "
+            "Use on busy clusters where the head (CPU) starts quickly but the worker (GPU) queues for hours: "
+            "a short worker walltime aids backfill scheduling but the resulting large array may exceed the "
+            "cluster's per-user job quota. The lane may stop renewing before the head completes."
+        ),
+    )
 
     @field_validator("memory")
     @classmethod
@@ -311,7 +333,14 @@ class SlurmRayRuntimeConfig(BaseModel):
 
     model_config = _CONFIG_MODEL
 
-    container_image: str = Field(default=_DEFAULT_CONTAINER_IMAGE, description="Host path to the squashfs image.")
+    container_image: str = Field(
+        default=_DEFAULT_CONTAINER_IMAGE,
+        description=(
+            "Host path to a squashfs image, or a registry reference (Pyxis enroot format: `host#org/image:tag`) "
+            "pulled at job start by the node runtime. Registry pulls happen inside the `ray.startup_timeout` "
+            "window; increase it for large images."
+        ),
+    )
     curator_path: str | None = Field(default=None, description="Optional host path to a Cosmos Curator checkout.")
     workspace_path: str = Field(
         default=_default_host_path(environment.LOCAL_WORKSPACE_PATH),
@@ -341,7 +370,18 @@ class SlurmRayRuntimeConfig(BaseModel):
         description="Optional Pixi environment warmup override.",
     )
 
-    @field_validator("container_image", "workspace_path", "cache_path")
+    @field_validator("container_image")
+    @classmethod
+    def _validate_container_image(cls, value: str) -> str:
+        value = value.strip()
+        # Host paths keep the existing validation; a value with a '#' is a registry reference the
+        # node runtime pulls. Other shapes (colon-registry refs, relative paths) fall through to
+        # host-path validation and fail there.
+        if value.startswith(("~/", "/")) or "#" not in value:
+            return _host_path(value, field_name="container_image")
+        return value
+
+    @field_validator("workspace_path", "cache_path")
     @classmethod
     def _validate_required_paths(cls, value: str, info: Any) -> str:  # noqa: ANN401
         return _host_path(value, field_name=str(info.field_name))
@@ -524,11 +564,16 @@ def lane_allocations(config: SlurmRayConfig) -> int:
 
     A worker walltime at least as long as the head's needs a single allocation. A shorter one needs a chain,
     because Slurm does not requeue a job that hit its time limit. Rounding up only over-provisions: allocations
-    the run outlives are canceled with the rest of the lane at teardown.
+    the run outlives are canceled with the rest of the lane at teardown. ``worker.max_lane_allocations`` caps
+    the chain for clusters that limit a user's job count; when it binds, lane coverage ends before the head.
     """
     head_seconds = slurm_time_seconds(config.slurm.head.time)
     worker_seconds = slurm_time_seconds(config.slurm.worker.time)
-    return max(1, math.ceil(head_seconds / worker_seconds))
+    derived = max(1, math.ceil(head_seconds / worker_seconds))
+    cap = config.slurm.worker.max_lane_allocations
+    if cap is not None and derived > cap:
+        return cap
+    return derived
 
 
 def startup_timeout_seconds(value: str) -> int:

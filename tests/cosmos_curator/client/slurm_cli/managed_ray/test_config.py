@@ -24,6 +24,8 @@ from typer.testing import CliRunner
 
 from cosmos_curator.client.cli import cosmos_curator
 from cosmos_curator.client.slurm_cli.managed_ray.config import (
+    lane_allocations,
+    resolve_container_image,
     resolve_slurm_ray_config,
     resolve_slurm_ray_config_data,
     startup_timeout_seconds,
@@ -64,6 +66,53 @@ def test_yaml_and_json_resolve_to_the_same_canonical_config(
     assert yaml_config.slurm.worker.gpus == 8
     assert yaml_config.runtime.workspace_path == "~/cosmos_curator_local_workspace"
     assert "state_dir" not in yaml_config.model_dump()
+
+
+def test_container_image_accepts_registry_references(tmp_path: Path) -> None:
+    """Registry references (tag or digest) pass through for the node runtime to pull."""
+    refs = [
+        "registry.example.com#org/repository:2.2.0",
+        "registry.example.com#org/repository:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ]
+    for ref in refs:
+        payload: dict[str, object] = {"schema_version": 1, "runtime": {"container_image": ref}}
+        config = resolve_slurm_ray_config(_write_config(tmp_path / "cluster.yaml", payload))
+        assert config.runtime.container_image == ref
+        assert resolve_container_image(ref, Path("/home/user")) == ref
+    assert resolve_container_image("~/images/run.sqsh", Path("/home/user")) == "/home/user/images/run.sqsh"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["images/run.sqsh", "registry.example.com:5005/org/repository:2.2.0"],
+)
+def test_container_image_rejects_non_reference_values(tmp_path: Path, bad: str) -> None:
+    """Values that are neither host paths nor '#' registry references fail host-path validation."""
+    payload: dict[str, object] = {"schema_version": 1, "runtime": {"container_image": bad}}
+    with pytest.raises(ValidationError):
+        resolve_slurm_ray_config(_write_config(tmp_path / "cluster.yaml", payload))
+
+
+def test_max_lane_allocations_caps_derived_lane_array(tmp_path: Path) -> None:
+    """max_lane_allocations caps the head/worker-derived lane array; a loose cap is a no-op."""
+
+    def resolve_with(max_cap: int | None) -> int:
+        worker: dict[str, object] = {"partition": "gpu", "gpus": 1, "time": "00:30:00"}
+        if max_cap is not None:
+            worker["max_lane_allocations"] = max_cap
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "worker_lanes": 1,
+            "slurm": {"head": {"partition": "cpu", "time": "12:00:00"}, "worker": worker},
+        }
+        config = resolve_slurm_ray_config(_write_config(tmp_path / f"cluster-{max_cap}.yaml", payload))
+        return lane_allocations(config)
+
+    assert resolve_with(None) == 24  # 12h head over 30m slots
+    assert resolve_with(48) == 24  # loose cap is a no-op
+    assert resolve_with(20) == 20  # tight cap binds
+    with pytest.raises(ValidationError):
+        resolve_with(0)
 
 
 def test_environment_account_default_and_set_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
