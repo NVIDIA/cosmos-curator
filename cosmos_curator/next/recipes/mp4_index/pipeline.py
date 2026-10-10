@@ -15,6 +15,7 @@
 
 """Ray Data entry point for the ``mp4-index`` recipe -- the only module here allowed to import Ray."""
 
+import os
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -29,14 +30,16 @@ from cosmos_curator.next.core.ray_runtime import (
     ensure_ray_initialized,
 )
 from cosmos_curator.next.recipes.mp4_index import lance_sink
-from cosmos_curator.next.recipes.mp4_index.config import Mp4IndexInputConfig, ResolvedMp4IndexConfig
+from cosmos_curator.next.recipes.mp4_index.config import Mp4IndexInputConfig, Mp4IndexRunConfig, ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
+    RECORD_SCHEMA_VERSION,
+    VIDEO_MANIFEST_SCHEMA,
     derive_session_and_camera,
     make_session_camera_id,
     make_video_id,
 )
 from cosmos_curator.next.recipes.mp4_index.discovery import resolve_input_selection
-from cosmos_curator.next.recipes.mp4_index.processing import _ProcessOneVideo
+from cosmos_curator.next.recipes.mp4_index.processing import Mp4ExtensionFactory, _ProcessOneVideo
 
 _BYTES_PER_GIB = 1024**3
 
@@ -105,10 +108,24 @@ def _empty_summary(
     }
 
 
-def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) -> dict[str, Any]:
+def _indexing_io_resources() -> dict[str, float]:
+    """Honor explicit IO budgets; otherwise use one slot per available CPU."""
+    if environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR in os.environ:
+        return curator_io_resources()
+    slots = os.process_cpu_count() or environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE
+    return {environment.CURATOR_IO_RESOURCE_NAME: float(slots)}
+
+
+def _run_manifest(
+    rows: list[dict[str, str]],
+    config: Mp4IndexRunConfig,
+    *,
+    extension_factory: Mp4ExtensionFactory | None = None,
+) -> dict[str, Any]:
     """Reconcile *rows* against already-committed/known-failed work, dispatch, and publish.
 
     Reserves one ``curator_io`` slot per actor task unconditionally.
+    Extensions contribute frame columns within the fixed shared output schema.
     """
     manifest_lance_uri = config.output.manifest_lance_uri
     errors_lance_uri = config.output.errors_lance_uri
@@ -121,8 +138,14 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
         )
 
     # Bootstrapped before dispatch: a reconciliation scan needs the table to already exist.
-    manifest_dataset = lance_sink.open_or_create_manifest_table(uri=manifest_lance_uri, storage_profile=storage_profile)
-    lance_sink.validate_committed_versions(manifest_dataset, extraction_contract_id=config.extraction_contract_id)
+    manifest_dataset = lance_sink.open_or_create_manifest_table(
+        uri=manifest_lance_uri, storage_profile=storage_profile, schema=VIDEO_MANIFEST_SCHEMA, kind=config.kind
+    )
+    lance_sink.validate_committed_versions(
+        manifest_dataset,
+        extraction_contract_id=config.extraction_contract_id,
+        record_schema_version=RECORD_SCHEMA_VERSION,
+    )
 
     candidate_session_camera_ids = {
         make_session_camera_id(
@@ -173,13 +196,13 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
             skipped=skipped,
         )
 
-    ensure_ray_initialized(local_resources=curator_io_resources())
+    ensure_ray_initialized(local_resources=_indexing_io_resources())
     configure_ray_data_progress(progress=config.execution.progress)
     configure_ray_data_stability()
     ray.data.DataContext.get_current().execution_no_progress_timeout_s = config.execution.no_progress_timeout_s
 
     results = ray.data.from_items(new_rows, override_num_blocks=len(new_rows)).map_batches(
-        cast("Any", _ProcessOneVideo),
+        _ProcessOneVideo,
         batch_format="pyarrow",
         batch_size=1,
         compute=ray.data.ActorPoolStrategy(min_size=config.execution.min_actors, max_size=config.execution.max_actors),
@@ -190,7 +213,7 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
         # One slot per actor task -- the concurrency bound, not the node's own total budget
         # (curator_io_resources(), passed above to ensure_ray_initialized instead).
         resources={environment.CURATOR_IO_RESOURCE_NAME: 1.0},
-        fn_constructor_kwargs={"config": config},
+        fn_constructor_kwargs={"config": config, "extension_factory": extension_factory},
     )
 
     # Batched, not one commit per video -- repartitions into blocks of videos_per_fragment and
@@ -202,7 +225,7 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
         cast("Any", lance_sink.stage_manifest_batch),
         batch_format="pyarrow",
         batch_size=None,
-        fn_kwargs={"uri": manifest_lance_uri, "storage_profile": storage_profile},
+        fn_kwargs={"uri": manifest_lance_uri, "storage_profile": storage_profile, "schema": VIDEO_MANIFEST_SCHEMA},
     )
 
     attempted_at = datetime.now(UTC)
@@ -223,7 +246,11 @@ def _run_manifest(rows: list[dict[str, str]], config: ResolvedMp4IndexConfig) ->
                 )
                 continue
             lance_sink.append_manifest_fragment(
-                result["candidate_json"], uri=manifest_lance_uri, storage_profile=storage_profile
+                result["candidate_json"],
+                uri=manifest_lance_uri,
+                storage_profile=storage_profile,
+                schema=VIDEO_MANIFEST_SCHEMA,
+                kind=config.kind,
             )
             extracted += int(result["extracted_count"])
             logger.info("{}: committed {} video(s)", log_prefix, result["extracted_count"])

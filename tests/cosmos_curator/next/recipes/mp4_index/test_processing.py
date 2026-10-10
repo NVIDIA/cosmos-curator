@@ -25,6 +25,8 @@ refetch fails the test loudly rather than just being slow.
 """
 
 import pathlib
+import struct
+import sys
 from typing import Any, Self
 
 import pyarrow as pa
@@ -34,6 +36,8 @@ import smart_open  # type: ignore[import-untyped]
 from cosmos_curator.core.sensors.data.mp4 import InvalidTimeBaseError
 from cosmos_curator.core.sensors.mp4 import box_locate
 from cosmos_curator.core.sensors.mp4.box_primitives import AmbiguousVideoTrackError
+from cosmos_curator.core.sensors.mp4.box_traversal import BoxLocation, UuidHandler
+from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.fragment_table import CompositionOffsetUnsupportedError
 from cosmos_curator.core.sensors.mp4.moov_track import EmptySampleTableError
 from cosmos_curator.next.recipes.mp4_index import processing
@@ -208,6 +212,9 @@ def test_process_one_video_nonfragmented_extracts_and_indexes_on_a_cache_miss(tm
 
     frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.num_rows == 1
+    for name in ("eof_ns", "sof_ns", "moe_ns"):
+        assert frame_table.schema.field(name).type == pa.int64()
+        assert frame_table.column(name).null_count == frame_table.num_rows
     assert set(VIDEO_METADATA_SCHEMA.names) <= set(metadata_row)
     assert (tmp_path / "moov" / f"{result['video_id']}.moov").exists()
 
@@ -367,6 +374,50 @@ def test_process_one_video_moof_cache_hit_never_rewalks(
     assert result["status"] == "success"
     frame_table, _metadata_row = read_video_record(processing.result_table(result))
     assert frame_table.column("dts_ticks").to_pylist() == [0, 1]
+
+
+@pytest.mark.parametrize("column", ["moof_start", "moof_bytes"])
+@pytest.mark.parametrize("corruption", ["missing", "null", "wrong_type"])
+def test_process_one_video_rebuilds_malformed_moof_cache(
+    tmp_path: pathlib.Path,
+    column: str,
+    corruption: str,
+    capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readable caches with missing, null, or mistyped columns are replaced from the source."""
+
+    # Route expected warnings through the current capture stream, including in -s runs.
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
+    from cosmos_curator.next.recipes.mp4_index.contracts import write_arrow_sidecar  # noqa: PLC0415
+
+    media_path = tmp_path / "session-a" / "unit-00" / "extra" / "video-1.mp4"
+    _write_synthetic_fragmented_mp4(media_path)
+    first = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+    assert first["status"] == "success"
+    cache_path = str(tmp_path / "moof" / f"{first['video_id']}.arrow")
+    original = processing.read_arrow_sidecar(cache_path, transport_params=None)
+    if corruption == "missing":
+        malformed = original.drop([column])
+    else:
+        values = (
+            pa.nulls(original.num_rows, type=original.schema.field(column).type)
+            if corruption == "null"
+            else pa.array(["invalid"] * original.num_rows)
+        )
+        malformed = original.set_column(original.schema.get_field_index(column), column, values)
+    write_arrow_sidecar(malformed.to_pylist(), malformed.schema, cache_path)
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+
+    assert result["status"] == "success"
+    frames, _metadata = read_video_record(processing.result_table(result))
+    assert frames.column("dts_ticks").to_pylist() == [0, 1]
+    assert processing.read_arrow_sidecar(cache_path, transport_params=None).equals(original)
+    assert "invalid cached boxes; refetching from the source" in capfd.readouterr().err
 
 
 def test_process_one_video_reuses_cached_moov_without_touching_the_source_file(
@@ -756,16 +807,16 @@ def test_process_one_video_instance_resolves_a_separate_client_per_storage_backe
     assert seen_clients[2] is None
 
 
+@pytest.mark.parametrize(
+    ("input_location", "output_root"),
+    [("s3://bucket/a.mp4", "/local"), ("/local/a.mp4", "s3://bucket/out")],
+)
 def test_process_one_video_instance_resolves_a_separate_output_client_from_the_input_one(
     monkeypatch: pytest.MonkeyPatch,
+    input_location: str,
+    output_root: str,
 ) -> None:
-    """An s3:// media_location with a local output root resolves two different clients, not one reused for both.
-
-    Before this, a single client keyed off media_location's own scheme was reused for every
-    sidecar existence check/read/write under output.path -- S3 input with local output crashed
-    (an S3 client's own prefix parser rejecting a local path), local input with S3 output
-    silently never cache-hit (a bare pathlib check against an s3:// string is always False).
-    """
+    """Local/S3 inputs and sidecar destinations resolve independent clients in both directions."""
     resolved: dict[str, object] = {}
 
     def _fake_get_storage_client(target_path: str, *, profile_name: str) -> object:
@@ -796,13 +847,288 @@ def test_process_one_video_instance_resolves_a_separate_output_client_from_the_i
         {
             "schema_version": 1,
             "kind": "mp4-index",
-            "input": {"uris": ["s3://bucket/a.mp4"], "container_kind": "nonfragmented"},
-            "output": {"path": "/local"},
+            "input": {"uris": [input_location], "container_kind": "nonfragmented"},
+            "output": {"path": output_root},
         }
     )
     instance = processing._ProcessOneVideo(config=config_stub)
-    instance(pa.Table.from_pylist([{"video_id": "a", "media_location": "s3://bucket/a.mp4"}])).to_pylist()[0]
+    instance(pa.Table.from_pylist([{"video_id": "a", "media_location": input_location}])).to_pylist()[0]
 
-    assert seen["input_storage_client"] is resolved["s3://bucket/a.mp4"]
-    assert seen["input_storage_client"] is not None
-    assert seen["output_storage_client"] is None
+    assert seen["input_storage_client"] is resolved[input_location]
+    assert seen["output_storage_client"] is resolved[config_stub.output.moov_sidecar_root]
+    assert (seen["input_storage_client"] is not None) == input_location.startswith("s3://")
+    assert (seen["output_storage_client"] is not None) == output_root.startswith("s3://")
+
+
+def test_extension_uses_extracted_bytes_in_the_complete_record(tmp_path: pathlib.Path) -> None:
+    """Extension columns and standard samples are assembled together from one extraction."""
+    media = tmp_path / "session" / "unit-00" / "camera.mp4"
+    moov = _write_synthetic_nonfragmented_mp4(media)
+    calls: list[processing.Mp4Extraction] = []
+
+    class Extension:
+        uuid_handlers = ()
+        frame_schema = pa.schema([pa.field(name, pa.int64()) for name in ("eof_ns", "sof_ns", "moe_ns")])
+
+        def frame_columns(self, extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+            calls.append(extraction)
+            return pa.RecordBatch.from_arrays(
+                [pa.array([123], type=pa.int64()), pa.nulls(1, type=pa.int64()), pa.array([100], type=pa.int64())],
+                schema=self.frame_schema,
+            )
+
+    result = processing.process_one_video(
+        {"video_id": make_video_id(str(media)), "media_location": str(media)},
+        config=_config_stub(tmp_path),
+        extension_factory=lambda _media_location: Extension(),
+    )
+
+    frames, metadata = read_video_record(processing.result_table(result))
+    assert result["status"] == "success"
+    assert len(calls) == 1
+    assert calls[0].media_location == str(media)
+    assert calls[0].moov_bytes == moov
+    assert calls[0].moof_rows is None
+    assert metadata["frame_count"] == len(calls[0].video_track.size) == 1
+    assert frames.select(["eof_ns", "sof_ns", "moe_ns"]).to_pylist() == [{"eof_ns": 123, "sof_ns": None, "moe_ns": 100}]
+
+
+@pytest.mark.parametrize("invalid", ["standard", "unknown", "duplicate", "type", "count", "schema", "nulls"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_invalid_extension_columns_propagate(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, invalid: str, *, cached: bool
+) -> None:
+    """Extension contract violations fail the attempt without quarantining or refetching the video."""
+    media = tmp_path / "session" / "unit-00" / "video.mp4"
+    _write_synthetic_nonfragmented_mp4(media)
+    row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
+    config = _config_stub(tmp_path)
+    if cached:
+        assert processing.process_one_video(row, config=config)["status"] == "success"
+
+        def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("Unexpected source refetch after an extension contract violation")
+
+        monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+
+    class Extension:
+        uuid_handlers = ()
+        frame_schema = pa.schema([pa.field("eof_ns", pa.int64())])
+
+        def frame_columns(self, _extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+            name = {"standard": "dts_ticks", "unknown": "custom"}.get(invalid, "eof_ns")
+            dtype = pa.string() if invalid == "type" else pa.int64()
+            fields = [pa.field(name, dtype, nullable=invalid != "nulls")]
+            arrays = [pa.array(["value"] if invalid == "type" else [123], type=dtype)]
+            if invalid == "duplicate":
+                fields *= 2
+                arrays *= 2
+            elif invalid == "count":
+                arrays = [pa.array([123, 456], type=dtype)]
+            elif invalid == "nulls":
+                arrays = [pa.nulls(1, type=dtype)]
+            schema = pa.schema(fields)
+            if invalid != "schema":
+                self.frame_schema = schema
+            else:
+                self.frame_schema = pa.schema([pa.field("sof_ns", pa.int64())])
+            return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+    message = {
+        "standard": "supplied more than once",
+        "unknown": "Unknown frame column",
+        "duplicate": "supplied more than once",
+        "type": "incompatible type",
+        "count": "rows for",
+        "schema": "declared schema",
+        "nulls": "non-nullable but contains nulls",
+    }[invalid]
+    with pytest.raises(ValueError, match=message):
+        processing.process_one_video(row, config=config, extension_factory=lambda _media_location: Extension())
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [ValueError, pa.ArrowInvalid, OverflowError, FileNotFoundError, RuntimeError, IndexError, struct.error],
+)
+def test_uuid_callback_bugs_propagate_without_cache_recovery(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    """Handler bugs must not be mistaken for truncated standard MP4 data."""
+    media = tmp_path / "session" / "unit-00" / "video.mp4"
+    media.parent.mkdir(parents=True)
+    identifier = b"1234567890abcdef"
+    moov = bf.synthetic_moov(
+        frame_count=1,
+        keyframe_index=0,
+        ctts_offset=None,
+        stbl_extra_children=bf.uuid_box(identifier, b"payload"),
+    )
+    media.write_bytes(bf.pack_box("ftyp", b"isom") + moov + bf.pack_box("mdat", b"data"))
+    row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
+    config = _config_stub(tmp_path)
+    assert processing.process_one_video(row, config=config)["status"] == "success"
+    error = error_type("callback bug")
+
+    class Extension:
+        frame_schema = pa.schema([pa.field("eof_ns", pa.int64())])
+
+        def __init__(self, _media_location: str) -> None:
+            self.uuid_handlers = (
+                UuidHandler(identifier, frozenset({("moov", "trak", "mdia", "minf", "stbl")}), self.parse),
+            )
+
+        def parse(self, _payload: bytes, _box: BoxLocation) -> None:
+            raise error
+
+        def frame_columns(self, _extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+            pytest.fail("Failed callbacks must not reach record assembly")
+
+    def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Unexpected source refetch after a callback bug")
+
+    monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+    with pytest.raises(error_type) as caught:
+        processing.process_one_video(row, config=config, extension_factory=Extension)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("failure_stage", ["factory", "uuid_handlers"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_extension_setup_refusal_does_not_refetch(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    failure_stage: str,
+    *,
+    cached: bool,
+) -> None:
+    """Setup refusals retain their per-video error without attempting cache recovery."""
+
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
+    media = tmp_path / "session" / "unit-00" / "video.mp4"
+    _write_synthetic_nonfragmented_mp4(media)
+    row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
+    config = _config_stub(tmp_path)
+    if cached:
+        assert processing.process_one_video(row, config=config)["status"] == "success"
+
+    class SetupRefusalError(UnindexableVideoError):
+        pass
+
+    error = SetupRefusalError("extension setup refused this video")
+    setup_calls: list[str] = []
+
+    class Extension:
+        def __init__(self, _media_location: str) -> None:
+            setup_calls.append(_media_location)
+            if failure_stage == "factory":
+                raise error
+
+        @property
+        def uuid_handlers(self) -> tuple[UuidHandler, ...]:
+            raise error
+
+    source_reads: list[str] = []
+    original_fetch_range = processing._make_fetch_range
+
+    def fetch_range(uri: str, transport_params: dict[str, Any] | None) -> processing.FetchRange:
+        source_reads.append(uri)
+        if cached or len(source_reads) > 1:
+            msg = "source unavailable on unexpected refetch"
+            raise FileNotFoundError(msg)
+        return original_fetch_range(uri, transport_params)
+
+    monkeypatch.setattr(processing, "_make_fetch_range", fetch_range)
+    result = processing.process_one_video(row, config=config, extension_factory=Extension)
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "SetupRefusalError"
+    assert result["error_message"] == str(error)
+    assert setup_calls == [str(media)]
+    assert len(source_reads) == (0 if cached else 1)
+    captured = capfd.readouterr()
+    assert str(error) in captured.err
+    assert "invalid cached boxes" not in captured.err
+
+
+def test_extension_parse_refusal_refetches_cached_boxes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal after parsing cached boxes still retries with a fresh extension."""
+
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
+    media = tmp_path / "session" / "unit-00" / "video.mp4"
+    _write_synthetic_nonfragmented_mp4(media)
+    row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
+    config = _config_stub(tmp_path)
+    assert processing.process_one_video(row, config=config)["status"] == "success"
+
+    class Extension:
+        uuid_handlers = ()
+        frame_schema = pa.schema([pa.field("eof_ns", pa.int64())])
+
+        def __init__(self, _media_location: str) -> None:
+            instances.append(self)
+
+        def frame_columns(self, _extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+            if len(instances) == 1:
+                msg = "cached boxes lack extension data"
+                raise UnindexableVideoError(msg)
+            return pa.RecordBatch.from_arrays([pa.array([123], type=pa.int64())], schema=self.frame_schema)
+
+    instances: list[Extension] = []
+    source_reads: list[str] = []
+    original_fetch_range = processing._make_fetch_range
+
+    def fetch_range(uri: str, transport_params: dict[str, Any] | None) -> processing.FetchRange:
+        source_reads.append(uri)
+        return original_fetch_range(uri, transport_params)
+
+    monkeypatch.setattr(processing, "_make_fetch_range", fetch_range)
+    result = processing.process_one_video(row, config=config, extension_factory=Extension)
+
+    assert result["status"] == "success"
+    assert len(instances) == 2
+    assert source_reads == [str(media)]
+    assert result["frames"].values.field("eof_ns").to_pylist() == [123]
+    assert "invalid cached boxes; refetching from the source" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("error_type", [ValueError, pa.ArrowInvalid, OverflowError, FileNotFoundError])
+@pytest.mark.parametrize("failure_stage", ["factory", "columns"])
+def test_extension_bugs_propagate_without_cache_recovery(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], failure_stage: str
+) -> None:
+    """Unexpected extension failures retain their original exception and do not become failed rows."""
+    media = tmp_path / "session" / "unit-00" / "video.mp4"
+    _write_synthetic_nonfragmented_mp4(media)
+    row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
+    config = _config_stub(tmp_path)
+    assert processing.process_one_video(row, config=config)["status"] == "success"
+    error = error_type("extension bug")
+
+    class Extension:
+        uuid_handlers = ()
+        frame_schema = pa.schema([pa.field("eof_ns", pa.int64())])
+
+        def __init__(self, _media_location: str) -> None:
+            if failure_stage == "factory":
+                raise error
+
+        def frame_columns(self, _extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+            raise error
+
+    def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Unexpected source refetch after an extension bug")
+
+    monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+    with pytest.raises(error_type) as caught:
+        processing.process_one_video(row, config=config, extension_factory=Extension)
+    assert caught.value is error

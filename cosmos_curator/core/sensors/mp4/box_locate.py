@@ -206,7 +206,6 @@ def get_moov_head_guess(
                 logger.info(
                     "{}: moov found on retry at a {} B head (initial guess was too small)", source_name, head_bytes
                 )
-            logger.debug("{}: moov is {} B", source_name, box_end - box_start)
             return head[box_start:box_end]
         if head_bytes >= file_size:
             break  # already fetched the whole file; a bigger retry would only repeat it

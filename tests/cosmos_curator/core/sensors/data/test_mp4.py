@@ -16,10 +16,12 @@
 
 import pathlib
 from fractions import Fraction
+from functools import partial
 from typing import Any, cast
 
 import attrs
 import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
 import pytest
 
@@ -391,7 +393,7 @@ def test_mp4_frame_index_pts_ns_matches_hand_computed_dts_plus_composition_offse
     """pts_ns = dts_ns + (composition_offset_ns or 0) - edit_list_shift_ns, computed once, real B-frame data.
 
     This clip's own elst has a single normal-rate entry with media_time=1024 ticks at a
-    12288 timescale -- 83_333_333 ns, hand-verified directly against its own raw bytes.
+    12288 timescale -- 83_333_333 ns, hand-verified directly against its own bytes.
     """
     frame_index = _real_bframes_frame_index()
 
@@ -501,7 +503,7 @@ def test_unsupported_edit_list_error_is_an_unindexable_video_error() -> None:
 
 
 def test_mp4_frame_index_raises_on_a_truncated_edit_list() -> None:
-    """A real elst box's bytes cut short mid-entry fails loudly as UnsupportedEditListError, not a raw struct.error."""
+    """A real elst box's bytes cut short mid-entry fails loudly as UnsupportedEditListError, not a struct.error."""
     moov = bf.synthetic_moov(frame_count=4, keyframe_index=0, ctts_offset=None)
     video_track = parse_video_track(moov)
     truncated_elst_bytes = bf.elst_box()[:14]  # cuts off before entry_count's own 4 bytes can be read in full
@@ -518,10 +520,271 @@ def test_ticks_to_ns_raises_on_zero_time_base_denominator() -> None:
 
 
 def test_mp4_frame_index_raises_on_a_zero_timescale_video_track() -> None:
-    """A VideoTrack with timescale=0 fails loudly as InvalidTimeBaseError, not a raw ZeroDivisionError."""
+    """A VideoTrack with timescale=0 fails loudly as InvalidTimeBaseError, not a ZeroDivisionError."""
     moov = bf.synthetic_moov(frame_count=4, keyframe_index=0, ctts_offset=None)
     video_track = parse_video_track(moov)
     video_track = attrs.evolve(video_track, timescale=0)
 
     with pytest.raises(InvalidTimeBaseError):
         Mp4FrameIndex.from_video_track(video_track)
+
+
+def _frame_table_with_timing(timing: pa.Table) -> pa.Table:
+    rows = [
+        {"dts_ticks": i * 10, "composition_offset_ticks": None, "is_keyframe": i == 0, "offset": i * 100, "size": 100}
+        for i in range(len(timing))
+    ]
+    table = pa.Table.from_pylist(rows, schema=FRAME_INDEX_SCHEMA).drop(["eof_ns", "sof_ns", "moe_ns"])
+    for field in timing.schema:
+        if field.name in ("eof_ns", "sof_ns", "moe_ns"):
+            table = table.append_column(field, timing.column(field.name))
+    return table
+
+
+def _index_with_timing(timing: pa.Table) -> Mp4FrameIndex:
+    return Mp4FrameIndex.from_frame_index_table(
+        _frame_table_with_timing(timing), time_base_num=1, time_base_den=1_000_000
+    )
+
+
+#: A timing record with EOF, SOF, and MOE populated.
+_ROWS_WITH_SOF_MOE: list[dict[str, Any]] = [
+    {"eof_ns": 1_000_000, "sof_ns": 900_000, "moe_ns": 950_000},
+    {"eof_ns": 2_000_000, "sof_ns": 1_900_000, "moe_ns": 1_950_000},
+    {"eof_ns": 3_000_000, "sof_ns": 2_900_000, "moe_ns": 2_950_000},
+]
+
+#: A timing record carrying EOF only; optional SOF/MOE are absent.
+_ROWS_EOF_ONLY: list[dict[str, Any]] = [
+    {"eof_ns": 1_000_000, "sof_ns": None, "moe_ns": None},
+    {"eof_ns": 2_000_000, "sof_ns": None, "moe_ns": None},
+]
+
+
+def test_mp4_frame_index_timing_reads_every_field_when_sof_moe_present() -> None:
+    """A real v2+ box shape: eof_ns/sof_ns/moe_ns all populated and round-trip exactly."""
+    table = pa.Table.from_pylist(_ROWS_WITH_SOF_MOE, schema=FRAME_INDEX_SCHEMA)
+
+    camera_timing = _index_with_timing(table)
+
+    assert len(camera_timing) == 3
+    assert camera_timing.eof_ns is not None
+    assert camera_timing.eof_ns.tolist() == [row["eof_ns"] for row in _ROWS_WITH_SOF_MOE]
+    assert camera_timing.sof_ns is not None
+    assert camera_timing.sof_ns.tolist() == [row["sof_ns"] for row in _ROWS_WITH_SOF_MOE]
+    assert camera_timing.moe_ns is not None
+    assert camera_timing.moe_ns.tolist() == [row["moe_ns"] for row in _ROWS_WITH_SOF_MOE]
+
+
+def test_mp4_frame_index_timing_collapses_all_null_sof_moe_to_none() -> None:
+    """A real v0/v1 box shape: sof_ns/moe_ns entirely null collapse to None, not all-null arrays."""
+    table = pa.Table.from_pylist(_ROWS_EOF_ONLY, schema=FRAME_INDEX_SCHEMA)
+
+    camera_timing = _index_with_timing(table)
+
+    assert len(camera_timing) == 2
+    assert camera_timing.eof_ns is not None
+    assert camera_timing.eof_ns.tolist() == [row["eof_ns"] for row in _ROWS_EOF_ONLY]
+    assert camera_timing.sof_ns is None
+    assert camera_timing.moe_ns is None
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("eof_present", [False, True])
+def test_mp4_frame_index_preserves_partial_timing_masks_and_int64_precision(
+    *, chunked: bool, eof_present: bool
+) -> None:
+    """Different SOF/MOE gaps preserve decode order and integers above float64 precision."""
+    large = (1 << 62) + 1
+    table = pa.Table.from_pylist(
+        [
+            {"eof_ns": large + 100 if eof_present else None, "sof_ns": large, "moe_ns": None},
+            {"eof_ns": large + 200 if eof_present else None, "sof_ns": None, "moe_ns": large + 2},
+            {"eof_ns": large + 300 if eof_present else None, "sof_ns": large + 1, "moe_ns": large + 3},
+        ],
+        schema=FRAME_INDEX_SCHEMA,
+    )
+    if chunked:
+        table = pa.concat_tables([table.slice(0, 1), table.slice(1)])
+
+    index = _index_with_timing(table)
+
+    if eof_present:
+        assert index.eof_ns is not None
+        assert index.eof_ns.tolist() == [large + 100, large + 200, large + 300]
+    else:
+        assert index.eof_ns is None
+    for name, values, mask in (
+        ("sof_ns", [large, None, large + 1], [False, True, False]),
+        ("moe_ns", [None, large + 2, large + 3], [True, False, False]),
+    ):
+        column = getattr(index, name)
+        assert isinstance(column, np.ma.MaskedArray)
+        assert column.dtype == np.int64
+        assert column.tolist() == values
+        assert np.ma.getmaskarray(column).tolist() == mask
+        assert column.compressed().tolist() == [value for value in values if value is not None]
+
+
+@pytest.mark.parametrize("construction", ["direct", "evolve"])
+@pytest.mark.parametrize("field", ["sof_ns", "moe_ns"])
+@pytest.mark.parametrize("eof_present", [False, True])
+def test_optional_timing_accepts_masked_int64_arrays(construction: str, field: str, *, eof_present: bool) -> None:
+    """Direct construction and attrs.evolve preserve the same validity and integer contract."""
+    index = _index_with_timing(pa.Table.from_pylist(_ROWS_EOF_ONLY, schema=FRAME_INDEX_SCHEMA))
+    values = np.ma.array(np.array([(1 << 62) + 1, 0], dtype=np.int64), mask=[False, True])
+    construct = (
+        partial(Mp4FrameIndex, **attrs.asdict(index, recurse=False))
+        if construction == "direct"
+        else partial(attrs.evolve, index)
+    )
+    updated = construct(**{field: values, "eof_ns": index.eof_ns if eof_present else None})
+    assert (updated.eof_ns is not None) == eof_present
+    assert getattr(updated, field) is values
+    assert getattr(updated, field).tolist() == [(1 << 62) + 1, None]
+
+
+@pytest.mark.parametrize("construction", ["direct", "evolve"])
+def test_eof_rejects_masked_missing_frames(construction: str) -> None:
+    """When supplied, EOF remains a complete int64 array on every construction path."""
+    index = _index_with_timing(pa.Table.from_pylist(_ROWS_EOF_ONLY, schema=FRAME_INDEX_SCHEMA))
+    construct = (
+        partial(Mp4FrameIndex, **attrs.asdict(index, recurse=False))
+        if construction == "direct"
+        else partial(attrs.evolve, index)
+    )
+    with pytest.raises(ValueError, match="eof_ns"):
+        construct(eof_ns=np.ma.array(np.array([10, 20], dtype=np.int64), mask=[False, True]))
+
+
+@pytest.mark.parametrize("fields", [("sof_ns",), ("moe_ns",), ("sof_ns", "moe_ns")])
+def test_optional_timing_reads_without_eof(fields: tuple[str, ...]) -> None:
+    """SOF-only, MOE-only, and combined upstream timing are usable independently of EOF."""
+    large = (1 << 62) + 1
+    rows = [
+        {"eof_ns": None, "sof_ns": None, "moe_ns": None, **dict.fromkeys(fields, value)} for value in (large, large + 2)
+    ]
+    index = _index_with_timing(pa.Table.from_pylist(rows, schema=FRAME_INDEX_SCHEMA))
+    assert index.eof_ns is None
+    for field in ("sof_ns", "moe_ns"):
+        values = getattr(index, field)
+        if field in fields:
+            assert values.dtype == np.int64
+            assert values.tolist() == [large, large + 2]
+        else:
+            assert values is None
+
+
+def test_float_timing_is_rejected() -> None:
+    """Readers must not accept timing data that lost integer precision."""
+    table = pa.table({"eof_ns": [1.0], "sof_ns": [None], "moe_ns": [None]})
+    with pytest.raises(ValueError, match="int64"):
+        _index_with_timing(table)
+
+
+def test_mp4_frame_index_preserves_recorder_clock_with_presentation_reordering_and_edit_shift() -> None:
+    """Container sorting and time shifts must preserve exact recorder nanoseconds in decode order."""
+    eof = [9_007_199_254_740_993, 9_007_199_254_741_003, 9_007_199_254_741_013]
+    timing = pa.Table.from_pylist(
+        [{"eof_ns": value, "sof_ns": None, "moe_ns": value - 5} for value in eof],
+        schema=FRAME_INDEX_SCHEMA,
+    )
+    frames = _frame_table_with_timing(timing)
+    frames = frames.set_column(
+        frames.schema.get_field_index("composition_offset_ticks"),
+        FRAME_INDEX_SCHEMA.field("composition_offset_ticks"),
+        pa.array([30, 0, -5], type=pa.int64()),
+    )
+    index = Mp4FrameIndex.from_frame_index_table(
+        frames,
+        time_base_num=1,
+        time_base_den=1_000_000,
+        elst_bytes=bf.edit_list_box(entries=[(1000, 5, 1, 0)]),
+    )
+    assert index.dts_ns.tolist() == [0, 10_000, 20_000]
+    assert index.pts_ns.tolist() == [25_000, 5_000, 10_000]
+    assert index.pts_sort_order.tolist() == [1, 2, 0]
+    assert index.eof_ns is not None
+    assert index.eof_ns.dtype == np.int64
+    assert index.eof_ns.tolist() == eof
+    assert index.sof_ns is None
+    assert index.moe_ns is not None
+    assert index.moe_ns.tolist() == [value - 5 for value in eof]
+
+
+def test_ordinary_mp4_frame_index_has_no_recorder_timing() -> None:
+    """Ordinary Arrow rows and parsed tracks do not synthesize recorder timestamps."""
+    table = pa.Table.from_pylist(_FRAME_ROWS_WITH_CTTS, schema=FRAME_INDEX_SCHEMA)
+    index = Mp4FrameIndex.from_frame_index_table(table, time_base_num=1, time_base_den=1_000_000)
+    assert index.eof_ns is index.sof_ns is index.moe_ns is None
+    track_index = Mp4FrameIndex.from_video_track(
+        parse_video_track(bf.synthetic_moov(frame_count=2, keyframe_index=0, ctts_offset=None))
+    )
+    assert track_index.eof_ns is track_index.sof_ns is track_index.moe_ns is None
+
+
+def test_partially_null_eof_is_rejected() -> None:
+    """A supplied EOF column must be fully populated; it has no per-frame validity mask."""
+    timing = pa.Table.from_pylist(
+        [{"eof_ns": 1_000_000, "sof_ns": None, "moe_ns": None}, {"eof_ns": None, "sof_ns": None, "moe_ns": None}],
+        schema=FRAME_INDEX_SCHEMA,
+    )
+    with pytest.raises(ValueError, match="eof_ns"):
+        _index_with_timing(timing)
+
+
+@pytest.mark.parametrize("construction", ["direct", "evolve"])
+@pytest.mark.parametrize("field", ["eof_ns", "sof_ns", "moe_ns"])
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (np.array([1.0, 2.0]), "dtype int64"),
+        (np.array([[1, 2]], dtype=np.int64), "1-D"),
+        (np.array([1], dtype=np.int64), "length must equal the frame count"),
+    ],
+)
+def test_camera_timing_fields_validate_all_construction_paths(
+    construction: str, field: str, value: npt.NDArray[np.int64] | npt.NDArray[np.float64], message: str
+) -> None:
+    """Model validation applies even when no Arrow reader is involved."""
+    index = _index_with_timing(pa.Table.from_pylist(_ROWS_EOF_ONLY, schema=FRAME_INDEX_SCHEMA))
+    changes = {field: value}
+    construct = (
+        partial(Mp4FrameIndex, **attrs.asdict(index, recurse=False))
+        if construction == "direct"
+        else partial(attrs.evolve, index)
+    )
+    with pytest.raises(ValueError, match=message):
+        construct(**changes)
+
+
+@pytest.mark.parametrize("construction", ["direct", "evolve"])
+@pytest.mark.parametrize("fields", [("sof_ns",), ("moe_ns",), ("sof_ns", "moe_ns")])
+def test_camera_timing_fields_are_independent_of_eof(construction: str, fields: tuple[str, ...]) -> None:
+    """Direct construction and attrs.evolve accept optional timing while removing EOF."""
+    index = _index_with_timing(pa.Table.from_pylist(_ROWS_EOF_ONLY, schema=FRAME_INDEX_SCHEMA))
+    values = np.array([(1 << 62) + 1, (1 << 62) + 3], dtype=np.int64)
+    changes = {"eof_ns": None, **dict.fromkeys(fields, values)}
+    construct = (
+        partial(Mp4FrameIndex, **attrs.asdict(index, recurse=False))
+        if construction == "direct"
+        else partial(attrs.evolve, index)
+    )
+    updated = construct(**changes)
+    assert updated.eof_ns is None
+    for field in ("sof_ns", "moe_ns"):
+        assert getattr(updated, field) is (values if field in fields else None)
+
+
+@pytest.mark.parametrize("field", ["sof_ns", "moe_ns"])
+def test_camera_timing_field_validation_preserves_values_and_optional_columns(field: str) -> None:
+    """Zero, negative, and nonmonotonic upstream timestamps remain untouched."""
+    index = _index_with_timing(pa.Table.from_pylist(_ROWS_WITH_SOF_MOE, schema=FRAME_INDEX_SCHEMA))
+    values = np.array([0, -1, -1], dtype=np.int64)
+    updated = attrs.evolve(index, eof_ns=values, **{field: values})
+    np.testing.assert_array_equal(updated.eof_ns, values)
+    np.testing.assert_array_equal(getattr(updated, field), values)
+    without_optional = attrs.evolve(updated, sof_ns=None, moe_ns=None)
+    assert without_optional.sof_ns is without_optional.moe_ns is None
+    ordinary = attrs.evolve(without_optional, eof_ns=None)
+    assert ordinary.eof_ns is ordinary.sof_ns is ordinary.moe_ns is None

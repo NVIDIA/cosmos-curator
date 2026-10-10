@@ -17,9 +17,36 @@
 from typing import Any
 
 _FRAME_ROWS: list[dict[str, Any]] = [
-    {"dts_ticks": 12, "composition_offset_ticks": None, "is_keyframe": True, "offset": 0, "size": 100},
-    {"dts_ticks": 422, "composition_offset_ticks": 6, "is_keyframe": False, "offset": 100, "size": 50},
-    {"dts_ticks": 832, "composition_offset_ticks": None, "is_keyframe": False, "offset": 150, "size": 42},
+    {
+        "dts_ticks": 12,
+        "composition_offset_ticks": None,
+        "is_keyframe": True,
+        "offset": 0,
+        "size": 100,
+        "eof_ns": None,
+        "sof_ns": None,
+        "moe_ns": None,
+    },
+    {
+        "dts_ticks": 422,
+        "composition_offset_ticks": 6,
+        "is_keyframe": False,
+        "offset": 100,
+        "size": 50,
+        "eof_ns": None,
+        "sof_ns": None,
+        "moe_ns": None,
+    },
+    {
+        "dts_ticks": 832,
+        "composition_offset_ticks": None,
+        "is_keyframe": False,
+        "offset": 150,
+        "size": 42,
+        "eof_ns": None,
+        "sof_ns": None,
+        "moe_ns": None,
+    },
 ]
 
 _METADATA_ROW: dict[str, Any] = {

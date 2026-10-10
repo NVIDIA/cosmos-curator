@@ -199,7 +199,7 @@ def test_validate_committed_versions_raises_on_a_mismatched_record_schema_versio
     """A row stamped with a stale row-shape version refuses the whole table, naming the count."""
     uri = str(tmp_path / "manifest.lance")
     _publish_manifest_row(
-        uri, video_id="a", record_schema_version=RECORD_SCHEMA_VERSION + 1, extraction_contract_id=_CURRENT_CONTRACT_ID
+        uri, video_id="a", record_schema_version=RECORD_SCHEMA_VERSION - 1, extraction_contract_id=_CURRENT_CONTRACT_ID
     )
     dataset = lance.dataset(uri)
 

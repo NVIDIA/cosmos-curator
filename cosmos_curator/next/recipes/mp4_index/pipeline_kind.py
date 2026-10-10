@@ -13,81 +13,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Config-backed pipeline-kind surface for Curator Next ``mp4-index``.
-
-Lazy-imports inside each adapter function (``next/AGENTS.md``'s own instruction -- "Keep the
-adapter lightweight by deferring config, runtime, Ray, and model imports until the selected
-operation needs them"). Registered in ``builtin_pipeline_kinds.py``'s ``BUILTIN_PIPELINE_KINDS``.
-"""
+"""Lazy CLI adapters for MP4 indexing recipes."""
 
 from collections.abc import Sequence
+from importlib import import_module
 from pathlib import Path
+from typing import cast
 
 from cosmos_curator.next.core.pipeline_kind import PipelineKind, PipelinePreset, PipelineRunOutput, PreparedPipelineRun
 
 
-def _template_yaml() -> str:
-    from cosmos_curator.next.recipes.mp4_index.config import config_template_yaml  # noqa: PLC0415
+def make_mp4_pipeline_kind(*, name: str, config_module: str, pipeline_module: str) -> PipelineKind:
+    """Bind MP4 config callbacks and a deferred runtime without importing either at registration."""
 
-    return config_template_yaml()
+    def template_yaml() -> str:
+        return cast("str", import_module(config_module).config_template_yaml())
 
+    def template_payload() -> dict[str, object]:
+        return cast("dict[str, object]", import_module(config_module).config_template_payload())
 
-def _template_payload() -> dict[str, object]:
-    from cosmos_curator.next.recipes.mp4_index.config import config_template_payload  # noqa: PLC0415
+    def validate(config: Path, overrides: Sequence[str]) -> dict[str, object]:
+        import_module(config_module).resolve_config(config, overrides=overrides)
+        return {"ok": True}
 
-    return config_template_payload()
+    def render(config: Path, overrides: Sequence[str]) -> str:
+        module = import_module(config_module)
+        return cast("str", module.resolved_config_to_json(module.resolve_config(config, overrides=overrides)))
 
+    def schema_json() -> str:
+        return cast("str", import_module(config_module).config_schema_json())
 
-def _validate(config: Path, overrides: Sequence[str]) -> dict[str, object]:
-    from cosmos_curator.next.recipes.mp4_index.config import resolve_config  # noqa: PLC0415
+    def list_presets() -> list[PipelinePreset]:
+        return []
 
-    resolve_config(config, overrides=overrides)
-    return {"ok": True}
+    def prepare_run(config: Path, *, set_overrides: list[str]) -> PreparedPipelineRun:
+        resolved = import_module(config_module).resolve_config(config, overrides=set_overrides)
 
+        def run() -> PipelineRunOutput:
+            summary = cast("dict[str, object]", import_module(pipeline_module).run_config(resolved))
+            return PipelineRunOutput(
+                json_payload=summary,
+                message=f"{name}: {summary['videos_extracted']} video(s) indexed, {summary['videos_failed']} error(s)",
+            )
 
-def _render(config: Path, overrides: Sequence[str]) -> str:
-    from cosmos_curator.next.recipes.mp4_index.config import (  # noqa: PLC0415
-        resolve_config,
-        resolved_config_to_json,
+        return run
+
+    return PipelineKind(
+        name=name,
+        template_yaml=template_yaml,
+        template_payload=template_payload,
+        validate=validate,
+        render=render,
+        schema_json=schema_json,
+        list_presets=list_presets,
+        prepare_run=prepare_run,
     )
 
-    return resolved_config_to_json(resolve_config(config, overrides=overrides))
 
-
-def _schema_json() -> str:
-    from cosmos_curator.next.recipes.mp4_index.config import config_schema_json  # noqa: PLC0415
-
-    return config_schema_json()
-
-
-def _list_presets() -> list[PipelinePreset]:
-    return []  # no presets yet
-
-
-def _prepare_run(config: Path, *, set_overrides: list[str]) -> PreparedPipelineRun:
-    from cosmos_curator.next.recipes.mp4_index.config import resolve_config  # noqa: PLC0415
-
-    resolved = resolve_config(config, overrides=set_overrides)
-
-    def run() -> PipelineRunOutput:
-        from cosmos_curator.next.recipes.mp4_index.pipeline import run_config  # noqa: PLC0415
-
-        summary = run_config(resolved)
-        return PipelineRunOutput(
-            json_payload=summary,
-            message=f"mp4-index: {summary['videos_extracted']} video(s) indexed, {summary['videos_failed']} error(s)",
-        )
-
-    return run
-
-
-MP4_INDEX_KIND = PipelineKind(
+MP4_INDEX_KIND = make_mp4_pipeline_kind(
     name="mp4-index",
-    template_yaml=_template_yaml,
-    template_payload=_template_payload,
-    validate=_validate,
-    render=_render,
-    schema_json=_schema_json,
-    list_presets=_list_presets,
-    prepare_run=_prepare_run,
+    config_module="cosmos_curator.next.recipes.mp4_index.config",
+    pipeline_module="cosmos_curator.next.recipes.mp4_index.pipeline",
 )

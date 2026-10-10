@@ -23,12 +23,14 @@ import pytest
 import smart_open
 from pyarrow import ipc
 
-from cosmos_curator.core.sensors.data.mp4 import Mp4Metadata
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.next.recipes.mp4_index import contracts
 from cosmos_curator.next.recipes.mp4_index.contracts import (
+    FRAME_INDEX_SCHEMA,
     UnresolvableMediaLocationError,
     derive_session_and_camera,
     make_session_camera_id,
+    read_video_record,
 )
 from tests.cosmos_curator.next.recipes.mp4_index._record_fixtures import _FRAME_ROWS, _METADATA_ROW
 
@@ -328,3 +330,132 @@ def test_write_then_read_back_over_an_s3_uri(tmp_path: pathlib.Path, monkeypatch
 
     assert frame_table.to_pylist() == _FRAME_ROWS
     assert seen_paths == [path, path]
+
+
+def test_sliced_chunked_records_preserve_timing_buffers() -> None:
+    """Unwrap the chosen video, retaining integer precision and independent optional nulls."""
+    rows = [
+        {
+            "dts_ticks": 10,
+            "composition_offset_ticks": None,
+            "is_keyframe": True,
+            "offset": 100,
+            "size": 20,
+            "eof_ns": 9_007_199_254_740_993,
+            "sof_ns": None,
+            "moe_ns": 9_007_199_254_740_001,
+        }
+    ]
+    frame_schema = FRAME_INDEX_SCHEMA
+    values = pa.StructArray.from_arrays(
+        [pa.array([r[f.name] for r in rows], type=f.type) for f in frame_schema],
+        fields=list(frame_schema),
+    )
+    frames = pa.LargeListArray.from_arrays(pa.array([0, 1], type=pa.int64()), values)
+    record = pa.table({"frames": frames, "metadata": [{"frame_count": 1}]})
+    first = record.set_column(0, "frames", pa.array([[{**rows[0], "eof_ns": 1, "moe_ns": None}]], type=frames.type))
+    chunked = pa.concat_tables([first, record])
+    assert read_video_record(chunked, row_index=1)[0]["eof_ns"].to_pylist() == [rows[0]["eof_ns"]]
+    table = chunked.slice(1, 1)
+    timing = read_video_record(table)[0].select(["eof_ns", "sof_ns", "moe_ns"])
+    assert timing.schema == pa.schema([FRAME_INDEX_SCHEMA.field(name) for name in ["eof_ns", "sof_ns", "moe_ns"]])
+    assert timing["eof_ns"].chunk(0).buffers()[1].address == values.field("eof_ns").buffers()[1].address
+    frame_table, metadata = read_video_record(table)
+    for field in FRAME_INDEX_SCHEMA:
+        output_buffers = frame_table[field.name].chunk(0).buffers()
+        stored_buffers = values.field(field.name).buffers()
+        assert [buffer.address if buffer is not None else None for buffer in output_buffers] == [
+            buffer.address if buffer is not None else None for buffer in stored_buffers
+        ]
+    assert metadata["frame_count"] == 1
+    assert frame_table.schema == frame_schema
+    parsed = Mp4FrameIndex.from_frame_index_table(frame_table, time_base_num=1, time_base_den=1_000_000)
+    assert parsed.eof_ns is not None
+    assert parsed.dts_ns.tolist() == [10_000]
+    assert parsed.eof_ns.tolist() == [rows[0]["eof_ns"]]
+    assert parsed.sof_ns is None
+    assert parsed.moe_ns is not None
+    assert parsed.moe_ns.tolist() == [rows[0]["moe_ns"]]
+
+
+def test_reader_refuses_inconsistent_frame_count() -> None:
+    """Do not expose timing from a record whose metadata disagrees with its frame list."""
+    table = pa.table(
+        {
+            "frames": pa.array([_FRAME_ROWS], type=contracts.VIDEO_MANIFEST_SCHEMA.field("frames").type),
+            "metadata": [{"frame_count": 2}],
+        }
+    )
+    with pytest.raises(ValueError, match="count"):
+        read_video_record(table)
+
+
+def test_reader_rejects_float_timing() -> None:
+    """The reader rejects floating-point timing before a cast can conceal lost precision."""
+    frame_schema = pa.schema(
+        [
+            pa.field(field.name, pa.float64() if field.name == "eof_ns" else field.type, nullable=field.nullable)
+            for field in FRAME_INDEX_SCHEMA
+        ]
+    )
+    table = pa.table(
+        {
+            "frames": pa.array(
+                [
+                    [
+                        {
+                            "dts_ticks": 10,
+                            "composition_offset_ticks": None,
+                            "is_keyframe": True,
+                            "offset": 100,
+                            "size": 20,
+                            "eof_ns": 9_007_199_254_740_992.0,
+                            "sof_ns": None,
+                            "moe_ns": None,
+                        }
+                    ]
+                ],
+                type=pa.large_list(pa.struct(frame_schema)),
+            ),
+            "metadata": [{"frame_count": 1}],
+        }
+    )
+    with pytest.raises(ValueError, match=r"eof_ns.*int64.*double"):
+        read_video_record(table)
+
+
+@pytest.mark.parametrize("column", FRAME_INDEX_SCHEMA.names)
+@pytest.mark.parametrize("stored_type", [pa.float64(), pa.int32(), pa.uint64()])
+def test_reader_rejects_incompatible_frame_column_types(column: str, stored_type: pa.DataType) -> None:
+    """Every frame field enforces its declared type, including types Arrow could safely cast."""
+    fields = [
+        pa.field(field.name, stored_type if field.name == column else field.type, nullable=field.nullable)
+        for field in FRAME_INDEX_SCHEMA
+    ]
+    row = {**_FRAME_ROWS[0], column: 100.5 if stored_type == pa.float64() else 100}
+    values = pa.StructArray.from_arrays(
+        [pa.array([row[field.name]], type=field.type) for field in fields], fields=fields
+    )
+    frames = pa.LargeListArray.from_arrays(pa.array([0, 1], type=pa.int64()), values)
+    table = pa.table({"frames": frames, "metadata": [{"frame_count": 1}]})
+    expected = FRAME_INDEX_SCHEMA.field(column).type
+
+    with pytest.raises(ValueError, match=rf"{column}.*{expected}.*{stored_type}"):
+        read_video_record(table)
+
+
+def test_reader_rejects_integer_keyframe_flags() -> None:
+    """A nonzero integer must not be accepted as a Boolean keyframe flag."""
+    fields = [
+        pa.field(field.name, pa.int64() if field.name == "is_keyframe" else field.type, nullable=field.nullable)
+        for field in FRAME_INDEX_SCHEMA
+    ]
+    row = {**_FRAME_ROWS[0], "is_keyframe": 2}
+    values = pa.StructArray.from_arrays(
+        [pa.array([row[field.name]], type=field.type) for field in fields], fields=fields
+    )
+    frames = pa.LargeListArray.from_arrays(pa.array([0, 1], type=pa.int64()), values)
+    table = pa.table({"frames": frames, "metadata": [{"frame_count": 1}]})
+
+    with pytest.raises(ValueError, match=r"is_keyframe.*bool.*int64"):
+        read_video_record(table)

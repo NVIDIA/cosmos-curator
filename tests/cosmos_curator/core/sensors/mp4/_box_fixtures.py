@@ -161,6 +161,8 @@ def synthetic_fragmented_moov(
     include_elst: bool = False,
     include_trex: bool = True,
     trex_sample_duration: int = 0,
+    minf_extra_children: bytes = b"",
+    mdia_extra_children: bytes = b"",
 ) -> bytes:
     """Pack a full, real, minimal fragmented ``moov`` box -- real ``stsd``, empty ``stbl`` around it.
 
@@ -175,9 +177,9 @@ def synthetic_fragmented_moov(
         extradata = bytes([1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 0])
     stsd = avc1_stsd(width, height, extradata) if fourcc == "avc1" else hevc_stsd(width, height)
     stbl = pack_box("stbl", stsd)
-    minf = pack_box("minf", stbl)
+    minf = pack_box("minf", stbl + minf_extra_children)
     mdhd = pack_full_box("mdhd", 0, struct.pack(">III", 0, 0, timescale) + struct.pack(">I", duration))
-    mdia = pack_box("mdia", mdhd + minf)
+    mdia = pack_box("mdia", mdhd + minf + mdia_extra_children)
     tkhd = tkhd_box(version=tkhd_version)
     edts = pack_box("edts", elst_box()) if include_elst else b""
     trak = pack_box("trak", tkhd + mdia + edts)
@@ -296,6 +298,8 @@ def synthetic_moov(
     stsd_extra_children: bytes = b"",
     stsd_entry_count: int = 1,
     stbl_extra_children: bytes = b"",
+    minf_extra_children: bytes = b"",
+    mdia_extra_children: bytes = b"",
     moov_extra_children: bytes = b"",
     mvhd_version: int = 0,
     tkhd_version: int = 0,
@@ -344,9 +348,9 @@ def synthetic_moov(
         )
     stbl = pack_box("stbl", stbl_children + stbl_extra_children)
 
-    minf = pack_box("minf", stbl)
+    minf = pack_box("minf", stbl + minf_extra_children)
     mdhd = pack_full_box("mdhd", 0, struct.pack(">III", 0, 0, timescale) + struct.pack(">I", frame_count * 512))
-    mdia = pack_box("mdia", mdhd + minf)
+    mdia = pack_box("mdia", mdhd + minf + mdia_extra_children)
     tkhd = tkhd_box(version=tkhd_version, width=tkhd_width, height=tkhd_height)
     edts = pack_box("edts", elst_content if elst_content is not None else elst_box()) if include_elst else b""
     trak = pack_box("trak", tkhd + mdia + edts)

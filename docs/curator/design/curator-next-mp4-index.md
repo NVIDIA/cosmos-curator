@@ -42,10 +42,13 @@ falls back to a single full listing.
 | --- | --- |
 | `video_id` | Hash of the normalized `media_location`. Deliberately stable: changing it would orphan every already-extracted `moov`/`moof` sidecar on disk. |
 | `session_camera_id` | Hash of `(source_session_id, camera_key)`, derived from `media_location`'s path `execution.session_id_path_depth` directories up (default 2). Two distinct `video_id`s deriving the same `session_camera_id` refuse the whole run upfront (`SessionCameraIdCollisionError`), before any Ray dispatch. Consumers can query this logical key in Lance. |
-| `extraction_contract_id` | Hash of `{extraction_version, container_kind, session_id_path_depth}` -- see "Reconciliation" below. |
+| `extraction_contract_id` | Hash of `{kind, extraction_version, container_kind, session_id_path_depth}` -- see "Reconciliation" below. |
 
 One row per video in `manifest.lance`
 ([`VIDEO_MANIFEST_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
+
+The record schema version is 6. Version 5 lacks the nullable EOF/SOF/MOE frame fields;
+existing version-5 datasets require a fresh output dataset. Moov/moof caches can be reused.
 
 | Field | Nullable | Notes |
 | --- | --- | --- |
@@ -53,7 +56,7 @@ One row per video in `manifest.lance`
 | `source_session_id`, `camera_key` | no | |
 | `source_width`, `source_height`, `source_frame_rate`, `source_frame_count`, `source_duration_ns`, `source_video_codec` | no | Summary fields derived from the same metadata object, named to match `video_cut`. Queries can project these columns without loading frame arrays. |
 | `metadata` | no | Struct containing every `VIDEO_METADATA_SCHEMA` field, including extradata and edit-list bytes. |
-| `frames` | no | Large list of non-null `FRAME_INDEX_SCHEMA` structs, in decode order. Composition offsets may be all null when absent from the source. |
+| `frames` | no | Large list of non-null `FRAME_INDEX_SCHEMA` structs, in decode order. Composition offsets may be all null when absent from the source. EOF/SOF/MOE timestamps are nullable int64 nanoseconds. |
 | `moov_location` | no | Raw `moov` bytes, named by `video_id`. |
 | `moof_table_location` | yes | Raw `moof` bytes, one row per fragment; null for a nonfragmented video. |
 | `container_kind` | no | `"fragmented"`/`"nonfragmented"`, this video's own declared run shape. |
@@ -74,9 +77,17 @@ video index must fit in memory.
 
 A consumer can project summaries for selection, then read selected `metadata`/`frames` fields
 in distributed input workers. `read_video_record(table, row_index=…)` unwraps the nested frame
-list into an ordinary frame table while reusing Arrow value buffers. `Mp4Metadata.from_row` and
+list into an ordinary frame table while reusing Arrow value buffers. The reader requires each
+frame column's declared type and rejects mismatches without casting. `Mp4Metadata.from_row` and
 `Mp4FrameIndex.from_frame_index_table` remain independent of Lance. Arrow unwrapping does not
 eliminate allocations for subsequent NumPy conversion or derived timestamp calculations.
+
+The ordinary `mp4-index` recipe leaves EOF/SOF/MOE fields null. Extensions can supply timing
+columns within the fixed shared frame schema; recorder-specific requirements and sentinel
+normalization belong in the extension. The shared reader preserves partially missing timing as
+masked `int64` arrays (`True` marks missing timing), fully populated columns as ordinary NumPy
+arrays, and entirely missing columns as `None`. The sensor library checks dtype and frame count
+without requiring EOF when SOF or MOE is present.
 
 Raw `moof` Arrow caches are still fetched wholesale before IPC parsing; they are extraction caches,
 not the canonical metadata/index output. Source media remains in its original storage.
@@ -93,7 +104,8 @@ hashes exactly the settings that change what gets extracted for identical input 
 
 ```python
 {
-    "extraction_version": 1,  # bumped manually when moov/moof parsing semantics change
+    "kind": config.kind,
+    "extraction_version": 1,  # bumped manually when extraction semantics change
     "container_kind": config.input.container_kind,
     "session_id_path_depth": config.execution.session_id_path_depth,
 }
@@ -125,11 +137,28 @@ source file replaced in place between two runs would read back stale bytes.
 | `UnresolvableMediaLocationError` (path too shallow for session/camera derivation) | `errors.lance`, per-video |
 | `FileNotFoundError` (an explicit `uris` entry that's missing -- no upfront `HEAD`) | `errors.lance`, per-video |
 | Manifest table has rows from a different contract/schema version | Whole run refuses before dispatch |
+| Extension contract violations or unexpected extension errors | Whole run fails; no per-video error row |
+
+Extensions report malformed source data through explicit `UnindexableVideoError` subclasses.
+Refusals from extension construction or handler registration become per-video failures without
+cache recovery. Refusals after parsing cached boxes may trigger the same one-time refetch as
+standard MP4 parse failures, with a fresh extension for the retry.
+Unknown or duplicate columns, schema/type mismatches, and incorrectly shaped extension batches fail the run
+without retrying cached boxes or adding the video to `errors.lance`. Previously recorded failures can
+be retried with `--set execution.skip_known_failures=false` after fixing the extension.
 
 Every video's own extraction is a real network read against `media_location`, and a fragmented run's
 moof walk reads the whole source sequentially -- the large-source-download pattern
 [`ray-data.md`](ray-data.md)'s own `curator_io` section covers. `run_config` reserves one `curator_io`
 slot per actor task unconditionally.
+
+Indexing actors retain MP4 boxes and frame arrays, stream source reads when needed, and do not
+keep whole videos or decoded frames in memory. Observed actor memory use is about 300–400 MB,
+so this recipe can support a higher IO budget than stages that buffer full videos. For a new local
+Ray node, the slot budget defaults to the process's available CPU count;
+`COSMOS_CURATOR_RAY_IO_SLOTS_PER_NODE` overrides it. Existing clusters retain their launch-time
+resource budgets. Indexing actors reserve 0.5 GiB by default, adjustable through
+`execution.actor_memory_gb`.
 
 ## Running
 
@@ -152,6 +181,5 @@ output:
 `manifest.lance`, `errors.lance`, `moov/`, and `moof/` are all written under
 `output.path`. Local/shared paths are supported in place of S3, visible to every Ray worker.
 
-The complete-record layout uses `record_schema_version: 5`. Older manifests must be recreated
-or explicitly backfilled before rerunning; changing storage shape does not change the extraction
-contract. Existing raw-box caches remain reusable. No standalone Arrow export is included.
+Older manifest layouts require a fresh output dataset. Existing moov/moof caches
+remain reusable. No standalone Arrow export is included.

@@ -65,29 +65,33 @@ _PUBLISH_RESULT_SCHEMA = pa.schema(
 )
 
 
-def open_or_create_manifest_table(*, uri: str, storage_profile: str) -> lance.LanceDataset:
+def open_or_create_manifest_table(
+    *, uri: str, storage_profile: str, schema: pa.Schema = VIDEO_MANIFEST_SCHEMA, kind: str = _KIND
+) -> lance.LanceDataset:
     """Open the canonical manifest table or atomically bootstrap its zero-row schema."""
     return lance_fragment_recovery.open_or_create_table(
         uri=uri,
         storage_profile=storage_profile,
-        schema=VIDEO_MANIFEST_SCHEMA,
+        schema=schema,
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
-        kind=_KIND,
+        kind=kind,
     )
 
 
-def validate_committed_versions(dataset: lance.LanceDataset, *, extraction_contract_id: str) -> None:
+def validate_committed_versions(
+    dataset: lance.LanceDataset, *, extraction_contract_id: str, record_schema_version: int = RECORD_SCHEMA_VERSION
+) -> None:
     """Refuse a table containing any row from an incompatible schema/extraction-contract version.
 
     Scans the whole table, not just this run's own candidate ``video_id``s: unlike
     ``robot_action_split``'s ``clip_id``, ``video_id`` doesn't bake the contract into the identity,
     so a stale row outside this run's own discovered set would otherwise go unchecked forever.
     """
-    mismatched_schema = dataset.count_rows(filter=f"record_schema_version != {RECORD_SCHEMA_VERSION}")
+    mismatched_schema = dataset.count_rows(filter=f"record_schema_version != {record_schema_version}")
     if mismatched_schema:
         msg = (
             f"Manifest table contains {mismatched_schema} row(s) with record_schema_version other than "
-            f"{RECORD_SCHEMA_VERSION}. Recreate the table and rerun, or backfill the stale rows, before "
+            f"{record_schema_version}. Recreate the table and rerun, or backfill the stale rows, before "
             "continuing."
         )
         raise ValueError(msg)
@@ -166,7 +170,9 @@ def known_failed_video_ids(errors_lance_uri: str, storage_profile: str, candidat
     return {str(value) for value in table.column("video_id").to_pylist()}
 
 
-def stage_manifest_batch(batch: pa.Table, *, uri: str, storage_profile: str) -> pa.Table:
+def stage_manifest_batch(
+    batch: pa.Table, *, uri: str, storage_profile: str, schema: pa.Schema = VIDEO_MANIFEST_SCHEMA
+) -> pa.Table:
     """Stage one bounded block's worth of successful rows as a single Lance fragment."""
     is_success = pc.equal(batch["status"], "success")
     successes = batch.filter(is_success)
@@ -174,12 +180,12 @@ def stage_manifest_batch(batch: pa.Table, *, uri: str, storage_profile: str) -> 
 
     rows: list[dict[str, Any]] = []
     if successes.num_rows:
-        manifest_table = successes.select(VIDEO_MANIFEST_SCHEMA.names).cast(VIDEO_MANIFEST_SCHEMA)
+        manifest_table = successes.select(schema.names).cast(schema)
         candidate = lance_fragment_recovery.write_row_fragment(
             manifest_table,
             uri=uri,
             storage_profile=storage_profile,
-            schema=VIDEO_MANIFEST_SCHEMA,
+            schema=schema,
             id_column="video_id",
             data_storage_version=LANCE_DATA_STORAGE_VERSION,
         )
@@ -210,15 +216,17 @@ def stage_manifest_batch(batch: pa.Table, *, uri: str, storage_profile: str) -> 
     return pa.Table.from_pylist(rows, schema=_PUBLISH_RESULT_SCHEMA)
 
 
-def append_manifest_fragment(candidate_json: str, *, uri: str, storage_profile: str) -> int:
+def append_manifest_fragment(
+    candidate_json: str, *, uri: str, storage_profile: str, schema: pa.Schema = VIDEO_MANIFEST_SCHEMA, kind: str = _KIND
+) -> int:
     """Idempotently append one staged manifest fragment and return the version containing it."""
     return lance_fragment_recovery.append_row_fragment(
         candidate_json,
         uri=uri,
         storage_profile=storage_profile,
-        schema=VIDEO_MANIFEST_SCHEMA,
+        schema=schema,
         id_column="video_id",
-        kind=_KIND,
+        kind=kind,
         operation=_APPEND_OPERATION,
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
         attempts=_COMMIT_ATTEMPTS,

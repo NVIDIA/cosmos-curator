@@ -44,7 +44,8 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 
-from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, find_box, uuid_extension_boxes
+from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, find_box, find_video_trak
+from cosmos_curator.core.sensors.mp4.box_traversal import BoxScope, BoxTraversal
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.utils.helpers import as_optional_readonly_view, as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import int64_array, optional_bool_array
@@ -53,6 +54,21 @@ if TYPE_CHECKING:
     AttrsAttribute = attrs.Attribute[Any]
 else:
     AttrsAttribute = attrs.Attribute
+
+
+def video_track_scopes(buf: bytes, moov_scope: BoxScope) -> tuple[BoxScope, BoxScope, BoxScope, str]:
+    """Select the video track and identify its sample-table scopes before dispatch."""
+    trak_start, trak_end, stbl_start, stbl_end, stsd_start, stsd_end, fourcc = find_video_trak(
+        buf, moov_scope.start, moov_scope.end
+    )
+    tkhd_start, _tkhd_end = find_box(buf, ("tkhd",), trak_start, trak_end)
+    track_id_offset = tkhd_start + (20 if buf[tkhd_start] == 1 else 12)
+    track_id = struct.unpack_from(">I", buf, track_id_offset)[0]
+    trak_scope = BoxScope(trak_start, trak_end, (*moov_scope.path, "trak"), track_id=track_id)
+    stbl_scope = BoxScope(stbl_start, stbl_end, (*trak_scope.path, "mdia", "minf", "stbl"), track_id=track_id)
+    stsd_scope = BoxScope(stsd_start, stsd_end, (*stbl_scope.path, "stsd"), track_id=track_id)
+    return trak_scope, stbl_scope, stsd_scope, fourcc
+
 
 #: SampleEntry base (8B+6B+2B) + VisualSampleEntry's own fixed fields (70B) = 86B;
 #: nested config boxes (``avcC`` etc.) start right after.
@@ -130,7 +146,7 @@ class StsdBox:
     stsd_extension_boxes: tuple[tuple[bytes, bytes], ...]
 
     @classmethod
-    def parse(cls, buf: bytes, stsd_start: int, stsd_end: int, fourcc: str) -> Self:  # noqa: ARG003 -- stsd_end kept for symmetry with sibling parsers
+    def parse(cls, buf: bytes, traversal: BoxTraversal, scope: BoxScope, fourcc: str) -> Self:
         """Parse ``stsd``'s one sample-description entry.
 
         Called by both combiners -- a fragmented track's ``moov`` still carries this box,
@@ -156,28 +172,29 @@ class StsdBox:
                 before reading anything past ``entry_count`` itself.
 
         """
-        entry_count = struct.unpack_from(">I", buf, stsd_start + 4)[0]
+        entry_count = struct.unpack_from(">I", buf, scope.start + 4)[0]
         if entry_count > 1:
             msg = f"stsd has {entry_count} sample-description entries, expected exactly one"
             raise AmbiguousSampleDescriptionError(msg)
 
-        entry_start = stsd_start + 8  # FullBox header (4B) + entry_count (4B)
+        entry_start = scope.start + 8  # FullBox header (4B) + entry_count (4B)
         entry_size = struct.unpack_from(">I", buf, entry_start)[0]
         entry_end = entry_start + entry_size
 
         width, height = struct.unpack_from(">HH", buf, entry_start + _WIDTH_OFFSET_IN_ENTRY)
         config_start = entry_start + _VISUAL_SAMPLE_ENTRY_FIXED_BYTES
+        entry_scope = BoxScope(config_start, entry_end, (*scope.path, fourcc), scope.track_id, scope.fragment_index)
 
         try:
-            btrt_start, _btrt_end = find_box(buf, ("btrt",), config_start, entry_end)
+            btrt_start, _btrt_end = traversal.find_bounds(entry_scope, ("btrt",))
             buffer_size_db, max_bitrate_bps, avg_bitrate_bps = struct.unpack_from(">III", buf, btrt_start)
         except BoxNotFoundError:
             buffer_size_db = max_bitrate_bps = avg_bitrate_bps = None
-        stsd_extension_boxes = uuid_extension_boxes(buf, config_start, entry_end)
+        stsd_extension_boxes = traversal.extension_boxes(entry_scope)
 
         box_name = "avcC" if fourcc in ("avc1", "avc3") else "hvcC"
         try:
-            config_content_start, config_content_end = find_box(buf, (box_name,), config_start, entry_end)
+            config_content_start, config_content_end = traversal.find_bounds(entry_scope, (box_name,))
         except BoxNotFoundError:
             return cls(
                 fourcc,

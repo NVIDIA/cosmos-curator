@@ -63,7 +63,7 @@ def test_resolves_a_minimal_uris_config(tmp_path: pathlib.Path) -> None:
     assert resolved.execution.storage_profile == "default"
     assert resolved.execution.min_actors == 2
     assert resolved.execution.max_actors is None
-    assert resolved.execution.actor_memory_gb is None
+    assert resolved.execution.actor_memory_gb == 0.5
     assert resolved.execution.skip_known_failures is True
     assert resolved.execution.videos_per_fragment == 1_000
     assert resolved.execution.progress is False

@@ -41,7 +41,7 @@ CONTAINER_KIND_FRAGMENTED = "fragmented"
 CONTAINER_KIND_NONFRAGMENTED = "nonfragmented"
 
 #: VIDEO_MANIFEST_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
-RECORD_SCHEMA_VERSION = 5
+RECORD_SCHEMA_VERSION = 6
 
 
 def make_video_id(media_location: str) -> str:
@@ -132,7 +132,8 @@ def _open_sidecar_for_write(path: str, *, transport_params: dict[str, Any] | Non
 
 
 #: One struct per sample, in decode order. Ticks use the video's metadata time base,
-#: without edit-list shifts or sensor-clock timing. Composition offsets are null
+#: without edit-list shifts. Upstream-provided EOF/SOF/MOE are expressed in nanoseconds
+#: and are all-null for ordinary MP4s. Composition offsets are null
 #: when absent; explicit offsets, including zero, remain signed integers.
 FRAME_INDEX_SCHEMA = pa.schema(
     [
@@ -141,6 +142,9 @@ FRAME_INDEX_SCHEMA = pa.schema(
         pa.field("is_keyframe", pa.bool_(), nullable=False),
         pa.field("offset", pa.int64(), nullable=False),  # packet data start
         pa.field("size", pa.int64(), nullable=False),
+        pa.field("eof_ns", pa.int64(), nullable=True),
+        pa.field("sof_ns", pa.int64(), nullable=True),
+        pa.field("moe_ns", pa.int64(), nullable=True),
     ]
 )
 
@@ -272,7 +276,8 @@ def read_video_record(table: pa.Table, *, row_index: int = 0) -> tuple[pa.Table,
     """Unwrap one video record's frame columns without copying their Arrow value buffers.
 
     Accepts projected or chunked Arrow tables, including slices of a Lance scan.
-    Metadata alone is converted to Python; frame values remain Arrow-native.
+    Metadata alone is converted to Python; frame values remain Arrow-native. Frame
+    columns must match their declared types; incompatible stored types are never cast.
     """
     metadata = table.column("metadata")[row_index]
     frames = table.column("frames")[row_index]
@@ -283,8 +288,15 @@ def read_video_record(table: pa.Table, *, row_index: int = 0) -> tuple[pa.Table,
     if values.null_count:
         msg = "Frame records must not be null"
         raise ValueError(msg)
+    frame_fields = [values.type.field(name) for name in FRAME_INDEX_SCHEMA.names]
+    # Validate before constructing the table: Arrow could otherwise cast compatible
+    # types, concealing an incompatible stored representation or lost precision.
+    for field, expected in zip(frame_fields, FRAME_INDEX_SCHEMA, strict=True):
+        if field.type != expected.type:
+            msg = f"Frame column {field.name!r} must have type {expected.type}, got {field.type}"
+            raise ValueError(msg)
     frame_table = pa.Table.from_arrays(
-        [values.field(field.name) for field in FRAME_INDEX_SCHEMA], schema=FRAME_INDEX_SCHEMA
+        [values.field(field.name) for field in frame_fields], schema=pa.schema(frame_fields)
     )
     metadata_row = metadata.as_py()
     if len(frame_table) != metadata_row["frame_count"]:

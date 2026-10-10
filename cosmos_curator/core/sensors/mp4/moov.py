@@ -32,6 +32,7 @@ Box layout this module reads (everything below lives inside one ``moov``, under 
 """
 
 import struct
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -39,13 +40,9 @@ import numpy.typing as npt
 from cosmos_curator.core.sensors.mp4.box_primitives import (
     BoxNotFoundError,
     MalformedBoxHeaderError,
-    find_all_boxes,
-    find_box,
-    find_box_bytes,
-    find_video_trak,
     read_box_header,
-    uuid_extension_boxes,
 )
+from cosmos_curator.core.sensors.mp4.box_traversal import BoxScope, BoxTraversal, UuidHandler
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.moov_track import (
     CttsBox,
@@ -54,6 +51,7 @@ from cosmos_curator.core.sensors.mp4.moov_track import (
     StsdBox,
     TrackHeader,
     VideoTrack,
+    video_track_scopes,
 )
 
 
@@ -149,12 +147,12 @@ def _expand_dts_ticks(stts: list[tuple[int, int]]) -> npt.NDArray[np.int64]:
     return np.concatenate(runs)
 
 
-def _chunk_offsets(buf: bytes, stbl_start: int, stbl_end: int) -> list[int]:
+def _chunk_offsets(buf: bytes, traversal: BoxTraversal, scope: BoxScope) -> list[int]:
     try:
-        start, end = find_box(buf, ("stco",), stbl_start, stbl_end)
+        start, end = traversal.find_bounds(scope, ("stco",))
         return parse_stco(buf, start, end)
     except BoxNotFoundError:
-        start, end = find_box(buf, ("co64",), stbl_start, stbl_end)
+        start, end = traversal.find_bounds(scope, ("co64",))
         return parse_co64(buf, start, end)
 
 
@@ -176,20 +174,22 @@ def _expand_sample_offsets(
     return np.array(offsets, dtype=np.int64)
 
 
-def parse_video_track(buf: bytes) -> VideoTrack:
+def parse_video_track(buf: bytes, *, uuid_handlers: Sequence[UuidHandler] = ()) -> VideoTrack:
     """Parse one non-fragmented file's ``moov`` box (header included) into a faithful :class:`VideoTrack`.
 
     Args:
         buf: exactly one ``moov`` box, header included.
+        uuid_handlers: invocation-local handlers for UUID boxes in visited scopes.
 
     Raises:
         BoxNotFoundError: *buf* is not a ``moov`` box, or carries no video
             ``trak``.
         MalformedBoxHeaderError: *buf* is truncated or corrupt partway through parsing.
+        UuidCallbackError: a registered UUID handler failed; ``error`` retains its exception.
 
     """
     try:
-        return _parse_video_track(buf)
+        return _parse_video_track(buf, uuid_handlers=uuid_handlers)
     except (struct.error, IndexError) as exc:
         msg = f"moov buffer ({len(buf)} byte(s)) ran out mid-parse -- truncated or corrupt: {exc}"
         raise MalformedBoxHeaderError(msg) from exc
@@ -202,46 +202,49 @@ def _check_sample_count(actual: int, frame_count: int, source: str) -> None:
         raise MalformedSampleTableError(msg)
 
 
-def _parse_video_track(buf: bytes) -> VideoTrack:
+def _parse_video_track(buf: bytes, *, uuid_handlers: Sequence[UuidHandler]) -> VideoTrack:
     box_type, box_size, header_len = read_box_header(buf, 0, len(buf))
     if box_type != "moov":
         msg = f"expected a moov box, found {box_type!r}"
         raise BoxNotFoundError(msg)
     moov_start, moov_end = header_len, box_size
 
-    trak_start, trak_end, stbl_start, stbl_end, stsd_start, stsd_end, fourcc = find_video_trak(
-        buf, moov_start, moov_end
-    )
+    traversal = BoxTraversal(buf, uuid_handlers=uuid_handlers)
+    moov_scope = BoxScope(moov_start, moov_end, ("moov",))
+    trak_scope, stbl_scope, stsd_scope, fourcc = video_track_scopes(buf, moov_scope)
+    # Visit the selected track's intermediate containers as well as stbl,
+    # so UUID handlers registered for mdia/minf are dispatched with track context.
+    traversal.find(trak_scope, ("mdia", "minf", "stbl"))
+    traversal.scan_children(stbl_scope)
 
-    mvhd_start, mvhd_end = find_box(buf, ("mvhd",), moov_start, moov_end)
+    mvhd_start, mvhd_end = traversal.find_bounds(moov_scope, ("mvhd",))
     movie_header = MovieHeader.parse(buf, mvhd_start, mvhd_end)
-    moov_extension_boxes = uuid_extension_boxes(buf, moov_start, moov_end)
+    moov_extension_boxes = traversal.extension_boxes(moov_scope)
 
-    tkhd_start, tkhd_end = find_box(buf, ("tkhd",), trak_start, trak_end)
+    tkhd_start, tkhd_end = traversal.find_bounds(trak_scope, ("tkhd",))
     track_header = TrackHeader.parse(buf, tkhd_start, tkhd_end)
     try:
-        edts_start, edts_end = find_box(buf, ("edts",), trak_start, trak_end)
-        elst_bytes = find_box_bytes(buf, "elst", edts_start, edts_end)
+        elst_bytes = traversal.find_bytes(trak_scope, ("edts", "elst"))
     except BoxNotFoundError:
         elst_bytes = None
 
-    mdhd_start, mdhd_end = find_box(buf, ("mdia", "mdhd"), trak_start, trak_end)
+    mdhd_start, mdhd_end = traversal.find_bounds(trak_scope, ("mdia", "mdhd"))
     media_header = MediaHeader.parse(buf, mdhd_start, mdhd_end)
 
-    sample_description = StsdBox.parse(buf, stsd_start, stsd_end, fourcc)
+    sample_description = StsdBox.parse(buf, traversal, stsd_scope, fourcc)
 
-    stts_start, stts_end = find_box(buf, ("stts",), stbl_start, stbl_end)
+    stts_start, stts_end = traversal.find_bounds(stbl_scope, ("stts",))
     dts_ticks = _expand_dts_ticks(parse_stts(buf, stts_start, stts_end))
     frame_count = len(dts_ticks)
 
     try:
-        stss_start, stss_end = find_box(buf, ("stss",), stbl_start, stbl_end)
+        stss_start, stss_end = traversal.find_bounds(stbl_scope, ("stss",))
         keyframe_numbers = parse_stss(buf, stss_start, stss_end)
         is_keyframe = np.array([(i + 1) in keyframe_numbers for i in range(frame_count)], dtype=np.bool_)
     except BoxNotFoundError:
         is_keyframe = None  # faithful: stss absent, not defaulted to "every sample is a keyframe"
 
-    ctts_boxes = find_all_boxes(buf, "ctts", stbl_start, stbl_end)
+    ctts_boxes = [(box.content_start, box.end) for box in traversal.scan_children(stbl_scope) if box.box_type == "ctts"]
     if ctts_boxes:
         ctts_start, ctts_end = ctts_boxes[0]
         ctts_pairs = parse_ctts(buf, ctts_start, ctts_end)
@@ -256,13 +259,13 @@ def _parse_video_track(buf: bytes) -> VideoTrack:
     else:
         composition_offsets = None
 
-    stsz_start, stsz_end = find_box(buf, ("stsz",), stbl_start, stbl_end)
+    stsz_start, stsz_end = traversal.find_bounds(stbl_scope, ("stsz",))
     sample_sizes = parse_stsz(buf, stsz_start, stsz_end)
     _check_sample_count(len(sample_sizes), frame_count, "stsz")
 
-    stsc_start, stsc_end = find_box(buf, ("stsc",), stbl_start, stbl_end)
+    stsc_start, stsc_end = traversal.find_bounds(stbl_scope, ("stsc",))
     stsc = parse_stsc(buf, stsc_start, stsc_end)
-    chunk_offsets = _chunk_offsets(buf, stbl_start, stbl_end)
+    chunk_offsets = _chunk_offsets(buf, traversal, stbl_scope)
     offsets = _expand_sample_offsets(stsc, chunk_offsets, sample_sizes)
     _check_sample_count(len(offsets), frame_count, "stsc/stco expansion")
 

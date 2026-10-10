@@ -24,7 +24,14 @@ import struct
 import pytest
 
 from cosmos_curator.core.sensors.mp4 import moov as st
-from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, MalformedBoxHeaderError
+from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, MalformedBoxHeaderError, find_box
+from cosmos_curator.core.sensors.mp4.box_traversal import (
+    BoxLocation,
+    BoxScope,
+    BoxTraversal,
+    UuidCallbackError,
+    UuidHandler,
+)
 from cosmos_curator.core.sensors.mp4.moov_track import AmbiguousSampleDescriptionError
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
 from tests.cosmos_curator.core.sensors.mp4._box_fixtures import pack_box as _box
@@ -362,7 +369,7 @@ def test_chunk_offsets_falls_back_to_co64_when_stco_is_absent() -> None:
     co64 = bf.pack_full_box("co64", 0, struct.pack(">I", len(entries)) + struct.pack(">2Q", *entries))
     stbl = _box("stbl", co64)
 
-    offsets = st._chunk_offsets(stbl, 8, len(stbl))
+    offsets = st._chunk_offsets(stbl, BoxTraversal(stbl), BoxScope(8, len(stbl), ("stbl",)))
 
     assert offsets == entries
 
@@ -373,6 +380,95 @@ def test_chunk_offsets_prefers_stco_when_both_are_present() -> None:
     co64 = bf.pack_full_box("co64", 0, struct.pack(">I", 1) + struct.pack(">Q", 5_000_000_000))
     stbl = _box("stbl", stco + co64)
 
-    offsets = st._chunk_offsets(stbl, 8, len(stbl))
+    offsets = st._chunk_offsets(stbl, BoxTraversal(stbl), BoxScope(8, len(stbl), ("stbl",)))
 
     assert offsets == [1234]
+
+
+@pytest.mark.parametrize("error_type", [IndexError, struct.error, RuntimeError, ValueError])
+def test_uuid_callback_errors_are_not_malformed_mp4_data(error_type: type[Exception]) -> None:
+    """Handler failures remain distinct from standard buffer-read failures."""
+    identifier = b"1234567890abcdef"
+    moov = bf.synthetic_moov(
+        frame_count=1,
+        keyframe_index=0,
+        ctts_offset=None,
+        stbl_extra_children=bf.uuid_box(identifier, b"payload"),
+    )
+    error = error_type("handler failed")
+
+    def fail(_payload: bytes, _box: BoxLocation) -> None:
+        raise error
+
+    handler = UuidHandler(identifier, frozenset({("moov", "trak", "mdia", "minf", "stbl")}), fail)
+    with pytest.raises(UuidCallbackError) as caught:
+        st.parse_video_track(moov, uuid_handlers=[handler])
+    assert caught.value.error is error
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("tkhd_version", [0, 1])
+def test_uuid_handlers_follow_selected_video_scopes(tkhd_version: int) -> None:
+    """Handlers receive video track context and leave preserved UUID bytes unchanged."""
+    identifier = b"1234567890abcdef"
+    events: list[tuple[bytes, BoxLocation]] = []
+    moov = bf.synthetic_moov(
+        frame_count=2,
+        keyframe_index=0,
+        ctts_offset=None,
+        tkhd_version=tkhd_version,
+        stbl_extra_children=bf.uuid_box(identifier, b"frames"),
+        stsd_extra_children=bf.uuid_box(identifier, b"description"),
+        moov_extra_children=bf.uuid_box(identifier, b"movie"),
+    )
+    paths = frozenset(
+        {("moov",), ("moov", "trak", "mdia", "minf", "stbl"), ("moov", "trak", "mdia", "minf", "stbl", "stsd", "avc1")}
+    )
+    handler = UuidHandler(identifier, paths, lambda payload, box: events.append((payload, box)))
+    track = st.parse_video_track(moov, uuid_handlers=[handler])
+    assert len(events) == 3
+    by_payload = dict(events)
+    assert by_payload[b"movie"].parent.track_id is None
+    assert by_payload[b"frames"].parent.track_id == 1
+    assert by_payload[b"description"].parent.track_id == 1
+    assert track.moov_extension_boxes == ((identifier, b"movie"),)
+    assert track.sample_description.stsd_extension_boxes == ((identifier, b"description"),)
+    assert track.size.tolist() == st.parse_video_track(moov).size.tolist()
+
+
+def test_uuid_handlers_do_not_run_for_unselected_tracks() -> None:
+    """An unselected track's UUID boxes cannot contribute to the video index."""
+    identifier = b"1234567890abcdef"
+    events: list[bytes] = []
+    video = bf.synthetic_moov(
+        frame_count=1, keyframe_index=0, ctts_offset=None, stbl_extra_children=bf.uuid_box(identifier, b"video")
+    )
+    other = video.replace(b"avc1", b"mp4a").replace(b"video", b"audio")
+    start, end = find_box(other, ("trak",), 8, len(other))
+    moov = _box("moov", _box("trak", other[start:end]) + video[8:])
+    handler = UuidHandler(
+        identifier, frozenset({("moov", "trak", "mdia", "minf", "stbl")}), lambda payload, _box: events.append(payload)
+    )
+    st.parse_video_track(moov, uuid_handlers=[handler])
+    assert events == [b"video"]
+
+
+@pytest.mark.parametrize("parent", ["mdia", "minf"])
+def test_uuid_handlers_visit_intermediate_track_containers(parent: str) -> None:
+    """Track-container UUIDs dispatch exactly once with the selected track identity."""
+    identifier = b"1234567890abcdef"
+    payload = b"track timing"
+    extras = {f"{parent}_extra_children": bf.uuid_box(identifier, payload)}
+    moov = bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None, **extras)
+    events: list[tuple[bytes, BoxLocation]] = []
+    parent_path = ("moov", "trak", "mdia") + (("minf",) if parent == "minf" else ())
+    handler = UuidHandler(identifier, frozenset({parent_path}), lambda value, box: events.append((value, box)))
+
+    track = st.parse_video_track(moov, uuid_handlers=[handler])
+
+    assert track.size.tolist()
+    assert len(events) == 1
+    assert events[0][0] == payload
+    assert events[0][1].parent.path == parent_path
+    assert events[0][1].parent.track_id == 1
+    assert events[0][1].parent.fragment_index is None

@@ -190,7 +190,7 @@ class Mp4IndexExecutionConfig(BaseModel):
         description="Maximum Ray Data actor pool size, or null to let Ray Data bound it by available resources.",
     )
     actor_memory_gb: float | None = Field(
-        default=None,
+        default=0.5,
         gt=0.0,
         description="Amount of heap one indexing actor reserves, in GiB, or null to accept Ray Data's own default.",
     )
@@ -235,16 +235,33 @@ class Mp4IndexExecutionConfig(BaseModel):
     )
 
 
-class ResolvedMp4IndexConfig(BaseModel):
-    """Canonical execution contract for the ``mp4-index`` recipe."""
+class Mp4IndexRunConfig(BaseModel):
+    """Shared settings and extraction contract for MP4 indexing recipes."""
 
     model_config = _MODEL_CONFIG
 
     schema_version: SchemaVersion
-    kind: Mp4IndexKind
+    kind: str
     input: Mp4IndexInputConfig
     output: Mp4IndexOutputConfig
     execution: Mp4IndexExecutionConfig = Field(default_factory=Mp4IndexExecutionConfig)
+
+    @classmethod
+    def resolve_config(cls, config_path: str | Path, *, overrides: Sequence[str] = ()) -> Self:
+        """Load, override, and validate one config file for this recipe."""
+        return cls.resolve_config_data(load_config_data(config_path), overrides=overrides)
+
+    @classmethod
+    def resolve_config_data(cls, config_data: Mapping[str, Any], *, overrides: Sequence[str] = ()) -> Self:
+        """Apply dotted YAML-valued overrides without modifying the supplied config."""
+        data = copy.deepcopy(dict(config_data))
+        apply_dotted_overrides(data, overrides)
+        return cls.model_validate(data)
+
+    @classmethod
+    def config_schema_json(cls, *, indent: int = 2) -> str:
+        """Render JSON Schema using this recipe's concrete model."""
+        return json.dumps(cls.model_json_schema(), indent=indent, ensure_ascii=False) + "\n"
 
     @property
     def extraction_contract(self) -> dict[str, object]:
@@ -255,7 +272,8 @@ class ResolvedMp4IndexConfig(BaseModel):
         excluded, since neither changes the output.
         """
         return {
-            "extraction_version": 1,  # bumped manually when moov/moof parsing semantics change
+            "kind": self.kind,
+            "extraction_version": 1,  # bumped manually when extraction semantics change
             "container_kind": self.input.container_kind,
             "session_id_path_depth": self.execution.session_id_path_depth,
         }
@@ -264,6 +282,12 @@ class ResolvedMp4IndexConfig(BaseModel):
     def extraction_contract_id(self) -> str:
         """Identify compatible extraction work."""
         return canonical_digest(self.extraction_contract)
+
+
+class ResolvedMp4IndexConfig(Mp4IndexRunConfig):
+    """Canonical execution contract for the ``mp4-index`` recipe."""
+
+    kind: Mp4IndexKind
 
 
 _TEMPLATE_BASE: dict[str, Any] = {
@@ -298,35 +322,14 @@ def load_config_data(config_path: str | Path) -> dict[str, Any]:
     return cast("dict[str, Any]", loaded)
 
 
-def resolve_config(
-    config_path: str | Path,
-    *,
-    overrides: Sequence[str] = (),
-) -> ResolvedMp4IndexConfig:
-    """Load, override, and validate one config file."""
-    return resolve_config_data(load_config_data(config_path), overrides=overrides)
+resolve_config = ResolvedMp4IndexConfig.resolve_config
+resolve_config_data = ResolvedMp4IndexConfig.resolve_config_data
+config_schema_json = ResolvedMp4IndexConfig.config_schema_json
 
 
-def resolve_config_data(
-    config_data: Mapping[str, Any],
-    *,
-    overrides: Sequence[str] = (),
-) -> ResolvedMp4IndexConfig:
-    """Apply dotted YAML-valued overrides and return canonical typed config."""
-    data = copy.deepcopy(dict(config_data))
-    apply_dotted_overrides(data, overrides)
-    return ResolvedMp4IndexConfig.model_validate(data)
-
-
-def resolved_config_to_json(config: ResolvedMp4IndexConfig, *, indent: int = 2) -> str:
+def resolved_config_to_json(config: Mp4IndexRunConfig, *, indent: int = 2) -> str:
     """Render canonical resolved JSON."""
     return json.dumps(config.model_dump(mode="json"), indent=indent, ensure_ascii=False) + "\n"
-
-
-def config_schema_json(*, indent: int = 2) -> str:
-    """Return JSON Schema for v1 configs."""
-    schema = ResolvedMp4IndexConfig.model_json_schema()
-    return json.dumps(schema, indent=indent, ensure_ascii=False) + "\n"
 
 
 def config_template() -> dict[str, Any]:

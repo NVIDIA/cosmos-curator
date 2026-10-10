@@ -20,11 +20,14 @@ real corpus file -- everything else (mvhd/tkhd/mdhd/stsd) is exercised by ``test
 already, since this module reuses those parsers verbatim.
 """
 
+import struct
+
 import pytest
 
 from cosmos_curator.core.sensors.data.mp4 import Mp4Metadata
 from cosmos_curator.core.sensors.mp4 import fragment_table as ft
 from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, MalformedBoxHeaderError
+from cosmos_curator.core.sensors.mp4.box_traversal import BoxLocation, UuidCallbackError, UuidHandler
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
 
 
@@ -401,3 +404,72 @@ def test_parse_fragment_table_elst_is_none_when_absent() -> None:
     table = ft.parse_fragment_table(moov, moof_rows)
 
     assert table.elst_bytes is None
+
+
+@pytest.mark.parametrize("error_type", [IndexError, struct.error, RuntimeError, ValueError])
+@pytest.mark.parametrize("parent_path", [("moov",), ("moof",), ("moof", "traf")])
+def test_uuid_callback_errors_are_not_malformed_mp4_data(
+    error_type: type[Exception], parent_path: tuple[str, ...]
+) -> None:
+    """Failures in either input buffer remain distinct from malformed MP4 data."""
+    identifier = b"1234567890abcdef"
+    uuid = bf.uuid_box(identifier, b"payload")
+    moov = bf.synthetic_fragmented_moov()
+    traf = bf.real_traf(decode_time=0, data_offset=32, sample_size=500, is_keyframe=True)
+    if parent_path == ("moov",):
+        moov = bf.pack_box("moov", moov[8:] + uuid)
+    elif parent_path == ("moof", "traf"):
+        traf = bf.pack_box("traf", traf[8:] + uuid)
+    moof = bf.pack_moof(traf, siblings=uuid if parent_path == ("moof",) else b"")
+    error = error_type("handler failed")
+
+    def fail(_payload: bytes, _box: BoxLocation) -> None:
+        raise error
+
+    handler = UuidHandler(identifier, frozenset({parent_path}), fail)
+    with pytest.raises(UuidCallbackError) as caught:
+        ft.parse_fragment_table(moov, [(1000, moof)], uuid_handlers=[handler])
+    assert caught.value.error is error
+    assert caught.value.__cause__ is error
+
+
+def test_uuid_handlers_preserve_fragment_order_and_scope() -> None:
+    """Moof UUIDs are fragment-scoped; traf UUIDs retain their declared track ID."""
+    identifier = b"1234567890abcdef"
+    events: list[tuple[bytes, BoxLocation]] = []
+    rows: list[tuple[int, bytes]] = []
+    for index in range(2):
+        traf = bf.real_traf(decode_time=index * 3000, data_offset=32, sample_size=500, is_keyframe=True)
+        traf = bf.pack_box("traf", traf[8:] + bf.uuid_box(identifier, b"track"))
+        rows.append((1000 + index * 1000, bf.pack_moof(traf, siblings=bf.uuid_box(identifier, bytes([index])))))
+    handler = UuidHandler(
+        identifier, frozenset({("moof",), ("moof", "traf")}), lambda payload, box: events.append((payload, box))
+    )
+    track = ft.parse_fragment_table(bf.synthetic_fragmented_moov(), rows, uuid_handlers=[handler])
+    assert [payload for payload, _box in events] == [b"\x00", b"track", b"\x01", b"track"]
+    assert [box.parent.fragment_index for _payload, box in events] == [0, 0, 1, 1]
+    assert [box.parent.track_id for _payload, box in events] == [None, 1, None, 1]
+    assert track.dts_ticks.tolist() == [0, 3000]
+
+
+@pytest.mark.parametrize("parent", ["mdia", "minf"])
+def test_uuid_handlers_visit_intermediate_track_containers(parent: str) -> None:
+    """Track-container UUIDs dispatch exactly once with the selected track identity."""
+    identifier = b"1234567890abcdef"
+    payload = b"track timing"
+    extras = {f"{parent}_extra_children": bf.uuid_box(identifier, payload)}
+    moov = bf.synthetic_fragmented_moov(**extras)
+    events: list[tuple[bytes, BoxLocation]] = []
+    parent_path = ("moov", "trak", "mdia") + (("minf",) if parent == "minf" else ())
+    handler = UuidHandler(identifier, frozenset({parent_path}), lambda value, box: events.append((value, box)))
+
+    track = ft.parse_fragment_table(
+        moov, [_moof(moof_start=1000, decode_time=0, data_offset=32, sample_size=500)], uuid_handlers=[handler]
+    )
+
+    assert track.size.tolist()
+    assert len(events) == 1
+    assert events[0][0] == payload
+    assert events[0][1].parent.path == parent_path
+    assert events[0][1].parent.track_id == 1
+    assert events[0][1].parent.fragment_index is None

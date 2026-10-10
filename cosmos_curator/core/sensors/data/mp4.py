@@ -23,12 +23,16 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from cosmos_curator.core.sensors.mp4.box_primitives import VIDEO_FOURCC_CODEC_NAMES
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.moov_track import VideoTrack
+from cosmos_curator.core.sensors.utils.validation import AttrsAttribute, optional_int64_array
 
 _NS_PER_SECOND = 1_000_000_000
+
+type TimestampArray = npt.NDArray[np.int64] | np.ma.MaskedArray[Any, np.dtype[np.int64]]
 
 
 def video_track_sample_arrays(
@@ -175,6 +179,17 @@ class Mp4FrameIndex:
     The track's time base converts ticks to nanoseconds; a supported ``edts/elst`` edit
     shifts ``pts_ns`` but leaves ``dts_ns`` unchanged.
 
+    Optional upstream-provided EOF/SOF/MOE arrays use int64 nanoseconds and share
+    the frame index's decode order. Container time-base conversion, edit-list shifts,
+    and presentation sorting never transform these values.
+
+    ``eof_ns``, ``sof_ns``, and ``moe_ns`` are independently optional; recipes decide
+    which timestamps are required. ``sof_ns`` records readout start; ``moe_ns`` records exposure midpoint
+    and may precede SOF. SOF/MOE are independently absent when the recorder did not
+    populate them. Partially missing SOF/MOE use masked int64 arrays, with ``True``
+    marking unavailable frames; entirely missing columns are ``None``. Fully populated
+    columns remain ordinary NumPy arrays. Exposure midpoint is not derived from SOF/EOF.
+
     ``pts_sort_order[rank]`` maps a presentation-order rank to a decode-order sample
     index, without reordering the frame arrays.
     """
@@ -189,6 +204,23 @@ class Mp4FrameIndex:
     is_keyframe: npt.NDArray[np.bool_]
     offset: npt.NDArray[np.int64]
     size: npt.NDArray[np.int64]
+    eof_ns: npt.NDArray[np.int64] | None = attrs.field(default=None, validator=optional_int64_array)
+    sof_ns: TimestampArray | None = attrs.field(default=None, validator=optional_int64_array)
+    moe_ns: TimestampArray | None = attrs.field(default=None, validator=optional_int64_array)
+
+    @eof_ns.validator
+    @sof_ns.validator
+    @moe_ns.validator
+    def _validate_camera_timing(self, attribute: AttrsAttribute, value: TimestampArray | None) -> None:
+        """Require supplied arrays to match the frame count; EOF cannot contain masked entries."""
+        if value is None:
+            return
+        if len(value) != len(self):
+            msg = f"{attribute.name} length must equal the frame count ({len(self)}), got {len(value)}"
+            raise ValueError(msg)
+        if attribute.name == "eof_ns" and isinstance(value, np.ma.MaskedArray) and np.any(value.mask):
+            msg = "eof_ns must be populated for every frame"
+            raise ValueError(msg)
 
     def __len__(self) -> int:
         """Return the sample count."""
@@ -206,6 +238,9 @@ class Mp4FrameIndex:
         time_base_num: int,
         time_base_den: int,
         elst_bytes: bytes | None,
+        eof_ns: npt.NDArray[np.int64] | None = None,
+        sof_ns: TimestampArray | None = None,
+        moe_ns: TimestampArray | None = None,
     ) -> Self:
         """Shared construction path for both real constructors below -- one place ticks become ns/pts/order.
 
@@ -239,6 +274,9 @@ class Mp4FrameIndex:
             is_keyframe=is_keyframe,
             offset=offset,
             size=size,
+            eof_ns=eof_ns,
+            sof_ns=sof_ns,
+            moe_ns=moe_ns,
         )
 
     @classmethod
@@ -251,8 +289,9 @@ class Mp4FrameIndex:
         to convert ticks and apply the presentation-time shift.
 
         Raises:
-            ValueError: Composition offsets contain a mix of null and non-null values;
-                each video's column must be all-null or fully populated.
+            ValueError: Composition offsets or EOF contain a mix of null and non-null values;
+                those columns must be all-null or fully populated. Partially missing SOF/MOE
+                are represented as masked int64 arrays without rounding through float64.
             UnsupportedEditListError: The edit list has an unsupported shape.
             InvalidTimeBaseError: ``time_base_den`` is zero.
 
@@ -269,6 +308,23 @@ class Mp4FrameIndex:
             raise ValueError(msg)
         else:
             composition_offset_ticks = composition_offset_column.to_numpy(zero_copy_only=False)
+        # Fill missing values before NumPy conversion to retain exact int64 values.
+        # The independent mask, not the fill value, represents unavailable timing.
+        timing: dict[str, TimestampArray | None] = {}
+        for name in ("eof_ns", "sof_ns", "moe_ns"):
+            column = table.column(name)
+            if column.null_count == len(table):
+                timing[name] = None
+            elif column.null_count:
+                if name == "eof_ns":
+                    msg = "eof_ns must be populated for every frame or entirely absent"
+                    raise ValueError(msg)
+                # The pinned NumPy stubs lack a typed masked-array constructor.
+                timing[name] = np.ma.MaskedArray(  # type: ignore[no-untyped-call]
+                    pc.fill_null(column, 0).to_numpy(), mask=column.is_null().to_numpy(), copy=False
+                )
+            else:
+                timing[name] = column.to_numpy()
         return cls._assemble(
             dts_ticks=dts_ticks,
             composition_offset_ticks=composition_offset_ticks,
@@ -278,6 +334,9 @@ class Mp4FrameIndex:
             time_base_num=time_base_num,
             time_base_den=time_base_den,
             elst_bytes=elst_bytes,
+            eof_ns=timing["eof_ns"],
+            sof_ns=timing["sof_ns"],
+            moe_ns=timing["moe_ns"],
         )
 
     @classmethod

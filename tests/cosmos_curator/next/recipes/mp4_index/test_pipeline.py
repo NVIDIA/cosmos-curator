@@ -27,6 +27,7 @@ run still succeeds, moov/moof were never touched.
 one run" scenario to test.
 """
 
+import os
 import pathlib
 from datetime import UTC, datetime
 from typing import Any, Self
@@ -534,6 +535,7 @@ class _CapturingDataset:
     """
 
     def __init__(self) -> None:
+        self.map_function: Any = None
         self.map_kwargs: dict[str, Any] = {}
 
     def map(self, *_args: Any, **kwargs: Any) -> Self:  # noqa: ANN401
@@ -543,8 +545,9 @@ class _CapturingDataset:
     def repartition(self, *_args: Any, **_kwargs: Any) -> Self:  # noqa: ANN401
         return self
 
-    def map_batches(self, *_args: Any, **kwargs: Any) -> Self:  # noqa: ANN401
+    def map_batches(self, function: Any, *_args: Any, **kwargs: Any) -> Self:  # noqa: ANN401
         if "resources" in kwargs:
+            self.map_function = function
             self.map_kwargs = kwargs
         return self
 
@@ -552,27 +555,39 @@ class _CapturingDataset:
         return []
 
 
+@pytest.mark.parametrize(
+    ("cpu_count", "io_override", "expected_slots"),
+    [(64, None, 64.0), (64, "7", 7.0), (None, None, float(environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE))],
+)
 def test_run_config_requests_one_curator_io_slot_per_actor(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_count: int | None,
+    io_override: str | None,
+    expected_slots: float,
 ) -> None:
-    """Every dispatch requests exactly one curator_io slot per actor task, not the whole node budget.
-
-    The node-level budget (curator_io_resources(), e.g. 16.0) and the per-task reservation (1.0)
-    use the same resource name but are not interchangeable -- this is what actually bounds
-    concurrent actors by IO capacity rather than by CPU count (see
-    docs/curator/design/ray-data.md's own "Large source downloads and curator_io" section).
-    """
+    """Local IO capacity follows CPUs unless overridden; each actor reserves one slot."""
     media_path = tmp_path / "input" / "sess-a" / "unit-00" / "camera.mp4"
     _write_synthetic_nonfragmented_mp4(media_path)
 
     fake_dataset = _CapturingDataset()
-    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **_kwargs: None)
+    init_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **kwargs: init_calls.append(kwargs))
+    monkeypatch.setattr(os, "process_cpu_count", lambda: cpu_count)
+    if io_override is None:
+        monkeypatch.delenv(environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(environment.CURATOR_IO_SLOTS_PER_NODE_ENV_VAR, io_override)
     monkeypatch.setattr(ray.data, "from_items", lambda *_args, **_kwargs: fake_dataset)
 
     cfg = _resolved_config(tmp_path)
     pipeline.run_config(cfg)
 
+    assert init_calls == [{"local_resources": {environment.CURATOR_IO_RESOURCE_NAME: expected_slots}}]
     assert fake_dataset.map_kwargs["resources"] == {environment.CURATOR_IO_RESOURCE_NAME: 1.0}
+    assert fake_dataset.map_kwargs["memory"] == 512 * 1024**2
+    assert fake_dataset.map_function is pipeline._ProcessOneVideo
+    assert fake_dataset.map_kwargs["fn_constructor_kwargs"] == {"config": cfg, "extension_factory": None}
 
 
 @pytest.mark.integration

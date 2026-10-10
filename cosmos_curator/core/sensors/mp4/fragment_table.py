@@ -16,6 +16,7 @@
 """Decode a fragmented MP4's ``moov`` and every ``moof``/``traf``/``trun`` into :class:`VideoTrack`."""
 
 import struct
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -23,11 +24,9 @@ from cosmos_curator.core.sensors.mp4.box_primitives import (
     BoxNotFoundError,
     MalformedBoxHeaderError,
     find_box,
-    find_box_bytes,
-    find_video_trak,
     read_box_header,
-    uuid_extension_boxes,
 )
+from cosmos_curator.core.sensors.mp4.box_traversal import BoxScope, BoxTraversal, UuidHandler
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.moov_track import (
     MediaHeader,
@@ -35,6 +34,7 @@ from cosmos_curator.core.sensors.mp4.moov_track import (
     StsdBox,
     TrackHeader,
     VideoTrack,
+    video_track_scopes,
 )
 
 # tfhd flags (ISO/IEC 14496-12 §8.8.7)
@@ -166,7 +166,12 @@ def _parse_trex_defaults(moov_buf: bytes, moov_content_start: int, moov_content_
 
 
 def _parse_fragment(
-    moof_start: int, moof_bytes: bytes, trex_defaults: dict[str, int | None]
+    moof_start: int,
+    moof_bytes: bytes,
+    trex_defaults: dict[str, int | None],
+    *,
+    uuid_handlers: Sequence[UuidHandler],
+    fragment_index: int,
 ) -> tuple[int, int, bool, int, int | None]:
     """Parse one ``moof``'s single sample into ``(offset, size, is_keyframe, decode_time, sample_duration)``.
 
@@ -174,6 +179,8 @@ def _parse_fragment(
         moof_start: the ``moof`` box's absolute offset in the source file.
         moof_bytes: the entire ``moof`` box, header included.
         trex_defaults: this video's ``mvex``/``trex`` fallback, parsed once from ``moov``.
+        uuid_handlers: invocation-local handlers for visited UUID boxes.
+        fragment_index: position in the supplied fragment rows.
 
     Raises:
         FragmentLayoutUnsupportedError: the fragment's ``tfhd``/``trun`` don't match the one
@@ -183,12 +190,17 @@ def _parse_fragment(
     """
     _box_type, box_size, header_len = read_box_header(moof_bytes, 0, len(moof_bytes))
     moof_content_start, moof_content_end = header_len, box_size
-    traf_start, traf_end = find_box(moof_bytes, ("traf",), moof_content_start, moof_content_end)
-    tfhd_start, _tfhd_end = find_box(moof_bytes, ("tfhd",), traf_start, traf_end)
+    traversal = BoxTraversal(moof_bytes, uuid_handlers=uuid_handlers)
+    moof_scope = BoxScope(moof_content_start, moof_content_end, ("moof",), fragment_index=fragment_index)
+    traf = traversal.find(moof_scope, ("traf",))
+    tfhd_start, _tfhd_end = find_box(moof_bytes, ("tfhd",), traf.content_start, traf.end)
+    track_id = struct.unpack_from(">I", moof_bytes, tfhd_start + 4)[0]
+    traf_scope = traf.child_scope(track_id=track_id)
+    tfhd_start, _tfhd_end = traversal.find_bounds(traf_scope, ("tfhd",))
     tfhd = _parse_tfhd(moof_bytes, tfhd_start)
-    tfdt_start, _tfdt_end = find_box(moof_bytes, ("tfdt",), traf_start, traf_end)
+    tfdt_start, _tfdt_end = traversal.find_bounds(traf_scope, ("tfdt",))
     decode_time = _parse_tfdt(moof_bytes, tfdt_start)
-    trun_start, _trun_end = find_box(moof_bytes, ("trun",), traf_start, traf_end)
+    trun_start, _trun_end = traversal.find_bounds(traf_scope, ("trun",))
     trun = _parse_trun(moof_bytes, trun_start)
 
     if trun["sample_composition_offset"]:
@@ -221,12 +233,15 @@ def _parse_fragment(
     return absolute_offset, sample_size, is_keyframe, decode_time, sample_duration
 
 
-def parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) -> VideoTrack:
+def parse_fragment_table(
+    moov_bytes: bytes, moof_rows: list[tuple[int, bytes]], *, uuid_handlers: Sequence[UuidHandler] = ()
+) -> VideoTrack:
     """Parse a fragmented video's ``moov`` plus every published ``moof`` row into a faithful :class:`VideoTrack`.
 
     Args:
         moov_bytes: exactly one ``moov`` box, header included.
         moof_rows: every ``(moof_start, moof_bytes)`` pair for this video, in file order.
+        uuid_handlers: invocation-local handlers for UUID boxes in visited scopes.
 
     Raises:
         BoxNotFoundError: *moov_bytes* is not a ``moov`` box, or carries no video ``trak``.
@@ -235,10 +250,11 @@ def parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) 
         CompositionOffsetUnsupportedError: a sample carries a nonzero composition offset.
         MalformedBoxHeaderError: *moov_bytes* or a *moof_rows* entry is truncated or corrupt
             partway through parsing.
+        UuidCallbackError: a registered UUID handler failed; ``error`` retains its exception.
 
     """
     try:
-        return _parse_fragment_table(moov_bytes, moof_rows)
+        return _parse_fragment_table(moov_bytes, moof_rows, uuid_handlers=uuid_handlers)
     except (struct.error, IndexError) as exc:
         msg = f"moov/moof buffer ran out mid-parse -- truncated or corrupt: {exc}"
         raise MalformedBoxHeaderError(msg) from exc
@@ -258,33 +274,38 @@ def _duration_from_decode_times(decode_times: list[int], sample_durations: list[
     return span + last_interval
 
 
-def _parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]]) -> VideoTrack:
+def _parse_fragment_table(
+    moov_bytes: bytes, moof_rows: list[tuple[int, bytes]], *, uuid_handlers: Sequence[UuidHandler]
+) -> VideoTrack:
     box_type, box_size, header_len = read_box_header(moov_bytes, 0, len(moov_bytes))
     if box_type != "moov":
         msg = f"expected a moov box, found {box_type!r}"
         raise BoxNotFoundError(msg)
     moov_start, moov_end = header_len, box_size
 
-    trak_start, trak_end, _stbl_start, _stbl_end, stsd_start, stsd_end, fourcc = find_video_trak(
-        moov_bytes, moov_start, moov_end
-    )
+    traversal = BoxTraversal(moov_bytes, uuid_handlers=uuid_handlers)
+    moov_scope = BoxScope(moov_start, moov_end, ("moov",))
+    trak_scope, stbl_scope, stsd_scope, fourcc = video_track_scopes(moov_bytes, moov_scope)
+    # Visit the selected track's intermediate containers as well as stbl,
+    # so UUID handlers registered for mdia/minf are dispatched with track context.
+    traversal.find(trak_scope, ("mdia", "minf", "stbl"))
+    traversal.scan_children(stbl_scope)
 
-    mvhd_start, mvhd_end = find_box(moov_bytes, ("mvhd",), moov_start, moov_end)
+    mvhd_start, mvhd_end = traversal.find_bounds(moov_scope, ("mvhd",))
     movie_header = MovieHeader.parse(moov_bytes, mvhd_start, mvhd_end)
-    moov_extension_boxes = uuid_extension_boxes(moov_bytes, moov_start, moov_end)
+    moov_extension_boxes = traversal.extension_boxes(moov_scope)
 
-    tkhd_start, tkhd_end = find_box(moov_bytes, ("tkhd",), trak_start, trak_end)
+    tkhd_start, tkhd_end = traversal.find_bounds(trak_scope, ("tkhd",))
     track_header = TrackHeader.parse(moov_bytes, tkhd_start, tkhd_end)
     try:
-        edts_start, edts_end = find_box(moov_bytes, ("edts",), trak_start, trak_end)
-        elst_bytes = find_box_bytes(moov_bytes, "elst", edts_start, edts_end)
+        elst_bytes = traversal.find_bytes(trak_scope, ("edts", "elst"))
     except BoxNotFoundError:
         elst_bytes = None
 
-    mdhd_start, mdhd_end = find_box(moov_bytes, ("mdia", "mdhd"), trak_start, trak_end)
+    mdhd_start, mdhd_end = traversal.find_bounds(trak_scope, ("mdia", "mdhd"))
     media_header = MediaHeader.parse(moov_bytes, mdhd_start, mdhd_end)
 
-    sample_description = StsdBox.parse(moov_bytes, stsd_start, stsd_end, fourcc)
+    sample_description = StsdBox.parse(moov_bytes, traversal, stsd_scope, fourcc)
 
     trex_defaults = _parse_trex_defaults(moov_bytes, moov_start, moov_end)
 
@@ -293,8 +314,10 @@ def _parse_fragment_table(moov_bytes: bytes, moof_rows: list[tuple[int, bytes]])
     is_keyframe: list[bool] = []
     decode_times: list[int] = []
     sample_durations: list[int | None] = []
-    for moof_start, moof_bytes in moof_rows:
-        offset, size, keyframe, decode_time, sample_duration = _parse_fragment(moof_start, moof_bytes, trex_defaults)
+    for fragment_index, (moof_start, moof_bytes) in enumerate(moof_rows):
+        offset, size, keyframe, decode_time, sample_duration = _parse_fragment(
+            moof_start, moof_bytes, trex_defaults, uuid_handlers=uuid_handlers, fragment_index=fragment_index
+        )
         offsets.append(offset)
         sizes.append(size)
         is_keyframe.append(keyframe)
