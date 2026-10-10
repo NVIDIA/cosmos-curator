@@ -462,6 +462,7 @@ def test_the_reserved_heap_is_logged_in_the_unit_it_was_configured_in(monkeypatc
     assert "advertise 16 GiB free memory against 8 GiB per actor" in "".join(lines)
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_staging_writes_every_owed_row_partitioned_by_fragment(
     make_clips_table: ClipsTableFactory, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -485,6 +486,7 @@ def test_staging_writes_every_owed_row_partitioned_by_fragment(
     assert _staged_clips(workspace) == ["c0", "c1", "c2", "c3"]
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_ray_plans_the_job_checkpoint_for_this_dag(
     make_clips_table: ClipsTableFactory, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -507,6 +509,7 @@ def test_ray_plans_the_job_checkpoint_for_this_dag(
     assert not [warning for warning in caught if "doesn't support checkpointing" in str(warning.message)]
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_resume_hands_the_embedder_only_the_rows_no_attempt_committed(
     make_clips_table: ClipsTableFactory, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -546,6 +549,7 @@ def test_a_resume_hands_the_embedder_only_the_rows_no_attempt_committed(
     assert _staged_clips(workspace) == ["c0", "c1", "c2", "c3"]
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_fully_checkpointed_phase_hands_the_embedder_nothing(
     make_clips_table: ClipsTableFactory, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
