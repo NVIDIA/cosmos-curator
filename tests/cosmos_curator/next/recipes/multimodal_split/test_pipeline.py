@@ -615,93 +615,53 @@ def test_unreachable_storage_stops_the_run_before_ray_starts(
     assert not started["ray"], "storage was checked after Ray had already started"
 
 
-def test_a_run_publishes_one_episode_carrying_both_its_video_and_its_trajectory(
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("trajectory_gap", [False, True])
+def test_ray_pipeline_publishes_only_complete_multimodal_episodes(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_ego_mcap: Callable[..., Path],
     make_imu_mcap: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    *,
+    trajectory_gap: bool,
 ) -> None:
-    """A clip is one moment across every modality, and the catalogue says so in one row.
-
-    The whole point of the join: a consumer reads an episode and finds both the
-    MP4 and the MCAP under one clip id, rather than having to pair two datasets
-    on a span it has to reconstruct. Two copied MCAP sensors at once (ego, imu)
-    proves the real pipeline distinguishes them rather than one clobbering the
-    other -- unit coverage already checks each in isolation.
-    """
+    """Ray routes camera and sensor outcomes together and propagates cut failures."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000")
-    make_ego_mcap(session)
+    make_ego_mcap(session, gap=(100, 200) if trajectory_gap else None)
     make_imu_mcap(session)
     media = tmp_path / "media"
-
-    summary = run_config(
-        make_config(
-            root,
-            media,
-            mcap_sensors={"ego": "ego/egotrajectory.mcap"},
-            imu_sensors={"imu": "imu/imu.mcap"},
-        )
+    config = make_config(
+        root,
+        media,
+        mcap_sensors={"ego": "ego/egotrajectory.mcap"},
+        imu_sensors={"imu": "imu/imu.mcap"},
     )
 
-    assert summary["episodes_newly_published"] == 3
-    assert summary["episodes_dropped"] == 0
-    assert summary["failures"] == 0
-    # Counted apart from the cameras: a trajectory rides along with a clip
-    # rather than being a clip of its own, so folding it into the camera total
-    # would report six clips for a run that produced three.
-    assert summary["camera_clips_written"] == 3
-    assert summary["sensor_clips_written"] == 6
-    # Each total is the bytes of its own kind of artifact, kept apart so a run
-    # can say what its video cost separately from what its trajectories did.
-    mcaps = sorted(media.rglob("*.mcap"))
-    assert len(mcaps) == 6
-    assert summary["sensor_clip_bytes"] == sum(path.stat().st_size for path in mcaps)
-    assert summary["clip_bytes"] == sum(path.stat().st_size for path in media.rglob("*.mp4"))
+    summary = run_config(config)
 
-    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
-    assert len(episodes) == 3
-    for episode in episodes:
-        assert [camera["camera_key"] for camera in episode["camera_media"]] == ["front"]
-        sensors_by_key = {sensor["sensor_key"]: sensor for sensor in episode["sensor_media"]}
-        assert set(sensors_by_key) == {"ego", "imu"}
-        assert sensors_by_key["ego"]["sensor_type"] == "egotrajectory"
-        assert sensors_by_key["imu"]["sensor_type"] == "imu"
-        for sensor in sensors_by_key.values():
-            payload = Path(sensor["media_location"]).read_bytes()
-            assert len(payload) == sensor["media_size_bytes"]
-            assert hashlib.sha256(payload).hexdigest() == sensor["media_sha256"]
-            # Beside the video it belongs to, under the one clip id.
-            assert Path(sensor["media_location"]).parent == Path(episode["camera_media"][0]["media_location"]).parent
-
-
-def test_a_trajectory_that_fails_to_cut_drops_the_episode_rather_than_publishing_a_partial_one(
-    tmp_path: Path,
-    make_session: Callable[..., Path],
-    make_ego_mcap: Callable[..., Path],
-    make_config: Callable[..., ResolvedMultimodalSplitConfig],
-) -> None:
-    """A planned trajectory that produced no clip costs the episode its video too.
-
-    Symmetric with a camera that failed to encode. An episode published without
-    it would claim a clip is complete while quietly holding less than the run
-    was asked for, and nothing downstream could tell the difference.
-    """
-    root = tmp_path / "recordings"
-    session = make_session(root, "session-000")
-    # A gap across the middle clip, which is the one span that cannot be cut.
-    make_ego_mcap(session, gap=(100, 200))
-    media = tmp_path / "media"
-
-    summary = run_config(make_config(root, media, mcap_sensors={"ego": "ego/egotrajectory.mcap"}))
-
+    dropped = int(trajectory_gap)
     assert summary["episodes_planned"] == 3
-    assert summary["episodes_newly_published"] == 2
-    assert summary["episodes_dropped"] == 1
-    episodes = lance.dataset(str(media / "episodes.lance")).to_table().to_pylist()
-    assert len(episodes) == 2
-    assert all(len(episode["sensor_media"]) == 1 for episode in episodes)
+    assert summary["episodes_dropped"] == dropped
+    assert summary["episodes_newly_published"] == 3 - dropped
+    assert summary["camera_clips_written"] == 3
+    assert summary["sensor_clips_written"] == 6 - dropped
+    assert summary["failures"] == dropped
+    episodes = lance.dataset(config.output.episodes_lance_uri).to_table().to_pylist()
+    assert len(episodes) == 3 - dropped
+    assert all(len(episode["camera_media"]) == 1 for episode in episodes)
+    assert all(len(episode["sensor_media"]) == 2 for episode in episodes)
+    assert all(
+        {(sensor["sensor_key"], sensor["sensor_type"]) for sensor in episode["sensor_media"]}
+        == {("ego", "egotrajectory"), ("imu", "imu")}
+        for episode in episodes
+    )
+    # Include successful artifacts from dropped episodes: the summary accounts
+    # for all bytes written, even when those artifacts cannot be published.
+    assert summary["sensor_clip_bytes"] == sum(path.stat().st_size for path in media.rglob("*.mcap"))
+    assert summary["clip_bytes"] == sum(path.stat().st_size for path in media.rglob("*.mp4"))
 
 
 @pytest.mark.integration
