@@ -707,6 +707,7 @@ mypy:
 
 unit_tests:
   stage: test
+  timeout: 20 minutes
   needs:
     - job: resolve_version
       artifacts: true
