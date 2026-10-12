@@ -145,7 +145,7 @@ def test_pipeline_runtime_hands_resolved_config_to_video_transcode(
 ) -> None:
     """The packaged runner dispatches video-transcode configs with typed overrides."""
     configs: list[ResolvedVideoTranscodeConfig] = []
-    summary: dict[str, object] = {"spans": 12, "transcoded_spans": 12}
+    summary: dict[str, object] = {"input_rows": 12, "selected_rows": 4, "remaining_fragments": 2}
 
     def fake_run_config(config: ResolvedVideoTranscodeConfig) -> dict[str, object]:
         configs.append(config)
@@ -167,7 +167,7 @@ def test_pipeline_runtime_hands_resolved_config_to_video_transcode(
     if json_output:
         assert json.loads(captured.out) == summary
     else:
-        assert captured.out == "video-transcode: 12 transcoded clip(s)\n"
+        assert captured.out == "video-transcode: published results for 4 of 12 input row(s); 2 fragment(s) pending\n"
 
 
 def test_pipeline_runtime_reports_runtime_errors_as_json(

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lazy CLI adapter for checkpointed source video cutting."""
+"""Lazy generic CLI adapter for checkpointed span transcoding."""
 
 from collections.abc import Sequence
 from pathlib import Path
@@ -53,13 +53,11 @@ def _prepare_run(config: Path, *, set_overrides: list[str]) -> PreparedPipelineR
     resolved = resolve_config(config, overrides=set_overrides)
 
     def run() -> PipelineRunOutput:
+        from cosmos_curator.next.enrichment.execution import summary_message  # noqa: PLC0415
         from cosmos_curator.next.recipes.video_transcode.pipeline import run_config  # noqa: PLC0415
 
         summary = run_config(resolved)
-        return PipelineRunOutput(
-            json_payload=summary,
-            message=f"video-transcode: {summary['spans']} transcoded clip(s)",
-        )
+        return PipelineRunOutput(json_payload=summary, message=summary_message("video-transcode", summary))
 
     return run
 

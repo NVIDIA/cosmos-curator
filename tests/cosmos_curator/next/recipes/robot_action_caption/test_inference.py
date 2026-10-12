@@ -22,8 +22,8 @@ manager.
 
 ``installed_checkpoint``'s own contract - refusing to replace an installed
 config, verifying the one it installed became active, clearing on the way out,
-and passing a filesystem through - belongs to the generic runtime helper and is
-covered in ``tests/cosmos_curator/next/core/test_ray_runtime.py``. What is
+and passing a filesystem through - belongs to the generic checkpoint helper and is
+covered in ``tests/cosmos_curator/next/core/test_ray_checkpoints.py``. What is
 covered here is the RECIPE's use of it: which column, which path, whose
 filesystem.
 """

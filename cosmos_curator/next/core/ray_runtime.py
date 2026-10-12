@@ -15,27 +15,17 @@
 
 """Shared Ray Data runtime configuration for Curator Next recipes.
 
-Every function here mutates the process-global ``ray.data.DataContext``, which is
-what makes this one module rather than several: progress output, stability knobs,
-eager actor autoscaling, and the job checkpoint are all fields on the same
-ambient object, and a caller needs to know that setting one of them affects every
-dataset the process later builds.
-
-``installed_checkpoint`` is the only one that is scoped rather than set-and-forget,
-because leaking a checkpoint config would silently checkpoint an unrelated later
-plan under the wrong id column.
+Progress, stability, and autoscaling settings affect the process-global
+``ray.data.DataContext`` and every dataset built afterward. Scoped checkpoint
+ownership lives in ``ray_checkpoints``.
 """
 
 import os
-import threading
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from typing import Any, Final
 
-import pyarrow.fs as pafs
 import ray
 from loguru import logger
-from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.core.utils import environment
 
@@ -61,7 +51,6 @@ _MAP_RETRY_PATTERNS: list[str] = [
     "ProbeError",
 ]
 _MAP_MAX_RETRIES = 3
-_CHECKPOINT_CONFIG_LOCK = threading.Lock()
 
 # What the startup snapshot reports per node and in total: the two resources Ray
 # knows natively plus the logical IO budget Curator adds. Every Curator stage
@@ -150,102 +139,6 @@ def configure_ray_data_eager_actor_autoscaling() -> None:
     ctx = ray.data.DataContext.get_current()
     ctx.autoscaling_config.actor_pool_util_upscaling_threshold = 1.0
     ctx.autoscaling_config.actor_pool_max_upscaling_delta = None
-
-
-@contextmanager
-def installed_checkpoint(
-    *,
-    id_column: str,
-    checkpoint_path: str,
-    filesystem: pafs.FileSystem | None = None,
-) -> Iterator[None]:
-    """Install one Ray Data job checkpoint for the enclosed plan and always clear it.
-
-    Two properties of the id column decide whether a resume works at all, and both
-    are the CALLER's responsibility - this function only names the column::
-
-        Read --> ... --> terminal write
-          ^                    ^
-          |                    +-- the id column must SURVIVE into the written
-          |                        output; Ray marks a row complete by reading
-          |                        the column back off the sink
-          +-- the id column must be present on the FIRST operator; the checkpoint
-              filter reads it off the Read output, so a column added later in the
-              plan is invisible to the skip
-
-    A plan that drops the column anywhere between those two points records no
-    progress at all while appearing to work. Ray also plans job checkpointing only
-    for a logical DAG that ends in a write, so a ``materialize()`` terminal
-    disables the mechanism with nothing but a Python warning.
-
-    Args:
-        id_column: Column holding one completed row's checkpoint id. Values are
-            the caller's; only its own datasource knows the snapshot they are
-            drawn from.
-        checkpoint_path: Cluster-accessible directory - object storage or a
-            network-mounted path. A node-local path gives each worker a
-            checkpoint no other worker can read.
-        filesystem: Filesystem the checkpoint is read and written through. Pass
-            the same one the sink uses, or a run under a non-ambient credential
-            profile writes results it cannot read back.
-
-    Yields:
-        Nothing; the context is the installation.
-
-    Raises:
-        RuntimeError: If a configuration is already installed, or if the active
-            one is not the one installed here.
-
-    """
-    installed = CheckpointConfig(
-        id_column=id_column,
-        checkpoint_path=checkpoint_path,
-        # The most dangerous default in this design. Ray's default is True, and it
-        # deletes the checkpoint when the DATASET EXECUTION succeeds - which is the
-        # end of the inference phase, before anything has been published. Accepting
-        # the default would destroy the progress record inside exactly the window
-        # this configuration exists to protect.
-        delete_checkpoint_on_success=False,
-        override_filesystem=filesystem,
-    )
-    with _CHECKPOINT_CONFIG_LOCK:
-        context = ray.data.DataContext.get_current()
-        # Process-global ambient state, so the guard and installation are one
-        # operation: otherwise two threads can both observe None and replace
-        # each other's checkpoint before either plan starts.
-        if context.checkpoint_config is not None:
-            msg = (
-                f"a Ray Data checkpoint configuration is already installed "
-                f"(id column {context.checkpoint_config.id_column!r}); refusing to replace it"
-            )
-            raise RuntimeError(msg)
-        context.checkpoint_config = installed
-        # ASSERTED rather than assumed: setting the config on a context the
-        # execution does not use is a silent no-op that costs a full re-run of a
-        # GPU phase to discover.
-        active = ray.data.DataContext.get_current().checkpoint_config
-        if (
-            active is None
-            or active.id_column != id_column
-            or active.checkpoint_path != checkpoint_path
-            or active.filesystem is not installed.filesystem
-        ):
-            context.checkpoint_config = None
-            msg = (
-                f"the active Ray Data checkpoint configuration is not the one just installed "
-                f"(expected id column {id_column!r} at {checkpoint_path!r}, found "
-                f"{active and active.id_column!r} at {active and active.checkpoint_path!r}; "
-                f"expected filesystem type {type(installed.filesystem).__name__!r}, found "
-                f"{active and type(active.filesystem).__name__!r}); "
-                f"refusing to run a phase that would record no progress"
-            )
-            raise RuntimeError(msg)
-    try:
-        logger.info(f"Installed Ray Data job checkpoint on {id_column!r} at {checkpoint_path}")
-        yield
-    finally:
-        with _CHECKPOINT_CONFIG_LOCK:
-            context.checkpoint_config = None
 
 
 def curator_io_slots_per_node() -> int:

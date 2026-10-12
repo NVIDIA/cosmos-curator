@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small completed cut tables and deterministic transcode results."""
+"""Small canonical span tables and deterministic transcode results."""
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +10,12 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.enrichment.contracts import EnrichmentInput, open_enrichment_input
 from cosmos_curator.next.recipes.video_cut.config import FixedStrideConfig
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id, span_schema
+from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_transcode.contracts import RESULT_SCHEMA, make_clip_id
-from cosmos_curator.next.recipes.video_transcode.publication import open_input
+from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
 
 
 @pytest.fixture
@@ -29,8 +29,9 @@ def config(tmp_path: Path) -> ResolvedVideoTranscodeConfig:
             "execution": {
                 "transcode_cpus": 1.0,
                 "transcode_memory_gib": 0.5,
+                "publication_memory_gib": 0.25,
                 "source_partitions": 2,
-                "spans_per_checkpoint": 1,
+                "parquet_rows_per_file": 1,
                 "ffmpeg_batch_size": 2,
                 "transcode_attempts": 1,
                 "probe_attempts": 1,
@@ -75,22 +76,32 @@ def span_rows(source_path: Path) -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-def dataset(config: ResolvedVideoTranscodeConfig, span_rows: list[dict[str, Any]]) -> lance.LanceDataset:
-    """Create the same canonical fields and completion marker as video-cut."""
-    schema = span_schema(FixedStrideConfig(), "input-snapshot")
-    metadata = dict(schema.metadata or {})
-    metadata[b"video_cut.publication"] = json.dumps({"publication_version": 2, "spans": len(span_rows)}).encode()
+def enrichment_input(config: ResolvedVideoTranscodeConfig, span_rows: list[dict[str, Any]]) -> EnrichmentInput:
+    """Create canonical span fragments; transcode does not require cut receipts."""
+    schema = span_schema(FixedStrideConfig())
     lance.write_dataset(
-        pa.Table.from_pylist(span_rows, schema=schema.with_metadata(metadata)),
+        pa.Table.from_pylist(span_rows, schema=schema),
         config.input.spans_lance_uri,
         max_rows_per_file=2,
         data_storage_version="2.2",
     )
-    return open_input(config)
+    return open_enrichment_input(resolve_bindings(config))
 
 
 @pytest.fixture
-def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset) -> pa.Table:
+def dataset(enrichment_input: EnrichmentInput) -> lance.LanceDataset:
+    """Expose the pinned handle for tests of the lower-level Lance primitives."""
+    return enrichment_input.dataset
+
+
+@pytest.fixture
+def staged_schema(config: ResolvedVideoTranscodeConfig) -> pa.Schema:
+    """Use the staged clip rows the recipe's enrichment spec defines, as processing receives them."""
+    return resolve_bindings(config).spec.staged_schema
+
+
+@pytest.fixture
+def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, staged_schema: pa.Schema) -> pa.Table:
     """Build completed results with exact original span addresses."""
     rows = []
     for fragment in dataset.get_fragments():
@@ -113,4 +124,4 @@ def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset) -
                     "clip_video_codec": "h264",
                 }
             )
-    return pa.Table.from_pylist(rows, schema=RESULT_SCHEMA)
+    return pa.Table.from_pylist(rows, schema=staged_schema)

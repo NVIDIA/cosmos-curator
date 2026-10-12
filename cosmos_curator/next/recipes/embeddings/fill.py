@@ -69,7 +69,7 @@ from loguru import logger
 from ray.data import ActorPoolStrategy, SaveMode
 
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
-from cosmos_curator.next.core.ray_runtime import installed_checkpoint
+from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
 from cosmos_curator.next.embeddings.schemas import KEY_COLUMN, EmbeddingColumnGroup
 from cosmos_curator.next.recipes.embeddings.columns import pending_filter
 from cosmos_curator.next.recipes.embeddings.datasource import (

@@ -11,12 +11,19 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment.execution import selection_datasource
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id
+from cosmos_curator.next.recipes.video_embed.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, resolve_model_spec, terminal_row
-from cosmos_curator.next.recipes.video_embed.pipeline import ClipDatasource
-from cosmos_curator.next.recipes.video_embed.state import open_input, pending_fragment_ids
-from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, make_clip_id
+from cosmos_curator.next.recipes.video_embed.contracts import READ_COLUMNS, ModelSpec, resolve_model_spec, terminal_row
+from cosmos_curator.next.recipes.video_transcode.contracts import (
+    CLIP_SCHEMA,
+    PUBLICATION_KEY,
+    PUBLICATION_VERSION,
+    make_clip_id,
+)
+from tests.cosmos_curator.next.enrichment.helpers import attempt_all
 
 
 @pytest.fixture
@@ -27,7 +34,12 @@ def config(tmp_path: Path) -> ResolvedVideoEmbedConfig:
             "schema_version": 1,
             "kind": "video-embed",
             "input": {"media_root": str(tmp_path / "media")},
-            "execution": {"parquet_rows_per_file": 1, "lance_read_batch_size": 2, "media_attempts": 1},
+            "execution": {
+                "parquet_rows_per_file": 1,
+                "lance_read_batch_size": 2,
+                "media_attempts": 1,
+                "publication_memory_gib": 0.25,
+            },
         }
     )
 
@@ -80,40 +92,42 @@ def write_clips(config: ResolvedVideoEmbedConfig, *, payload: bytes = b"mp4") ->
                 "clip_video_codec": "h264",
             }
         )
-    schema = CLIP_SCHEMA.with_metadata(
-        {b"video_transcode.publication": json.dumps({"publication_version": 1, "spans": len(rows)}).encode()}
-    )
     return lance.write_dataset(
-        pa.Table.from_pylist(rows, schema=schema),
+        pa.Table.from_pylist(rows, schema=CLIP_SCHEMA),
         config.input.clips_lance_uri,
         max_rows_per_file=2,
         data_storage_version="2.2",
+        transaction_properties={
+            PUBLICATION_KEY: json.dumps({"publication_version": PUBLICATION_VERSION, "spans": len(rows)})
+        },
     )
 
 
 @pytest.fixture
-def dataset(config: ResolvedVideoEmbedConfig, spec: ModelSpec) -> lance.LanceDataset:
-    """Register embedding columns exactly as a new invocation does."""
+def enrichment_input(config: ResolvedVideoEmbedConfig) -> contracts.EnrichmentInput:
+    """Validate input and register embedding columns exactly as a new invocation does."""
     write_clips(config)
-    return open_input(config, spec)
+    return contracts.open_enrichment_input(resolve_bindings(config))
 
 
 @pytest.fixture
-def work_rows(dataset: lance.LanceDataset, config: ResolvedVideoEmbedConfig, spec: ModelSpec) -> list[dict[str, Any]]:
-    """Read the real datasource directly without starting Ray."""
-    return [
-        row
-        for task in ClipDatasource(dataset, config, pending_fragment_ids(dataset, spec)).get_read_tasks(2)
-        for batch in task()
-        for row in batch.to_pylist()
-    ]
+def dataset(enrichment_input: contracts.EnrichmentInput) -> lance.LanceDataset:
+    """Expose the pinned handle for tests of the lower-level Lance primitives."""
+    return enrichment_input.dataset
 
 
 @pytest.fixture
-def results(work_rows: list[dict[str, Any]], spec: ModelSpec) -> pa.Table:
+def work_rows(enrichment_input: contracts.EnrichmentInput) -> list[dict[str, Any]]:
+    """Read the pending selection with the real datasource, without starting Ray."""
+    datasource = selection_datasource(attempt_all(enrichment_input), columns=READ_COLUMNS)
+    return [row for task in datasource.get_read_tasks(2) for batch in task() for row in batch.to_pylist()]
+
+
+@pytest.fixture
+def results(enrichment_input: contracts.EnrichmentInput, work_rows: list[dict[str, Any]], spec: ModelSpec) -> pa.Table:
     """Supply valid normalized output, including one terminal media failure."""
     rows = [terminal_row(row, spec, [1.0, *([0.0] * (spec.dimension - 1))]) for row in work_rows[:-1]]
     rows.append(
         terminal_row(work_rows[-1] | {"error_type": "MediaObjectError", "error_message": "missing"}, spec, None)
     )
-    return pa.Table.from_pylist(rows, schema=spec.result_schema)
+    return pa.Table.from_pylist(rows, schema=enrichment_input.bindings.spec.staged_schema)

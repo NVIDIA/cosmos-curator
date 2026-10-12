@@ -17,10 +17,23 @@
 
 import hashlib
 import json
+from collections.abc import Mapping
 from typing import Any
 
 
+def canonical_json(value: Any) -> str:  # noqa: ANN401
+    """Render sorted compact UTF-8 JSON with non-finite values forbidden."""
+    return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def canonical_digest(value: Any) -> str:  # noqa: ANN401
-    """Hash sorted compact UTF-8 JSON with non-finite values forbidden."""
-    payload = json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Hash the canonical JSON rendering of a value."""
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def json_snapshot(value: Mapping[str, Any] | str) -> str:
+    """Freeze a JSON object as canonical text, so later caller mutations cannot change it.
+
+    Canonical text passes through unchanged, as ``attrs.evolve`` supplies it to converters.
+    """
+    return canonical_json(json.loads(value) if isinstance(value, str) else dict(value))

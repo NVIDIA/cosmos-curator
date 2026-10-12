@@ -19,6 +19,11 @@ The implementation lives in `cosmos_curator.next.recipes.video_embed`. It uses n
 Pixi environment, and media-reading utilities. It imports no legacy pipeline or Xenna model wrapper. The robotics
 embedding recipe's modality and publication contracts are not part of this recipe.
 
+Checkpoint reuse, atomic enrichment, commit reconciliation, and cleanup follow the
+[shared checkpoint and recovery contract](curator-next-checkpoint-recovery.md), also used by video-transcode. Embedding
+supplies clip identity, its model and result contract, clip readiness, and terminal-result validation, which its
+`bindings.py` declares to the shared contract; media handling and GPU inference remain recipe-owned.
+
 ## Model-card contract
 
 The model IDs and immutable revisions come from `cosmos_curator/configs/all_models.json`. These are the reference
@@ -78,11 +83,12 @@ embedding_cosmos_embed1_336p_v1_metadata: struct<
 Arrow field metadata records owner `video-embed` and the variant's field set. Existing fields must match exactly.
 A successful row has a finite vector of the model's dimension, terminal `success` metadata, and no error details.
 A terminal `error` row has a null vector and nonempty error details. Both fields are null only while pending.
-Each selected physical fragment must be wholly pending or wholly terminal under the requested contract; partial,
-mixed, and incompatible fragments are rejected.
+Every physical fragment in the pinned table must be wholly pending or wholly terminal under the requested contract;
+partial, mixed, and incompatible fragments anywhere in the snapshot are rejected before selection.
 
-The logical result identity is `(clip_id, embedding_contract_digest)`. Upstream clip IDs, URIs, sizes, media contents,
-row order, and source-column bindings are immutable. Existing vectors are not overwritten when model behavior changes:
+The logical result identity is `(clip_id, embedding_contract_digest)`. Upstream clips follow the
+[shared input immutability requirements](curator-next-checkpoint-recovery.md#assumptions-and-guarantees).
+Existing vectors are not overwritten when model behavior changes:
 such a change requires a new versioned field contract. Ordinary reruns skip all terminal rows, including media errors.
 There is no error-reset or in-place replacement operation. The initial version 1 contract records NVDEC RGB conversion
 and CUDA processor execution. Earlier development results and checkpoints with a different contract digest cannot
@@ -90,42 +96,37 @@ be reused, even if their fields were also named version 1.
 
 ## Checkpoints and publication
 
-An attempt validates completed transcode output, registers its fields, and pins a finite Lance snapshot. It reads
-only pending fragments. Ray filters checkpointed `clip_id` values before media reads or GPU work.
+An attempt validates the canonical clip schema, registers its fields, and checks clip values in the pinned Lance
+snapshot. New work selects all pending embedding fragments; the recipe exposes no public selection-size limit.
+Saved selections follow the [shared recovery rules](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace).
+Ray filters checkpointed string `clip_id` values before media reads or GPU work.
+Fragment counts follow the [shared run summary definitions](curator-next-checkpoint-recovery.md#run-summaries).
+
+Input readiness comes from data: the table must have the canonical clip schema, globally unique non-null `clip_id`
+values, non-null `clip_uri` values, and positive non-null `clip_size_bytes`. No transcode publication receipt is required;
+valid clip tables remain usable after upstream history is pruned. Empty tables are valid. These checks cover the entire
+pinned snapshot; selecting individually ready fragments from a growing table remains follow-up work. Payload reads
+and decoding still validate the media during processing.
 
 Parquet stores `fragment_id`, `row_offset`, `clip_id`, the vector, and metadata. Encoded media and prepared tensors
-never enter durable result files. Staging uses variable-length vector lists because Arrow 25 cannot round-trip null
-fixed-size lists through Parquet. Publication validates dimensions and casts to the fixed-size canonical fields.
-Strict result repartitioning sets the checkpoint shard boundary, defaulting to 1,024 rows.
+never enter durable result files. The shared staged schema stores vectors as variable-length lists because Arrow 25
+cannot read back null fixed-size lists from Parquet. Publication validates dimensions and casts to the fixed-size
+canonical fields.
+`execution.parquet_rows_per_file` sets the strict repartition and checkpoint shard boundary, defaulting to 1,000 rows.
+Shared non-null `int64` fields define the fragment and row addresses; the logical `clip_id` retains its canonical field
+definition. These staged schema definitions isolate incompatible earlier development workspaces.
 
-The workspace is:
+The workspace is `<output.staging_root_uri>/<contract-namespace>/<selection-digest>/`. Embedding contributes its
+pinned model and result contract to the
+[shared compatibility manifest](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace), so each variant
+uses its own contract namespace.
+A valid processing-completion marker allows publication retries to skip model setup.
 
-```text
-<staging-root>/<vector-field>/<scope-digest>/
-  workspace.json
-  phase-a-complete.json
-  results/
-  checkpoints/
-```
-
-The scope binds the input URI, selected source-field IDs and physical fragment bindings, model/result contract, staged
-schema, and workspace version. It deliberately excludes the Lance version and execution tuning: a caption/schema
-commit or different batching must not discard compatible GPU work. Appended clips, compaction, or changed source
-bindings select a different workspace. Reusing unfinished work across those input-layout changes is not supported.
-Workspaces are temporary but must survive driver/cluster loss; abandoned incompatible workspaces require operator cleanup.
-
-After the complete read-to-Parquet plan finishes, the driver clears Ray's checkpoint configuration. A completion marker
-allows publication-only retries to skip model setup. Its absence costs checkpoint loading, not loss of durable results.
-
-Publication groups results by original fragment on Ray workers. Each group must cover every offset exactly once,
-with the exact ordered clip IDs, compatible provenance, and valid terminal values. Workers prepare new files for only
-the two owned columns and return compact fragment descriptors. No result becomes visible during preparation.
-
-The driver validates exact fragment coverage and current input bindings, then commits **all prepared fragments in one
-Lance transaction**. If a caption writer changed a fragment's other files, the driver rebuilds column descriptors from
-the same staged Parquet against the latest version. It never attaches stale file bindings to a newer read version.
-Commit conflicts retry this reconciliation; inference does not repeat. A transaction receipt resolves an ambiguous
-success response. Canonical verification precedes best-effort workspace removal.
+Workers validate terminal metadata and use vectorized checks for vector dimensions and finite values before preparing
+the two owned columns. Publication follows the
+[shared publication and concurrency rules](curator-next-checkpoint-recovery.md#canonical-publication-and-concurrent-writers).
+The [shared failure boundaries](curator-next-checkpoint-recovery.md#failure-and-recovery-boundaries) cover interrupted
+processing, ambiguous commit responses, and cleanup; publication retries reuse staged vectors without inference.
 
 ## Failure and concurrency boundaries
 
@@ -133,10 +134,8 @@ Missing/empty/size-mismatched objects and identifiable corrupt video become term
 storage outages after transport retries, model/processor setup failures, unexpected decoder faults, invalid inference
 output, and GPU failures stop the attempt. There is no catch-all conversion of inference failures to clip errors.
 
-One logical writer owns each variant's field set. Disjoint caption or other variant writers can publish concurrently.
-Mutation/deletion/reordering of selected clip rows, changed clip bindings, and compaction during publication are refused.
-New rows outside the pinned attempt are not included. Canonical values for the selected pending fragments become
-visible together; field registration itself is a separate metadata-only commit.
+One logical writer owns each variant's field set. Disjoint caption or other variant writers can publish concurrently
+under the shared contract; each attempt covers the clip snapshot selected at its start.
 
 CPU tasks use `map` to download clips, reusing storage connections within each worker. GPU actors use `map_batches`
 to decode, prepare, and embed those clips. Only metadata and compressed clips enter the object store between stages;
@@ -148,10 +147,10 @@ triggered Ray OOM kills. Ray's output backpressure alone did not bound worker he
 there is no download actor pool or actor-autoscaling workaround. Ray Core enforces each node's IO slots, including
 on late workers; Ray Data still regulates queued output and may submit tasks that wait for those slots.
 
-Lance scanner batches are sized by `lance_read_batch_size`; Ray's automatic read splitting determines downstream
-blocks, without a separate input repartition. Download tasks reserve 0.25 CPUs; each inference actor reserves one CPU
-and one GPU. The plan retains Ray's default target block size. Model pools use Ray's default scale-up threshold and
-task prefetching, executing one call per actor at a time. This inference plan sets the utilization downscaling threshold
+Lance scanner batches are sized by `lance_read_batch_size`; the shared reader balances fragment row ranges across Ray's
+requested read tasks, without a separate input repartition. Download tasks reserve 0.25 CPUs; each inference actor
+reserves one CPU and one GPU. The plan retains Ray's default target block size. Model pools use Ray's default scale-up
+threshold and task prefetching, executing one call per actor at a time. This inference plan sets the utilization downscaling threshold
 to `0.0` for the inference pool: one idle GPU alongside a busy GPU no longer triggers model retirement. Fully idle pools
 can still shrink; resource-pressure downscaling and end-of-input cleanup remain enabled. This addresses repeated model loads
 at Ray's default `0.5` threshold. Pools start small and may grow with live resources, including late workers, unless
@@ -198,8 +197,8 @@ cosmos-curator slurm ray submit CLUSTER_CONFIG -- pixi run --as-is run-pipeline 
 ```
 
 CPU unit coverage includes sample indices for short clips, media failure classification,
-Parquet null-vector round trips, output validation, coverage rejection, concurrent caption commits, and ambiguous
-publication. A CPU integration test uses model stand-ins to run the native Ray plan across fresh local clusters
+Parquet null-vector round trips, output validation, and caption coexistence. The shared conformance suite runs against
+embedding's clip fixtures, covering coverage rejection, concurrent writers, ambiguous publication, and recovery. A CPU integration test uses model stand-ins to run the native Ray plan across fresh local clusters
 with one `curator_io` slot and verifies that previously checkpointed clips are neither downloaded nor inferred again.
 Each observed download also asserts that it holds its IO resource. GPU tests verify short-clip repeats and reordered
 frames against a full CPU decode with an RGB rounding tolerance, compare all three variants' preprocessing and visual
@@ -207,3 +206,5 @@ output with direct pinned-processor/model calls, and exercise the complete recip
 
 These checks do not constitute managed Slurm worker-churn or head-loss qualification. Cluster-scale throughput and
 memory measurements, actual worker removal/requeue, and concurrent multi-job qualification remain follow-up work.
+For fragment memory and checkpoint-index limits, see the
+[shared publication sizing guidance](curator-next-checkpoint-recovery.md#publication-sizing).

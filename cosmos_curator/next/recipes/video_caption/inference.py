@@ -7,7 +7,6 @@ import base64
 import copy
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from hashlib import sha256
@@ -22,12 +21,12 @@ import ray
 from botocore.exceptions import BotoCoreError, ClientError
 from loguru import logger
 from ray.data.block import BlockMetadata
-from ray.data.checkpoint import CheckpointConfig
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
+from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
 from cosmos_curator.next.recipes.video_caption.bindings import (
     CaptionInferenceBindings,
     CaptionInputBindings,
@@ -549,13 +548,11 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
         source_schema=bindings.input.source_schema,
     )
 
-    checkpoint = CheckpointConfig(
+    with installed_checkpoint(
         id_column=bindings.input.row_id_column,
         checkpoint_path=workspace.checkpoints_uri,
-        delete_checkpoint_on_success=False,
-        override_filesystem=workspace.filesystem,
-    )
-    with installed_checkpoint_config(checkpoint):
+        filesystem=workspace.filesystem,
+    ):
         source = ray.data.read_datasource(
             caption_source,
             override_num_blocks=len(attempt.pending_fragment_ids),
@@ -658,20 +655,6 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
             len(attempt.pending_fragment_ids),
             workspace.phase_a_completion_uri,
         )
-
-
-@contextmanager
-def installed_checkpoint_config(checkpoint: CheckpointConfig) -> Iterator[None]:
-    """Install the recipe-owned job checkpoint and always clear it before Phase B."""
-    context = ray.data.DataContext.get_current()
-    if context.checkpoint_config is not None:
-        msg = "video-caption cannot replace an already installed Ray Data checkpoint configuration"
-        raise RuntimeError(msg)
-    context.checkpoint_config = checkpoint
-    try:
-        yield
-    finally:
-        context.checkpoint_config = None
 
 
 def staged_result_files(workspace: CaptionWorkspace) -> tuple[str, ...]:

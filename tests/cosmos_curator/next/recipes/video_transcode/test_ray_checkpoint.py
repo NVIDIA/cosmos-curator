@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import attrs
 import lance
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -21,14 +22,14 @@ from ray._private.state import actors
 from ray.data.context import DataContext
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.enrichment.contracts import open_enrichment_input
+from cosmos_curator.next.enrichment.execution import checkpointed_processing, publish_enrichment
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_transcode import pipeline, processing
+from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
-from cosmos_curator.next.recipes.video_transcode.contracts import (
-    RESULT_SCHEMA,
-    make_clip_id,
-)
-from cosmos_curator.next.recipes.video_transcode.publication import resolve_workspace
+from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
 
 # Own both Ray clusters in a child so restarting them cannot replace the suite's
 # shared cluster. Save child coverage alongside pytest-cov's data when enabled.
@@ -116,13 +117,15 @@ class _StreamingDownloader(_RecordingDownloader):
         return super().__call__(source)
 
 
-def _upload_without_io_slot(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig) -> pa.Table:
+def _upload_without_io_slot(
+    batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, staged_schema: pa.Schema
+) -> pa.Table:
     """Exercise real uploads while checking that only downloads reserve IO slots."""
     resources = ray.get_runtime_context().get_assigned_resources()
     assert resources["CPU"] == 0.25
     assert environment.CURATOR_IO_RESOURCE_NAME not in resources
-    results = processing.upload_clips(batch, config=config)
-    assert results.schema.equals(RESULT_SCHEMA, check_metadata=True)
+    results = processing.upload_clips(batch, config=config, staged_schema=staged_schema)
+    assert results.schema.equals(staged_schema, check_metadata=True)
     return results
 
 
@@ -171,48 +174,52 @@ def _start_ray() -> None:
     DataContext.get_current().enable_progress_bars = False
 
 
-def _assert_span_resume(
+def _assert_span_resume(  # noqa: PLR0915 -- one fresh-cluster recovery scenario
     config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Assert a fresh cluster filters durable spans before regrouping an unfinished source."""
-    workspace = resolve_workspace(config, dataset)
-    datasource = pipeline.SpanDatasource
-
-    class FirstFragment(datasource):
-        def __init__(self, ds: lance.LanceDataset, cfg: ResolvedVideoTranscodeConfig) -> None:
-            super().__init__(ds, cfg)
-            self._fragments = self._fragments[:1]
-
+    bindings = resolve_bindings(config)
+    attempt = reconcile_and_select_attempt(open_enrichment_input(bindings))
+    workspace = attempt.workspace
+    assert workspace is not None
     monkeypatch.setattr(pipeline, "SourceDownloader", _RecordingDownloader)
     monkeypatch.setattr(pipeline, "transcode_source", _synthetic_transcode)
     monkeypatch.setattr(pipeline, "upload_clips", _upload_without_io_slot)
-    monkeypatch.setattr(pipeline, "SpanDatasource", FirstFragment)
     try:
         _start_ray()
         shuffle_strategy = DataContext.get_current().shuffle_strategy
         scaling_threshold = DataContext.get_current().autoscaling_config.actor_pool_util_upscaling_threshold
-        pipeline.transcode_spans(dataset, config, workspace)
+        # An interrupted run leaves only the first fragment's spans durable.
+        with checkpointed_processing(attrs.evolve(attempt, selected=attempt.selected[:1])) as processing:
+            pipeline.transcode_spans(processing, config)
         assert DataContext.get_current().checkpoint_config is None
         assert DataContext.get_current().shuffle_strategy == shuffle_strategy
         assert DataContext.get_current().autoscaling_config.actor_pool_util_upscaling_threshold == scaling_threshold
         assert pq.read_table(workspace.results).num_rows == 2
         assert lance.dataset(dataset.uri).to_table(columns=["clip_uri"])["clip_uri"].null_count == 4
+        # Simulate a crash after only some results are durable, without a completion marker.
+        Path(workspace.completion).unlink()
         ray.shutdown()
 
-        monkeypatch.setattr(pipeline, "SpanDatasource", datasource)
-        _start_ray()
+        # A disjoint schema commit must not invalidate durable transcodes on the fresh attempt,
+        # and execution tuning does not change the workspace.
+        latest = lance.dataset(dataset.uri)
+        latest.add_columns(pa.schema([pa.field("other_enrichment", pa.string())]))
         resumed = config.model_copy(
             update={
                 "execution": config.execution.model_copy(
-                    update={"spans_per_checkpoint": 2, "transcode_memory_gib": 0.75}
+                    update={"parquet_rows_per_file": 2, "transcode_memory_gib": 0.75}
                 )
             }
         )
-        assert resolve_workspace(resumed, dataset) == workspace
-        pipeline.transcode_spans(dataset, resumed, workspace)
+        resumed_attempt = reconcile_and_select_attempt(open_enrichment_input(resolve_bindings(resumed)))
+        assert (resumed_attempt.selected, resumed_attempt.workspace) == (attempt.selected, workspace)
+        _start_ray()
+        with checkpointed_processing(resumed_attempt) as processing:
+            pipeline.transcode_spans(processing, resumed)
         assert DataContext.get_current().checkpoint_config is None
         results = pq.read_table(workspace.results)
-        assert results.schema.equals(RESULT_SCHEMA, check_metadata=True)
+        assert results.schema.equals(bindings.spec.staged_schema, check_metadata=True)
         assert results.num_rows == len(set(results["span_id"].to_pylist())) == 4
         work = [json.loads(line) for line in Path(config.input.media_root, "processed.jsonl").read_text().splitlines()]
         assert [len(group) for group in work] == [2, 2]
@@ -221,11 +228,17 @@ def _assert_span_resume(
             json.loads(line) for line in Path(config.input.media_root, "downloaded.jsonl").read_text().splitlines()
         ]
         assert [download["span_ids"] for download in downloads] == work
-        pipeline.transcode_spans(dataset, resumed, workspace)
+        with checkpointed_processing(resumed_attempt) as processing:
+            pipeline.transcode_spans(processing, resumed)
         assert len(Path(config.input.media_root, "processed.jsonl").read_text().splitlines()) == 2
         assert len(Path(config.input.media_root, "downloaded.jsonl").read_text().splitlines()) == 2
-        published = pipeline.publish_results(dataset, config, workspace)
-        assert published.version == dataset.version + 1
+        outcome = publish_enrichment(
+            resumed_attempt, transaction_properties=pipeline.publication_properties(resumed_attempt)
+        )
+        published = outcome.dataset
+        assert published.version == resumed_attempt.input.dataset.version + 1
+        assert outcome.cleanup_complete
+        assert "other_enrichment" in published.schema.names
         for row in published.to_table(columns=["clip_uri", "clip_size_bytes"]).to_pylist():
             assert Path(row["clip_uri"]).read_bytes() == b"clip"
             assert row["clip_size_bytes"] == 4
@@ -261,10 +274,8 @@ def test_sources_in_one_partition_stream_from_one_download_task(
                 "span_id": make_span_id(source_id, template["start_ns"], template["end_ns"]),
             }
         )
-    metadata = dict(original.schema.metadata or {})
-    metadata[b"video_cut.publication"] = json.dumps({"publication_version": 2, "spans": len(rows)}).encode()
     dataset = lance.write_dataset(
-        pa.Table.from_pylist(rows, schema=original.schema.with_metadata(metadata)),
+        pa.Table.from_pylist(rows, schema=original.schema),
         dataset.uri,
         mode="overwrite",
         data_storage_version="2.2",
@@ -273,8 +284,10 @@ def test_sources_in_one_partition_stream_from_one_download_task(
     monkeypatch.setattr(pipeline, "SourceDownloader", _StreamingDownloader)
     monkeypatch.setattr(pipeline, "transcode_source", _synthetic_transcode)
     monkeypatch.setattr(pipeline, "upload_clips", _upload_without_io_slot)
-    workspace = resolve_workspace(config, dataset)
-    pipeline.transcode_spans(dataset, config, workspace)
+    attempt = reconcile_and_select_attempt(open_enrichment_input(resolve_bindings(config)))
+    assert attempt.workspace is not None
+    with checkpointed_processing(attempt) as processing:
+        pipeline.transcode_spans(processing, config)
     downloads = [
         json.loads(line) for line in Path(config.input.media_root, "downloaded.jsonl").read_text().splitlines()
     ]
@@ -282,6 +295,6 @@ def test_sources_in_one_partition_stream_from_one_download_task(
     assert len({download["task_id"] for download in downloads}) == 1
     assert len({download["actor_id"] for download in downloads}) == 1
     assert all(len(download["span_ids"]) == 1 for download in downloads)
-    results = pq.read_table(workspace.results)
+    results = pq.read_table(attempt.workspace.results)
     assert results.num_rows == 3
     assert set(results["span_id"].to_pylist()) == {row["span_id"] for row in rows}

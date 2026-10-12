@@ -68,18 +68,18 @@ destination, and workspace version to isolate compatible recovery state.
 On resume, checkpointed outcomes for sources already published by an intervening cut invocation are excluded.
 Phase B expands the remaining source plans with Arrow and packs spans across source boundaries into Lance fragments controlled
 by `spans_per_fragment`. Workers stage the fragments; the driver commits them with one atomic `Append` transaction.
-The transaction's `video_cut.publication` property records the input snapshot, processed source IDs, outcome counts,
-and error report. Even a zero-span run commits its receipt. Reruns recognize the receipt despite intervening enrichment
-commits, and later input selections skip its source IDs. Retain Lance transaction history for these run receipts,
-especially the identities of sources with no span rows.
+The transaction's `video_cut.publication` property uses publication format version 1 and records the input snapshot,
+processed source IDs, outcome counts, and error report. Even a zero-span run commits its receipt. Reruns recognize the
+receipt despite intervening enrichment commits, and later input selections skip its source IDs. Retain Lance transaction
+history for these run receipts, especially the identities of sources with no span rows.
 
 Every committed fragment is ready for transcode; there is no whole-table completion gate. An empty table can coexist
 with an active cut run. Append preserves enrichment columns, and newly appended narrow span rows read those nullable
 columns as null. Previous fragments are never repacked, including an earlier run's partially filled final fragment.
 
-Legacy snapshot tables are accepted when their cutting contract matches. Their v2 schema completion record still makes
-an identical input selection a no-op. For a different selection, existing span rows identify previously processed
-sources; legacy zero-span/error sources may be probed once again because the old receipt did not store their IDs.
+This implementation assumes freshly created datasets and recovery workspaces. Source completion is determined from
+transaction receipts, including zero-span outcomes; earlier schema receipts have no migration path. Tables carrying
+schema receipts are rejected at open with a request to use a new output location.
 
 | Failure boundary | Recovery |
 | --- | --- |

@@ -20,7 +20,6 @@ import ray.cloudpickle as ray_cloudpickle
 import ray.data.llm as ray_data_llm
 from botocore.exceptions import ClientError
 from lance.fragment import LanceFragment
-from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.next.recipes.video_caption import inference
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings, CaptionRunBindings
@@ -39,7 +38,6 @@ from cosmos_curator.next.recipes.video_caption.inference import (
     caption_llm_preprocess,
     decompose_row_addresses,
     fetch_media_batch,
-    installed_checkpoint_config,
     result_schema,
     run_inference_phase,
     staged_result_files,
@@ -975,24 +973,6 @@ def test_canonicalization_uses_the_model_bound_output_limit(caption_bindings: Ca
     terminal = canonicalize_llm_batch(raw, bindings=bindings).to_pylist()[0]
 
     assert terminal[caption_bindings.result.metadata_field_name]["status"] == "truncated"
-
-
-def test_checkpoint_config_is_always_cleared(tmp_path: Path) -> None:
-    """The job checkpoint cannot leak into Phase B, even after an exception."""
-    context = ray.data.DataContext.get_current()
-    context.checkpoint_config = None
-    checkpoint = CheckpointConfig(id_column="clip_id", checkpoint_path=str(tmp_path))
-
-    def install_and_fail() -> None:
-        with installed_checkpoint_config(checkpoint):
-            assert context.checkpoint_config is checkpoint
-            msg = "boom"
-            raise RuntimeError(msg)
-
-    with pytest.raises(RuntimeError, match="boom"):
-        install_and_fail()
-
-    assert context.checkpoint_config is None
 
 
 @pytest.mark.integration

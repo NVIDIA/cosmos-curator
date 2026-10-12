@@ -5,7 +5,6 @@
 
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
 from functools import partial
 from typing import Any, cast
 
@@ -15,13 +14,13 @@ import ray
 from loguru import logger
 from ray.data.aggregate import Count
 from ray.data.block import BlockMetadata
-from ray.data.checkpoint import CheckpointConfig
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
+from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
 from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_progress,
     configure_ray_data_stability,
@@ -91,28 +90,10 @@ class SourceDatasource(Datasource):
         return tasks
 
 
-@contextmanager
-def source_checkpoints(config: ResolvedVideoCutConfig, workspace: Workspace) -> Iterator[None]:
-    """Install native checkpoints for exactly one read-to-Parquet execution."""
-    context = DataContext.get_current()
-    if context.checkpoint_config is not None:
-        msg = "video-cut cannot replace an existing Ray checkpoint configuration"
-        raise RuntimeError(msg)
-    context.checkpoint_config = CheckpointConfig(
-        id_column="source_id",
-        checkpoint_path=workspace.checkpoints,
-        delete_checkpoint_on_success=False,
-        override_filesystem=arrow_filesystem(workspace.root, config.execution.storage_profile),
-    )
-    try:
-        yield
-    finally:
-        context.checkpoint_config = None
-
-
 def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uris: tuple[str, ...]) -> None:
     """Checkpoint complete source plans before any Lance publication begins."""
-    with source_checkpoints(config, workspace):
+    filesystem = arrow_filesystem(workspace.root, config.execution.storage_profile)
+    with installed_checkpoint(id_column="source_id", checkpoint_path=workspace.checkpoints, filesystem=filesystem):
         sources = ray.data.read_datasource(
             SourceDatasource(source_uris),
             override_num_blocks=min(len(source_uris), 256),
@@ -130,7 +111,7 @@ def cut_sources(config: ResolvedVideoCutConfig, workspace: Workspace, source_uri
         groups = planned.repartition(target_num_rows_per_block=config.execution.sources_per_checkpoint, strict=True)
         groups.write_parquet(
             workspace.results,
-            filesystem=arrow_filesystem(workspace.root, config.execution.storage_profile),
+            filesystem=filesystem,
             min_rows_per_file=config.execution.sources_per_checkpoint,
             max_rows_per_file=config.execution.sources_per_checkpoint,
         )

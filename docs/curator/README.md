@@ -34,6 +34,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 
 - [Cosmos Curator Next](design/curator-next.md) - agent-friendly toolkit direction centered on reusable components and
   maintained reference recipes.
+- [Curator Next Checkpointing and Recovery](design/curator-next-checkpoint-recovery.md) - shared durable progress,
+  atomic enrichment, and convergence of recovery behavior across recipes.
 - [Curator Next Video Cut](design/curator-next-video-cut.md) - plan fixed-stride spans in Lance.
 - [Curator Next Video Transcode](design/curator-next-video-transcode.md) - checkpointed CPU transcoding and atomic clip
   metadata publication.

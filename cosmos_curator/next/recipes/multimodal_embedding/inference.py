@@ -28,13 +28,13 @@ import ray
 from loguru import logger
 from ray.data import ActorPoolStrategy
 from ray.data.block import BlockMetadata
-from ray.data.checkpoint import CheckpointConfig
 from ray.data.context import DataContext
 from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv, ray_data_gpu_runtime_env
 from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
+from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
 from cosmos_curator.next.recipes.multimodal_embedding.config import ResolvedMultimodalEmbeddingConfig
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     EmbeddingTerminalResult,
@@ -63,7 +63,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.video_media import (
     decode_selected_frames,
     inspect_video,
 )
-from cosmos_curator.next.recipes.video_caption.inference import installed_checkpoint_config
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace, record_phase_a_completion
 from cosmos_curator.next.utils.media_reader import MediaObjectError, MediaObjectReader
@@ -563,13 +562,9 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit finite work, output, and r
 ) -> None:
     """Share actors across cameras and checkpoint each pair before atomic episode assembly."""
     source = _CameraDatasource(dataset, config, pending_cameras, storage_options)
-    checkpoint = CheckpointConfig(
-        id_column=CAMERA_WORK_ID,
-        checkpoint_path=workspace.checkpoints_uri,
-        delete_checkpoint_on_success=False,
-        override_filesystem=workspace.filesystem,
-    )
-    with installed_checkpoint_config(checkpoint):
+    with installed_checkpoint(
+        id_column=CAMERA_WORK_ID, checkpoint_path=workspace.checkpoints_uri, filesystem=workspace.filesystem
+    ):
         rows = ray.data.read_datasource(source, override_num_blocks=len(pending_cameras))
         rows = rows.repartition(target_num_rows_per_block=config.execution.lance_read_batch_size, strict=True)
         embedded = map_video_embeddings(rows, config, num_input_rows=source.num_rows, camera_results=camera_results)

@@ -3,7 +3,6 @@
 
 """Atomic append publication, ambiguous responses, and incremental source selection."""
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -324,47 +323,13 @@ def test_growing_selection_processes_only_new_sources(
     assert summary["source_results"] == 1
 
 
-def test_legacy_completed_snapshot_can_be_reopened_and_extended(
-    config: ResolvedVideoCutConfig,
-    snapshot_id: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Existing v2 metadata remains readable while the input selection may grow."""
-    outcomes, _ = _stage(config)
-    spans = pa.concat_tables(
-        list(publication.expand_sources(outcomes, contract_id=config.split.contract_id, spans_per_fragment=2))
-    )
-    metadata = dict(span_schema(config.split).metadata or {})
-    metadata[b"video_cut.input_snapshot"] = snapshot_id.encode()
-    metadata[b"video_cut.publication"] = json.dumps(
-        {"publication_version": 2, "spans": 3, "source_results": 2, "errors": 0, "errors_uri": None}
-    ).encode()
-    lance.write_dataset(
-        spans.cast(span_schema(config.split).with_metadata(metadata)),
-        config.output.spans_lance_uri,
-        mode="overwrite",
-        data_storage_version="2.2",
-    )
-    monkeypatch.setattr(
-        pipeline, "ensure_ray_initialized", lambda **_: pytest.fail("Legacy completion should skip Ray")
-    )
-    assert pipeline.run_config(config)["source_results"] == 2
-    current = publication.open_span_table(config, "different-selection")
-    assert publication.pending_source_uris(current, (config.input.uris[0], "s3://test-bucket/new.mp4")) == (
-        "s3://test-bucket/new.mp4",
-    )
-
-
-@pytest.mark.parametrize("legacy_record", [False, True])
 def test_completed_run_reopens_without_touching_staging(
     config: ResolvedVideoCutConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     snapshot_id: str,
-    *,
-    legacy_record: bool,
 ) -> None:
-    """Completed reopens ignore legacy cleanup paths, including under a different staging profile."""
+    """Completed reopens leave staging untouched, including under a different storage profile."""
     outcomes, record = _stage(config)
     workspace = publication.resolve_workspace(config, snapshot_id)
     moved = resolve_config_data(
@@ -375,8 +340,6 @@ def test_completed_run_reopens_without_touching_staging(
     Path(sibling.results).mkdir(parents=True)
     sibling_result = Path(sibling.results, "retained.parquet")
     sibling_result.write_bytes(b"unrelated recovery state")
-    if legacy_record:
-        record["workspace_root"] = sibling.root
     dataset = publication.commit_fragments(
         _candidates(outcomes, config), config=config, input_snapshot_id=snapshot_id, publication=record, read_version=1
     )
@@ -451,6 +414,46 @@ def test_resumed_workspace_cleanup_is_best_effort(
         assert "cleanup interrupted" in warning
     else:
         assert not warnings
+
+
+@pytest.mark.parametrize(
+    "legacy_receipt",
+    [
+        pytest.param(b'{"publication_version":2,"source_results":1,"errors":0,"spans":3,"errors_uri":null}', id="v2"),
+        pytest.param(b"", id="empty"),
+        pytest.param(b"not-json", id="malformed"),
+    ],
+)
+def test_table_rejects_legacy_schema_receipt_without_mutation(
+    config: ResolvedVideoCutConfig, snapshot_id: str, legacy_receipt: bytes
+) -> None:
+    """Reject legacy completion evidence before its spans can be selected for duplicate publication."""
+    row = source_result(
+        config.input.uris[0], VideoMetadata(5_000_000_000, 64, 48, 30.0, None, "h264"), 50, config.split
+    )
+    spans = pa.concat_tables(
+        list(
+            publication.expand_sources(
+                pa.Table.from_pylist([row], schema=SOURCE_SCHEMA),
+                contract_id=config.split.contract_id,
+                spans_per_fragment=config.execution.spans_per_fragment,
+            )
+        )
+    )
+    metadata = (span_schema(config.split).metadata or {}) | {
+        b"video_cut.input_snapshot": snapshot_id.encode(),
+        b"video_cut.publication": legacy_receipt,
+    }
+    legacy = lance.write_dataset(
+        spans.replace_schema_metadata(metadata), config.output.spans_lance_uri, data_storage_version="2.2"
+    )
+
+    with pytest.raises(ValueError, match="legacy video-cut schema receipt; use a new output location"):
+        publication.open_span_table(config, snapshot_id)
+
+    current = lance.dataset(config.output.spans_lance_uri)
+    assert current.version == legacy.version
+    assert current.to_table().equals(legacy.to_table(), check_metadata=True)
 
 
 def test_table_rejects_incompatible_contract_but_allows_new_staging(

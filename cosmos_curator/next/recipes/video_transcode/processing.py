@@ -26,7 +26,6 @@ from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import (
-    RESULT_SCHEMA,
     SOURCE_WORK_SCHEMA,
     SPAN_WORK_SCHEMA,
     make_clip_id,
@@ -180,8 +179,8 @@ def _encode(source: Path, outputs: tuple[tuple[Span, Path], ...], config: Resolv
     )
 
 
-def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig) -> pa.Table:
-    """Upload each clip before returning typed metadata for checkpointing."""
+def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, staged_schema: pa.Schema) -> pa.Table:
+    """Upload each clip before returning its metadata as ``staged_schema`` rows for checkpointing."""
     for index in range(batch.num_rows):
         payload = batch["clip_bytes"][index].as_py()
         if not payload or len(payload) != batch["clip_size_bytes"][index].as_py():
@@ -198,4 +197,4 @@ def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig) -> pa
             max_attempts=config.execution.storage_attempts,
             name="clip-upload",
         )
-    return batch.select(RESULT_SCHEMA.names).cast(RESULT_SCHEMA)
+    return batch.select(staged_schema.names).cast(staged_schema)

@@ -3,7 +3,6 @@
 
 """Download admission and worker churn on an isolated CPU-only Ray cluster."""
 
-import json
 import subprocess
 import sys
 import threading
@@ -178,7 +177,7 @@ def _assert_download_churn(config: ResolvedVideoTranscodeConfig, monkeypatch: py
         _wait_for(lambda: len(list(root.glob("started-*"))) > 2, future)
         (root / "release-downloads").touch()
         summary = future.result(timeout=120)
-        assert summary["spans"] == 8
+        assert summary["input_rows"] == 8
         assert summary["cleanup_complete"] is True
     finally:
         (root / "release-downloads").touch()
@@ -215,10 +214,8 @@ def test_download_submission_tracks_live_io_capacity_and_recovers(
                 "span_id": make_span_id(source_id, template["start_ns"], template["end_ns"]),
             }
         )
-    metadata = dict(table.schema.metadata or {})
-    metadata[b"video_cut.publication"] = json.dumps({"publication_version": 2, "spans": len(rows)}).encode()
     dataset = lance.write_dataset(
-        pa.Table.from_pylist(rows, schema=table.schema.with_metadata(metadata)),
+        pa.Table.from_pylist(rows, schema=table.schema),
         dataset.uri,
         mode="overwrite",
         max_rows_per_file=2,

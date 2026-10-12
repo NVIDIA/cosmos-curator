@@ -15,4 +15,10 @@ Coding agents and contributors starting a new recipe should first read the
 [Curator Next agent guidelines](AGENTS.md). They cover shared component adoption, recipe contracts, and managed Ray
 qualification criteria.
 
+For checkpointed enrichment, start with the
+[adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-the-reference-pattern).
+`video_embed` demonstrates independent row processing; `video_transcode` demonstrates source grouping and durable payload
+writes. The shared [`enrichment`](enrichment/__init__.py) package owns the run sequence, checkpoint scopes, publication,
+and recovery proof, while each recipe's Ray processing graph remains explicit.
+
 See [Cosmos Curator Next](../../docs/curator/design/curator-next.md) for the design direction.

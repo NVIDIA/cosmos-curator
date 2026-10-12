@@ -17,7 +17,7 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
     caption_contract_digest,
     resolve_model_spec,
 )
-from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, PUBLICATION_KEY
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, PUBLICATION_KEY, PUBLICATION_VERSION
 from tests.cosmos_curator.next.recipes.video_caption.helpers import caption_run_bindings
 
 
@@ -99,15 +99,13 @@ def clip_dataset_factory(
         )
         uri = str(tmp_path / f"clips-{created}.lance")
         dataset = lance.write_dataset(
-            pa.Table.from_pylist(
-                values,
-                schema=CLIP_SCHEMA.with_metadata(
-                    {PUBLICATION_KEY: json.dumps({"publication_version": 1, "spans": len(values)}).encode()}
-                ),
-            ),
+            pa.Table.from_pylist(values, schema=CLIP_SCHEMA),
             uri,
             max_rows_per_file=rows_per_fragment,
             data_storage_version="2.2",
+            transaction_properties={
+                PUBLICATION_KEY: json.dumps({"publication_version": PUBLICATION_VERSION, "spans": len(values)})
+            },
         )
         return uri, dataset
 

@@ -3,8 +3,7 @@
 ## Direction and Scope
 
 Curator Next is the starting point for new curation workflows: maintained reference recipes backed by a shared toolkit.
-The goal is to replace Xenna and the legacy Ray Data pipelines once their workflows have transitioned. Existing pipelines
-move here through explicit transition work.
+The goal is to replace Xenna and the legacy Ray Data pipelines through explicit workflow migrations.
 
 Implementation and mirrored tests live in `cosmos_curator/next` and `tests/cosmos_curator/next`. During incubation,
 schemas, identities, config shapes, and import paths have no backward-compatibility guarantee. Prefer rerunning to
@@ -34,8 +33,15 @@ Inspect shared components and relevant recipes before implementing common concer
 keep domain behavior local where reuse is uncertain. Shared APIs should preserve differences justified by data contracts
 or measured performance, rather than every historical implementation choice.
 
-Scope extractions and adoptions to the task. Document shared assumptions and guarantees, and cover existing consumers
-when changing a shared contract.
+Scope extractions and adoptions to the task. Document shared assumptions and guarantees; extend the contract explicitly
+when semantics change, with tests for new and existing consumers.
+
+For checkpointing and recovery, `video_transcode`, `video_embed`, and their shared components are the canonical reference.
+Migrate other recipes and older recovery helpers toward that pattern, but check the
+[extensions it lacks](../../docs/curator/design/curator-next-checkpoint-recovery.md#expansion-across-curator-next)
+first: row-level selection (embeddings, robot-action-caption) and several field sets in one commit
+(multimodal-embedding) each need an explicit extension, not a force-fit. `lance_fragment_recovery` is deprecated for new
+workflows; producers need an explicit append-publication extension to shared recovery before migration.
 
 ## Recipe Contracts
 
@@ -52,8 +58,15 @@ Before scaling or declaring a recipe complete, record its contract in module doc
 - recovery boundary and compatibility inputs, when supported;
 - failure and quarantine behavior.
 
-Use the recipe's current design notes when changing publication or recovery. Shared recovery requirements belong with
-the shared design and explicit recipe adoption work.
+Use the recipe's current design notes when changing publication or recovery. When adopting shared recovery, follow the
+[shared contract](../../docs/curator/design/curator-next-checkpoint-recovery.md#assumptions-and-guarantees).
+Document how the recipe and deployment meet its assumptions, and test its guarantees.
+Start from the
+[adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-the-reference-pattern): the
+recipe's `run_config` calls `run_enrichment`, and its tests subclass the shared
+[conformance suite](../../tests/cosmos_curator/next/enrichment/conformance.py). The
+[`enrichment` package docstring](enrichment/__init__.py) lists the rest of the recipe-facing API. Keep processing graphs,
+payload durability, and terminal-error policy recipe-owned.
 
 ## Configuration and CLI
 
@@ -103,15 +116,16 @@ publication, item failures, retry/recovery decisions, and a small Ray Data run t
 Keep a cheap smoke config or equivalent first successful run. Follow the [root testing guidance](../../AGENTS.md#development)
 for suite and marker selection.
 
-Before claiming managed Ray qualification, exercise:
+Before claiming cross-run recovery, exercise:
 
-1. workers joining, leaving, or being requeued, including a temporary period with no workers;
-2. a fresh cluster and driver recovering after durable work has completed;
-3. failures around payload, checkpoint, Lance-commit, and final-status boundaries;
-4. comparison with a clean reference run by logical identity and schema.
+1. a fresh cluster and driver recovering after durable work has completed;
+2. failures around payload, checkpoint, Lance-commit, and final-status boundaries;
+3. comparison with a clean reference run by logical identity and schema.
 
 Clean and resumed runs must produce the same visible records and payload references, with no missing or duplicate logical
-outputs. Shared helper adoption alone does not establish qualification; test the recipe's complete path before claiming it.
+outputs. Managed Ray qualification additionally requires testing workers joining, leaving, or being requeued, including a
+temporary period with no workers. Shared helper adoption alone does not establish qualification; test the recipe's complete
+path before claiming it.
 
 ## Design References
 

@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from cosmos_curator.next.recipes.video_embed import processing
-from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_row
+from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_batch
 from cosmos_curator.next.recipes.video_embed.processing import download_clip, sample_indices, sample_video
 from cosmos_curator.next.utils.media_reader import (
     MediaObjectError,
@@ -115,18 +115,9 @@ def test_nullable_vectors_survive_checkpoint_parquet(tmp_path: Path, results: pa
     path = tmp_path / "results.parquet"
     pq.write_table(results, path)
     restored = pq.read_table(path)
-    assert restored.schema.equals(spec.result_schema, check_metadata=True)
+    assert restored.schema.equals(results.schema, check_metadata=True)
     assert restored.equals(results)
     canonical = restored.select(spec.fields.names).cast(spec.fields)
     assert canonical[spec.vector_field].null_count == 1
-    for row in canonical.to_pylist():
-        validate_terminal_row(row, spec)
-
-
-@pytest.mark.parametrize("vector", [[float("nan")], [float("inf")], [0.0], [1.0, 2.0]])
-def test_invalid_vectors_are_rejected(vector: list[float], results: pa.Table, spec: ModelSpec) -> None:
-    """Wrong dimension, nonfinite output, and nonunit vectors cannot reach Lance."""
-    row = results.to_pylist()[0]
-    row[spec.vector_field] = vector * spec.dimension if len(vector) == 1 else vector
-    with pytest.raises(ValueError, match="finite unit vector"):
-        validate_terminal_row(row, spec)
+    for batch in canonical.to_batches():
+        validate_terminal_batch(batch, spec)

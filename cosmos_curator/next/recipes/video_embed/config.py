@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 from cosmos_curator.next.utils.uris import normalize_location
 
 ModelVariant = Literal["224p", "336p", "448p"]
@@ -52,17 +53,14 @@ class ModelConfig(_Config):
     variant: ModelVariant = "336p"
 
 
-class ExecutionConfig(_Config):
+class ExecutionConfig(EnrichmentExecutionConfig):
     """Resource and durability tuning, excluded from embedding identity."""
 
-    storage_profile: str = Field(default="default", min_length=1)
+    # Smaller scanner batches spread clip downloads across more Ray tasks.
+    lance_read_batch_size: int = Field(default=128, ge=1, description="Clip rows per Lance scanner batch.")
     media_attempts: int = Field(default=3, ge=1)
     inference_concurrency: Concurrency = "auto"
     inference_batch_size: int = Field(default=16, ge=1)
-    lance_read_batch_size: int = Field(default=128, ge=1, description="Clip rows per Lance scanner batch.")
-    parquet_rows_per_file: int = Field(default=1_024, ge=1)
-    commit_attempts: int = Field(default=5, ge=1)
-    progress: bool = False
 
 
 class ResolvedVideoEmbedConfig(_Config):

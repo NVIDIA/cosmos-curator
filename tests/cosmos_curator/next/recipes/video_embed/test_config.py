@@ -39,6 +39,10 @@ def test_model_variants(variant: str, dimension: int) -> None:
         "execution.inference_batch_size=0",
         "execution.inference_concurrency=0",
         "execution.inference_concurrency=false",
+        "execution.publication_memory_gib=0",
+        "execution.publication_memory_gib=-1",
+        "execution.publication_memory_gib=.inf",
+        "execution.publication_memory_gib=.nan",
         "execution.decode_concurrency=2",
         "execution.decode_cpus=1",
         "execution.decode_memory_gib=2.0",
@@ -61,17 +65,31 @@ def test_template_and_lazy_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     from cosmos_curator.pipelines.builtin_pipeline_kinds import BUILTIN_PIPELINE_KINDS  # noqa: PLC0415
 
     template = config_module.config_template()
+    assert template["execution"]["publication_memory_gib"] == 8.0
     assert yaml.safe_load(VIDEO_EMBED_KIND.template_yaml()) == template
     path = tmp_path / "embed.yaml"
     path.write_text(yaml.safe_dump(template), encoding="utf-8")
     kind = BUILTIN_PIPELINE_KINDS.get("video-embed")
     assert kind.validate(path, ()) == {"ok": True}
-    rendered = json.loads(kind.render(path, ("execution.inference_batch_size=2",)))
+    rendered = json.loads(
+        kind.render(path, ("execution.inference_batch_size=2", "execution.publication_memory_gib=1.5"))
+    )
     assert rendered["execution"]["inference_batch_size"] == 2
+    assert rendered["execution"]["publication_memory_gib"] == 1.5
     assert rendered["input"]["clips_lance_uri"].endswith("/lance")
     assert kind.list_presets() == []
     assert json.loads(kind.schema_json())["properties"]["kind"]["const"] == "video-embed"
     assert config_module.resolve_config_data(rendered).model.variant == spec.variant
-    monkeypatch.setattr(pipeline, "run_config", lambda config: {"clips": config.execution.inference_batch_size})
+    monkeypatch.setattr(
+        pipeline,
+        "run_config",
+        lambda config: {
+            "input_rows": 4,
+            "selected_rows": config.execution.inference_batch_size,
+            "remaining_fragments": 1,
+        },
+    )
     run = kind.prepare_run(path, set_overrides=["execution.inference_batch_size=3"])
-    assert run().json_payload == {"clips": 3}
+    output = run()
+    assert output.json_payload == {"input_rows": 4, "selected_rows": 3, "remaining_fragments": 1}
+    assert output.message == "video-embed: published results for 3 of 4 input row(s); 1 fragment(s) pending"

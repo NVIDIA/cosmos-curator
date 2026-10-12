@@ -36,9 +36,8 @@ from cosmos_curator.next.utils import lance_fragment_recovery
 from cosmos_curator.next.utils.identity import canonical_digest
 from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 
-_PUBLICATION_KEY = b"video_cut.publication"
-_PUBLICATION_VERSION = 3
-_LEGACY_PUBLICATION_VERSION = 2
+_PUBLICATION_KEY = "video_cut.publication"
+_PUBLICATION_VERSION = 1
 _FRAGMENT_SCHEMA = pa.schema([pa.field("fragment", pa.string(), nullable=False)])
 
 
@@ -90,6 +89,9 @@ def open_span_table(config: ResolvedVideoCutConfig, input_snapshot_id: str) -> l
         kind="video-cut",
     )
     actual = dataset.schema.metadata or {}
+    if b"video_cut.publication" in actual:
+        msg = "Lance table contains a legacy video-cut schema receipt; use a new output location"
+        raise ValueError(msg)
     if any(actual.get(key) != value for key, value in (schema.metadata or {}).items()):
         msg = "Lance table belongs to a different video-cut contract; use a new output location"
         raise ValueError(msg)
@@ -110,27 +112,18 @@ def source_result_files(workspace: Workspace, config: ResolvedVideoCutConfig) ->
 
 
 def publication_records(dataset: lance.LanceDataset) -> Iterator[dict[str, Any]]:
-    """Read committed run receipts, newest first, including the old snapshot receipt."""
+    """Read committed run receipts from Lance transaction properties, newest first."""
     for version in range(int(dataset.version), 0, -1):
         transaction = dataset.read_transaction(version)
         if transaction is None:
             continue
-        encoded = (transaction.transaction_properties or {}).get(_PUBLICATION_KEY.decode())
+        encoded = (transaction.transaction_properties or {}).get(_PUBLICATION_KEY)
         if encoded is not None:
             record = json.loads(encoded)
             if not isinstance(record, dict) or record.get("publication_version") != _PUBLICATION_VERSION:
                 msg = "Unsupported video-cut publication record"
                 raise ValueError(msg)
             yield record
-    encoded = (dataset.schema.metadata or {}).get(_PUBLICATION_KEY)
-    if encoded is None:
-        return
-    record = json.loads(encoded)
-    if not isinstance(record, dict) or record.get("publication_version") != _LEGACY_PUBLICATION_VERSION:
-        msg = "Unsupported video-cut publication record"
-        raise ValueError(msg)
-    snapshot = (dataset.schema.metadata or {}).get(b"video_cut.input_snapshot", b"").decode()
-    yield record | {"input_snapshot": snapshot}
 
 
 def completed_publication(dataset: lance.LanceDataset, input_snapshot_id: str | None = None) -> dict[str, Any] | None:
@@ -148,10 +141,6 @@ def completed_publication(dataset: lance.LanceDataset, input_snapshot_id: str | 
 def pending_source_uris(dataset: lance.LanceDataset, source_uris: tuple[str, ...]) -> tuple[str, ...]:
     """Skip committed sources, including empty plans/errors that have no canonical span row."""
     published = {source_id for record in publication_records(dataset) for source_id in record.get("source_ids", [])}
-    # Also recognize spans from the previous snapshot implementation, whose
-    # completion record did not retain the identities of zero-span sources.
-    for batch in dataset.to_batches(columns=["source_id"]):
-        published.update(pc.unique(batch.column("source_id")).to_pylist())
     return tuple(uri for uri in source_uris if make_source_id(uri) not in published)
 
 
@@ -245,7 +234,7 @@ def commit_fragments(
             "kind": "video-cut",
             "operation": "append-spans",
             "input_snapshot": input_snapshot_id,
-            _PUBLICATION_KEY.decode(): json.dumps(record, sort_keys=True),
+            _PUBLICATION_KEY: json.dumps(record, sort_keys=True),
         },
     )
     for attempt in range(1, config.execution.commit_attempts + 1):

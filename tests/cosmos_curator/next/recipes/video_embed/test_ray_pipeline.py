@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import attrs
 import av
 import lance
 import pyarrow as pa
@@ -20,7 +21,11 @@ from coverage import Coverage
 from ray.data.context import DataContext
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.enrichment.contracts import open_enrichment_input
+from cosmos_curator.next.enrichment.execution import checkpointed_processing, publish_enrichment
 from cosmos_curator.next.recipes.video_embed import pipeline
+from cosmos_curator.next.recipes.video_embed.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedConfig
 from cosmos_curator.next.recipes.video_embed.contracts import (
     ModelSpec,
@@ -28,12 +33,6 @@ from cosmos_curator.next.recipes.video_embed.contracts import (
     terminal_row,
 )
 from cosmos_curator.next.recipes.video_embed.processing import download_clip
-from cosmos_curator.next.recipes.video_embed.state import (
-    ensure_workspace,
-    open_input,
-    pending_fragment_ids,
-    resolve_workspace,
-)
 from tests.cosmos_curator.next.recipes.video_embed.conftest import write_clips
 from tests.cosmos_curator.next.recipes.video_embed.test_processing import video_bytes
 
@@ -66,9 +65,10 @@ def recording_download(row: dict[str, Any], **kwargs: Any) -> dict[str, Any]:  #
 class CpuEmbedder:
     """Stand in for GPU inference while retaining terminal schemas and row identities."""
 
-    def __init__(self, *, spec: ModelSpec, model_dir: str) -> None:
+    def __init__(self, *, spec: ModelSpec, model_dir: str, staged_schema: pa.Schema) -> None:
         """Use the test media directory for an expensive-work log."""
         self._spec = spec
+        self._staged_schema = staged_schema
         self._root = Path(model_dir)
 
     def __call__(self, batch: pa.Table) -> pa.Table:
@@ -83,7 +83,7 @@ class CpuEmbedder:
             rows.append(terminal_row(row, self._spec, vector))
             with (self._root / "inference.jsonl").open("a") as log:
                 log.write(json.dumps(row["clip_id"]) + "\n")
-        return pa.Table.from_pylist(rows, schema=self._spec.result_schema)
+        return pa.Table.from_pylist(rows, schema=self._staged_schema)
 
 
 def _start_ray() -> None:
@@ -101,19 +101,14 @@ def _start_ray() -> None:
     DataContext.get_current().enable_progress_bars = False
 
 
-def assert_resume(config: ResolvedVideoEmbedConfig) -> None:
+def assert_resume(config: ResolvedVideoEmbedConfig) -> None:  # noqa: PLR0915 -- one fresh-cluster recovery scenario
     """Resume on a fresh cluster after durable results, including a caption schema race."""
     spec = resolve_model_spec(config.model.variant)
     write_clips(config, payload=video_bytes(3))
-    dataset = open_input(config, spec)
-    workspace = resolve_workspace(config, dataset, spec)
-    ensure_workspace(workspace, config)
-    original_datasource = pipeline.ClipDatasource
+    attempt = reconcile_and_select_attempt(open_enrichment_input(resolve_bindings(config)))
+    workspace = attempt.workspace
+    assert workspace is not None
     map_batches = ray.data.Dataset.map_batches
-
-    class FirstFragment(original_datasource):
-        def get_read_tasks(self, *args: Any, **kwargs: Any) -> list[Any]:  # noqa: ANN401 -- Ray test wrapper
-            return super().get_read_tasks(*args, **kwargs)[:1]
 
     def cpu_batches(self: ray.data.Dataset, fn: Any, **kwargs: Any) -> ray.data.Dataset:  # noqa: ANN401
         if fn is CpuEmbedder:
@@ -127,27 +122,22 @@ def assert_resume(config: ResolvedVideoEmbedConfig) -> None:
         monkeypatch.setattr(pipeline, "VideoEmbedder", CpuEmbedder)
         monkeypatch.setattr(pipeline, "validate_model_directory", lambda _spec: Path(config.input.media_root))
         monkeypatch.setattr(ray.data.Dataset, "map_batches", cpu_batches)
-        monkeypatch.setattr(pipeline, "ClipDatasource", FirstFragment)
         try:
             _start_ray()
-            pipeline.embed_clips(dataset, config, spec, workspace, pending=pending_fragment_ids(dataset, spec))
+            # An interrupted run leaves only the first fragment's clips durable.
+            with checkpointed_processing(attrs.evolve(attempt, selected=attempt.selected[:1])) as processing:
+                pipeline.embed_clips(processing, config, spec)
             assert pq.read_table(workspace.results).num_rows == 2
             assert DataContext.get_current().checkpoint_config is None
+            dataset = attempt.input.dataset
             assert lance.dataset(dataset.uri).to_table(columns=[spec.vector_field]).column(0).null_count == 4
             # Simulate a crash after a subset of shards is durable, before a complete inference marker.
             Path(workspace.completion).unlink()
             ray.shutdown()
 
-            # A disjoint schema change must not invalidate saved GPU work.
+            # A disjoint schema change and execution tuning must not invalidate saved GPU work.
             latest = lance.dataset(dataset.uri)
             latest.add_columns(pa.schema([pa.field("caption_test_v1", pa.string())]))
-            resumed = open_input(config, spec)
-            assert resolve_workspace(config, resumed, spec) == workspace
-            # One unfinished clip disappears: it still needs a terminal row and checkpoint.
-            final_uri = resumed.get_fragment(1).to_table(columns=["clip_uri"]).column(0)[-1].as_py()
-            Path(final_uri).unlink()
-            monkeypatch.setattr(pipeline, "ClipDatasource", original_datasource)
-            _start_ray()
             tuned = config.model_copy(
                 update={
                     "execution": config.execution.model_copy(
@@ -155,17 +145,25 @@ def assert_resume(config: ResolvedVideoEmbedConfig) -> None:
                     )
                 }
             )
-            pipeline.embed_clips(resumed, tuned, spec, workspace, pending=pending_fragment_ids(resumed, spec))
+            resumed_attempt = reconcile_and_select_attempt(open_enrichment_input(resolve_bindings(tuned)))
+            assert (resumed_attempt.selected, resumed_attempt.workspace) == (attempt.selected, workspace)
+            resumed = resumed_attempt.input.dataset
+            # One unfinished clip disappears: it still needs a terminal row and checkpoint.
+            final_uri = resumed.get_fragment(1).to_table(columns=["clip_uri"]).column(0)[-1].as_py()
+            Path(final_uri).unlink()
+            _start_ray()
+            with checkpointed_processing(resumed_attempt) as processing:
+                pipeline.embed_clips(processing, tuned, spec)
             rows = pq.read_table(workspace.results)
             assert rows.num_rows == len(set(rows["clip_id"].to_pylist())) == 4
             for name in ("downloads.jsonl", "inference.jsonl"):
                 log = Path(config.input.media_root, name).read_text().splitlines()
                 assert len(log) == len(set(log)) == 4
-            assert pipeline._inference_complete(workspace, config)
-            published = pipeline.publish_results(
-                resumed, config, spec, workspace, pending=pending_fragment_ids(resumed, spec)
-            )
+            assert resumed_attempt.processing_complete()
+            outcome = publish_enrichment(resumed_attempt)
+            published = outcome.dataset
             assert published.version == resumed.version + 1
+            assert outcome.cleanup_complete
             assert published.to_table(columns=[spec.vector_field]).column(0).null_count == 1
             assert "caption_test_v1" in published.schema.names
         finally:

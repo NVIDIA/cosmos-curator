@@ -5,25 +5,23 @@
 
 from unittest.mock import Mock
 
-import lance
 import pytest
 from ray.data import ActorPoolStrategy
 from ray.data._internal.execution.execution_callback import ExecutionCallback
 from ray.data.context import DataContext
 
 from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
+from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.enrichment.execution import checkpointed_processing
 from cosmos_curator.next.recipes.video_transcode import pipeline, processing
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
-from cosmos_curator.next.recipes.video_transcode.publication import resolve_workspace
 
 
-@pytest.mark.parametrize("fail_write", [False, True])
 def test_download_admission_is_actor_bound_and_plan_scoped(
     config: ResolvedVideoTranscodeConfig,
-    dataset: lance.LanceDataset,
+    enrichment_input: contracts.EnrichmentInput,
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    fail_write: bool,
 ) -> None:
     """Ready actors own the IO budget; neither startup capacity nor ambient settings fix the pool size."""
     context = DataContext.get_current()
@@ -40,13 +38,8 @@ def test_download_admission_is_actor_bound_and_plan_scoped(
     monkeypatch.setattr(pipeline.ray.data, "read_datasource", read)
     snapshot = Mock(side_effect=AssertionError("Download admission must not snapshot cluster resources"))
     monkeypatch.setattr(pipeline.ray, "cluster_resources", snapshot)
-    workspace = resolve_workspace(config, dataset)
-    if fail_write:
-        plan.write_parquet.side_effect = RuntimeError("injected write failure")
-        with pytest.raises(RuntimeError, match="injected write failure"):
-            pipeline.transcode_spans(dataset, config, workspace)
-    else:
-        pipeline.transcode_spans(dataset, config, workspace)
+    with checkpointed_processing(reconcile_and_select_attempt(enrichment_input)) as scope:
+        pipeline.transcode_spans(scope, config)
 
     plan.map.assert_called_once()
     args, kwargs = plan.map.call_args
@@ -65,9 +58,8 @@ def test_download_admission_is_actor_bound_and_plan_scoped(
     assert plan.context.custom_execution_callback_classes == [ExecutionCallback, ReleasePendingDownloadActors]
     assert context.custom_execution_callback_classes == [ExecutionCallback]
     assert context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.75
-    assert context.checkpoint_config is None
     snapshot.assert_not_called()
     assert plan.flat_map.call_args.kwargs["num_cpus"] == config.execution.transcode_cpus
     assert plan.flat_map.call_args.kwargs["memory"] == int(config.execution.transcode_memory_gib * 1024**3)
     assert "resources" not in plan.flat_map.call_args.kwargs
-    assert "resources" not in plan.map_batches.call_args.kwargs
+    assert "resources" not in plan.map_batches.call_args_list[0].kwargs

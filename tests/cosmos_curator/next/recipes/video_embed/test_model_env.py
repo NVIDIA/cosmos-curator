@@ -14,7 +14,8 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.utils import environment
-from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedConfig
+from cosmos_curator.next.recipes.video_embed.bindings import resolve_bindings
+from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedConfig, resolve_config_data
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, resolve_model_spec, validate_model_directory
 from cosmos_curator.next.recipes.video_embed.processing import VideoDecoder, VideoEmbedder, download_clip, sample_video
 from tests.cosmos_curator.next.recipes.video_embed.conftest import write_clips
@@ -146,7 +147,16 @@ def test_reference_video_inference(variant: str, tmp_path: Path, monkeypatch: py
     reference_inputs = processor(videos=reference_batch)
     assert reference_inputs["videos"].is_cuda
 
-    embedder = VideoEmbedder(spec=spec, model_dir=str(directory))
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-embed",
+            "input": {"media_root": str(tmp_path)},
+            "model": {"variant": variant},
+        }
+    )
+    staged_schema = resolve_bindings(config).spec.staged_schema
+    embedder = VideoEmbedder(spec=spec, model_dir=str(directory), staged_schema=staged_schema)
     model_inference = embedder._model.get_video_embeddings
     projections: list[npt.NDArray[np.float32]] = []
 
@@ -212,7 +222,7 @@ def test_full_recipe_on_gpu(config: ResolvedVideoEmbedConfig, monkeypatch: pytes
         )
         summary = run_config(config)
         published = lance.dataset(config.input.clips_lance_uri)
-        assert summary["clips"] == 4
+        assert summary["input_rows"] == 4
         assert summary["cleanup_complete"] is True
         assert published.version == input_table.version + 2  # field registration, then one data commit
         rows = published.to_table(columns=spec.fields.names).to_pylist()

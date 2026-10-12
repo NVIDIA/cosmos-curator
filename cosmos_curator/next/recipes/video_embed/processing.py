@@ -14,7 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 
-from cosmos_curator.next.recipes.video_embed.contracts import ADDRESS_SCHEMA, NUM_FRAMES, ModelSpec, terminal_row
+from cosmos_curator.next.recipes.video_embed.contracts import NUM_FRAMES, ModelSpec, terminal_row
 from cosmos_curator.next.utils.media_reader import MediaObjectError, MediaObjectReader
 
 if TYPE_CHECKING:
@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
     import torch
 
-INPUT_SCHEMA = pa.schema([*ADDRESS_SCHEMA, ("clip_uri", pa.large_string()), ("clip_size_bytes", pa.int64())])
 _DECODER_CACHE_SIZE = 4
 
 
@@ -157,13 +156,14 @@ class VideoDecoder:
 class VideoEmbedder:
     """Decode, preprocess, and run one BF16 Cosmos-Embed1 model on the same GPU."""
 
-    def __init__(self, *, spec: ModelSpec, model_dir: str) -> None:
-        """Initialize every new actor incarnation solely from staged weights."""
+    def __init__(self, *, spec: ModelSpec, model_dir: str, staged_schema: pa.Schema) -> None:
+        """Initialize every new actor incarnation solely from staged weights; emit ``staged_schema`` rows."""
         import torch  # noqa: PLC0415
         from transformers import AutoModel, AutoProcessor  # noqa: PLC0415
 
         torch.set_num_threads(1)
         self._spec = spec
+        self._staged_schema = staged_schema
         self._decoder = VideoDecoder()
         self._processor = AutoProcessor.from_pretrained(  # type: ignore[no-untyped-call]
             model_dir, trust_remote_code=True, local_files_only=True
@@ -213,5 +213,5 @@ class VideoEmbedder:
                 vectors = dict(zip(positions, output.tolist(), strict=True))
         return pa.Table.from_pylist(
             [terminal_row(row, self._spec, vectors.get(index)) for index, row in enumerate(rows)],
-            schema=self._spec.result_schema,
+            schema=self._staged_schema,
         )

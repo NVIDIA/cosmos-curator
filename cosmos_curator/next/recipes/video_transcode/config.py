@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 from cosmos_curator.next.utils.identity import canonical_digest
 from cosmos_curator.next.utils.uris import normalize_location
 
@@ -69,10 +70,9 @@ class TranscodeConfig(_Config):
         return canonical_digest({"behavior_version": 1, "encoding": self.model_dump(mode="json")})
 
 
-class ExecutionConfig(_Config):
+class ExecutionConfig(EnrichmentExecutionConfig):
     """Resource and checkpoint tuning excluded from clip identity."""
 
-    storage_profile: str = Field(default="default", min_length=1)
     transcode_cpus: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     transcode_memory_gib: float = Field(
         default=4.0,
@@ -87,13 +87,9 @@ class ExecutionConfig(_Config):
     storage_attempts: int = Field(default=3, ge=1)
     transcode_attempts: int = Field(default=3, ge=1)
     probe_attempts: int = Field(default=3, ge=1)
-    spans_per_checkpoint: int = Field(default=1_000, ge=1)
     source_partitions: int = Field(
         default=256, ge=1, description="Target read block count for the source-grouping sort."
     )
-    lance_read_batch_size: int = Field(default=1_000, ge=1)
-    commit_attempts: int = Field(default=3, ge=1)
-    progress: bool = False
 
 
 class ResolvedVideoTranscodeConfig(_Config):

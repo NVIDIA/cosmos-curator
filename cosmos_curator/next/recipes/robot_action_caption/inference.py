@@ -27,7 +27,7 @@ from ray.data import ActorPoolStrategy, SaveMode
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.models.registry import RegisteredModel
-from cosmos_curator.next.core.ray_runtime import installed_checkpoint
+from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
 from cosmos_curator.next.recipes.robot_action_caption.config import (
     DEFAULT_MEDIA_FETCH_WORKERS,
     ResolvedRobotActionCaptionConfig,

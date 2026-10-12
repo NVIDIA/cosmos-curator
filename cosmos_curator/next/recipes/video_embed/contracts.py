@@ -8,18 +8,21 @@ from dataclasses import dataclass
 from functools import cached_property
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.enrichment.contracts import owned_fields
 from cosmos_curator.next.recipes.video_embed.config import ModelVariant
 from cosmos_curator.next.utils.identity import canonical_digest
 
 NUM_FRAMES = 8
 SCHEMA_VERSION = 1
-ADDRESS_SCHEMA = pa.schema([("fragment_id", pa.int64()), ("row_offset", pa.int64()), ("clip_id", pa.string())])
+# Clip columns processing reads besides clip_id and row addresses.
+READ_COLUMNS = ("clip_uri", "clip_size_bytes")
 
 
 @dataclass(frozen=True)
@@ -50,7 +53,6 @@ class ModelSpec:
     @cached_property
     def fields(self) -> pa.Schema:
         """Canonical Lance fields, registered together and nullable while pending."""
-        ownership = {b"cosmos_curator.owner": b"video-embed", b"cosmos_curator.field_set": self.vector_field.encode()}
         metadata = pa.struct(
             [
                 pa.field("embedding_schema_version", pa.int32(), nullable=False),
@@ -62,11 +64,15 @@ class ModelSpec:
                 pa.field("error_message", pa.large_string()),
             ]
         )
-        return pa.schema(
-            [
-                pa.field(self.vector_field, pa.list_(pa.float32(), self.dimension), metadata=ownership),
-                pa.field(self.metadata_field, metadata, metadata=ownership),
-            ]
+        return owned_fields(
+            pa.schema(
+                [
+                    pa.field(self.vector_field, pa.list_(pa.float32(), self.dimension)),
+                    pa.field(self.metadata_field, metadata),
+                ]
+            ),
+            owner="video-embed",
+            field_set=self.vector_field,
         )
 
     @cached_property
@@ -96,23 +102,6 @@ class ModelSpec:
     def digest(self) -> str:
         """Name one embedding computation independently of batching and placement."""
         return canonical_digest(self.contract)
-
-    @cached_property
-    def result_schema(self) -> pa.Schema:
-        """Durable Parquet rows retain identities and compact values only.
-
-        Arrow 25 cannot round-trip null fixed-size lists through Parquet. Stage
-        ordinary lists and validate/cast their width at the Lance boundary.
-        """
-        return pa.schema(
-            [
-                *ADDRESS_SCHEMA,
-                # Parquet uses the child name "element"; match it so strict
-                # field-metadata validation also survives a durable round trip.
-                self.fields.field(self.vector_field).with_type(pa.list_(pa.field("element", pa.float32()))),
-                self.fields.field(self.metadata_field),
-            ]
-        )
 
 
 def resolve_model_spec(variant: ModelVariant) -> ModelSpec:
@@ -145,7 +134,10 @@ def validate_model_directory(spec: ModelSpec) -> Path:
 
 
 def terminal_row(row: dict[str, Any], spec: ModelSpec, vector: list[float] | None) -> dict[str, Any]:
-    """Attach result provenance without carrying clip bytes or prepared frames."""
+    """Attach result provenance without carrying clip bytes or prepared frames.
+
+    Shared processing validates every staged row before Ray checkpoints it.
+    """
     metadata = {
         "embedding_schema_version": SCHEMA_VERSION,
         "contract_digest": spec.digest,
@@ -155,15 +147,15 @@ def terminal_row(row: dict[str, Any], spec: ModelSpec, vector: list[float] | Non
         "error_type": row.get("error_type"),
         "error_message": row.get("error_message"),
     }
-    result = {name: row[name] for name in ADDRESS_SCHEMA.names}
+    result = {name: row[name] for name in ("fragment_id", "row_offset", "clip_id")}
     result.update({spec.vector_field: vector, spec.metadata_field: metadata})
-    validate_terminal_row(result, spec)
     return result
 
 
-def validate_terminal_row(row: dict[str, Any], spec: ModelSpec) -> None:
-    """Reject partial, incompatible, nonfinite, and malformed terminal values."""
-    metadata = row[spec.metadata_field]
+def _validate_terminal_metadata(
+    metadata: object, spec: ModelSpec, *, vector_is_null: bool
+) -> Literal["success", "error"]:
+    """Validate provenance, terminal status, and its required vector presence."""
     expected = {
         "embedding_schema_version": SCHEMA_VERSION,
         "contract_digest": spec.digest,
@@ -173,24 +165,51 @@ def validate_terminal_row(row: dict[str, Any], spec: ModelSpec) -> None:
     if not isinstance(metadata, dict) or any(metadata.get(key) != value for key, value in expected.items()):
         msg = "Incompatible or missing embedding provenance"
         raise ValueError(msg)
-    vector = row[spec.vector_field]
     if metadata.get("status") == "error":
-        if vector is not None or any(
+        if not vector_is_null or any(
             not isinstance(metadata.get(key), str) or not metadata[key] for key in ("error_type", "error_message")
         ):
             msg = "Error embeddings require a null vector and non-empty error details"
             raise ValueError(msg)
-        return
-    values = np.asarray(vector, dtype=np.float32)
+        return "error"
     if (
         metadata.get("status") != "success"
         or metadata.get("error_type") is not None
         or metadata.get("error_message") is not None
-        or values.shape != (spec.dimension,)
+        or vector_is_null
+    ):
+        msg = "Successful embeddings require a finite unit vector of the model's dimension and no error"
+        raise ValueError(msg)
+    return "success"
+
+
+def validate_terminal_batch(batch: pa.RecordBatch, spec: ModelSpec) -> None:
+    """Reject partial, incompatible, nonfinite, and malformed terminal values.
+
+    Vector values stay in Arrow and NumPy rather than expanding into Python objects.
+    """
+    vectors = batch.column(spec.vector_field)
+    metadata = batch.column(spec.metadata_field)
+    success = []
+    vector_nulls = vectors.is_null().to_numpy(zero_copy_only=False)
+    for index, value in enumerate(metadata.to_pylist()):
+        if _validate_terminal_metadata(value, spec, vector_is_null=bool(vector_nulls[index])) == "success":
+            success.append(index)
+    if not success:
+        return
+    selected = vectors.take(pa.array(success, type=pa.int64()))
+    lengths = pc.list_value_length(selected).to_numpy(zero_copy_only=False)
+    if not np.all(lengths == spec.dimension):
+        msg = "Successful embeddings require a finite unit vector of the model's dimension and no error"
+        raise ValueError(msg)
+    flattened = pc.list_flatten(selected)
+    values = flattened.to_numpy(zero_copy_only=False).reshape(len(success), spec.dimension)
+    if (
+        flattened.null_count
         or not np.isfinite(values).all()
         # visual_proj is already normalized by the model in BF16. Preserve that
         # output rather than silently introducing another normalization step.
-        or not np.isclose(np.linalg.norm(values), 1.0, atol=0.02)
+        or not np.isclose(np.linalg.norm(values, axis=1), 1.0, atol=0.02).all()
     ):
         msg = "Successful embeddings require a finite unit vector of the model's dimension and no error"
         raise ValueError(msg)
