@@ -1,0 +1,22 @@
+schema_version: 1
+kind: robot-action-split
+input:
+  uris:
+    - /config/videos/vitra_epic_lerobot/
+  source_dataset: vitra_epic
+split:
+  # VITRA episodes are sub-second single hand-actions: 0.58-2.2 s, median 0.86 s.
+  # The 4-20 s mecka defaults would reject every one of them.
+  min_duration_s: 0.4
+  max_duration_s: 3.0
+  max_keep_per_description: 3
+output:
+  media_root: /config/output/vitra_epic/
+  lance_uri: /config/output/vitra_epic/lance/clips.lance
+  action_format: bin
+  video_bitrate: 2M
+execution:
+  discovery_workers: 2
+  max_segments_per_batch: 50
+  cut_attempts: 3
+  storage_profile: default

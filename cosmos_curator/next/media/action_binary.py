@@ -97,6 +97,16 @@ ACTION_BINARY_SPECS: dict[str, ActionBinarySpec] = {
         ),
         per_clip_fields=(ActionFieldSpec(name="intrinsics", shape=(8,)),),
     ),
+    "vitra_hand": ActionBinarySpec(
+        per_frame_fields=(
+            ActionFieldSpec(name="hand_left_cam", shape=(63,)),
+            ActionFieldSpec(name="hand_right_cam", shape=(63,)),
+            ActionFieldSpec(name="hand_left_cam_rotation", shape=(144,)),
+            ActionFieldSpec(name="hand_right_cam_rotation", shape=(144,)),
+            ActionFieldSpec(name="camera_position", shape=(3,)),
+            ActionFieldSpec(name="camera_rotation", shape=(9,)),
+        ),
+    ),
     "droid_lerobot": ActionBinarySpec(
         per_frame_fields=(
             ActionFieldSpec(name="action", shape=(7,)),
@@ -124,6 +134,7 @@ ACTION_BINARY_SPECS: dict[str, ActionBinarySpec] = {
 
 ACTION_BINARY_SPEC_BY_DATASET: dict[str, str] = {
     "libero_10": "libero",
+    "vitra_epic": "vitra_hand",
     "libero_90": "libero",
     "feb_08_500hr_lerobot_no_bframes": "mecka",
     "mar_6_ego_dexterous_lerobot_no_bframes": "mecka",

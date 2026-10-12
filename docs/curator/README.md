@@ -12,6 +12,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 - [Multimodal AV: End-to-End Guide](guides/multimodal-av-e2e.md) - prepare recordings and model weights,
   publish multimodal episodes, caption selected views with optional Ego context, and embed camera videos.
 - [Curate Runbook](guides/curate-runbook.md) - run the Curate selection leg (fuse, cluster, dedup, balance).
+- [VITRA / EPIC-KITCHENS Sample Dataset](guides/vitra-epic-sample.md) - a small public egocentric sample for
+  running robot-action-split end to end into a Lance table.
 - [Stage Replay Guide](guides/stage-replay.md) - debug stages in isolation.
 - [Interactive Slurm Development Guide](guides/slurm-interactive.md) - iterate from an interactive Slurm allocation.
 - [Profiling Guide](guides/profiling.md) - collect and inspect CPU and memory profiles.
