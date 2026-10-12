@@ -16,9 +16,9 @@
 """Reading a session's artifacts, whatever backend holds them.
 
 The sensor library accepts no URIs and imports no cloud client by design, so
-resolving one to an open stream is this recipe's job. ``smart_open`` covers a
-local path, a ``file://`` URI and an ``s3://`` URI alike, which is why nothing
-here inspects the scheme.
+resolving one to an open stream is this recipe's job. Local URI text is resolved
+through the shared boundary before stream reads or directory listings; S3
+retains its configured client and URI.
 """
 
 import fnmatch
@@ -42,6 +42,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import read_bounds
 from cosmos_curator.next.recipes.multimodal_split.reports import errors_prefix
 from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed, timestamps_sidecar_uri
+from cosmos_curator.next.utils.local_uri import local_path
 
 
 @contextmanager
@@ -51,10 +52,10 @@ def open_sensor_source(
     """Open a camera artifact as the seekable stream the sensor library takes.
 
     The sensor library accepts no URIs and imports no cloud client by design, so
-    resolving one to bytes is this caller's job. ``smart_open`` returns a seekable
-    stream for a local path, a ``file://`` URI, and an ``s3://`` URI alike, which
-    is why nothing here inspects the scheme -- a recipe that branched on it would
-    be re-deciding something the storage layer already knows.
+    resolving one to bytes is this caller's job. Local ``file://`` forms are
+    normalized to the filesystem path they name before ``smart_open`` sees them;
+    this includes the supported ``localhost`` authority, which ``smart_open``
+    does not resolve itself. S3 retains its URI and configured client.
 
     The stream is handed over as the ``io.BufferedIOBase`` arm of ``DataSource``
     even for a local path, rather than as a ``Path``. That arm is caller-owned:
@@ -67,10 +68,15 @@ def open_sensor_source(
     run cannot read with one identity and write with another.
     """
     client = get_storage_client(sensor_uri, profile_name=storage_profile)
-    # ``None`` means the storage layer recognized no remote backend, which is the
-    # only signal needed: transport params configure a client or there is none.
+    source = sensor_uri
+    # ``None`` means either a local location or a remote one for which no client
+    # was built. Resolve accepted local URI spellings because smart_open does not
+    # handle localhost authority; preserve a remote URI so a client failure is
+    # not silently reinterpreted as a filesystem path.
     if client is None:
         transport_params: dict[str, Any] = {}
+        if not is_remote_path(sensor_uri):
+            source = str(local_path(sensor_uri))
     elif isinstance(client, S3Client):
         transport_params = {"client": client.s3}
         # S3 only. A local path goes through the builtin open, which takes no
@@ -89,7 +95,7 @@ def open_sensor_source(
         msg = f"multimodal-split can read a camera over S3 or a local path, not {type(client).__name__}"
         raise NotImplementedError(msg)
 
-    with smart_open.open(sensor_uri, "rb", transport_params=transport_params) as stream:
+    with smart_open.open(source, "rb", transport_params=transport_params) as stream:
         # smart_open types its return as BinaryIO; every backend reachable here
         # yields a seekable buffered reader, which is DataSource's third arm.
         yield cast("io.BufferedIOBase", stream)
@@ -260,7 +266,9 @@ def list_session_paths(session_uri: str, *, storage_profile: str = "default") ->
     # Passed explicitly rather than resolved inside: left to itself it builds one
     # on the default profile, and a run must not read with one identity and write
     # with another.
-    return get_files_relative(slashed(session_uri), client)
+    if client is not None:
+        return get_files_relative(slashed(session_uri), client)
+    return get_files_relative(str(local_path(session_uri)))
 
 
 def match_session_paths(paths: list[str], uri_pattern: str) -> list[str]:

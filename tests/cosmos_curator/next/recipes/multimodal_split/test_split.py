@@ -458,9 +458,8 @@ def test_a_recording_shorter_than_one_clip_yields_no_rows(
 def test_a_camera_is_opened_as_a_stream_rather_than_a_path(tmp_path: Path, make_session: Callable[..., Path]) -> None:
     """The sensor library is dropping its ``Path`` arm, so nothing here may rely on it.
 
-    Opening every backend the same way is also what keeps a scheme check out of
-    this recipe: ``smart_open`` returns a seekable stream for a local path, a
-    ``file://`` URI, and an ``s3://`` URI alike.
+    The recipe resolves accepted local URI forms before opening, then presents
+    every backend as the same seekable stream contract to the sensor library.
     """
     root = tmp_path / "recordings"
     make_session(root, "session-000")

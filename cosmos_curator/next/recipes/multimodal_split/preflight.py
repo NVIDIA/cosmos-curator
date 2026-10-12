@@ -28,12 +28,12 @@ signature.
 """
 
 import uuid
-from pathlib import Path
 
 from loguru import logger
 
 from cosmos_curator.core.utils.storage.storage_utils import get_storage_client, path_to_prefix
 from cosmos_curator.next.recipes.multimodal_split.uris import slashed
+from cosmos_curator.next.utils.local_uri import local_path
 
 # Says what it is and whose it is, so an operator who finds one knows it is ours
 # and safe to remove. Unique per attempt, because two runs may preflight the
@@ -55,7 +55,7 @@ def check_readable(location: str, *, storage_profile: str = "default") -> None:
         # is discovered, and that error says nothing about which prefix wanted it.
         client = get_storage_client(location, profile_name=storage_profile)
         if client is None:
-            if not Path(location).is_dir():
+            if not local_path(location).is_dir():
                 msg = f"Input prefix {location} is not a readable directory"
                 raise NotADirectoryError(msg)  # noqa: TRY301 -- reported as the check's own failure
         else:
@@ -76,12 +76,13 @@ def check_writable(location: str, *, storage_profile: str = "default") -> None:
     is logged rather than raised: by then the thing this set out to prove is
     proven, and refusing the run over a leftover byte would be the wrong trade.
     """
-    probe = f"{location.rstrip('/')}/{_PROBE_PREFIX}-{uuid.uuid4().hex}"
+    probe_name = f"{_PROBE_PREFIX}-{uuid.uuid4().hex}"
+    probe = f"{location.rstrip('/')}/{probe_name}"
     client = None
     try:
         client = get_storage_client(location, profile_name=storage_profile, can_overwrite=True, can_delete=True)
         if client is None:
-            path = Path(probe)
+            path = local_path(location) / probe_name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"")
         else:
@@ -92,7 +93,7 @@ def check_writable(location: str, *, storage_profile: str = "default") -> None:
 
     try:
         if client is None:
-            Path(probe).unlink()
+            (local_path(location) / probe_name).unlink()
         else:
             client.delete_object(path_to_prefix(probe))
     except Exception as error:  # noqa: BLE001 -- the write already proved what this checks

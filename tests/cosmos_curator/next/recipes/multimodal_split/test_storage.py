@@ -16,6 +16,7 @@
 """Tests for reading a ``multimodal-split`` session's artifacts."""
 
 import io
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -25,7 +26,10 @@ import numpy as np
 import pytest
 
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
+from cosmos_curator.next.recipes.multimodal_split import pipeline
 from cosmos_curator.next.recipes.multimodal_split import storage as storage_module
+from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
+from cosmos_curator.next.recipes.multimodal_split.reports import failure, write_plan_errors
 from cosmos_curator.next.recipes.multimodal_split.uris import slashed
 
 _S = 1_000_000_000
@@ -133,6 +137,46 @@ def test_a_remote_session_with_no_client_says_so_instead_of_walking_a_local_path
 
     with pytest.raises(NotImplementedError, match="hyperion"):
         storage_module.list_session_paths("s3://bucket/sessions/session-000", storage_profile="hyperion")
+
+
+@pytest.mark.parametrize("authority", ["", "localhost"])
+def test_file_uri_error_reports_are_listed(tmp_path: Path, authority: str) -> None:
+    """Verify failure reports are listed through supported local file URIs."""
+    output_path = tmp_path / "media"
+    report_path = output_path / "errors" / "session-000" / "span_planner.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("{}", encoding="utf-8")
+    location = output_path.as_uri() if not authority else f"file://{authority}{output_path}"
+
+    reports = storage_module.list_error_reports(location)
+
+    assert reports == [f"{location}/errors/session-000/span_planner.json"]
+
+
+@pytest.mark.parametrize("authority", ["", "localhost"])
+@pytest.mark.integration
+@pytest.mark.usefixtures("ray_local")
+def test_file_uri_error_reports_survive_completion_readback(
+    tmp_path: Path,
+    authority: str,
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """Verify completion counts failure reports through supported local file URIs."""
+    output_path = tmp_path / "media"
+    location = output_path.as_uri() if not authority else f"file://{authority}{output_path}"
+    write_plan_errors(
+        "session-000",
+        [failure("session-000", None, None, "span_planner", FileNotFoundError("missing front camera"))],
+        output_path=location,
+        storage_profile="default",
+    )
+    config = make_config(tmp_path / "recordings", location)
+
+    summary = pipeline.read_failures(config)
+
+    assert summary.total == 1
+    assert summary.by_category == {"FileNotFoundError": 1}
+    assert summary.examples[0]["message"] == "missing front camera"
 
 
 def test_a_read_buffer_reaches_s3_and_never_a_local_path(monkeypatch: pytest.MonkeyPatch) -> None:

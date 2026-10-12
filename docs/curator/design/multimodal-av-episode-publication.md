@@ -463,6 +463,17 @@ execution:
   storage_profile: default
 ```
 
+Local input and output locations may be written as bare filesystem paths,
+`file:///...` URIs, or `file://localhost/...` URIs. Storage preflight resolves
+those forms through the shared local-URI boundary before checking the input
+directory or creating the temporary output probe; diagnostics retain the
+original configured location. Completion reporting uses the same boundary when
+it lists and opens persisted failure reports, so a `file://` output cannot be
+summarized as clean merely because its URI text is not a filesystem path. The
+open boundary resolves `file://localhost/...` itself rather than relying on a
+dependency that only handles the empty-authority form. A `file://` URI with any
+other authority is refused because it does not name a path on the local machine.
+
 The Lance URI is always `<output.path>/episodes.lance`; there is no location override or publication tuning surface.
 The invocation succeeds only after canonical publication succeeds. Artifacts committed before a publication failure
 remain available for retry and diagnosis.

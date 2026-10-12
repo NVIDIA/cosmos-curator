@@ -223,6 +223,11 @@ execution:             # all fields optional; shown with defaults
   storage_attempts: 3             # retries for the idempotent Lance fragment commit
 ```
 
+After the first successful publication from a discovered shard, its source
+media and span-defining Parquet/JSON metadata are immutable inputs. Corrected
+source versions follow the new-output or complete-rebuild procedure in
+"Cross-Run Recovery"; overwriting those artifacts in place is unsupported.
+
 ---
 
 ## Span Provider
@@ -235,7 +240,7 @@ per (span, view):
 @attrs.define(frozen=True)
 class SpanWorkItem:
     # Identity
-    source_id: str             # hash of normalized dataset root URI
+    source_id: str             # hash of normalized discovered shard URI
     span_group_id: str         # hash of (source_id, episode_id, subtask_index, frame_start)
     clip_id: str               # hash of (media_contract_version, span_group_id, video_bitrate[, view_name])
     view_name: str
@@ -411,7 +416,7 @@ retry against in the first place.
 | `clip_id` | `string` | yes | Stable per-view clip identifier |
 | `span_group_id` | `string` | yes | Stable id shared across all views of this span |
 | `view_name` | `string` | yes | Camera view (e.g. `observation.images.wrist_image`) |
-| `source_id` | `string` | yes | Hash of the normalized dataset root URI |
+| `source_id` | `string` | yes | Hash of the normalized discovered shard URI |
 | `source_dataset` | `string` | yes | Registered dataset name (`source_dataset` config field) |
 | `episode_id` | `string` | yes | Source episode identifier (from episode parquet) |
 | `episode_index` | `int32` | yes | Episode index within the shard |
@@ -440,6 +445,10 @@ diffed for dedup — a rerun simply replaces it.
 `(media_contract_version, span_group_id, video_bitrate)`, plus `view_name` for
 multi-view sources. `action_data_uri` is keyed by `action_id`, which hashes
 `(action_contract_version, span_group_id, action_format, source_dataset)`.
+`source_id` is location-based: it hashes the normalized discovered shard URI,
+not the media or metadata bytes at that location. Its stability therefore
+depends on the source media and span-defining Parquet/JSON metadata remaining
+immutable at that versioned shard URI.
 `task_description` participates in none of these identities. Record schema
 version 4 adds that nullable metadata field; reconciliation rejects rows stamped
 with version 3. `MEDIA_CONTRACT_VERSION` remains unchanged because it versions
@@ -461,6 +470,21 @@ The recovery protocol follows [Curator Next Incremental Curation](curator-next-i
 is both published output and cross-run checkpoint, deterministic identities, idempotent fragment-scoped
 commits, and driver-side reconciliation before any expensive work starts.
 
+**Immutable source contract.** Exact rerun and recovery require the source media
+and the Parquet/JSON metadata under each discovered shard URI to remain
+unchanged after rows from that shard are published. In particular, correcting a
+span's frame or time bounds in place is unsupported: `span_group_id` includes
+`frame_start` but not the end bound, so reconciliation may treat the corrected
+span as the already-published clip rather than as new work.
+
+Publish corrected source artifacts at versioned shard URIs, normally beneath a
+versioned dataset root, and write to a new `output.lance_uri` and
+`output.media_root`, or completely rebuild the existing outputs. Changing only
+the source root while retaining the cumulative output is insufficient: moving
+the shards creates new source identities, but the old rows remain canonical
+because this recipe appends and reconciles; it does not retire or replace rows
+from earlier source versions.
+
 **v3-to-v4 rollout.** Record schema v4 adds nullable `task_description`.
 The recipe intentionally provides no in-place migration. Strict schema
 validation refuses an existing v3 table that lacks the field before
@@ -472,21 +496,25 @@ metadata-only backfill keyed by `(source_id, episode_id)` to populate
 `task_description` for every matching span/view row and stamp the completed
 rows with schema version 4.
 
-**Recovery unit.** `source_id` here hashes the *whole dataset root*, which can span many shards, chunk MP4s,
-and thousands of spans — too coarse a unit to check "is this already done" against. The natural recovery unit
-is `ChunkSpanBatch`'s key, `(chunk_mp4_uri, data_parquet_uri)`: the same unit `_iter_sequential` downloads
-once and reuses, and the unit Ray Data parallelizes over. Reconciliation (`recovery.reconcile_batches`)
-operates at `clip_id` granularity within each batch: a batch whose every `(span, view)` `clip_id` is already
-committed is dropped before any chunk MP4 download; a partially-committed batch is still downloaded and cut,
-but only for its still-missing `SpanWorkItem`s.
+**Recovery unit.** `source_id` hashes one normalized discovered shard URI. A
+shard can still contain many chunk MP4s and thousands of spans, so it is too
+coarse a unit to check "is this already done" against. The natural recovery
+unit is `ChunkSpanBatch`'s key, `(chunk_mp4_uri, data_parquet_uri)`: the same unit
+`_iter_sequential` downloads once and reuses, and the unit Ray Data parallelizes
+over. Reconciliation (`recovery.reconcile_batches`) operates at `clip_id`
+granularity within each batch: a batch whose every `(span, view)` `clip_id` is
+already committed is dropped before any chunk MP4 download; a
+partially-committed batch is still downloaded and cut, but only for its
+still-missing `SpanWorkItem`s.
 
 **Why no known-source replan shortcut.** Unlike `video-split`, span discovery here (`discover_spans`) is cheap,
 pure parquet/JSON metadata reading — no video decode, no probing (see "Span Provider" above: *"No source media
 is touched during discovery"*). `video-split`'s reconciliation goes to real effort reconstructing a known
 source's expected clip geometry from stored Lance fields specifically to avoid re-probing, since probing costs
 an object read. That shortcut isn't needed here: rerunning `discover_spans` in full is itself the cheap,
-always-correct way to recompute "what should exist," so reconciliation is a direct diff against freshly
-discovered `clip_id`s rather than a replan from stored metadata.
+authoritative way to recompute "what should exist" while source artifacts obey
+the immutable source contract above. Reconciliation is therefore a direct diff
+against freshly discovered `clip_id`s rather than a replan from stored metadata.
 
 **Idempotent commits.** Successful clip rows are buffered and staged/committed as one Lance fragment every
 `clips_per_publish_batch` rows (buffer-to-threshold, plus one final smaller flush at run end — the same shape

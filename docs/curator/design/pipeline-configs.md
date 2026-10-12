@@ -151,27 +151,28 @@ Config files introduce a new user contract, so the design should optimize the fi
 fully reproducible expert run. Users and agents should not have to infer "what should I write?" from Pydantic internals
 or from a large JSON Schema document.
 
-The CLI should expose three related artifacts:
+The CLI should expose two related artifacts:
 
-1. **Base template**: the smallest runnable config that relies on packaged defaults.
-2. **Smoke template**: the cheap first-run config. It should favor reliability and short feedback loops over exercising
-   every default. For video split, that means fixed-stride splitting with captioning disabled.
-3. **Resolved config**: the canonical expanded JSON used for execution.
+1. **Editable template**: one smallest runnable config per pipeline kind, relying on packaged defaults.
+2. **Resolved config**: the canonical expanded JSON used for execution.
 
 Templates and presets serve different roles:
 
-- **Templates** are whole starting config documents printed by `cosmos-curator pipeline template`. Template profiles such
-  as `base` and `smoke` control how much example YAML is printed.
+- **Templates** are whole starting config documents printed by `cosmos-curator pipeline template`. Each kind exposes one
+  template; whole-template profiles are not part of the CLI contract.
 - **Presets** are named section-local config fragments applied during resolution. A preset is referenced from inside a
   config section, such as `split.preset: fixed_stride_10s`, and is not runnable by itself.
 
-A template may include preset references. For example, the `smoke` template can include:
+Users may edit the printed template to add preset references and lower the
+input limit. For example, a cheap first `video_split` run can select:
 
 ```yaml
+input:
+  limit: 2
 split:
   preset: fixed_stride_10s
 caption:
-  enabled: false
+  preset: off
 ```
 
 During `render` or execution, the resolver expands `fixed_stride_10s` into explicit split settings. Explicit user fields
@@ -196,7 +197,7 @@ The pipeline config CLI should be small and JSON-friendly. The initial namespace
 config-backed pipelines do not need their own top-level command:
 
 ```text
-cosmos-curator pipeline template <kind> [--profile base|smoke]
+cosmos-curator pipeline template <kind> [--json]
 cosmos-curator pipeline validate <config>
 cosmos-curator pipeline render <config> [--set path=value]
 cosmos-curator pipeline schema <kind>
@@ -206,7 +207,7 @@ cosmos-curator pipeline presets show <name>
 
 Human-readable output is useful, but every command should support `--json`. Tools should not need to scrape prose. The
 `template` command should print editable YAML by default and machine-readable metadata with `--json`, including the
-selected profile, required author fields, and the template config.
+pipeline kind, description, required author fields, and template config.
 
 Ray Data split knobs should be added to the typed config first. The Ray Data split module entry point should accept a
 config file and small `--set` overrides only, avoiding a second long-form flag surface.
@@ -243,7 +244,7 @@ file, support small overrides, and avoid growing a second long-form flag surface
 This gives the project a clean example of how new Ray Data pipelines should be structured:
 
 - typed config in;
-- base and smoke templates discoverable from the CLI;
+- one minimal template per kind discoverable from the CLI;
 - resolved config rendered before execution;
 - JSON Schema generated from the same models used by execution;
 - Ray Data primitives and execution settings derived directly from the resolved config.
@@ -260,7 +261,7 @@ Do not start with an arbitrary DAG. An ordered pipeline with typed fragments is 
 ## Success Criteria
 
 - A user can run Ray Data video split from a schema-versioned YAML config.
-- A new human user can print a base YAML config from CLI help and run it after editing only paths.
+- A new human user can print the kind's YAML template from CLI help and run it after editing only paths.
 - An AI agent can discover supported kinds, required author fields, examples, schemas, presets, and validation errors
   through JSON outputs.
 - `validate` catches unknown fields, invalid values, and invalid combinations before execution.

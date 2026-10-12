@@ -71,11 +71,64 @@ def test_a_local_input_that_is_not_a_directory_is_refused(tmp_path: Path) -> Non
         check_readable(str(tmp_path / "absent"))
 
 
+@pytest.mark.parametrize("authority", ["", "localhost"])
+def test_a_file_uri_input_is_resolved_before_the_directory_check(tmp_path: Path, authority: str) -> None:
+    """Verify local file URIs resolve to filesystem paths."""
+    input_path = tmp_path / "recordings"
+    input_path.mkdir()
+    location = input_path.as_uri() if not authority else f"file://{authority}{input_path}"
+
+    check_readable(location)
+
+
+def test_a_file_uri_with_a_remote_authority_is_refused(tmp_path: Path) -> None:
+    """Verify remote file authorities are refused for input."""
+    location = f"file://other-host{tmp_path}/recordings"
+
+    with pytest.raises(RuntimeError, match="Unsupported local file URI"):
+        check_readable(location)
+
+
+def test_a_failed_file_uri_input_names_the_configured_location(tmp_path: Path) -> None:
+    """Verify input failures retain the configured URI in diagnostics."""
+    location = (tmp_path / "absent").as_uri()
+
+    with pytest.raises(RuntimeError, match="Cannot read the input prefix") as error:
+        check_readable(location)
+    assert location in str(error.value)
+
+
 def test_a_local_output_is_proven_writable_and_left_clean(tmp_path: Path) -> None:
     """Writing is the only way to learn whether writing is permitted."""
     check_writable(str(tmp_path / "out"))
 
     assert [entry.name for entry in (tmp_path / "out").iterdir()] == []
+
+
+@pytest.mark.parametrize("authority", ["", "localhost"])
+def test_a_file_uri_output_probe_uses_the_resolved_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+) -> None:
+    """Verify output probes use resolved URI paths."""
+    monkeypatch.chdir(tmp_path)
+    output_path = tmp_path / "out"
+    location = output_path.as_uri() if not authority else f"file://{authority}{output_path}"
+
+    check_writable(location)
+
+    assert output_path.is_dir()
+    assert list(output_path.iterdir()) == []
+    assert not (tmp_path / "file:").exists()
+
+
+def test_a_file_uri_with_a_remote_authority_is_refused_for_output(tmp_path: Path) -> None:
+    """Verify remote file authorities are refused for output."""
+    location = f"file://other-host{tmp_path}/media"
+
+    with pytest.raises(RuntimeError, match="Unsupported local file URI"):
+        check_writable(location)
 
 
 def test_a_remote_read_probe_lists_one_object(monkeypatch: pytest.MonkeyPatch) -> None:
