@@ -11,13 +11,14 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment.contracts import open_enrichment_input
 from cosmos_curator.next.enrichment.execution import selection_datasource
+from cosmos_curator.next.enrichment.inputs import open_enrichment_input
 from cosmos_curator.next.media.ffmpeg import assert_video_encoder_available, probe_video_path
 from cosmos_curator.next.recipes.video_transcode import processing
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
-from cosmos_curator.next.recipes.video_transcode.contracts import READ_COLUMNS, publication_properties
+from cosmos_curator.next.recipes.video_transcode.contracts import READ_COLUMNS
+from cosmos_curator.next.recipes.video_transcode.pipeline import publication_properties
 from tests.cosmos_curator.next.enrichment.helpers import attempt_all, publish_attempt
 
 

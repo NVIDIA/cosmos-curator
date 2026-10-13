@@ -17,7 +17,7 @@ import pytest
 from ray.data.context import DataContext
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
-from cosmos_curator.next.enrichment import commit, contracts, execution
+from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.identity import canonical_digest
@@ -40,7 +40,7 @@ def _readiness(dataset: lance.LanceDataset) -> None:
 @pytest.fixture
 def enrichment_input(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
-) -> contracts.EnrichmentInput:
+) -> inputs.EnrichmentInput:
     """Open the shared item table through the public API, retaining its validation proof."""
     bindings = make_bindings(
         dataset.uri,
@@ -49,7 +49,7 @@ def enrichment_input(
         result_contract={"version": 1},
         commit_attempts=2,
     )
-    return contracts.open_enrichment_input(bindings)
+    return inputs.open_enrichment_input(bindings)
 
 
 def _with_readiness(
@@ -59,7 +59,7 @@ def _with_readiness(
 
 
 @pytest.fixture
-def results(enrichment_input: contracts.EnrichmentInput) -> pa.Table:
+def results(enrichment_input: inputs.EnrichmentInput) -> pa.Table:
     """Supply valid results for both pending fragments."""
     return pa.Table.from_pylist(
         [
@@ -70,47 +70,45 @@ def results(enrichment_input: contracts.EnrichmentInput) -> pa.Table:
     )
 
 
-def _append(enrichment_input: contracts.EnrichmentInput, item_id: str, uri: str | None) -> lance.LanceDataset:
+def _append(enrichment_input: inputs.EnrichmentInput, item_id: str, uri: str | None) -> lance.LanceDataset:
     rows = pa.table({"item_id": [item_id], "uri": [uri]}, schema=enrichment_input.bindings.spec.input_fields)
     return lance.write_dataset(rows, enrichment_input.dataset.uri, mode="append", data_storage_version="2.2")
 
 
-def test_only_successful_validation_can_be_reused(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table
-) -> None:
+def test_only_successful_validation_can_be_reused(enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
     """Opening is insufficient evidence; only validated publication makes a later scan unnecessary."""
     validator = Mock(wraps=_readiness)
     bindings = _with_readiness(enrichment_input.bindings, validator)
-    contracts.open_enrichment_input(bindings)
+    inputs.open_enrichment_input(bindings)
     validator.assert_called_once()
     published = publish_results(results, enrichment_input)
-    assert published.read_transaction(published.version).transaction_properties[contracts.VALIDATED_INPUT_KEY] == (
+    assert published.read_transaction(published.version).transaction_properties[inputs.VALIDATED_INPUT_KEY] == (
         enrichment_input.fingerprint
     )
     validator.reset_mock()
-    reopened = contracts.open_enrichment_input(bindings)
+    reopened = inputs.open_enrichment_input(bindings)
     validator.assert_not_called()
     assert reopened.fingerprint == enrichment_input.fingerprint
 
     _append(enrichment_input, "c", None)
     with pytest.raises(ValueError, match="Items require URIs"):
-        contracts.open_enrichment_input(bindings)
+        inputs.open_enrichment_input(bindings)
     validator.assert_called_once()
 
 
 def test_shared_validation_rejects_duplicate_ids_before_recipe_checks(
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
 ) -> None:
     """Checkpoints key on IDs, so uniqueness is checked for every recipe across the whole snapshot."""
     _append(enrichment_input, "a", "duplicate.mp4")
     validator = Mock(wraps=_readiness)
     with pytest.raises(ValueError, match="item_id values must be non-null and globally unique"):
-        contracts.open_enrichment_input(_with_readiness(enrichment_input.bindings, validator))
+        inputs.open_enrichment_input(_with_readiness(enrichment_input.bindings, validator))
     validator.assert_not_called()
 
 
 def test_refresh_does_not_certify_concurrently_appended_input(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A descriptor refresh can use a new version without changing the validated snapshot's proof."""
     original_prepare = commit.prepare_fragment
@@ -130,16 +128,16 @@ def test_refresh_does_not_certify_concurrently_appended_input(
     published = publish_results(results, enrichment_input)
     assert max(versions) > enrichment_input.dataset.version
     transaction = published.read_transaction(published.version)
-    assert transaction.transaction_properties[contracts.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
-    assert contracts.input_fingerprint(published, enrichment_input.bindings) != enrichment_input.fingerprint
+    assert transaction.transaction_properties[inputs.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
+    assert inputs.input_fingerprint(published, enrichment_input.bindings) != enrichment_input.fingerprint
     assert published.to_table(columns=["unrelated"])["unrelated"].to_pylist() == ["keep"] * 3
     with pytest.raises(ValueError, match="globally unique"):
-        contracts.open_enrichment_input(enrichment_input.bindings)
+        inputs.open_enrichment_input(enrichment_input.bindings)
 
 
 @pytest.mark.parametrize("fault", ["selection", "contract", "snapshot", "missing_workspace"])
 def test_mismatched_attempts_fail_before_preparing_files(
-    enrichment_input: contracts.EnrichmentInput, monkeypatch: pytest.MonkeyPatch, fault: str
+    enrichment_input: inputs.EnrichmentInput, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     """The adapter cannot bind one selection's results to another input or recovery identity."""
     attempt = attempt_all(enrichment_input)
@@ -148,9 +146,12 @@ def test_mismatched_attempts_fail_before_preparing_files(
     elif fault == "contract":
         attempt = attrs.evolve(
             attempt,
-            workspace=contracts.resolve_workspace(
+            workspace=inputs.resolve_workspace(
                 enrichment_input.dataset,
-                attrs.evolve(enrichment_input.bindings, result_contract={"version": 2}),
+                attrs.evolve(
+                    enrichment_input.bindings,
+                    spec=attrs.evolve(enrichment_input.bindings.spec, result_contract={"version": 2}),
+                ),
                 selected=attempt.selected,
             ),
         )
@@ -170,31 +171,31 @@ def test_mismatched_attempts_fail_before_preparing_files(
 @pytest.mark.parametrize(
     "key",
     [
-        contracts.KIND_KEY,
-        contracts.FIELD_KEY,
-        contracts.CONTRACT_DIGEST_KEY,
-        contracts.PUBLICATION_RECEIPT_KEY,
-        contracts.VALIDATED_INPUT_KEY,
+        execution.KIND_KEY,
+        execution.FIELD_KEY,
+        execution.CONTRACT_DIGEST_KEY,
+        inputs.PUBLICATION_RECEIPT_KEY,
+        inputs.VALIDATED_INPUT_KEY,
     ],
 )
-def test_recipe_properties_cannot_replace_shared_proof(enrichment_input: contracts.EnrichmentInput, key: str) -> None:
+def test_recipe_properties_cannot_replace_shared_proof(enrichment_input: inputs.EnrichmentInput, key: str) -> None:
     """Recipes add their own records; the adapter supplies provenance, the recovery receipt, and evidence."""
     with pytest.raises(ValueError, match="cannot replace the shared provenance"):
         execution.publish_enrichment(attempt_all(enrichment_input), transaction_properties={key: "recipe-value"})
 
 
-def test_publication_records_shared_provenance(enrichment_input: contracts.EnrichmentInput, results: pa.Table) -> None:
+def test_publication_records_shared_provenance(enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
     """Every enrichment commit names its recipe, field set, and result contract without recipe properties."""
     published = publish_results(results, enrichment_input)
     properties = published.read_transaction(published.version).transaction_properties
-    assert properties[contracts.KIND_KEY] == "item-recipe"
-    assert properties[contracts.FIELD_KEY] == "result"
-    assert properties[contracts.CONTRACT_DIGEST_KEY] == canonical_digest({"version": 1})
+    assert properties[execution.KIND_KEY] == "item-recipe"
+    assert properties[execution.FIELD_KEY] == "result"
+    assert properties[execution.CONTRACT_DIGEST_KEY] == canonical_digest({"version": 1})
 
 
 @pytest.mark.parametrize("cleaned", [True, False])
 def test_publication_removes_the_verified_workspace(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch, *, cleaned: bool
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch, *, cleaned: bool
 ) -> None:
     """Cleanup follows canonical verification; its failure is reported without undoing publication."""
     attempt = reconcile_and_select_attempt(enrichment_input)
@@ -216,9 +217,7 @@ def test_publication_removes_the_verified_workspace(
     }
 
 
-def test_failed_publication_retains_the_workspace(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table
-) -> None:
+def test_failed_publication_retains_the_workspace(enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
     """Incomplete staged results fail before cleanup can discard recovery state."""
     attempt = reconcile_and_select_attempt(enrichment_input)
     assert attempt.workspace is not None
@@ -228,11 +227,11 @@ def test_failed_publication_retains_the_workspace(
 
 
 def test_nothing_selected_publishes_nothing(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A completed input reports its pinned version without preparing or committing."""
     publish_results(results, enrichment_input)
-    attempt = reconcile_and_select_attempt(contracts.open_enrichment_input(enrichment_input.bindings))
+    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(enrichment_input.bindings))
     assert (attempt.selected, attempt.workspace) == ((), None)
     monkeypatch.setattr(execution, "prepare_enrichment_fragments", Mock(side_effect=AssertionError("Prepared")))
     monkeypatch.setattr(commit, "commit_fragments", Mock(side_effect=AssertionError("Committed")))
@@ -244,12 +243,12 @@ def test_nothing_selected_publishes_nothing(
 @pytest.mark.parametrize("fail_write", [False, True])
 @pytest.mark.parametrize("include_uri", [False, True])
 def test_processing_scope_owns_checkpoint_and_sink(
-    enrichment_input: contracts.EnrichmentInput, monkeypatch: pytest.MonkeyPatch, *, fail_write: bool, include_uri: bool
+    enrichment_input: inputs.EnrichmentInput, monkeypatch: pytest.MonkeyPatch, *, fail_write: bool, include_uri: bool
 ) -> None:
     """The spec's ID keys the checkpoint, the sink shares its filesystem, and only success records completion."""
     bindings = enrichment_input.bindings
     tuned = bindings.execution.model_copy(update={"lance_read_batch_size": 7, "parquet_rows_per_file": 5})
-    attempt = reconcile_and_select_attempt(contracts.open_enrichment_input(attrs.evolve(bindings, execution=tuned)))
+    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(attrs.evolve(bindings, execution=tuned)))
     assert attempt.workspace is not None
     context = DataContext.get_current()
     monkeypatch.setattr(context, "checkpoint_config", None)
@@ -293,7 +292,7 @@ def test_processing_scope_owns_checkpoint_and_sink(
 
 
 def test_processing_validates_results_before_ray_checkpoints_them(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A row that publication would reject fails before the sink can checkpoint its ID."""
     attempt = reconcile_and_select_attempt(enrichment_input)
@@ -319,7 +318,7 @@ def test_processing_validates_results_before_ray_checkpoints_them(
 
 @pytest.mark.parametrize("marker", [False, True])
 def test_run_enrichment_starts_ray_whenever_fragments_are_selected(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch, *, marker: bool
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch, *, marker: bool
 ) -> None:
     """A processing marker skips the plan but not Ray, which publication needs; a finished input needs neither."""
     events: list[object] = []
@@ -356,7 +355,7 @@ def test_run_enrichment_starts_ray_whenever_fragments_are_selected(
 
 
 def test_run_enrichment_limits_only_a_new_selection(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fragment limit bounds new work and leaves the rest pending for a later run."""
     monkeypatch.setattr(execution, "prepare_enrichment_fragments", partial(prepare_results, results))
@@ -365,7 +364,7 @@ def test_run_enrichment_limits_only_a_new_selection(
         enrichment_input.bindings, start_ray=lambda _bindings: None, process=lambda _processing: None, max_fragments=1
     )
     assert (outcome.summary()["selected_fragments"], outcome.summary()["remaining_fragments"]) == (1, 1)
-    assert contracts.pending_fragment_ids(outcome.dataset, enrichment_input.bindings) == (1,)
+    assert inputs.pending_fragment_ids(outcome.dataset, enrichment_input.bindings) == (1,)
 
 
 def test_preparation_never_starts_a_default_ray_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,12 +387,12 @@ def test_preparation_never_starts_a_default_ray_runtime(tmp_path: Path, monkeypa
     ids=["undeclared", "owned_output", "row_address", "duplicate"],
 )
 def test_processing_reads_only_declared_input_columns(
-    enrichment_input: contracts.EnrichmentInput, columns: list[str], message: str, monkeypatch: pytest.MonkeyPatch
+    enrichment_input: inputs.EnrichmentInput, columns: list[str], message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every projected value belongs to the input contract that recovery protects."""
     dataset = lance.dataset(enrichment_input.dataset.uri)
     dataset.add_columns(pa.schema([pa.field("untracked", pa.string())]))
-    enrichment_input = contracts.open_enrichment_input(enrichment_input.bindings)
+    enrichment_input = inputs.open_enrichment_input(enrichment_input.bindings)
     attempt = reconcile_and_select_attempt(enrichment_input)
     monkeypatch.setattr(DataContext.get_current(), "checkpoint_config", None)
     read = Mock(side_effect=AssertionError("Invalid projections must fail before Ray reads"))
@@ -408,9 +407,9 @@ def test_processing_reads_only_declared_input_columns(
     assert not attempt.processing_complete()
 
 
-def test_processing_requires_selected_work(enrichment_input: contracts.EnrichmentInput, results: pa.Table) -> None:
+def test_processing_requires_selected_work(enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
     """A completed input has no checkpoint scope to own."""
     publish_results(results, enrichment_input)
-    attempt = reconcile_and_select_attempt(contracts.open_enrichment_input(enrichment_input.bindings))
+    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(enrichment_input.bindings))
     with ExitStack() as stack, pytest.raises(ValueError, match="selected fragments"):
         stack.enter_context(execution.checkpointed_processing(attempt))

@@ -8,11 +8,12 @@ from functools import partial
 from typing import Any
 from unittest.mock import patch
 
+import attrs
 import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from cosmos_curator.next.enrichment import commit, contracts, execution
+from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 
@@ -35,12 +36,11 @@ def make_bindings(
     result_contract: dict[str, Any] | None = None,
     commit_attempts: int = 1,
 ) -> contracts.EnrichmentBindings:
-    """Bind local test data to a small result contract and default execution settings."""
+    """Bind local test data to default execution settings, optionally replacing the spec's result contract."""
     return contracts.EnrichmentBindings(
         uri=uri,
-        spec=spec,
+        spec=spec if result_contract is None else attrs.evolve(spec, result_contract=result_contract),
         staging_root=staging_root,
-        result_contract={} if result_contract is None else result_contract,
         execution=EnrichmentExecutionConfig(commit_attempts=commit_attempts),
     )
 
@@ -87,7 +87,7 @@ def commit_items(
         prepare,
         dataset=dataset,
         selected=selected,
-        receipt=contracts.resolve_workspace(dataset, bindings, selected=selected).manifest_digest,
+        receipt=inputs.resolve_workspace(dataset, bindings, selected=selected).manifest_digest,
         transaction_properties={},
         bindings=bindings,
     )
@@ -110,11 +110,11 @@ def prepare_results(
     return candidates
 
 
-def attempt_all(enrichment_input: contracts.EnrichmentInput) -> EnrichmentAttempt:
+def attempt_all(enrichment_input: inputs.EnrichmentInput) -> EnrichmentAttempt:
     """Select every pending fragment without discovering or writing recovery state."""
     dataset, bindings = enrichment_input.dataset, enrichment_input.bindings
-    pending = contracts.pending_fragment_ids(dataset, bindings)
-    workspace = contracts.resolve_workspace(dataset, bindings, selected=pending) if pending else None
+    pending = inputs.pending_fragment_ids(dataset, bindings)
+    workspace = inputs.resolve_workspace(dataset, bindings, selected=pending) if pending else None
     return EnrichmentAttempt(enrichment_input, pending, pending, workspace, cleanup_complete=True)
 
 
@@ -133,7 +133,7 @@ def publish_attempt(
 
 def publish_results(
     results: pa.Table,
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     *,
     properties: Callable[[EnrichmentAttempt], Mapping[str, str]] | None = None,
 ) -> lance.LanceDataset:

@@ -13,7 +13,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment import inputs
 from cosmos_curator.next.recipes.video_caption.contracts import caption_contract_digest, terminal_metadata
 from cosmos_curator.next.recipes.video_caption.contracts import resolve_model_spec as caption_spec
 from cosmos_curator.next.recipes.video_embed.bindings import resolve_bindings
@@ -30,7 +30,7 @@ from tests.cosmos_curator.next.enrichment.helpers import publish_results
 
 
 def test_publication_records_the_embedding_contract(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, spec: ModelSpec
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, spec: ModelSpec
 ) -> None:
     """Shared publication names the variant's field set and model contract next to the receipt."""
     published = publish_results(results, enrichment_input)
@@ -70,7 +70,7 @@ def _write_caption(uri: str) -> None:
 
 
 def test_captions_and_embeddings_coexist(
-    enrichment_input: contracts.EnrichmentInput, results: pa.Table, spec: ModelSpec
+    enrichment_input: inputs.EnrichmentInput, results: pa.Table, spec: ModelSpec
 ) -> None:
     """A caption writer and the embedding publisher each keep their own column files."""
     _write_caption(enrichment_input.dataset.uri)
@@ -82,7 +82,7 @@ def test_captions_and_embeddings_coexist(
 
 @pytest.mark.parametrize("change", ["null_uri", "pruned_receipt"])
 def test_input_validation_is_repeated_when_evidence_changes(
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     results: pa.Table,
     config: ResolvedVideoEmbedConfig,
     dataset: lance.LanceDataset,
@@ -107,18 +107,18 @@ def test_input_validation_is_repeated_when_evidence_changes(
         current = lance.dataset(dataset.uri)
         current.cleanup_old_versions(versions=[publication_version])
     bindings = resolve_bindings(config)
-    assert not contracts.input_is_validated(current, fingerprint=contracts.input_fingerprint(current, bindings))
+    assert not inputs.input_is_validated(current, fingerprint=inputs.input_fingerprint(current, bindings))
 
     if change == "pruned_receipt":
-        assert contracts.open_enrichment_input(bindings).dataset.count_rows() == 4
+        assert inputs.open_enrichment_input(bindings).dataset.count_rows() == 4
     else:
         with pytest.raises(ValueError, match="Clips require non-null URIs and positive byte sizes"):
-            contracts.open_enrichment_input(bindings)
+            inputs.open_enrichment_input(bindings)
 
 
 @pytest.mark.parametrize("fault", ["wrong_dimension", "nan"])
 def test_invalid_vectors_leave_all_fragments_pending(
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     results: pa.Table,
     spec: ModelSpec,
     dataset: lance.LanceDataset,
@@ -133,11 +133,11 @@ def test_invalid_vectors_leave_all_fragments_pending(
     with pytest.raises(ValueError, match=r"canonical output types|finite unit"):
         publish_results(pa.Table.from_pylist(rows, schema=results.schema), enrichment_input)
     assert lance.dataset(dataset.uri).version == dataset.version
-    assert contracts.pending_fragment_ids(lance.dataset(dataset.uri), enrichment_input.bindings) == (0, 1)
+    assert inputs.pending_fragment_ids(lance.dataset(dataset.uri), enrichment_input.bindings) == (0, 1)
 
 
 def test_changed_model_contract_does_not_overwrite_existing_vectors(
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     results: pa.Table,
     config: ResolvedVideoEmbedConfig,
     spec: ModelSpec,
@@ -150,7 +150,7 @@ def test_changed_model_contract_does_not_overwrite_existing_vectors(
         lambda _variant: replace(spec, revision="a" * 40),
     )
     with pytest.raises(ValueError, match="Incompatible or missing embedding provenance"):
-        contracts.pending_fragment_ids(published, resolve_bindings(config))
+        inputs.pending_fragment_ids(published, resolve_bindings(config))
 
 
 @pytest.mark.parametrize("receipt", ["absent", "pruned"])
@@ -171,12 +171,12 @@ def test_ready_clips_do_not_require_a_retained_receipt(
         assert {ref["version"] for ref in dataset.version_refs()} == {dataset.version}
 
     bindings = resolve_bindings(config)
-    opened = contracts.open_enrichment_input(bindings).dataset
+    opened = inputs.open_enrichment_input(bindings).dataset
 
     assert opened.count_rows() == 4
     assert set(spec.fields.names).issubset(opened.schema.names)
     expected = (0, 1) if receipt == "pruned" else (0,)
-    assert contracts.pending_fragment_ids(opened, bindings) == expected
+    assert inputs.pending_fragment_ids(opened, bindings) == expected
 
 
 @pytest.mark.parametrize(
@@ -222,7 +222,7 @@ def test_publication_receipt_does_not_make_invalid_clip_inputs_ready(
         },
     )
     with pytest.raises(ValueError, match=message):
-        contracts.open_enrichment_input(resolve_bindings(config))
+        inputs.open_enrichment_input(resolve_bindings(config))
 
 
 def test_empty_clip_table_is_ready_without_a_receipt(config: ResolvedVideoEmbedConfig) -> None:
@@ -232,7 +232,7 @@ def test_empty_clip_table_is_ready_without_a_receipt(config: ResolvedVideoEmbedC
     )
 
     bindings = resolve_bindings(config)
-    opened = contracts.open_enrichment_input(bindings).dataset
+    opened = inputs.open_enrichment_input(bindings).dataset
 
     assert opened.count_rows() == 0
-    assert contracts.pending_fragment_ids(opened, bindings) == ()
+    assert inputs.pending_fragment_ids(opened, bindings) == ()

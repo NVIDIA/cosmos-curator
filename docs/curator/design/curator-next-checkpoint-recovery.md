@@ -5,6 +5,10 @@ durable Parquet results; a Lance commit makes those results visible to readers. 
 index until publication is verified lets a fresh driver or Ray cluster finish the run without repeating checkpointed
 work.
 
+The shared implementation currently covers whole-fragment enrichment: a recipe fills its owned columns on existing
+Lance rows. Append publication, which `video-cut` and other producers need, is a planned extension; see
+[Expansion across Curator Next](#expansion-across-curator-next).
+
 ## Assumptions and guarantees
 
 These are the defaults for shared recovery. [Video-transcode](curator-next-video-transcode.md),
@@ -53,27 +57,39 @@ a unit; it does not repartition staged results among newly chosen selections.
 
 The shared code lives in [`cosmos_curator.next.enrichment`](../../../cosmos_curator/next/enrichment/__init__.py).
 
+Recipes use only these names:
+
 | Component | Responsibility |
 | --- | --- |
-| [`EnrichmentSpec`, `owned_fields`, `EnrichmentBindings`, `open_enrichment_input`](../../../cosmos_curator/next/enrichment/contracts.py) | Describe the recipe's required input, owned outputs, input readiness, and terminal validation; derive Parquet-stable staged rows; register fields, pin the input, and validate it or reuse earlier proof. |
-| [`run_enrichment`](../../../cosmos_curator/next/enrichment/execution.py) | The shared run sequence: open the recipe's validated input from its bindings, select an attempt, start the recipe's Ray runtime with its bindings when fragments are selected, run its plan unless processing already completed, and publish. |
-| [`reconcile_and_select_attempt`](../../../cosmos_curator/next/enrichment/attempts.py) | Verify and clean published workspaces, then resume saved work or select pending fragments. Returns an `EnrichmentAttempt` with a durable workspace and the run counts. |
-| [`checkpointed_processing`](../../../cosmos_curator/next/enrichment/execution.py) | Own the Ray checkpoint for one plan. Its `ProcessingScope` reads the attempt's selection with IDs and row addresses, supplies the staged schema, then validates and writes staged results in checkpoint groups. |
-| [`publish_enrichment`](../../../cosmos_curator/next/enrichment/execution.py) | Prepare staged results with Ray Data, commit them atomically with shared provenance and recovery and validation evidence, verify, and remove the workspace. |
+| [`owned_fields`, `EnrichmentSpec`, `EnrichmentBindings`](../../../cosmos_curator/next/enrichment/contracts.py) | Declare the owned outputs; describe the required input, result contract, input readiness, and terminal validation, deriving Parquet-stable staged rows; bind the spec to one invocation's table, staging root, and execution settings. |
+| [`run_enrichment`, `ProcessingScope`, `summary_message`](../../../cosmos_curator/next/enrichment/execution.py) | The shared run sequence: open the recipe's validated input from its bindings, select an attempt, start the recipe's Ray runtime with its bindings when fragments are selected, run its plan unless processing already completed, and publish. The plan receives a `ProcessingScope` that reads the selection and writes staged rows. |
 | [`EnrichmentExecutionConfig`](../../../cosmos_curator/next/enrichment/config.py) | Base for a recipe's `execution` settings, which the bindings carry to every shared step: storage profile, read batches, checkpoint groups, publication memory, and commit attempts. |
-| [`LanceFragmentDatasource`](../../../cosmos_curator/next/core/lance_datasource.py) | Read selected fragments at a pinned version with original row addresses, `ROW_ADDRESS_FIELDS`. |
+| [`ROW_ADDRESS_FIELDS`](../../../cosmos_curator/next/core/lance_datasource.py) | Original physical row addresses, for recipe work schemas that carry them to the staged rows. |
+
+`run_enrichment` runs the remaining steps; recipes do not call them directly, though tests may:
+
+| Component | Responsibility |
+| --- | --- |
+| [`open_enrichment_input`](../../../cosmos_curator/next/enrichment/inputs.py) | Register fields, pin the input, and validate it or reuse earlier proof. The `inputs` module also defines recovery identity, what a publication receipt proves, and pending selection. |
+| [`reconcile_and_select_attempt`](../../../cosmos_curator/next/enrichment/attempts.py) | Verify and clean published workspaces, then resume saved work or select pending fragments. Returns an `EnrichmentAttempt` with a durable workspace and the run counts. |
+| [`checkpointed_processing`](../../../cosmos_curator/next/enrichment/execution.py) | Own the Ray checkpoint for one plan and create its `ProcessingScope`, which reads the attempt's selection with IDs and row addresses, then validates and writes staged results in checkpoint groups. |
+| [`publish_enrichment`](../../../cosmos_curator/next/enrichment/execution.py) | Prepare staged results with Ray Data, commit them atomically with shared provenance and recovery and validation evidence, verify, and remove the workspace. |
+| [`commit`](../../../cosmos_curator/next/enrichment/commit.py), [`workspace`](../../../cosmos_curator/next/enrichment/workspace.py), [`transactions`](../../../cosmos_curator/next/enrichment/transactions.py) | Validate coverage, reconcile concurrent writes, and commit; manage durable recovery state; find publication evidence in retained history. |
+| [`LanceFragmentDatasource`](../../../cosmos_curator/next/core/lance_datasource.py) | Read selected fragments at a pinned version with original row addresses. |
 | [`installed_checkpoint`](../../../cosmos_curator/next/core/ray_checkpoints.py) | Own Ray Data's ambient checkpoint configuration for one plan; every Curator Next recipe that checkpoints installs it here. |
-| [`commit`](../../../cosmos_curator/next/enrichment/commit.py), [`workspace`](../../../cosmos_curator/next/enrichment/workspace.py) | Internal: validate coverage, reconcile concurrent writes, and commit; manage durable recovery state. |
 
 Each reference recipe's `bindings.py` defines `resolve_bindings(config)`, which constructs one frozen
-`EnrichmentBindings` value per invocation from the spec, the `result_contract`, and the recipe's `execution` settings.
-The bindings snapshot the result contract, resolve storage credentials at runtime, derive the Ray workers' storage
-environment, and keep execution tuning out of workspace identity. Tests use the same recipe binding factories as
-production. Transcode's `contracts.py` also defines the receipt video-caption reads.
+`EnrichmentBindings` value per invocation. The spec says what the recipe produces; the bindings add where and how: the
+table, the staging root, and the recipe's `execution` settings. The bindings resolve storage credentials at runtime,
+derive the Ray workers' storage environment, and keep execution tuning out of workspace identity. Tests use the same
+recipe binding factories as production. Transcode's `contracts.py` also defines the receipt video-caption reads.
 
 `EnrichmentSpec` is the recipe's complete data contract. It names the logical `id_column`, the `input_fields` the recipe
-requires, the nullable `output_fields` it owns, `validate_batch` for terminal results, and an optional `validate_input`
-for domain readiness. `input_fields` is the upstream schema: registration validates it, recovery protects the file
+requires, the nullable `output_fields` it owns, the `result_contract`, `validate_batch` for terminal results, and an
+optional `validate_input` for domain readiness. The result contract holds only result-defining settings; the spec
+snapshots it as JSON, and it scopes recovery compatibility and publication provenance. Both validators must depend
+only on the result contract, so bind them to its values rather than to the whole config, as transcode's bindings do.
+`input_fields` is the upstream schema: registration validates it, recovery protects the file
 layout of every listed field, and processing reads a subset. Declare the output fields with
 `owned_fields(fields, owner=..., field_set=...)`. It makes them nullable while pending and stamps `cosmos_curator.owner`
 and `cosmos_curator.field_set` metadata, which registration compares exactly, so another recipe or field set cannot
@@ -233,8 +249,8 @@ The shared publisher records `cosmos_curator.enrichment.validated_input` from th
 frozen selection. An unchanged input can reuse the shared ID check and the spec's `validate_input`. Appends or a changed
 input file layout require those checks again across the complete table, so duplicates between old and new fragments
 remain detectable. Appends arriving during publication are excluded from the fingerprint, which describes the original
-validated snapshot. The fingerprint does not cover `validate_input`'s code: when a recipe tightens that check, it must
-change its result contract so earlier evidence is not reused.
+validated snapshot. Neither the fingerprint nor publication receipts cover validator code: a recipe that changes what
+`validate_input` or `validate_batch` accepts must change its result contract so earlier evidence is not reused.
 
 An unchanged rerun with retained evidence reads metadata and transaction history rather than table rows. Startup cost
 still depends on fragment and retained-history counts. Workers validate staged values before first publication; exact
@@ -313,17 +329,18 @@ READ_COLUMNS = ("uri",)  # Read besides item_id and row addresses.
 
 
 def resolve_bindings(config: ResolvedConfig) -> EnrichmentBindings:
+    revision = config.model.revision
     return EnrichmentBindings(
         uri=config.input.items_lance_uri,
         spec=EnrichmentSpec(
             id_column="item_id",
             input_fields=ITEM_SCHEMA,  # The upstream schema this recipe requires.
             output_fields=SCORE_FIELDS,
-            validate_batch=validate_scores,  # Reject any row that is not terminal.
+            result_contract={"scorer_revision": revision},  # Result-defining settings only.
+            validate_batch=partial(validate_scores, revision=revision),  # Reject any row that is not terminal.
             validate_input=validate_items,  # Optional readiness of the whole pinned table.
         ),
         staging_root=config.output.staging_root_uri,
-        result_contract={"scorer_revision": config.model.revision},  # Result-defining settings only.
         execution=config.execution,
     )
 
@@ -388,10 +405,9 @@ package paths remain provisional during incubation.
 
 Shared tests cover [checkpoint isolation](../../../tests/cosmos_curator/next/core/test_ray_checkpoints.py),
 [workspaces](../../../tests/cosmos_curator/next/enrichment/test_workspace.py),
+[pending selection and publication evidence](../../../tests/cosmos_curator/next/enrichment/test_inputs.py),
 [attempt selection](../../../tests/cosmos_curator/next/enrichment/test_attempts.py), and
-[publication invariants](../../../tests/cosmos_curator/next/enrichment/test_commit.py). Fresh-cluster tests cover
-[transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py) and
-[embedding with model stand-ins](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py).
+[publication invariants](../../../tests/cosmos_curator/next/enrichment/test_commit.py).
 
 Each adopting recipe runs the [conformance suite](../../../tests/cosmos_curator/next/enrichment/conformance.py) against
 its own data; the suite's module docstring lists the fixtures a recipe supplies. It drives the recipe's `run_config`
@@ -399,13 +415,23 @@ without Ray and exercises publication, misaligned and missing results, concurren
 appends, workspace identity, reruns, processing markers, incompatible workspaces, and cleanup failures. Recipe tests
 then cover only recipe-specific behavior.
 
+Each adopting recipe also runs the
+[fresh-cluster scenario](../../../tests/cosmos_curator/next/enrichment/fresh_cluster.py) from an integration test,
+supplying stand-ins for its expensive stages that record the IDs they process. On real Ray, the scenario interrupts
+processing after the first selected fragment, then resumes on a fresh cluster after a disjoint column write and
+execution retuning, and requires each expensive step to run exactly once per ID. Finally, it runs the recipe's own
+`run_config`, which must reprocess nothing, publish once, and remove the workspace. The
+[transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py) and
+[embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py) tests show the stand-ins.
+
 Each migration must document how it satisfies the [assumptions above](#assumptions-and-guarantees) and demonstrate that
 clean and resumed runs produce the same visible logical records and payload references. Exercise the failure boundaries,
 compatible and incompatible workspace changes, and concurrent disjoint writes. Changes to the shared contract must be
 documented and tested for both new and existing consumers.
 
-Verify native checkpointing against the supported Ray version and the recipe's complete plan; the helper alone cannot
-establish that the plan is checkpointable. Real Ray execution belongs in integration tests, with GPU/model tests as needed.
+The scenario verifies native checkpointing against the supported Ray version and the recipe's complete plan; the helper
+alone cannot establish that the plan is checkpointable. Real Ray execution belongs in integration tests, with GPU/model
+tests as needed.
 
 Managed Ray qualification additionally requires late workers, worker loss including a period with no workers, and a
 fresh head and driver. The [transcode](curator-next-video-transcode.md#failure-policy-and-validation) and

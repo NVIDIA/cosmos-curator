@@ -22,11 +22,11 @@ def resolve_bindings(config: ResolvedVideoEmbedConfig) -> EnrichmentBindings:
             id_column="clip_id",
             input_fields=CLIP_SCHEMA,
             output_fields=model.fields,
+            result_contract=model.contract,
             validate_batch=partial(validate_terminal_batch, spec=model),
             validate_input=_validate_input,
         ),
         staging_root=config.output.staging_root_uri,
-        result_contract=model.contract,
         execution=config.execution,
     )
 

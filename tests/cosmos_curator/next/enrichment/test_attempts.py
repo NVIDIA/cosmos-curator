@@ -11,7 +11,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment import attempts, commit, contracts
+from cosmos_curator.next.enrichment import attempts, commit, contracts, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt, reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.workspace import RecoveryStateError, RecoveryWorkspace
 from tests.cosmos_curator.next.enrichment.helpers import make_bindings
@@ -32,6 +32,7 @@ def spec() -> contracts.EnrichmentSpec:
         id_column="item_id",
         input_fields=items,
         output_fields=fields,
+        result_contract={},
         validate_batch=_validate,
     )
 
@@ -46,7 +47,7 @@ def dataset(tmp_path: Path, spec: contracts.EnrichmentSpec) -> lance.LanceDatase
         max_rows_per_file=1,
         data_storage_version="2.2",
     )
-    return contracts.register_fields(make_bindings(uri, spec))
+    return inputs.register_fields(make_bindings(uri, spec))
 
 
 def _select(
@@ -57,7 +58,7 @@ def _select(
     limit: int | None = None,
 ) -> EnrichmentAttempt:
     bindings = make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1})
-    enrichment_input = contracts.EnrichmentInput(dataset, bindings, contracts.input_fingerprint(dataset, bindings))
+    enrichment_input = inputs.EnrichmentInput(dataset, bindings, inputs.input_fingerprint(dataset, bindings))
     return reconcile_and_select_attempt(enrichment_input, max_fragments=limit)
 
 
@@ -123,7 +124,7 @@ def test_published_workspace_is_verified_and_cleaned_before_selecting_new_work(
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root, limit=1)
     assert attempt.workspace is not None
-    other = contracts.resolve_workspace(
+    other = inputs.resolve_workspace(
         dataset, make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 2}), selected=(1,)
     )
     other.ensure(storage_profile="default")
@@ -150,7 +151,7 @@ def test_missing_receipt_preserves_completed_workspace_and_continues(
     assert attempt.workspace is not None
     attempt.workspace.record_completion(storage_profile="default")
     published = _publish(dataset, spec, attempt.workspace, attempt.selected, matching_receipt=False)
-    next_workspace = contracts.resolve_workspace(
+    next_workspace = inputs.resolve_workspace(
         published,
         make_bindings(published.uri, spec, staging_root=str(root), result_contract={"version": 1}),
         selected=(1,),
@@ -237,7 +238,7 @@ def test_receipted_cleanup_still_requires_compatible_schema(
     published.alter_columns({"path": "item_id", "nullable": True})
 
     with pytest.raises(ValueError, match="Missing or incompatible Lance field: item_id"):
-        reconcile_and_select_attempt(contracts.EnrichmentInput(published, bindings, "unused"))
+        reconcile_and_select_attempt(inputs.EnrichmentInput(published, bindings, "unused"))
     assert Path(attempt.workspace.root, "workspace.json").exists()
 
 
@@ -247,7 +248,7 @@ def test_receipt_read_failure_prevents_all_cleanup(
     """Unavailable evidence remains fatal even after another workspace was verified."""
     root = tmp_path / "staging"
     workspaces = [
-        contracts.resolve_workspace(
+        inputs.resolve_workspace(
             dataset,
             make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1}),
             selected=(fragment_id,),
@@ -298,7 +299,7 @@ def test_multiple_unfinished_selections_require_explicit_resolution(
     """The recovery selector does not silently merge independently owned checkpoints."""
     root = tmp_path / "staging"
     workspaces = [
-        contracts.resolve_workspace(
+        inputs.resolve_workspace(
             dataset,
             make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1}),
             selected=(fragment_id,),
@@ -345,7 +346,7 @@ def test_empty_input_selects_nothing_and_creates_no_workspace(spec: contracts.En
     """An empty table has nothing to process or publish, so it leaves no recovery state."""
     uri = str(tmp_path / "empty.lance")
     lance.write_dataset(pa.Table.from_pylist([], schema=spec.input_fields), uri, data_storage_version="2.2")
-    dataset = contracts.register_fields(make_bindings(uri, spec))
+    dataset = inputs.register_fields(make_bindings(uri, spec))
     attempt = _select(dataset, spec, tmp_path / "staging")
     assert (attempt.pending, attempt.selected, attempt.workspace) == ((), (), None)
     assert not (tmp_path / "staging").exists()

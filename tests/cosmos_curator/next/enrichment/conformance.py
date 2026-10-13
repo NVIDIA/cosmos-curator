@@ -4,16 +4,18 @@
 """Shared recovery behavior that every checkpointed enrichment recipe must satisfy.
 
 A recipe adopts the suite by subclassing ``EnrichmentConformance`` as
-``Test<Recipe>Conformance`` in its ``test_conformance.py``, with a ``recipe`` fixture
-returning a ``RecipeUnderTest``, alongside its conftest's ``config``,
-``enrichment_input``, ``dataset``, and ``results`` fixtures. ``results`` must
-hold one valid staged row for every input row, spread across at least two fragments
-with at least two rows each. Fragment IDs and recipe-specific summary keys are
-unrestricted. The recipe's ``run_config`` must run through its pipeline module's
-``run_enrichment``; the suite replaces the ``start_ray`` and ``process`` callbacks
-passed there, checks the recipe's own ``transaction_properties``, and prepares
-fragments locally instead of starting Ray. It uses real Lance files. Recipe test
-modules keep only the checks specific to their own contract.
+``Test<Recipe>Conformance`` in its ``test_conformance.py``. Its conftest supplies the
+``config``, ``enrichment_input``, ``dataset``, and ``results`` fixtures and a ``recipe``
+fixture returning the recipe's module-level ``RecipeUnderTest``, which the fresh-cluster
+scenario in ``fresh_cluster.py`` reuses. ``config`` is the recipe's resolved config,
+whose ``kind`` the owned fields must name. ``results`` must hold one valid staged row
+for every input row, spread across at least two fragments with at least two rows each.
+Fragment IDs and recipe-specific summary keys are unrestricted. The recipe's
+``run_config`` must run through its pipeline module's ``run_enrichment``; the suite
+replaces the ``start_ray`` and ``process`` callbacks passed there, checks the recipe's
+own ``transaction_properties``, and prepares fragments locally instead of starting Ray.
+It uses real Lance files. Recipe test modules keep only the checks specific to their
+own contract.
 """
 
 import json
@@ -31,7 +33,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
-from cosmos_curator.next.enrichment import commit, contracts, execution
+from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment import workspace as recovery_workspace
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.workspace import RecoveryStateError
@@ -41,13 +43,16 @@ from tests.cosmos_curator.next.enrichment.helpers import attempt_all, prepare_re
 
 @attrs.frozen
 class RecipeUnderTest:
-    """How the conformance suite drives one recipe."""
+    """How the conformance suite and fresh-cluster scenario drive one recipe."""
 
     pipeline: ModuleType
     """Recipe pipeline module whose ``run_config`` calls its imported ``run_enrichment``."""
     resolve_bindings: Callable[[Any], contracts.EnrichmentBindings]
     retune: Callable[[Any], Any]
-    """Return the config with different execution tuning and the same results."""
+    """Return the config with different execution tuning and the same results.
+
+    The tuning must stay schedulable on the fresh-cluster scenario's small local cluster.
+    """
     recontract: Callable[[Any], Any]
     """Return the config with a different result contract."""
 
@@ -129,25 +134,29 @@ class EnrichmentConformance:
             read_version=current.version,
         )
 
+    def test_owner_is_the_recipe_kind(self, recipe: RecipeUnderTest, config: Any) -> None:  # noqa: ANN401
+        """Publication provenance names the recipe by the ``kind`` its config declares."""
+        assert recipe.resolve_bindings(config).spec.owner == config.kind
+
     def test_registration_adds_nullable_fields_without_data(
-        self, enrichment_input: contracts.EnrichmentInput, dataset: lance.LanceDataset
+        self, enrichment_input: inputs.EnrichmentInput, dataset: lance.LanceDataset
     ) -> None:
         """Registration is metadata only, and reopening a registered table commits nothing."""
         spec = enrichment_input.bindings.spec
         assert set(spec.output_fields.names) <= set(dataset.schema.names)
-        output_ids = set(contracts.field_ids(dataset, spec.output_fields.names).values())
+        output_ids = set(inputs.field_ids(dataset, spec.output_fields.names).values())
         assert all(
             not output_ids.intersection(data_file["fields"])
             for fragment in dataset.get_fragments()
             for data_file in fragment.metadata.to_json()["files"]
         )
-        assert contracts.open_enrichment_input(enrichment_input.bindings).dataset.version == dataset.version
+        assert inputs.open_enrichment_input(enrichment_input.bindings).dataset.version == dataset.version
 
     def test_one_commit_publishes_every_selected_fragment(
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -159,9 +168,9 @@ class EnrichmentConformance:
         ((recipe_arguments, outcome),) = runs
         published = outcome.dataset
         assert summary["field_set"] == bindings.spec.field_set
-        assert summary["contract_digest"] == canonical_digest(bindings.result_contract)
+        assert summary["contract_digest"] == canonical_digest(bindings.spec.result_contract)
         assert published.version == dataset.version + 1
-        assert contracts.pending_fragment_ids(published, enrichment_input.bindings) == ()
+        assert inputs.pending_fragment_ids(published, enrichment_input.bindings) == ()
         for before, after in zip(dataset.get_fragments(), published.get_fragments(), strict=True):
             assert before.fragment_id == after.fragment_id
             original_files = before.metadata.to_json()["files"]
@@ -171,17 +180,17 @@ class EnrichmentConformance:
         recipe_properties = recipe_arguments.get("transaction_properties")
         if recipe_properties is not None:
             assert recipe_properties(outcome.attempt).items() <= properties.items()
-        assert properties[contracts.KIND_KEY] == bindings.spec.owner
-        assert properties[contracts.FIELD_KEY] == bindings.spec.field_set
-        assert properties[contracts.CONTRACT_DIGEST_KEY] == canonical_digest(bindings.result_contract)
-        assert properties[contracts.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
+        assert properties[execution.KIND_KEY] == bindings.spec.owner
+        assert properties[execution.FIELD_KEY] == bindings.spec.field_set
+        assert properties[execution.CONTRACT_DIGEST_KEY] == canonical_digest(bindings.spec.result_contract)
+        assert properties[inputs.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
         assert published.to_table(columns=bindings.spec.input_fields.names).equals(
             dataset.to_table(columns=bindings.spec.input_fields.names)
         )
 
     @pytest.mark.parametrize("fault", ["missing", "duplicate", "wrong_id", "wrong_offset"])
     def test_misaligned_results_never_publish(
-        self, enrichment_input: contracts.EnrichmentInput, results: pa.Table, fault: str
+        self, enrichment_input: inputs.EnrichmentInput, results: pa.Table, fault: str
     ) -> None:
         """Every row address and ID is checked before any result becomes visible."""
         id_column = enrichment_input.bindings.spec.id_column
@@ -199,7 +208,7 @@ class EnrichmentConformance:
         assert lance.dataset(enrichment_input.dataset.uri).version == enrichment_input.dataset.version
 
     def test_missing_fragment_results_never_publish(
-        self, enrichment_input: contracts.EnrichmentInput, results: pa.Table
+        self, enrichment_input: inputs.EnrichmentInput, results: pa.Table
     ) -> None:
         """Valid results for one fragment cannot hide another fragment's absent work."""
         first_id = enrichment_input.dataset.get_fragments()[0].fragment_id
@@ -208,7 +217,7 @@ class EnrichmentConformance:
             publish_results(first, enrichment_input)
         assert lance.dataset(enrichment_input.dataset.uri).version == enrichment_input.dataset.version
 
-    def test_mixed_fragments_are_rejected(self, enrichment_input: contracts.EnrichmentInput, results: pa.Table) -> None:
+    def test_mixed_fragments_are_rejected(self, enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
         """Only whole-fragment publication is a supported recovery state."""
         spec = enrichment_input.bindings.spec
         fragment = enrichment_input.dataset.get_fragments()[0]
@@ -222,10 +231,10 @@ class EnrichmentConformance:
             read_version=enrichment_input.dataset.version,
         )
         with pytest.raises(ValueError, match="mixes pending and terminal"):
-            contracts.pending_fragment_ids(current, enrichment_input.bindings)
+            inputs.pending_fragment_ids(current, enrichment_input.bindings)
 
     def test_rewritten_input_files_reject_publication(
-        self, enrichment_input: contracts.EnrichmentInput, results: pa.Table
+        self, enrichment_input: inputs.EnrichmentInput, results: pa.Table
     ) -> None:
         """Stable IDs alone cannot rebind staged results to rewritten input files."""
         spec = enrichment_input.bindings.spec
@@ -238,7 +247,7 @@ class EnrichmentConformance:
     @pytest.mark.parametrize("during_commit", [False, True])
     def test_disjoint_writer_reprepares_only_stale_fragments(
         self,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         capfd: pytest.CaptureFixture[str],
@@ -287,14 +296,14 @@ class EnrichmentConformance:
             published.get_fragment(first_id).to_table(columns=["other_writer"])["other_writer"].to_pylist()
             == ["keep"] * rows
         )
-        assert contracts.pending_fragment_ids(published, enrichment_input.bindings) == ()
+        assert inputs.pending_fragment_ids(published, enrichment_input.bindings) == ()
         if during_commit:
             assert "Retrying" in capfd.readouterr().err
 
     @pytest.mark.parametrize("append_after_commit", [False, True])
     def test_lost_commit_response_is_reconciled(
         self,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         capfd: pytest.CaptureFixture[str],
@@ -333,7 +342,7 @@ class EnrichmentConformance:
     @pytest.mark.parametrize("during_commit", [False, True])
     def test_appends_stay_pending_for_a_later_selection(
         self,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -360,9 +369,9 @@ class EnrichmentConformance:
             _append_copy(enrichment_input.dataset, spec, new_id=True)
         published = publish_results(results, enrichment_input)
         transaction = published.read_transaction(published.version)
-        assert transaction.transaction_properties[contracts.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
-        assert not contracts.input_is_validated(
-            published, fingerprint=contracts.input_fingerprint(published, enrichment_input.bindings)
+        assert transaction.transaction_properties[inputs.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
+        assert not inputs.input_is_validated(
+            published, fingerprint=inputs.input_fingerprint(published, enrichment_input.bindings)
         )
         for fragment_id, files in original_files.items():
             assert published.get_fragment(fragment_id).metadata.to_json()["files"][: len(files)] == files
@@ -372,7 +381,7 @@ class EnrichmentConformance:
             if fragment.fragment_id not in original_files
         )
         assert len(appended_ids) == 1
-        attempt = reconcile_and_select_attempt(contracts.open_enrichment_input(enrichment_input.bindings))
+        attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(enrichment_input.bindings))
         assert attempt.selected == appended_ids
         tasks = execution.selection_datasource(attempt, columns=()).get_read_tasks(2)
         assert [row[spec.id_column] for task in tasks for batch in task() for row in batch.to_pylist()] == [
@@ -380,23 +389,23 @@ class EnrichmentConformance:
         ]
 
     def test_duplicate_append_requires_validation_again(
-        self, enrichment_input: contracts.EnrichmentInput, results: pa.Table
+        self, enrichment_input: inputs.EnrichmentInput, results: pa.Table
     ) -> None:
         """Earlier validation evidence cannot hide an ID duplicated by a later append."""
         published = publish_results(results, enrichment_input)
-        assert contracts.input_is_validated(published, fingerprint=enrichment_input.fingerprint)
+        assert inputs.input_is_validated(published, fingerprint=enrichment_input.fingerprint)
         _append_copy(published, enrichment_input.bindings.spec, new_id=False)
         with pytest.raises(ValueError, match="non-null and globally unique"):
-            contracts.open_enrichment_input(enrichment_input.bindings)
+            inputs.open_enrichment_input(enrichment_input.bindings)
 
     def test_execution_tuning_keeps_the_workspace(
         self, recipe: RecipeUnderTest, config: object, dataset: lance.LanceDataset
     ) -> None:
         """Changing tuning reuses durable results; a different result contract does not."""
-        selected = contracts.pending_fragment_ids(dataset, recipe.resolve_bindings(config))
-        workspace = contracts.resolve_workspace(dataset, recipe.resolve_bindings(config), selected=selected)
-        tuned = contracts.resolve_workspace(dataset, recipe.resolve_bindings(recipe.retune(config)), selected=selected)
-        changed = contracts.resolve_workspace(
+        selected = inputs.pending_fragment_ids(dataset, recipe.resolve_bindings(config))
+        workspace = inputs.resolve_workspace(dataset, recipe.resolve_bindings(config), selected=selected)
+        tuned = inputs.resolve_workspace(dataset, recipe.resolve_bindings(recipe.retune(config)), selected=selected)
+        changed = inputs.resolve_workspace(
             dataset, recipe.resolve_bindings(recipe.recontract(config)), selected=selected
         )
         assert tuned == workspace
@@ -407,7 +416,7 @@ class EnrichmentConformance:
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -440,7 +449,7 @@ class EnrichmentConformance:
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         *,
@@ -469,7 +478,7 @@ class EnrichmentConformance:
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -494,7 +503,7 @@ class EnrichmentConformance:
             "remaining_fragments": 1,
         }
         assert (
-            contracts.pending_fragment_ids(lance.dataset(enrichment_input.dataset.uri), enrichment_input.bindings)
+            inputs.pending_fragment_ids(lance.dataset(enrichment_input.dataset.uri), enrichment_input.bindings)
             == appended_ids
         )
         assert not Path(attempt.workspace.root).exists()
@@ -503,7 +512,7 @@ class EnrichmentConformance:
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
     ) -> None:
         """Canonical completion never authorizes removing recovery state that fails validation."""
@@ -521,7 +530,7 @@ class EnrichmentConformance:
         self,
         recipe: RecipeUnderTest,
         config: object,
-        enrichment_input: contracts.EnrichmentInput,
+        enrichment_input: inputs.EnrichmentInput,
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
         capfd: pytest.CaptureFixture[str],

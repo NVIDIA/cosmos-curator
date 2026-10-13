@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.utils.misc import retry_utils
-from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment import inputs
 from cosmos_curator.next.enrichment.execution import selection_datasource
 from cosmos_curator.next.media.ffmpeg import ProbeError, TranscodeError, VideoMetadata
 from cosmos_curator.next.recipes.video_transcode import processing
@@ -22,7 +22,7 @@ from tests.cosmos_curator.next.enrichment.helpers import attempt_all
 _CLIP_BYTES = pa.field("clip_bytes", pa.large_binary(), nullable=False)
 
 
-def _read_spans(enrichment_input: contracts.EnrichmentInput) -> pa.Table:
+def _read_spans(enrichment_input: inputs.EnrichmentInput) -> pa.Table:
     """Read every pending span with row addresses, as the checkpointed plan does, without Ray."""
     datasource = selection_datasource(attempt_all(enrichment_input), columns=READ_COLUMNS)
     return pa.concat_tables([table for task in datasource.get_read_tasks(2) for table in task()])
@@ -30,7 +30,7 @@ def _read_spans(enrichment_input: contracts.EnrichmentInput) -> pa.Table:
 
 def test_download_once_and_stream_bounded_clips(
     config: ResolvedVideoTranscodeConfig,
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     source_path: Path,
     staged_schema: pa.Schema,
     monkeypatch: pytest.MonkeyPatch,
@@ -92,7 +92,7 @@ def test_upload_batch_preserves_result_schema(
 
 
 def test_download_rejects_changed_source(
-    config: ResolvedVideoTranscodeConfig, enrichment_input: contracts.EnrichmentInput, source_path: Path
+    config: ResolvedVideoTranscodeConfig, enrichment_input: inputs.EnrichmentInput, source_path: Path
 ) -> None:
     """A size mismatch fails in the download stage before scheduling any encoding."""
     spans = _read_spans(enrichment_input)
@@ -102,7 +102,7 @@ def test_download_rejects_changed_source(
 
 
 def test_download_failure_produces_no_source(
-    config: ResolvedVideoTranscodeConfig, enrichment_input: contracts.EnrichmentInput, monkeypatch: pytest.MonkeyPatch
+    config: ResolvedVideoTranscodeConfig, enrichment_input: inputs.EnrichmentInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An exhausted source read cannot reach transcoding or a durable checkpoint."""
     spans = _read_spans(enrichment_input)
@@ -138,7 +138,7 @@ def test_upload_failure_produces_no_result(
 
 
 def test_failed_ffmpeg_batch_falls_back_to_individual_spans(
-    config: ResolvedVideoTranscodeConfig, enrichment_input: contracts.EnrichmentInput, monkeypatch: pytest.MonkeyPatch
+    config: ResolvedVideoTranscodeConfig, enrichment_input: inputs.EnrichmentInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Multi-output FFmpeg failures are retried per span without losing identity."""
     spans = _read_spans(enrichment_input)
@@ -168,7 +168,7 @@ def test_failed_ffmpeg_batch_falls_back_to_individual_spans(
 @pytest.mark.parametrize("probe_recovers", [True, False])
 def test_clip_probe_retries_reuse_encoded_media(
     config: ResolvedVideoTranscodeConfig,
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     monkeypatch: pytest.MonkeyPatch,
     ffmpeg_batch_size: int,
     *,

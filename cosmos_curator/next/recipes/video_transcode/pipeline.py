@@ -1,17 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Latest Lance spans -> checkpointed clip metadata -> one Lance publication."""
+"""Latest Lance spans -> checkpointed clip metadata -> one Lance publication with video-caption's receipt."""
 
 import json
 from functools import partial
 from typing import Any, cast
 
+import lance
 import ray
 from loguru import logger
 from ray.data.context import ShuffleStrategy
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
 from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
 from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_progress,
@@ -19,14 +21,16 @@ from cosmos_curator.next.core.ray_runtime import (
     curator_io_resources,
     ensure_ray_initialized,
 )
+from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt
 from cosmos_curator.next.enrichment.contracts import EnrichmentBindings
 from cosmos_curator.next.enrichment.execution import ProcessingScope, run_enrichment
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import (
+    PUBLICATION_KEY,
+    PUBLICATION_VERSION,
     READ_COLUMNS,
-    publication_properties,
-    record_empty_receipt,
+    completed_publication,
 )
 from cosmos_curator.next.recipes.video_transcode.processing import (
     SourceDownloader,
@@ -92,6 +96,61 @@ def transcode_spans(processing: ProcessingScope, config: ResolvedVideoTranscodeC
         num_cpus=0.25,
     )
     processing.write(uploaded)
+
+
+def _publication_record(
+    bindings: EnrichmentBindings, *, source_version: int, spans: int, fragment_ids: list[int]
+) -> dict[str, str]:
+    result_contract = bindings.spec.result_contract
+    record = {
+        "publication_version": PUBLICATION_VERSION,
+        "contract_id": result_contract["transcode_contract_id"],
+        "media_root": result_contract["media_root"],
+        "source_version": source_version,
+        "spans": spans,
+        "fragment_ids": fragment_ids,
+    }
+    return {PUBLICATION_KEY: json.dumps(record, sort_keys=True)}
+
+
+def publication_properties(attempt: EnrichmentAttempt) -> dict[str, str]:
+    """Record the transcode receipt video-caption reads; shared publication records provenance and evidence."""
+    counts = attempt.counts()
+    return _publication_record(
+        attempt.input.bindings,
+        source_version=int(attempt.input.dataset.version),
+        spans=counts["input_rows"] - counts["remaining_rows"],
+        fragment_ids=list(attempt.selected),
+    )
+
+
+def record_empty_receipt(dataset: lance.LanceDataset, bindings: EnrichmentBindings) -> lance.LanceDataset:
+    """Return the table, first recording a zero-span receipt if it is empty and has none.
+
+    Temporary: video-caption requires a whole-table transcode receipt. Remove this
+    once caption checks clip readiness from data, as video-embed does. Recording
+    the receipt again is harmless, so it needs no recovery workspace: each commit
+    attempt rereads the latest table and stops once any receipt exists.
+    """
+    if dataset.count_rows() or completed_publication(dataset) is not None:
+        return dataset
+    properties = _publication_record(bindings, source_version=int(dataset.version), spans=0, fragment_ids=[])
+    storage_options = bindings.storage_options
+
+    def commit() -> lance.LanceDataset:
+        latest = lance.dataset(dataset.uri, storage_options=storage_options)
+        if completed_publication(latest) is not None:
+            return latest
+        transaction = lance.Transaction(
+            read_version=int(latest.version),
+            operation=lance.LanceOperation.Update(updated_fragments=[], fields_modified=[]),
+            transaction_properties=properties,
+        )
+        return lance.LanceDataset.commit(dataset.uri, transaction, storage_options=storage_options)
+
+    return do_with_retries(
+        commit, exceptions_to_retry=(OSError, RuntimeError), max_attempts=bindings.execution.commit_attempts
+    )
 
 
 def run_config(config: ResolvedVideoTranscodeConfig) -> dict[str, object]:

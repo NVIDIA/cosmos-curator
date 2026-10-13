@@ -16,7 +16,7 @@ import attrs
 import lance
 from loguru import logger
 
-from cosmos_curator.next.enrichment import commit, contracts
+from cosmos_curator.next.enrichment import commit, contracts, inputs
 from cosmos_curator.next.enrichment.transactions import find_transaction
 from cosmos_curator.next.enrichment.workspace import RecoveryStateError, RecoveryWorkspace
 
@@ -31,7 +31,7 @@ class EnrichmentAttempt:
     already durable. Create attempts with ``reconcile_and_select_attempt``.
     """
 
-    input: contracts.EnrichmentInput = attrs.field(eq=False, repr=False)
+    input: inputs.EnrichmentInput = attrs.field(eq=False, repr=False)
     pending: tuple[int, ...]
     selected: tuple[int, ...]
     workspace: RecoveryWorkspace | None
@@ -86,39 +86,32 @@ def _recorded_selection(workspace: RecoveryWorkspace) -> tuple[int, ...]:
     return selected
 
 
-def _invalid_receipt(problem: str, workspace: RecoveryWorkspace) -> str:
-    return (
-        f"Enrichment recovery receipt {problem}: {workspace.root}. "
-        "Inspect the table's transaction history; the workspace is retained."
-    )
-
-
 def _verify_receipt(
     dataset: lance.LanceDataset,
     spec: contracts.EnrichmentSpec,
     workspace: RecoveryWorkspace,
     selected: tuple[int, ...],
 ) -> bool:
-    """Verify the canonical owned files, returning false when no receipt exists."""
-    contracts.validate_fields(dataset, spec.input_fields)
-    contracts.validate_fields(dataset, spec.output_fields)
-    owned = set(contracts.field_ids(dataset, spec.output_fields.names).values())
+    """Verify the canonical owned files, returning false when no receipt exists.
+
+    Pending selection already validated the schema, and workspace reconciliation
+    the selected input file layout.
+    """
     transaction = find_transaction(
-        dataset, property_key=contracts.PUBLICATION_RECEIPT_KEY, property_value=workspace.manifest_digest
+        dataset, property_key=inputs.PUBLICATION_RECEIPT_KEY, property_value=workspace.manifest_digest
     )
     if transaction is None:
         return False
-    operation = transaction.operation
-    if not isinstance(operation, lance.LanceOperation.Update):
-        raise RecoveryStateError(_invalid_receipt("does not describe a column update", workspace))
-    prepared = {int(fragment.id): fragment for fragment in operation.updated_fragments}
-    if len(prepared) != len(operation.updated_fragments) or set(prepared) != set(selected):
-        raise RecoveryStateError(_invalid_receipt("does not cover its recorded selection", workspace))
-    if set(operation.fields_modified) != owned:
-        raise RecoveryStateError(_invalid_receipt("modifies an unexpected field group", workspace))
-    commit.verify_result_files(dataset, spec, tuple(prepared.values()))
+    owned = set(inputs.field_ids(dataset, spec.output_fields.names).values())
+    prepared = inputs.receipt_fragments(transaction, owned)
+    if prepared is None or set(prepared) != set(selected):
+        msg = (
+            "Enrichment recovery receipt does not update exactly the owned fields of its recorded selection: "
+            f"{workspace.root}. Inspect the table's transaction history; the workspace is retained."
+        )
+        raise RecoveryStateError(msg)
     # These are the immutable files validated before the receipted publication.
-    # Workspace reconciliation already checked the selected input file layout.
+    commit.verify_result_files(dataset, spec, tuple(prepared.values()))
     return True
 
 
@@ -152,14 +145,14 @@ class _Reconciled:
     unproven: list[RecoveryWorkspace]
 
 
-def _reconcile(enrichment_input: contracts.EnrichmentInput, pending: tuple[int, ...]) -> _Reconciled:
+def _reconcile(enrichment_input: inputs.EnrichmentInput, pending: tuple[int, ...]) -> _Reconciled:
     """Classify every discovered workspace before any cleanup changes durable state."""
     dataset, bindings = enrichment_input.dataset, enrichment_input.bindings
     reconciled = _Reconciled([], [], [])
-    prefix = contracts.workspace_prefix(dataset, bindings)
+    prefix = inputs.workspace_prefix(dataset, bindings)
     for workspace in RecoveryWorkspace.discover(prefix, storage_profile=bindings.execution.storage_profile):
         selected = _recorded_selection(workspace)
-        if contracts.resolve_workspace(dataset, bindings, selected=selected) != workspace:
+        if inputs.resolve_workspace(dataset, bindings, selected=selected) != workspace:
             msg = (
                 f"Recovery workspace does not match the current input file layout: {workspace.root}. "
                 "Its selected input changed, which shared recovery does not support; "
@@ -184,7 +177,7 @@ def _reconcile(enrichment_input: contracts.EnrichmentInput, pending: tuple[int, 
 
 
 def reconcile_and_select_attempt(
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     *,
     max_fragments: int | None = None,
 ) -> EnrichmentAttempt:
@@ -206,7 +199,7 @@ def reconcile_and_select_attempt(
         msg = "The fragment selection limit must be positive"
         raise ValueError(msg)
     dataset, bindings = enrichment_input.dataset, enrichment_input.bindings
-    pending = contracts.pending_fragment_ids(dataset, bindings)
+    pending = inputs.pending_fragment_ids(dataset, bindings)
     reconciled = _reconcile(enrichment_input, pending)
     for unproven in reconciled.unproven:
         logger.warning(
@@ -223,7 +216,7 @@ def reconcile_and_select_attempt(
         ((selected, workspace),) = reconciled.active
     else:
         selected = tuple(sorted(pending)[:max_fragments])
-        workspace = contracts.resolve_workspace(dataset, bindings, selected=selected) if selected else None
+        workspace = inputs.resolve_workspace(dataset, bindings, selected=selected) if selected else None
     if workspace is not None:
         workspace.ensure(storage_profile=bindings.execution.storage_profile)
     return EnrichmentAttempt(enrichment_input, pending, selected, workspace, cleanup_complete)

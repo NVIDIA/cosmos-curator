@@ -10,12 +10,14 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment.contracts import EnrichmentInput, open_enrichment_input
+from cosmos_curator.next.enrichment.inputs import EnrichmentInput, open_enrichment_input
 from cosmos_curator.next.recipes.video_cut.config import FixedStrideConfig
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id, span_schema
+from cosmos_curator.next.recipes.video_transcode import pipeline
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig, resolve_config_data
 from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
+from tests.cosmos_curator.next.enrichment.conformance import RecipeUnderTest
 
 
 @pytest.fixture
@@ -125,3 +127,22 @@ def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, s
                 }
             )
     return pa.Table.from_pylist(rows, schema=staged_schema)
+
+
+def _retune(config: ResolvedVideoTranscodeConfig) -> ResolvedVideoTranscodeConfig:
+    execution = config.execution.model_copy(update={"parquet_rows_per_file": 2, "transcode_memory_gib": 0.75})
+    return config.model_copy(update={"execution": execution})
+
+
+def _recontract(config: ResolvedVideoTranscodeConfig) -> ResolvedVideoTranscodeConfig:
+    return config.model_copy(update={"transcode": config.transcode.model_copy(update={"video_bitrate": "8M"})})
+
+
+# How the shared conformance suite and fresh-cluster scenario drive this recipe.
+RECIPE = RecipeUnderTest(pipeline=pipeline, resolve_bindings=resolve_bindings, retune=_retune, recontract=_recontract)
+
+
+@pytest.fixture
+def recipe() -> RecipeUnderTest:
+    """Drive the transcode pipeline with its own bindings and provenance."""
+    return RECIPE

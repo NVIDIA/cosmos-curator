@@ -63,8 +63,9 @@ Use the recipe's current design notes when changing publication or recovery. Whe
 Document how the recipe and deployment meet its assumptions, and test its guarantees.
 Start from the
 [adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-the-reference-pattern): the
-recipe's `run_config` calls `run_enrichment`, and its tests subclass the shared
-[conformance suite](../../tests/cosmos_curator/next/enrichment/conformance.py). The
+recipe's `run_config` calls `run_enrichment`, its tests subclass the shared
+[conformance suite](../../tests/cosmos_curator/next/enrichment/conformance.py), and an integration test runs the shared
+[fresh-cluster scenario](../../tests/cosmos_curator/next/enrichment/fresh_cluster.py). The
 [`enrichment` package docstring](enrichment/__init__.py) lists the rest of the recipe-facing API. Keep processing graphs,
 payload durability, and terminal-error policy recipe-owned.
 

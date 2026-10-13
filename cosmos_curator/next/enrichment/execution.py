@@ -27,11 +27,17 @@ from ray.data.expressions import col
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
 from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
-from cosmos_curator.next.enrichment import commit, contracts
+from cosmos_curator.next.enrichment import commit, contracts, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt, reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.commit import PreparedFragment
 from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem
+
+# Free-form provenance under the keys other Curator Next enrichment commits use:
+# the publishing recipe, the field set it fills, and its result contract digest.
+KIND_KEY = "kind"
+FIELD_KEY = "field"
+CONTRACT_DIGEST_KEY = "contract_digest"
 
 
 def selection_datasource(attempt: EnrichmentAttempt, *, columns: Sequence[str]) -> LanceFragmentDatasource:
@@ -56,16 +62,20 @@ def _require_publishable(block: pa.Table, *, spec: contracts.EnrichmentSpec) -> 
 
 @attrs.frozen
 class ProcessingScope:
-    """Both ends of one checkpointed read-to-Parquet plan over an attempt's selection."""
+    """Both ends of one checkpointed read-to-Parquet plan over an attempt's selection.
 
-    attempt: EnrichmentAttempt
-    workspace: RecoveryWorkspace
-    filesystem: pafs.FileSystem
+    Recipes use ``read``, ``write``, and ``staged_schema``; ``checkpointed_processing``
+    owns the attempt, workspace, and filesystem behind them.
+    """
+
+    _attempt: EnrichmentAttempt
+    _workspace: RecoveryWorkspace
+    _filesystem: pafs.FileSystem
 
     @property
     def staged_schema(self) -> pa.Schema:
         """Return the schema of rows the plan passes to ``write``; build results in it on workers."""
-        return self.attempt.input.bindings.spec.staged_schema
+        return self._attempt.input.bindings.spec.staged_schema
 
     def read(self, columns: Sequence[str], *, override_num_blocks: int | None = None) -> ray.data.Dataset:
         """Read the IDs, named input columns, and row addresses, with checkpoint filtering before expensive work.
@@ -75,7 +85,7 @@ class ProcessingScope:
         return cast(
             "ray.data.Dataset",
             ray.data.read_datasource(
-                selection_datasource(self.attempt, columns=columns),
+                selection_datasource(self._attempt, columns=columns),
                 override_num_blocks=override_num_blocks,
             ),
         )
@@ -87,7 +97,7 @@ class ProcessingScope:
         its Parquet file is written, so every row is validated first: a checkpointed
         result can always be published.
         """
-        bindings = self.attempt.input.bindings
+        bindings = self._attempt.input.bindings
         rows_per_file = bindings.execution.parquet_rows_per_file
         publishable = results.map_batches(
             partial(_require_publishable, spec=bindings.spec),
@@ -98,12 +108,12 @@ class ProcessingScope:
         )
         groups = publishable.repartition(target_num_rows_per_block=rows_per_file, strict=True)
         groups.write_parquet(
-            self.workspace.results,
-            filesystem=self.filesystem,
+            self._workspace.results,
+            filesystem=self._filesystem,
             min_rows_per_file=rows_per_file,
             max_rows_per_file=rows_per_file,
         )
-        self.workspace.record_completion(storage_profile=bindings.execution.storage_profile)
+        self._workspace.record_completion(storage_profile=bindings.execution.storage_profile)
 
 
 @contextmanager
@@ -140,7 +150,7 @@ class EnrichmentOutcome:
             **self.attempt.counts(),
             "cleanup_complete": self.cleanup_complete,
             "field_set": bindings.spec.field_set,
-            "contract_digest": bindings.contract_digest,
+            "contract_digest": bindings.spec.contract_digest,
         }
 
 
@@ -155,11 +165,11 @@ def summary_message(kind: str, summary: Mapping[str, object]) -> str:
 def _bound_workspace(attempt: EnrichmentAttempt) -> RecoveryWorkspace:
     """Reject attempts assembled by hand from a different input, selection, or workspace."""
     enrichment_input = attempt.input
-    if enrichment_input.fingerprint != contracts.input_fingerprint(enrichment_input.dataset, enrichment_input.bindings):
+    if enrichment_input.fingerprint != inputs.input_fingerprint(enrichment_input.dataset, enrichment_input.bindings):
         msg = "Publication input no longer matches the validated snapshot"
         raise ValueError(msg)
     workspace = attempt.workspace
-    if workspace is None or workspace != contracts.resolve_workspace(
+    if workspace is None or workspace != inputs.resolve_workspace(
         enrichment_input.dataset, enrichment_input.bindings, selected=attempt.selected
     ):
         msg = "Publication requires the workspace belonging to its validated input and selected fragments"
@@ -182,13 +192,13 @@ def publish_enrichment(
     enrichment_input = attempt.input
     bindings = enrichment_input.bindings
     shared = {
-        contracts.KIND_KEY: bindings.spec.owner,
-        contracts.FIELD_KEY: bindings.spec.field_set,
-        contracts.CONTRACT_DIGEST_KEY: bindings.contract_digest,
-        contracts.VALIDATED_INPUT_KEY: enrichment_input.fingerprint,
+        KIND_KEY: bindings.spec.owner,
+        FIELD_KEY: bindings.spec.field_set,
+        CONTRACT_DIGEST_KEY: bindings.spec.contract_digest,
+        inputs.VALIDATED_INPUT_KEY: enrichment_input.fingerprint,
     }
     recipe_properties = dict(transaction_properties or {})
-    if {*shared, contracts.PUBLICATION_RECEIPT_KEY} & recipe_properties.keys():
+    if {*shared, inputs.PUBLICATION_RECEIPT_KEY} & recipe_properties.keys():
         msg = "Recipe properties cannot replace the shared provenance, recovery receipt, or validation evidence"
         raise ValueError(msg)
     if not attempt.selected:
@@ -238,7 +248,7 @@ def run_enrichment(
     optionally adds recipe records that other recipes read; the shared provenance
     needs none. ``max_fragments`` bounds only a new selection.
     """
-    attempt = reconcile_and_select_attempt(contracts.open_enrichment_input(bindings), max_fragments=max_fragments)
+    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(bindings), max_fragments=max_fragments)
     if attempt.selected:
         start_ray(bindings)
         if not attempt.processing_complete():

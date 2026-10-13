@@ -9,7 +9,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment import contracts, inputs
 from tests.cosmos_curator.next.enrichment.helpers import make_bindings, validate_items
 
 
@@ -26,6 +26,7 @@ def spec() -> contracts.EnrichmentSpec:
         id_column="item_id",
         input_fields=items,
         output_fields=fields,
+        result_contract={},
         validate_batch=validate_items,
     )
 
@@ -42,4 +43,4 @@ def dataset(tmp_path: Path, spec: contracts.EnrichmentSpec) -> lance.LanceDatase
         max_rows_per_file=1,
         data_storage_version="2.2",
     )
-    return contracts.register_fields(make_bindings(uri, spec))
+    return inputs.register_fields(make_bindings(uri, spec))

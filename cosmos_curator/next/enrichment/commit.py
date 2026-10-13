@@ -26,14 +26,13 @@ from lance.fragment import FragmentMetadata
 from loguru import logger
 
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
-from cosmos_curator.next.enrichment.contracts import (
+from cosmos_curator.next.enrichment.contracts import EnrichmentBindings, EnrichmentSpec, canonical_results
+from cosmos_curator.next.enrichment.inputs import (
     PUBLICATION_RECEIPT_KEY,
-    EnrichmentBindings,
-    EnrichmentSpec,
-    canonical_results,
     field_ids,
     file_layout_digest,
     fragment_complete,
+    result_files_match,
     selected_fragments,
     validate_fields,
 )
@@ -162,7 +161,7 @@ def verify_result_files(
     owned = set(field_ids(dataset, spec.output_fields.names).values())
     for metadata in prepared:
         fragment = dataset.get_fragment(metadata.id)
-        if fragment is None or file_layout_digest(metadata, owned) != file_layout_digest(fragment.metadata, owned):
+        if fragment is None or not result_files_match(fragment, metadata, owned):
             msg = f"Published result files differ from the publication evidence for fragment {metadata.id}"
             raise ValueError(msg)
 

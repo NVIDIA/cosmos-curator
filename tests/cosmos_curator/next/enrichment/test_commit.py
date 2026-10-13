@@ -13,7 +13,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment import commit, contracts
+from cosmos_curator.next.enrichment import commit, contracts, inputs
 from tests.cosmos_curator.next.enrichment.helpers import commit_items, make_bindings, prepare_items, validate_items
 
 
@@ -48,7 +48,7 @@ def test_invalid_descriptors_cannot_publish(
         candidates.append(candidates[0])
     elif corruption == "wrong_fields":
         candidates[0] = attrs.evolve(
-            candidates[0], fields_modified=tuple(contracts.field_ids(dataset, ["item_id"]).values())
+            candidates[0], fields_modified=tuple(inputs.field_ids(dataset, ["item_id"]).values())
         )
     else:
         metadata = candidates[0].fragment.to_json()
@@ -60,7 +60,7 @@ def test_invalid_descriptors_cannot_publish(
     with pytest.raises(ValueError, match=r"exactly cover|unexpected fragment or field|unowned columns"):
         commit_items(lambda *_: candidates, dataset, spec)
     assert lance.dataset(dataset.uri).version == dataset.version
-    assert contracts.pending_fragment_ids(dataset, make_bindings(dataset.uri, spec)) == (0, 1)
+    assert inputs.pending_fragment_ids(dataset, make_bindings(dataset.uri, spec)) == (0, 1)
 
 
 @pytest.mark.parametrize("mutation", ["delete_input", "replace_result"])
@@ -142,7 +142,7 @@ def test_commit_retry_retains_prepared_files(
     assert commit_calls == (1 if committed else 2)
     assert receipt_calls == 3
     assert published.version == dataset.version + 1
-    assert contracts.pending_fragment_ids(published, make_bindings(published.uri, spec)) == ()
+    assert inputs.pending_fragment_ids(published, make_bindings(published.uri, spec)) == ()
     captured = capfd.readouterr()
     assert "receipt lookup unavailable" in captured.err
     assert "Retrying" in captured.err
@@ -155,7 +155,7 @@ def test_publication_leaves_unselected_fragments_pending(
     candidates = prepare_items(dataset, spec, (0,))
     published = commit_items(lambda *_: candidates, dataset, spec, selected=(0,))
     commit.verify_completed(original=dataset, current=published, spec=spec, selected=(0,))
-    assert contracts.pending_fragment_ids(published, make_bindings(published.uri, spec)) == (1,)
+    assert inputs.pending_fragment_ids(published, make_bindings(published.uri, spec)) == (1,)
     assert commit_items(lambda *_: candidates, dataset, spec, selected=(0,)).version == published.version
 
 
@@ -165,7 +165,7 @@ def test_publication_ignores_unselected_fragment_changes(
 ) -> None:
     """Other jobs' input and owned files do not enter this selection's guards."""
     root = str(tmp_path / "staging")
-    workspace = contracts.resolve_workspace(
+    workspace = inputs.resolve_workspace(
         dataset, make_bindings(dataset.uri, spec, staging_root=root, result_contract={}), selected=(0,)
     )
     candidates = prepare_items(dataset, spec, (0,))
@@ -192,7 +192,7 @@ def test_publication_ignores_unselected_fragment_changes(
             read_version=current.version,
         )
     assert (
-        contracts.resolve_workspace(
+        inputs.resolve_workspace(
             current, make_bindings(current.uri, spec, staging_root=root, result_contract={}), selected=(0,)
         )
         == workspace
@@ -204,7 +204,7 @@ def test_publication_ignores_unselected_fragment_changes(
     elif mutation == "input":
         assert published.get_fragment(1).to_table(columns=["uri"]).column(0).to_pylist() == ["changed.mp4"]
     else:
-        assert contracts.fragment_complete(published.get_fragment(1), spec)
+        assert inputs.fragment_complete(published.get_fragment(1), spec)
 
 
 def test_only_stale_fragments_are_reprepared(dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec) -> None:
@@ -230,8 +230,8 @@ def test_only_stale_fragments_are_reprepared(dataset: lance.LanceDataset, spec: 
 
     published = commit_items(prepare, dataset, spec)
     assert calls == [(int(dataset.version), (0, 1)), (int(current.version), (0,))]
-    owned = set(contracts.field_ids(dataset, spec.output_fields.names).values())
-    assert contracts.file_layout_digest(published.get_fragment(1).metadata, owned) == contracts.file_layout_digest(
+    owned = set(inputs.field_ids(dataset, spec.output_fields.names).values())
+    assert inputs.file_layout_digest(published.get_fragment(1).metadata, owned) == inputs.file_layout_digest(
         candidates[1].fragment, owned
     )
     assert published.get_fragment(0).to_table(columns=["unrelated"]).column(0).to_pylist() == ["keep"]
@@ -285,7 +285,7 @@ def test_terminal_validation_uses_bounded_arrow_batches(
         validate_items(batch)
 
     bounded_spec = attrs.evolve(spec, validate_batch=validate)
-    dataset = contracts.register_fields(make_bindings(uri, bounded_spec))
+    dataset = inputs.register_fields(make_bindings(uri, bounded_spec))
     candidates = prepare_items(dataset, bounded_spec)
     assert sizes == [1_024, 1_024, 1]
     sizes.clear()
@@ -323,7 +323,7 @@ def test_duplicate_input_ids_are_rejected_before_join(tmp_path: Path, spec: cont
         uri,
         data_storage_version="2.2",
     )
-    dataset = contracts.register_fields(make_bindings(uri, spec))
+    dataset = inputs.register_fields(make_bindings(uri, spec))
     with pytest.raises(ValueError, match="non-null and unique"):
         prepare_items(dataset, spec)
 
@@ -344,11 +344,12 @@ def test_terminal_validation_sees_canonical_columns(tmp_path: Path) -> None:
         id_column="item_id",
         input_fields=items,
         output_fields=contracts.owned_fields(pa.schema([vector]), owner="item-recipe", field_set="vector"),
+        result_contract={},
         validate_batch=validate,
     )
     uri = str(tmp_path / "vectors.lance")
     lance.write_dataset(pa.table({"item_id": ["a", "b"]}, schema=items), uri, data_storage_version="2.2")
-    dataset = contracts.register_fields(make_bindings(uri, spec))
+    dataset = inputs.register_fields(make_bindings(uri, spec))
     staged = pa.table(
         {"fragment_id": [0, 0], "row_offset": [0, 1], "item_id": ["a", "b"], "vector": [[1.0, 0.0], [0.0, 1.0]]},
         schema=spec.staged_schema,
@@ -359,7 +360,7 @@ def test_terminal_validation_sees_canonical_columns(tmp_path: Path) -> None:
         for row in commit.prepare_fragment(staged, bindings=bindings, version=int(dataset.version)).to_pylist()
     ]
     published = commit_items(lambda *_: candidates, dataset, spec, selected=(0,))
-    assert contracts.fragment_complete(published.get_fragment(0), spec)
+    assert inputs.fragment_complete(published.get_fragment(0), spec)
     canonical = [("item_id", pa.string()), ("vector", vector.type)]
     assert seen == [canonical, canonical]
 

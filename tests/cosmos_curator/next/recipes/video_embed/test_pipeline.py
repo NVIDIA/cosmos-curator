@@ -10,8 +10,8 @@ from ray.data import ActorPoolStrategy
 from ray.data.context import DataContext
 
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
-from cosmos_curator.next.enrichment.contracts import EnrichmentInput
 from cosmos_curator.next.enrichment.execution import checkpointed_processing
+from cosmos_curator.next.enrichment.inputs import EnrichmentInput
 from cosmos_curator.next.recipes.video_embed import pipeline, processing
 from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedConfig
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec

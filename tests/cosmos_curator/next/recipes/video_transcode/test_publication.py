@@ -15,7 +15,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.utils.misc import retry_utils
-from cosmos_curator.next.enrichment import contracts, execution
+from cosmos_curator.next.enrichment import execution, inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.recipes.video_caption.contracts import caption_contract_digest, resolve_model_spec
 from cosmos_curator.next.recipes.video_caption.lance_state import ensure_caption_fields, validate_caption_input
@@ -27,9 +27,9 @@ from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTran
 from cosmos_curator.next.recipes.video_transcode.contracts import (
     completed_publication,
     make_clip_id,
-    publication_properties,
     validate_clip_table,
 )
+from cosmos_curator.next.recipes.video_transcode.pipeline import publication_properties
 from tests.cosmos_curator.next.enrichment.helpers import prepare_results, publish_results
 from tests.cosmos_curator.next.recipes.video_caption.helpers import caption_run_bindings
 
@@ -43,7 +43,7 @@ def _append_span(dataset: lance.LanceDataset) -> lance.LanceDataset:
 
 
 def test_publication_feeds_caption(
-    enrichment_input: contracts.EnrichmentInput, dataset: lance.LanceDataset, results: pa.Table
+    enrichment_input: inputs.EnrichmentInput, dataset: lance.LanceDataset, results: pa.Table
 ) -> None:
     """The transcode receipt describes the published spans, and caption accepts the output."""
     published = publish_results(results, enrichment_input, properties=publication_properties)
@@ -58,11 +58,11 @@ def test_publication_feeds_caption(
         bindings=caption_run_bindings(spec, caption_contract_digest(spec)),
         attempts=1,
     )
-    assert contracts.open_enrichment_input(enrichment_input.bindings).dataset.version == captioned.version
+    assert inputs.open_enrichment_input(enrichment_input.bindings).dataset.version == captioned.version
 
 
 def test_next_run_fills_only_appended_fragments(
-    config: ResolvedVideoTranscodeConfig, enrichment_input: contracts.EnrichmentInput, results: pa.Table
+    config: ResolvedVideoTranscodeConfig, enrichment_input: inputs.EnrichmentInput, results: pa.Table
 ) -> None:
     """Incremental publication retains completed files and counts every published span."""
     first = publish_results(results, enrichment_input, properties=publication_properties)
@@ -76,18 +76,18 @@ def test_next_run_fills_only_appended_fragments(
         "fragment_id": 2,
         "row_offset": 0,
     }
-    current = contracts.open_enrichment_input(enrichment_input.bindings)
+    current = inputs.open_enrichment_input(enrichment_input.bindings)
     published = publish_results(
         pa.Table.from_pylist([row], schema=results.schema), current, properties=publication_properties
     )
-    assert contracts.pending_fragment_ids(published, enrichment_input.bindings) == ()
+    assert inputs.pending_fragment_ids(published, enrichment_input.bindings) == ()
     assert [fragment.metadata.to_json() for fragment in published.get_fragments()[:2]] == files
     assert completed_publication(published)["spans"] == 5
 
 
 @pytest.mark.parametrize("corruption", ["wrong-contract", "wrong-uri"])
 def test_results_must_match_the_encoding_and_destination(
-    enrichment_input: contracts.EnrichmentInput, dataset: lance.LanceDataset, results: pa.Table, corruption: str
+    enrichment_input: inputs.EnrichmentInput, dataset: lance.LanceDataset, results: pa.Table, corruption: str
 ) -> None:
     """Clip metadata from another contract or media root cannot be published."""
     rows = results.to_pylist()
@@ -103,13 +103,13 @@ def test_input_accepts_committed_fragments_without_whole_table_completion(
     """Committed fragments are independently ready even while cutting continues."""
     assert completed_cut_publication(dataset) is None
     bindings = resolve_bindings(config)
-    current = contracts.open_enrichment_input(bindings).dataset
-    assert contracts.pending_fragment_ids(current, bindings) == (0, 1)
+    current = inputs.open_enrichment_input(bindings).dataset
+    assert inputs.pending_fragment_ids(current, bindings) == (0, 1)
 
 
 def test_resumed_selection_leaves_appends_out_of_the_downstream_receipt(
     config: ResolvedVideoTranscodeConfig,
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     results: pa.Table,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

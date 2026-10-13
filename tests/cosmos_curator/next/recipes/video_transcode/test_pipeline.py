@@ -11,7 +11,7 @@ from ray.data._internal.execution.execution_callback import ExecutionCallback
 from ray.data.context import DataContext
 
 from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
-from cosmos_curator.next.enrichment import contracts
+from cosmos_curator.next.enrichment import inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.execution import checkpointed_processing
 from cosmos_curator.next.recipes.video_transcode import pipeline, processing
@@ -20,7 +20,7 @@ from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTran
 
 def test_download_admission_is_actor_bound_and_plan_scoped(
     config: ResolvedVideoTranscodeConfig,
-    enrichment_input: contracts.EnrichmentInput,
+    enrichment_input: inputs.EnrichmentInput,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ready actors own the IO budget; neither startup capacity nor ambient settings fix the pool size."""

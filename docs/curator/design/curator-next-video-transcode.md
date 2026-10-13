@@ -155,8 +155,9 @@ Ray records a span ID. Source access, FFmpeg, probe, and upload failures stop th
 retries. Failed spans are never marked complete or silently omitted. The recipe currently has no quarantine
 or terminal bad-media rows, so a completed fragment supplies a usable clip for every span.
 
-Local tests exercise native checkpoint recovery across two fresh Ray clusters and a disjoint schema commit, including
-a source spanning multiple Lance fragments, plus actual CPU FFmpeg encoding and publication. The shared conformance
+Local tests run the shared fresh-cluster scenario: native checkpoint recovery across two fresh Ray clusters and a
+disjoint schema commit, including a source spanning multiple Lance fragments, then publication through the recipe's
+`run_config`. Separate tests cover actual CPU FFmpeg encoding and publication. The shared conformance
 suite runs against transcode's span fixtures, covering incomplete result rejection despite a processing marker, an
 ambiguous commit response, concurrent writers, and cleanup failure; recipe tests cover the downstream receipt, empty
 input, and clip validation. See the [shared validation criteria](curator-next-checkpoint-recovery.md#validation-and-adoption-criteria).

@@ -198,8 +198,10 @@ cosmos-curator slurm ray submit CLUSTER_CONFIG -- pixi run --as-is run-pipeline 
 
 CPU unit coverage includes sample indices for short clips, media failure classification,
 Parquet null-vector round trips, output validation, and caption coexistence. The shared conformance suite runs against
-embedding's clip fixtures, covering coverage rejection, concurrent writers, ambiguous publication, and recovery. A CPU integration test uses model stand-ins to run the native Ray plan across fresh local clusters
-with one `curator_io` slot and verifies that previously checkpointed clips are neither downloaded nor inferred again.
+embedding's clip fixtures, covering coverage rejection, concurrent writers, ambiguous publication, and recovery. A CPU
+integration test runs the shared fresh-cluster scenario with model stand-ins: the native Ray plan resumes across fresh
+local clusters with one `curator_io` slot, previously checkpointed clips are neither downloaded nor inferred again,
+and the recipe's `run_config` publishes the result.
 Each observed download also asserts that it holds its IO resource. GPU tests verify short-clip repeats and reordered
 frames against a full CPU decode with an RGB rounding tolerance, compare all three variants' preprocessing and visual
 output with direct pinned-processor/model calls, and exercise the complete recipe.
