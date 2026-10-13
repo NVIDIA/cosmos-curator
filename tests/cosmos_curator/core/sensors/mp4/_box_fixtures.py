@@ -161,6 +161,7 @@ def synthetic_fragmented_moov(
     include_elst: bool = False,
     include_trex: bool = True,
     trex_sample_duration: int = 0,
+    stbl_extra_children: bytes = b"",
     minf_extra_children: bytes = b"",
     mdia_extra_children: bytes = b"",
 ) -> bytes:
@@ -176,7 +177,7 @@ def synthetic_fragmented_moov(
     if extradata is None:
         extradata = bytes([1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 0])
     stsd = avc1_stsd(width, height, extradata) if fourcc == "avc1" else hevc_stsd(width, height)
-    stbl = pack_box("stbl", stsd)
+    stbl = pack_box("stbl", stsd + stbl_extra_children)
     minf = pack_box("minf", stbl + minf_extra_children)
     mdhd = pack_full_box("mdhd", 0, struct.pack(">III", 0, 0, timescale) + struct.pack(">I", duration))
     mdia = pack_box("mdia", mdhd + minf + mdia_extra_children)
@@ -356,3 +357,11 @@ def synthetic_moov(
     trak = pack_box("trak", tkhd + mdia + edts)
     mvhd = mvhd_box(version=mvhd_version)
     return pack_box("moov", mvhd + trak + moov_extra_children)
+
+
+def synthetic_nonfragmented_mp4(moov_box: bytes, *, frame_count: int) -> bytes:
+    """Wrap a synthetic moov in a file with payload bytes covering its sample ranges."""
+    prefix = pack_box("ftyp", b"isom") + moov_box
+    # synthetic_moov places one chunk at 5000, with sample sizes 1000, 1001, ... .
+    media_end = 5000 + sum(range(1000, 1000 + frame_count))
+    return prefix + pack_box("mdat", bytes(media_end - len(prefix) - 8))

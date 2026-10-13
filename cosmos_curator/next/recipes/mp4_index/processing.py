@@ -62,6 +62,10 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
 _VIDEO_ONLY_FIELDS = tuple(set(VIDEO_MANIFEST_SCHEMA.names) - {"video_id", "media_location"})
 
 
+class InvalidFrameByteRangeError(UnindexableVideoError):
+    """An indexed frame's byte range lies outside the source media."""
+
+
 def failed_result(row: dict[str, Any], error: Exception) -> dict[str, Any]:
     """Retain source fields and clear derived fields for a failed video."""
     return {
@@ -82,6 +86,19 @@ def _file_size(media_location: str, storage_client: StorageClient | None) -> int
             raise UnindexableVideoError(msg)
         return size_bytes
     return pathlib.Path(media_location).stat().st_size
+
+
+def _validate_frame_byte_ranges(video_track: VideoTrack, file_size: int) -> None:
+    """Reject out-of-file ranges before assembling a successful video record."""
+    # Subtract from the file size to avoid overflowing int64 when a range extends past EOF.
+    remaining = file_size - video_track.offset.clip(min=0)
+    invalid = (video_track.offset < 0) | (video_track.size < 0) | (video_track.size > remaining)
+    if invalid.any():
+        index = int(invalid.argmax())
+        offset = int(video_track.offset[index])
+        size = int(video_track.size[index])
+        msg = f"Frame {index} has byte range [{offset}, {offset + size}) outside media size {file_size}"
+        raise InvalidFrameByteRangeError(msg)
 
 
 def _standard_frame_columns(video_track: VideoTrack) -> pa.RecordBatch:
@@ -318,6 +335,8 @@ def _parse_mp4(
     moov_bytes: bytes,
     moof_rows: list[tuple[int, bytes]] | None,
     extension_factory: Mp4ExtensionFactory | None,
+    *,
+    file_size: int,
 ) -> tuple[Mp4Extraction, pa.LargeListArray]:
     try:
         extension = extension_factory(media_location) if extension_factory is not None else None
@@ -336,6 +355,7 @@ def _parse_mp4(
         if isinstance(exc.error, UnindexableVideoError):
             raise exc.error from exc
         raise _ExtensionContractError(exc.error) from exc
+    _validate_frame_byte_ranges(track, file_size)
     extraction = Mp4Extraction(media_location, track, moov_bytes, moof_rows)
     standard = _standard_frame_columns(track)
     if extension is None:
@@ -391,7 +411,7 @@ def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing s
                     output_transport_params=output_transport_params,
                 )
                 served_from_cache = served_from_cache or moof_from_cache
-            return _parse_mp4(media_location, moov_bytes, moof_rows, extension_factory)
+            return _parse_mp4(media_location, moov_bytes, moof_rows, extension_factory, file_size=file_size)
         except _ExtensionSetupError as exc:
             raise exc.error from exc
         except (UnindexableVideoError, pa.ArrowInvalid, OverflowError, _CachedBoxReadError) as exc:

@@ -29,13 +29,14 @@ import struct
 import sys
 from typing import Any, Self
 
+import av
 import pyarrow as pa
 import pytest
 import smart_open  # type: ignore[import-untyped]
 
 from cosmos_curator.core.sensors.data.mp4 import InvalidTimeBaseError
 from cosmos_curator.core.sensors.mp4 import box_locate
-from cosmos_curator.core.sensors.mp4.box_primitives import AmbiguousVideoTrackError
+from cosmos_curator.core.sensors.mp4.box_primitives import AmbiguousVideoTrackError, find_box
 from cosmos_curator.core.sensors.mp4.box_traversal import BoxLocation, UuidHandler
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.fragment_table import CompositionOffsetUnsupportedError
@@ -79,7 +80,7 @@ def _write_synthetic_nonfragmented_mp4(
         tkhd_height=tkhd_height,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bf.pack_box("ftyp", b"isom") + moov_box + bf.pack_box("mdat", b"data"))
+    path.write_bytes(bf.synthetic_nonfragmented_mp4(moov_box, frame_count=frame_count))
     return moov_box
 
 
@@ -99,10 +100,16 @@ def _write_synthetic_fragmented_mp4(
     path.parent.mkdir(parents=True, exist_ok=True)
     buf = bf.pack_box("ftyp", b"isom") + moov_box
     written_rows: list[tuple[int, bytes]] = []
-    for _, moof_box in rows:
+    for _, supplied_moof in rows:
+        moof_box = supplied_moof
+        if moof_rows is None:
+            moof = bytearray(moof_box)
+            start, _end = find_box(moof, ("moof", "traf", "trun"), 0, len(moof))
+            struct.pack_into(">i", moof, start + 8, len(moof) + 8)
+            moof_box = bytes(moof)
         written_rows.append((len(buf), moof_box))
         buf += moof_box
-        buf += bf.pack_box("mdat", b"video-bytes" * 20)
+        buf += bf.pack_box("mdat", b"video-bytes" * 50)
     path.write_bytes(buf)
     return moov_box, written_rows
 
@@ -151,6 +158,145 @@ def _call(
         {"video_id": make_video_id(str(media_path)), "media_location": str(media_path)},
         config=config,
     )
+
+
+@pytest.fixture
+def fragmented_mp4(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Copy the real 48-frame, two-fragment MP4 into a discoverable source path."""
+    fixture = pathlib.Path(__file__).parents[3] / "core/sensors/mp4/data/multi_sample_trun.mp4"
+    media_path = tmp_path / "session-a" / "unit-00" / "video.mp4"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(fixture.read_bytes())
+    return media_path
+
+
+@pytest.fixture(params=["negative_start", "start_past_eof", "end_past_eof"])
+def invalid_fragmented_mp4(fragmented_mp4: pathlib.Path, request: pytest.FixtureRequest) -> pathlib.Path:
+    """Corrupt a sample range in the real MP4's second fragment without changing its payload."""
+    data = bytearray(fragmented_mp4.read_bytes())
+    with fragmented_mp4.open("rb") as handle:
+        moofs = list(processing.walk_moofs(len(data), handle, chunk_bytes=1024))
+    moof_start, moof_bytes = moofs[-1]
+    trun_start, _end = find_box(moof_bytes, ("moof", "traf", "trun"), 0, len(moof_bytes))
+    # This fixture has data-offset, first-sample-flags, and a size for each sample.
+    assert int.from_bytes(moof_bytes[trun_start + 1 : trun_start + 4], "big") == 0x205
+    sample_count = struct.unpack_from(">I", moof_bytes, trun_start + 4)[0]
+    if request.param == "end_past_eof":
+        struct.pack_into(">I", data, moof_start + trun_start + 16 + 4 * (sample_count - 1), len(data) + 1)
+    else:
+        offset = -(2**31) if request.param == "negative_start" else 2**31 - 1
+        struct.pack_into(">i", data, moof_start + trun_start + 8, offset)
+    fragmented_mp4.write_bytes(data)
+    return fragmented_mp4
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_process_one_video_rejects_invalid_sample_ranges_without_decoding(
+    tmp_path: pathlib.Path,
+    invalid_fragmented_mp4: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    *,
+    cached: bool,
+) -> None:
+    """Out-of-file sample ranges become failed rows with no derived frame index."""
+
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    def unexpected_decode(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Invalid sample ranges must be rejected without decoding")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
+    monkeypatch.setattr(av, "open", unexpected_decode)
+    if cached:
+        _call(tmp_path, invalid_fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+        capfd.readouterr()
+
+    result = _call(tmp_path, invalid_fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "InvalidFrameByteRangeError"
+    assert "byte range" in result["error_message"]
+    assert result["frames"] is None
+    assert result["metadata"] is None
+    captured = capfd.readouterr()
+    assert "could not be indexed" in captured.err
+    assert ("invalid cached boxes" in captured.err) == cached
+
+
+def test_process_one_video_indexes_real_multi_sample_fragments(
+    fragmented_mp4: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The unmodified fixture still yields a complete 48-frame index."""
+    result = _call(tmp_path, fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+
+    assert result["status"] == "success"
+    frame_table, metadata = read_video_record(processing.result_table(result))
+    assert frame_table.num_rows == metadata["frame_count"] == 48
+
+
+@pytest.mark.parametrize("layout", ["negative_relative_offset", "end_at_eof"])
+def test_process_one_video_accepts_valid_sample_range_boundaries(
+    fragmented_mp4: pathlib.Path, tmp_path: pathlib.Path, layout: str
+) -> None:
+    """Valid signed offsets and samples ending exactly at EOF preserve the full index."""
+    original = _call(tmp_path, fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+    original_frames, _metadata = read_video_record(processing.result_table(original))
+    data = bytearray(fragmented_mp4.read_bytes())
+    if layout == "end_at_eof":
+        last = original_frames.to_pylist()[-1]
+        del data[last["offset"] + last["size"] :]
+    else:
+        with fragmented_mp4.open("rb") as handle:
+            moof_start, moof_bytes = list(processing.walk_moofs(len(data), handle, chunk_bytes=1024))[-1]
+        tfhd_start, _end = find_box(moof_bytes, ("moof", "traf", "tfhd"), 0, len(moof_bytes))
+        trun_start, _end = find_box(moof_bytes, ("moof", "traf", "trun"), 0, len(moof_bytes))
+        assert int.from_bytes(moof_bytes[tfhd_start + 1 : tfhd_start + 4], "big") & 1
+        base = struct.unpack_from(">Q", moof_bytes, tfhd_start + 8)[0]
+        relative_offset = struct.unpack_from(">i", moof_bytes, trun_start + 8)[0]
+        struct.pack_into(">Q", data, moof_start + tfhd_start + 8, base + relative_offset + 32)
+        struct.pack_into(">i", data, moof_start + trun_start + 8, -32)
+    fragmented_mp4.write_bytes(data)
+
+    result = _call(tmp_path, fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED, skip_existing_sidecars=False)
+
+    assert result["status"] == "success"
+    frames, _metadata = read_video_record(processing.result_table(result))
+    assert frames.num_rows == 48
+    assert frames.equals(original_frames)
+
+
+def test_process_one_video_refetches_cached_out_of_file_ranges(
+    fragmented_mp4: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Bad ranges in cached boxes are repaired when the source file remains valid."""
+
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
+    first = _call(tmp_path, fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+    assert first["status"] == "success"
+    cache_path = str(tmp_path / "moof" / f"{first['video_id']}.arrow")
+    original = processing.read_arrow_sidecar(cache_path, transport_params=None)
+    rows = original.to_pylist()
+    moof = bytearray(rows[-1]["moof_bytes"])
+    start, _end = find_box(moof, ("moof", "traf", "trun"), 0, len(moof))
+    struct.pack_into(">i", moof, start + 8, -(2**31))
+    rows[-1]["moof_bytes"] = bytes(moof)
+    processing.write_arrow_sidecar(rows, original.schema, cache_path)
+
+    result = _call(tmp_path, fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
+
+    assert result["status"] == "success"
+    frames, _metadata = read_video_record(processing.result_table(result))
+    assert frames.num_rows == 48
+    assert processing.read_arrow_sidecar(cache_path, transport_params=None).equals(original)
+    assert "invalid cached boxes; refetching from the source" in capfd.readouterr().err
 
 
 def test_make_fetch_range_threads_transport_params_through_unmodified(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -435,7 +581,7 @@ def test_process_one_video_reuses_cached_moov_without_touching_the_source_file(
 
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     media_path.parent.mkdir(parents=True, exist_ok=True)
-    media_path.write_bytes(b"not-a-real-mp4")  # never read when the moov sidecar already exists
+    media_path.write_bytes(bytes(real_media_path.stat().st_size))  # never read on a moov cache hit
 
     video_id = make_video_id(str(media_path))
     write_bytes_sidecar(real_moov_bytes, str(tmp_path / "moov" / f"{video_id}.moov"))
@@ -964,7 +1110,7 @@ def test_uuid_callback_bugs_propagate_without_cache_recovery(
         ctts_offset=None,
         stbl_extra_children=bf.uuid_box(identifier, b"payload"),
     )
-    media.write_bytes(bf.pack_box("ftyp", b"isom") + moov + bf.pack_box("mdat", b"data"))
+    media.write_bytes(bf.synthetic_nonfragmented_mp4(moov, frame_count=1))
     row = {"video_id": make_video_id(str(media)), "media_location": str(media)}
     config = _config_stub(tmp_path)
     assert processing.process_one_video(row, config=config)["status"] == "success"

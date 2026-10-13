@@ -341,12 +341,12 @@ def test_parse_fragment_table_raises_when_sample_size_is_unresolved_by_trun_tfhd
         ft.parse_fragment_table(moov, moof_rows)
 
 
-def test_parse_fragment_table_raises_when_trun_carries_more_than_one_sample() -> None:
-    """Refused: a multi-sample trun (see this module's own refusal policy)."""
+def test_parse_fragment_table_raises_when_trun_sample_entries_are_truncated() -> None:
+    """The run declares two samples but contains only one entry."""
     moov = bf.synthetic_fragmented_moov()
     moof_rows = [_moof(moof_start=1000, decode_time=0, data_offset=32, sample_size=500, sample_count=2)]
 
-    with pytest.raises(ft.FragmentLayoutUnsupportedError, match="2 samples"):
+    with pytest.raises(MalformedBoxHeaderError, match="truncated sample entries"):
         ft.parse_fragment_table(moov, moof_rows)
 
 

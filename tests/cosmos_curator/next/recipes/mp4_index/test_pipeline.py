@@ -58,10 +58,10 @@ from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
 from tests.cosmos_curator.next.recipes.mp4_index._record_fixtures import _FRAME_ROWS, _METADATA_ROW
 
 
-def _write_synthetic_nonfragmented_mp4(path: pathlib.Path) -> None:
+def _write_synthetic_nonfragmented_mp4(path: pathlib.Path, *, frame_count: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    moov_box = bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None)
-    path.write_bytes(bf.pack_box("ftyp", b"isom") + moov_box + bf.pack_box("mdat", b"data"))
+    moov_box = bf.synthetic_moov(frame_count=frame_count, keyframe_index=0, ctts_offset=None)
+    path.write_bytes(bf.synthetic_nonfragmented_mp4(moov_box, frame_count=frame_count))
 
 
 def _write_synthetic_fragmented_mp4(path: pathlib.Path) -> None:
@@ -481,14 +481,15 @@ def test_run_config_reuses_already_extracted_sidecars_via_the_caching_guard(
     """
     del curator_io_cluster
     media_path = tmp_path / "input" / "sess-a" / "unit-00" / "camera.mp4"
-    _write_synthetic_nonfragmented_mp4(media_path)
+    _write_synthetic_nonfragmented_mp4(media_path, frame_count=5)
 
     cfg = _resolved_config(tmp_path)
     video_id = make_video_id(str(media_path))
     moov_box = bf.synthetic_moov(frame_count=5, keyframe_index=0, ctts_offset=None)
     write_bytes_sidecar(moov_box, str(tmp_path / "output" / "moov" / f"{video_id}.moov"))
     # Corrupt the media file after its sidecars are pre-populated -- a real refetch would fail.
-    media_path.write_bytes(bf.pack_box("ftyp", b"isom") + bf.pack_box("mdat", b"data"))
+    prefix = bf.pack_box("ftyp", b"isom")
+    media_path.write_bytes(prefix + bf.pack_box("mdat", bytes(media_path.stat().st_size - len(prefix) - 8)))
 
     summary = pipeline.run_config(cfg)
 

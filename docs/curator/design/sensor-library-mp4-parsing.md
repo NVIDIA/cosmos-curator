@@ -153,11 +153,21 @@ Nonfragmented sample tables must agree on frame count: `stsz` and the expanded `
 `co64` mapping must cover the samples defined by `stts`; `ctts`, when present, must cover that same
 sample count. B-frame composition offsets are retained for presentation-time calculation.
 
-Fragmented support remains limited to one sample in the selected `trun` of each `moof`, with
-`default-base-is-moof` in `tfhd` and an explicit `trun` data offset. Sample size, flags, and duration
-are resolved from `trun`, then `tfhd`, then `trex` defaults. The parser supports these field variations
-rather than requiring one fixed flag combination. Nonzero fragment composition offsets are rejected;
-multiple tracks, track fragments, or runs per fragment are not generally supported.
+Fragmented support covers single-track, single-run profiles: one track in `moov`, one `traf`
+and one nonempty `trun` per `moof`, with a `tfdt` decode time and an explicit `trun.data_offset`.
+Initial sample tables in `moov` must be absent or empty. Files combining initial `moov` samples
+with `moof` samples are rejected, because this path indexes only the fragment samples.
+Each fragment's `tfhd.track_ID` must match the track selected from `moov`, and `tfdt` must use
+version 0 or 1; unknown decode-time layouts are rejected.
+The base is either `tfhd.base_data_offset` or `default-base-is-moof`; implicit addressing and
+multiple tracks or runs are refused. Sample durations, sizes, and flags resolve from `trun`,
+then `tfhd`, then `trex`. First-sample flags apply only to the first sample. Multi-sample runs
+require durations to compute subsequent decode timestamps. Nonzero fragment composition offsets
+are rejected.
+
+Both single-sample camera fragments and FFmpeg `frag_keyframe+empty_moov` output are covered.
+The checked-in two-fragment fixture is verified against PyAV packet timestamps, positions, sizes,
+keyframe flags, and payload bytes.
 
 Fragmented duration comes from the decode-time span plus the last sample's duration. If that duration
 is missing, the parser estimates it from the mean decode interval; a single sample uses its available

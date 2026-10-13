@@ -139,6 +139,10 @@ source file replaced in place between two runs would read back stale bytes.
 | Manifest table has rows from a different contract/schema version | Whole run refuses before dispatch |
 | Extension contract violations or unexpected extension errors | Whole run fails; no per-video error row |
 
+Before assembling a successful video record, the recipe checks every frame's byte range against
+the source file size. Negative offsets or sizes and ranges extending past EOF produce an
+`InvalidFrameByteRangeError` per-video failure without decoding frames.
+
 Extensions report malformed source data through explicit `UnindexableVideoError` subclasses.
 Refusals from extension construction or handler registration become per-video failures without
 cache recovery. Refusals after parsing cached boxes may trigger the same one-time refetch as

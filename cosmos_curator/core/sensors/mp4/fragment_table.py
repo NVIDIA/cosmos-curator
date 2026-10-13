@@ -16,13 +16,15 @@
 """Decode a fragmented MP4's ``moov`` and every ``moof``/``traf``/``trun`` into :class:`VideoTrack`."""
 
 import struct
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 from cosmos_curator.core.sensors.mp4.box_primitives import (
     BoxNotFoundError,
     MalformedBoxHeaderError,
+    find_all_boxes,
     find_box,
     read_box_header,
 )
@@ -61,19 +63,25 @@ _MIN_SAMPLES_FOR_A_DURATION_SPAN = 2
 
 
 class FragmentLayoutUnsupportedError(UnindexableVideoError):
-    """A fragment's layout doesn't match what every real production file examined so far looks like."""
+    """A fragment uses a layout outside the supported single-track, single-run profiles."""
 
 
 class CompositionOffsetUnsupportedError(UnindexableVideoError):
     """A sample carries a nonzero composition time offset -- never observed in real production data."""
 
 
-def _parse_tfhd(buf: bytes, start: int) -> dict[str, int | bool | None]:
+def _parse_tfhd(buf: bytes, start: int, end: int, *, expected_track_id: int | None) -> dict[str, int | bool | None]:
     """Parse ``tfhd``'s content into the fields a fragment's sample may need."""
-    flags = int.from_bytes(buf[start + 1 : start + 4], "big")
-    pos = start + 4  # skip version(1) + flags(3)
-    pos += 4  # track_ID, unused here -- a camera recording has exactly one track
+    buf = buf[start:end]
+    flags = int.from_bytes(buf[1:4], "big")
+    track_id = struct.unpack_from(">I", buf, 4)[0]
+    if track_id != expected_track_id:
+        msg = f"tfhd at offset {start}: track ID {track_id} does not match moov track ID {expected_track_id}"
+        raise FragmentLayoutUnsupportedError(msg)
+    pos = 8  # FullBox header and track_ID; only single-track files are supported.
+    base_data_offset = None
     if flags & _TFHD_BASE_DATA_OFFSET_PRESENT:
+        base_data_offset = struct.unpack_from(">Q", buf, pos)[0]
         pos += 8
     sample_description_index = None
     if flags & _TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT:
@@ -92,6 +100,7 @@ def _parse_tfhd(buf: bytes, start: int) -> dict[str, int | bool | None]:
         default_sample_flags = struct.unpack_from(">I", buf, pos)[0]
         pos += 4
     return {
+        "base_data_offset": base_data_offset,
         "default_base_is_moof": bool(flags & _TFHD_DEFAULT_BASE_IS_MOOF),
         "sample_description_index": sample_description_index,
         "default_sample_duration": default_sample_duration,
@@ -103,25 +112,42 @@ def _parse_tfhd(buf: bytes, start: int) -> dict[str, int | bool | None]:
 def _parse_tfdt(buf: bytes, start: int) -> int:
     """Parse ``tfdt``'s ``baseMediaDecodeTime`` (version-0 32-bit or version-1 64-bit)."""
     version = buf[start]
+    if version not in (0, 1):
+        msg = f"tfdt at offset {start}: unsupported version {version}"
+        raise FragmentLayoutUnsupportedError(msg)
     if version == 1:
         return int(struct.unpack_from(">Q", buf, start + 4)[0])
     return int(struct.unpack_from(">I", buf, start + 4)[0])
 
 
-def _parse_trun(buf: bytes, start: int) -> dict[str, int | None]:
-    """Parse a single-sample ``trun`` -- any other sample count is refused rather than guessed at.
+@dataclass(frozen=True)
+class _TrackRun:
+    sample_count: int
+    data_offset: int | None
+    first_sample_flags: int | None
+    durations: list[int] | None
+    sizes: list[int] | None
+    flags: list[int] | None
+    composition_offsets: list[int] | None
 
-    Raises:
-        FragmentLayoutUnsupportedError: ``sample_count`` is not exactly 1.
 
-    """
-    flags = int.from_bytes(buf[start + 1 : start + 4], "big")
-    sample_count = struct.unpack_from(">I", buf, start + 4)[0]
-    if sample_count != 1:
-        msg = f"trun at offset {start} carries {sample_count} samples, expected exactly 1"
+def _parse_trun(buf: bytes, start: int, end: int) -> _TrackRun:
+    """Read a run's sample columns within its declared box bounds."""
+    buf = buf[start:end]
+    version = buf[0]
+    if version not in (0, 1):
+        msg = f"trun at offset {start}: unsupported version {version}"
+        raise FragmentLayoutUnsupportedError(msg)
+    flags = int.from_bytes(buf[1:4], "big")
+    sample_count = struct.unpack_from(">I", buf, 4)[0]
+    if sample_count == 0:
+        msg = f"trun at offset {start}: empty runs are unsupported"
+        raise FragmentLayoutUnsupportedError(msg)
+    if flags & _TRUN_FIRST_SAMPLE_FLAGS_PRESENT and flags & _TRUN_SAMPLE_FLAGS_PRESENT:
+        msg = f"trun at offset {start}: first-sample flags and per-sample flags are mutually exclusive"
         raise FragmentLayoutUnsupportedError(msg)
 
-    pos = start + 8
+    pos = 8
     data_offset = None
     if flags & _TRUN_DATA_OFFSET_PRESENT:
         data_offset = struct.unpack_from(">i", buf, pos)[0]
@@ -130,29 +156,33 @@ def _parse_trun(buf: bytes, start: int) -> dict[str, int | None]:
     if flags & _TRUN_FIRST_SAMPLE_FLAGS_PRESENT:
         first_sample_flags = struct.unpack_from(">I", buf, pos)[0]
         pos += 4
-    sample_duration = None
-    if flags & _TRUN_SAMPLE_DURATION_PRESENT:
-        sample_duration = struct.unpack_from(">I", buf, pos)[0]
-        pos += 4
-    sample_size = None
-    if flags & _TRUN_SAMPLE_SIZE_PRESENT:
-        sample_size = struct.unpack_from(">I", buf, pos)[0]
-        pos += 4
-    sample_flags = None
-    if flags & _TRUN_SAMPLE_FLAGS_PRESENT:
-        sample_flags = struct.unpack_from(">I", buf, pos)[0]
-        pos += 4
-    sample_composition_offset = None
-    if flags & _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT:
-        sample_composition_offset = struct.unpack_from(">i", buf, pos)[0]
-        pos += 4
-    return {
-        "data_offset": data_offset,
-        "sample_duration": sample_duration,
-        "sample_size": sample_size,
-        "sample_flags": first_sample_flags if first_sample_flags is not None else sample_flags,
-        "sample_composition_offset": sample_composition_offset,
-    }
+
+    columns = _parse_sample_columns(buf, pos, sample_count, flags, version)
+    return _TrackRun(sample_count, data_offset, first_sample_flags, *columns)
+
+
+def _parse_sample_columns(
+    buf: bytes, pos: int, count: int, flags: int, version: int
+) -> tuple[list[int] | None, list[int] | None, list[int] | None, list[int] | None]:
+    fields = (
+        _TRUN_SAMPLE_DURATION_PRESENT,
+        _TRUN_SAMPLE_SIZE_PRESENT,
+        _TRUN_SAMPLE_FLAGS_PRESENT,
+        _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT,
+    )
+    columns: list[list[int] | None] = [[] if flags & field else None for field in fields]
+    entry_size = 4 * sum(column is not None for column in columns)
+    if pos + count * entry_size > len(buf):
+        msg = "trun contains truncated sample entries"
+        raise MalformedBoxHeaderError(msg)
+    if entry_size:
+        for _ in range(count):
+            for field, column in zip(fields, columns, strict=True):
+                if column is not None:
+                    fmt = ">i" if field == _TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT and version == 1 else ">I"
+                    column.append(struct.unpack_from(fmt, buf, pos)[0])
+                    pos += 4
+    return columns[0], columns[1], columns[2], columns[3]
 
 
 def _parse_trex_defaults(moov_buf: bytes, moov_content_start: int, moov_content_end: int) -> dict[str, int | None]:
@@ -165,72 +195,82 @@ def _parse_trex_defaults(moov_buf: bytes, moov_content_start: int, moov_content_
     return {"default_sample_duration": duration or None, "default_sample_size": size, "default_sample_flags": flags}
 
 
+def _find_single_box(buf: bytes, name: str, start: int, end: int) -> tuple[int, int]:
+    boxes = find_all_boxes(buf, name, start, end)
+    if not boxes:
+        msg = f"{name} not found"
+        raise BoxNotFoundError(msg)
+    if len(boxes) != 1:
+        msg = f"expected exactly one {name}, found {len(boxes)}"
+        raise FragmentLayoutUnsupportedError(msg)
+    return boxes[0]
+
+
+def _sample_value(
+    column: list[int] | None, index: int, tfhd_default: int | None, trex_default: int | None
+) -> int | None:
+    if column is not None:
+        return column[index]
+    return tfhd_default if tfhd_default is not None else trex_default
+
+
 def _parse_fragment(
-    moof_start: int,
-    moof_bytes: bytes,
+    moof_row: tuple[int, bytes],
     trex_defaults: dict[str, int | None],
     *,
     uuid_handlers: Sequence[UuidHandler],
     fragment_index: int,
-) -> tuple[int, int, bool, int, int | None]:
-    """Parse one ``moof``'s single sample into ``(offset, size, is_keyframe, decode_time, sample_duration)``.
-
-    Args:
-        moof_start: the ``moof`` box's absolute offset in the source file.
-        moof_bytes: the entire ``moof`` box, header included.
-        trex_defaults: this video's ``mvex``/``trex`` fallback, parsed once from ``moov``.
-        uuid_handlers: invocation-local handlers for visited UUID boxes.
-        fragment_index: position in the supplied fragment rows.
-
-    Raises:
-        FragmentLayoutUnsupportedError: the fragment's ``tfhd``/``trun`` don't match the one
-            shape verified against production files; refused rather than guessed at.
-        CompositionOffsetUnsupportedError: the sample carries a nonzero composition time offset.
-
-    """
+    expected_track_id: int | None,
+) -> Iterator[tuple[int, int, bool, int, int | None]]:
+    """Yield each sample's offset, size, keyframe flag, DTS, and duration in file order."""
+    moof_start, moof_bytes = moof_row
     _box_type, box_size, header_len = read_box_header(moof_bytes, 0, len(moof_bytes))
-    moof_content_start, moof_content_end = header_len, box_size
+    _find_single_box(moof_bytes, "traf", header_len, box_size)
     traversal = BoxTraversal(moof_bytes, uuid_handlers=uuid_handlers)
-    moof_scope = BoxScope(moof_content_start, moof_content_end, ("moof",), fragment_index=fragment_index)
+    moof_scope = BoxScope(header_len, box_size, ("moof",), fragment_index=fragment_index)
     traf = traversal.find(moof_scope, ("traf",))
-    tfhd_start, _tfhd_end = find_box(moof_bytes, ("tfhd",), traf.content_start, traf.end)
-    track_id = struct.unpack_from(">I", moof_bytes, tfhd_start + 4)[0]
+    tfhd_start, tfhd_end = _find_single_box(moof_bytes, "tfhd", traf.content_start, traf.end)
+    tfhd = _parse_tfhd(moof_bytes, tfhd_start, tfhd_end, expected_track_id=expected_track_id)
+    track_id = struct.unpack_from(">I", moof_bytes[tfhd_start:tfhd_end], 4)[0]
     traf_scope = traf.child_scope(track_id=track_id)
-    tfhd_start, _tfhd_end = traversal.find_bounds(traf_scope, ("tfhd",))
-    tfhd = _parse_tfhd(moof_bytes, tfhd_start)
-    tfdt_start, _tfdt_end = traversal.find_bounds(traf_scope, ("tfdt",))
-    decode_time = _parse_tfdt(moof_bytes, tfdt_start)
-    trun_start, _trun_end = traversal.find_bounds(traf_scope, ("trun",))
-    trun = _parse_trun(moof_bytes, trun_start)
+    traversal.scan_children(traf_scope)
+    tfdt_start, tfdt_end = _find_single_box(moof_bytes, "tfdt", traf.content_start, traf.end)
+    decode_time = _parse_tfdt(moof_bytes[tfdt_start:tfdt_end], 0)
+    trun_start, trun_end = _find_single_box(moof_bytes, "trun", traf.content_start, traf.end)
+    trun = _parse_trun(moof_bytes, trun_start, trun_end)
 
-    if trun["sample_composition_offset"]:
+    if trun.composition_offsets is not None and any(trun.composition_offsets):
         msg = f"moof at offset {moof_start}: trun carries a nonzero composition time offset"
         raise CompositionOffsetUnsupportedError(msg)
-    if not tfhd["default_base_is_moof"]:
-        msg = f"moof at offset {moof_start}: tfhd lacks default-base-is-moof -- unverified layout"
-        raise FragmentLayoutUnsupportedError(msg)
-    if trun["data_offset"] is None:
+    base_offset = tfhd["base_data_offset"]
+    if base_offset is None:
+        if not tfhd["default_base_is_moof"]:
+            msg = f"moof at offset {moof_start}: tfhd lacks base-data-offset and default-base-is-moof"
+            raise FragmentLayoutUnsupportedError(msg)
+        base_offset = moof_start
+    if trun.data_offset is None:
         msg = f"moof at offset {moof_start}: trun lacks data-offset-present -- unverified layout"
         raise FragmentLayoutUnsupportedError(msg)
+    absolute_offset = base_offset + trun.data_offset
 
-    sample_size = trun["sample_size"] if trun["sample_size"] is not None else tfhd["default_sample_size"]
-    if sample_size is None:
-        sample_size = trex_defaults["default_sample_size"]
-    sample_flags = trun["sample_flags"] if trun["sample_flags"] is not None else tfhd["default_sample_flags"]
-    if sample_flags is None:
-        sample_flags = trex_defaults["default_sample_flags"]
-    if sample_size is None or sample_flags is None:
-        msg = f"moof at offset {moof_start}: sample size/flags unresolved by trun, tfhd, or trex"
-        raise FragmentLayoutUnsupportedError(msg)
-
-    is_keyframe = not bool(sample_flags & _SAMPLE_IS_NON_SYNC_SAMPLE_BIT)
-    absolute_offset = moof_start + trun["data_offset"]
-    sample_duration = (
-        trun["sample_duration"] if trun["sample_duration"] is not None else tfhd["default_sample_duration"]
-    )
-    if sample_duration is None:
-        sample_duration = trex_defaults["default_sample_duration"]
-    return absolute_offset, sample_size, is_keyframe, decode_time, sample_duration
+    for index in range(trun.sample_count):
+        size = _sample_value(trun.sizes, index, tfhd["default_sample_size"], trex_defaults["default_sample_size"])
+        flags = _sample_value(trun.flags, index, tfhd["default_sample_flags"], trex_defaults["default_sample_flags"])
+        if index == 0 and trun.first_sample_flags is not None:
+            flags = trun.first_sample_flags
+        if size is None or flags is None:
+            msg = f"moof at offset {moof_start}: sample size/flags unresolved by trun, tfhd, or trex"
+            raise FragmentLayoutUnsupportedError(msg)
+        duration = _sample_value(
+            trun.durations, index, tfhd["default_sample_duration"], trex_defaults["default_sample_duration"]
+        )
+        if duration is None and index + 1 < trun.sample_count:
+            msg = f"moof at offset {moof_start}: sample duration unresolved by trun, tfhd, or trex"
+            raise FragmentLayoutUnsupportedError(msg)
+        yield absolute_offset, size, not bool(flags & _SAMPLE_IS_NON_SYNC_SAMPLE_BIT), decode_time, duration
+        absolute_offset += size
+        if duration is not None:
+            decode_time += duration
 
 
 def parse_fragment_table(
@@ -274,6 +314,17 @@ def _duration_from_decode_times(decode_times: list[int], sample_durations: list[
     return span + last_interval
 
 
+def _reject_initial_samples(buf: bytes, stbl_scope: BoxScope) -> None:
+    """Refuse initial sample tables that the fragment-only index would silently omit."""
+    for name in ("stts", "stsz", "stz2", "stsc", "stco", "co64"):
+        for start, end in find_all_boxes(buf, name, stbl_scope.start, stbl_scope.end):
+            count_offset = 8 if name in ("stsz", "stz2") else 4
+            count = struct.unpack_from(">I", buf[start:end], count_offset)[0]
+            if count:
+                msg = f"moov contains a nonempty {name} table; initial samples alongside fragments are unsupported"
+                raise FragmentLayoutUnsupportedError(msg)
+
+
 def _parse_fragment_table(
     moov_bytes: bytes, moof_rows: list[tuple[int, bytes]], *, uuid_handlers: Sequence[UuidHandler]
 ) -> VideoTrack:
@@ -282,6 +333,7 @@ def _parse_fragment_table(
         msg = f"expected a moov box, found {box_type!r}"
         raise BoxNotFoundError(msg)
     moov_start, moov_end = header_len, box_size
+    _find_single_box(moov_bytes, "trak", moov_start, moov_end)
 
     traversal = BoxTraversal(moov_bytes, uuid_handlers=uuid_handlers)
     moov_scope = BoxScope(moov_start, moov_end, ("moov",))
@@ -290,6 +342,7 @@ def _parse_fragment_table(
     # so UUID handlers registered for mdia/minf are dispatched with track context.
     traversal.find(trak_scope, ("mdia", "minf", "stbl"))
     traversal.scan_children(stbl_scope)
+    _reject_initial_samples(moov_bytes, stbl_scope)
 
     mvhd_start, mvhd_end = traversal.find_bounds(moov_scope, ("mvhd",))
     movie_header = MovieHeader.parse(moov_bytes, mvhd_start, mvhd_end)
@@ -314,15 +367,19 @@ def _parse_fragment_table(
     is_keyframe: list[bool] = []
     decode_times: list[int] = []
     sample_durations: list[int | None] = []
-    for fragment_index, (moof_start, moof_bytes) in enumerate(moof_rows):
-        offset, size, keyframe, decode_time, sample_duration = _parse_fragment(
-            moof_start, moof_bytes, trex_defaults, uuid_handlers=uuid_handlers, fragment_index=fragment_index
-        )
-        offsets.append(offset)
-        sizes.append(size)
-        is_keyframe.append(keyframe)
-        decode_times.append(decode_time)
-        sample_durations.append(sample_duration)
+    for fragment_index, moof_row in enumerate(moof_rows):
+        for offset, size, keyframe, decode_time, sample_duration in _parse_fragment(
+            moof_row,
+            trex_defaults,
+            uuid_handlers=uuid_handlers,
+            fragment_index=fragment_index,
+            expected_track_id=trak_scope.track_id,
+        ):
+            offsets.append(offset)
+            sizes.append(size)
+            is_keyframe.append(keyframe)
+            decode_times.append(decode_time)
+            sample_durations.append(sample_duration)
 
     return VideoTrack(
         timescale=media_header.timescale,
