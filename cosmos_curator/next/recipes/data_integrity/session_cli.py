@@ -62,12 +62,14 @@ from cosmos_curator.next.recipes.data_integrity.cli_support import (
     ERROR_EXIT_CODE,
     FAIL_EXIT_CODE,
     PASS_EXIT_CODE,
+    add_index_args,
     add_session_threshold_args,
     add_threshold_args,
     available_cpu_count,
     interrupt_guard,
     non_empty_str,
     non_negative_int,
+    open_index_manifest,
     positive_finite_float,
     positive_int,
     raise_if_interrupted,
@@ -169,6 +171,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "(default: on). stdout stays a clean report / JSON payload. Use --no-progress to silence."
         ),
     )
+    add_index_args(parser)
     add_threshold_args(parser)
     add_session_threshold_args(parser)
     add_store_args(parser)
@@ -367,6 +370,9 @@ def _run(
     """
     thresholds = thresholds_from_args(args)
     try:
+        index_lookup = open_index_manifest(
+            args.index_manifest, s3_profile_name=args.s3_profile_name, endpoint_url=endpoint_url
+        )
         report = run_session(
             args.session_path,
             expected_hz=args.expected_hz,
@@ -377,6 +383,7 @@ def _run(
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
             endpoint_url=endpoint_url,
+            index_lookup=index_lookup,
             max_workers=args.max_workers,
             cancel=interrupted,
             on_stream_start=progress.start if progress else None,

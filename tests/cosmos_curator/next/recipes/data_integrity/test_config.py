@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, MAX_PERCENT
 from cosmos_curator.next.recipes.data_integrity import config
+from cosmos_curator.next.utils.uris import normalize_location
 
 
 def _config_data(**overrides: Any) -> dict[str, Any]:  # noqa: ANN401 -- test builder, one block per key
@@ -167,6 +168,34 @@ def test_an_s3_store_root_is_left_verbatim() -> None:
     resolved = config.resolve_config_data(_config_data(output={"store_root": "s3://bucket/di-store/"}))
 
     assert resolved.output.store_root == "s3://bucket/di-store/"
+
+
+def test_no_index_manifest_is_the_default() -> None:
+    """Reading from an index is opt-in, so a config that says nothing gets the old behaviour."""
+    assert config.resolve_config_data(_config_data()).input.index_manifest_uri is None
+
+
+def test_an_index_manifest_is_normalized_the_way_mp4_index_normalizes_its_output() -> None:
+    """The two recipes have to arrive at one spelling or the lookup silently misses."""
+    resolved = config.resolve_config_data(_config_data(input={"sessions": ["/data/clips/one"]}))
+    assert resolved.input.index_manifest_uri is None
+
+    named = config.resolve_config_data(
+        _config_data(input={"sessions": ["/data/clips/one"], "index_manifest_uri": "~/di_index/smoke/manifest.lance"})
+    )
+
+    assert named.input.index_manifest_uri == normalize_location("~/di_index/smoke/manifest.lance")
+
+
+def test_an_s3_index_manifest_survives_resolution() -> None:
+    """The shared case: an index built once and read by every machine checking the corpus."""
+    resolved = config.resolve_config_data(
+        _config_data(
+            input={"sessions": ["/data/clips/one"], "index_manifest_uri": "s3://bucket/mp4-index/manifest.lance"}
+        )
+    )
+
+    assert resolved.input.index_manifest_uri == "s3://bucket/mp4-index/manifest.lance"
 
 
 def test_stream_globs_reach_the_resolved_input_as_a_tuple() -> None:

@@ -65,7 +65,7 @@ class _FakeSensor:
         self._ts = np.array(timestamps, dtype=np.int64)
         self.has_bframes = has_bframes
         self.codec_name = codec_name
-        self.video_metadata = SimpleNamespace(avg_frame_rate=avg_frame_rate)
+        self.avg_frame_rate = avg_frame_rate
         self._timestamp_source = timestamp_source
 
     @property

@@ -61,6 +61,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader, raise_if_interrupted
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
+from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 from cosmos_curator.next.recipes.data_integrity.sources import error_code, http_status, run_checks
 
 
@@ -221,6 +222,7 @@ def run_one_stream(  # noqa: PLR0913
     cancel: threading.Event | None = None,
     max_attempts: int = 1,
     raise_infrastructure_errors: bool = False,
+    index_lookup: Mp4IndexLookup | None = None,
 ) -> StreamResult:
     """Open a single stream and run the integrity metrics, capturing failures as ERROR.
 
@@ -250,6 +252,8 @@ def run_one_stream(  # noqa: PLR0913
             operator is watching. A run over thousands of streams wants ``True``: at
             that scale an environment failure would otherwise be persisted as a
             finding about the data, and outlive the run that manufactured it.
+        index_lookup: optional opened ``mp4-index`` manifest; a stream it covers is
+            measured from the index rather than by opening the video.
 
     Returns:
         The stream's result, carrying ``error`` when it could not be measured.
@@ -275,6 +279,7 @@ def run_one_stream(  # noqa: PLR0913
                 azure_profile_name=azure_profile_name,
                 endpoint_url=endpoint_url,
                 stream_wrapper=stream_wrapper,
+                index_lookup=index_lookup,
             )
         # A session is a batch: one unreadable or malformed stream must not abandon the
         # ones behind it, and the set of exceptions PyAV, botocore, and smart_open can
@@ -360,6 +365,7 @@ def run_session(  # noqa: PLR0913
     on_stream_start: Callable[[int, int, str], None] | None = None,
     on_stream_finish: Callable[[int, int, StreamResult], None] | None = None,
     make_stream_wrapper: Callable[[int, int, str], Callable[[BinaryIO], BinaryIO]] | None = None,
+    index_lookup: Mp4IndexLookup | None = None,
 ) -> SessionReport:
     """Discover and run integrity metrics over every stream in one session.
 
@@ -399,6 +405,10 @@ def run_session(  # noqa: PLR0913
         make_stream_wrapper: optional factory called with ``(index, total, source)``
             that returns a stream wrapper for that stream (e.g. a byte-counting
             reader for download progress), for local paths as well as cloud URIs.
+        index_lookup: optional opened ``mp4-index`` manifest, shared across every
+            stream in the session. Streams it covers are measured from the index
+            instead of being opened; the rest are unaffected, and discovery still
+            lists the session either way.
 
     Returns:
         A :class:`SessionReport` with one :class:`StreamResult` per discovered stream,
@@ -455,6 +465,7 @@ def run_session(  # noqa: PLR0913
             endpoint_url=endpoint_url,
             stream_wrapper=_wrapper_for(index, source),
             cancel=cancel,
+            index_lookup=index_lookup,
         )
         # Checked again because the stream may have *succeeded* despite the abort: libav
         # can swallow it and finish off a truncated source, and that verdict is no more

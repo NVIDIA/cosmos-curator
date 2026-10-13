@@ -24,7 +24,7 @@ import pytest
 
 from cosmos_curator.core.sensors.data_integrity.results import CheckResult, ResolvedConfig, VideoInfo
 from cosmos_curator.core.sensors.types.types import TimestampSource
-from cosmos_curator.next.recipes.data_integrity import cli
+from cosmos_curator.next.recipes.data_integrity import cli, cli_support
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     DEFAULT_THRESHOLDS,
     ERROR_EXIT_CODE,
@@ -41,6 +41,73 @@ def _stub_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the check phase succeed so a test can isolate the reporting phase."""
     monkeypatch.setattr(cli, "validate_source", lambda _source: None)
     monkeypatch.setattr(cli, "run_checks", lambda *_a, **_k: ([], None, None))
+
+
+def test_a_run_without_the_index_flag_never_reaches_for_a_manifest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reading from the index is opt-in, so an unflagged run must not open a dataset."""
+    seen: dict[str, object] = {}
+
+    def _run_checks(_source: str, **kwargs: object) -> EngineRun:
+        seen.update(kwargs)
+        return ([], None, None)
+
+    monkeypatch.setattr(cli, "validate_source", lambda _source: None)
+    monkeypatch.setattr(cli, "run_checks", _run_checks)
+    monkeypatch.setattr(cli, "_render_human", lambda *_a, **_k: "")
+    monkeypatch.setattr(
+        cli_support.Mp4IndexLookup, "open", staticmethod(lambda *_a, **_k: pytest.fail("opened a manifest unasked"))
+    )
+
+    assert cli.main(["--source", "video.mp4"]) == PASS_EXIT_CODE
+    assert seen["index_lookup"] is None
+    capsys.readouterr()
+
+
+def test_the_index_flag_hands_run_checks_the_opened_manifest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI opens the manifest once and passes it down; run_checks decides per stream."""
+    lookup = object()
+    seen: dict[str, object] = {}
+
+    def _run_checks(_source: str, **kwargs: object) -> EngineRun:
+        seen.update(kwargs)
+        return ([], None, None)
+
+    monkeypatch.setattr(cli, "validate_source", lambda _source: None)
+    monkeypatch.setattr(cli, "run_checks", _run_checks)
+    monkeypatch.setattr(cli, "_render_human", lambda *_a, **_k: "")
+    monkeypatch.setattr(cli_support.Mp4IndexLookup, "open", staticmethod(lambda *_a, **_k: lookup))
+
+    assert (
+        cli.main(["--source", "video.mp4", "--index-manifest", "s3://bucket/mp4-index/manifest.lance"])
+        == PASS_EXIT_CODE
+    )
+    assert seen["index_lookup"] is lookup
+    capsys.readouterr()
+
+
+def test_an_unreadable_manifest_is_reported_as_the_manifest_failing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The run still fails, but it names the manifest rather than the video."""
+
+    def _explode(*_args: object, **_kwargs: object) -> object:
+        msg = "manifest.lance has 3 row(s) at a record_schema_version other than 5"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(cli, "validate_source", lambda _source: None)
+    monkeypatch.setattr(cli_support.Mp4IndexLookup, "open", staticmethod(_explode))
+
+    exit_code = cli.main(["--source", "video.mp4", "--index-manifest", "s3://bucket/mp4-index/manifest.lance"])
+
+    assert exit_code == ERROR_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "--index-manifest s3://bucket/mp4-index/manifest.lance could not be read" in stderr
+    assert "record_schema_version" in stderr, "the underlying reason has to survive the rewrap"
+    assert "video.mp4" not in stderr, "the source is not what failed"
 
 
 def _raise_render(*_args: object, **_kwargs: object) -> str:

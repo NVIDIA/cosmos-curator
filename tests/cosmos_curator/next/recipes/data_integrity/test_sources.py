@@ -22,17 +22,28 @@ import threading
 from collections.abc import Callable
 from typing import BinaryIO
 
+import attrs
 import av
 import botocore.exceptions
 import numpy as np
 import numpy.typing as npt
 import pytest
 
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
+from cosmos_curator.core.sensors.data_integrity.results import CheckResult
+from cosmos_curator.core.sensors.mp4.box_locate import get_moov_auto
+from cosmos_curator.core.sensors.mp4.moov import parse_video_track
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader
+from cosmos_curator.next.recipes.data_integrity.index_source import (
+    IndexRecordUnusableError,
+    Mp4IndexSensor,
+)
 from cosmos_curator.next.recipes.data_integrity.session_runner import is_infrastructure_error
 from cosmos_curator.next.recipes.data_integrity.sources import (
     SOURCE_SENSOR_TIMESTAMPS_SUFFIX,
+    observed_size_bytes,
     open_source,
     read_sensor_timestamps,
     run_checks,
@@ -491,3 +502,246 @@ def test_a_bad_sensor_timeline_is_not_mistaken_for_an_unreachable_one() -> None:
     # A missing object is a fact about the dataset, so it stays a finding rather than
     # an absence of one -- which is why the 404 family is not infrastructure.
     assert not is_infrastructure_error(FileNotFoundError("front.mp4"))
+
+
+def _index_for(video_bytes: bytes) -> tuple[Mp4FrameIndex, Mp4Metadata]:
+    """Build the index and metadata mp4-index would store for *video_bytes*.
+
+    Parses the real boxes rather than hand-writing a row, so these tests go through the
+    same arithmetic a manifest row did.
+    """
+
+    def _fetch(offset: int, length: int) -> bytes:
+        return video_bytes[offset : offset + length]
+
+    track = parse_video_track(get_moov_auto(len(video_bytes), _fetch))
+    return Mp4FrameIndex.from_video_track(track), Mp4Metadata.from_video_track(track)
+
+
+class _StubLookup:
+    """An Mp4IndexLookup stand-in holding one prebuilt record, keyed by the path it covers.
+
+    These tests are about which sensor ``run_checks`` chooses; the manifest read itself
+    is covered in ``test_index_source``. ``media_size_bytes`` is recorded and not acted
+    on, which is what lets these tests prove "the video was never opened" by deleting
+    it -- the real guard needs the object there to size it.
+    """
+
+    def __init__(self, covered: str, video_bytes: bytes) -> None:
+        self._covered = covered
+        self._index, self._metadata = _index_for(video_bytes)
+        self.asked: list[str] = []
+        self.sizes: list[int | None] = []
+
+    def sensor_for(
+        self,
+        source: str,
+        *,
+        media_size_bytes: int | None,
+        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None,
+    ) -> Mp4IndexSensor | None:
+        self.asked.append(source)
+        self.sizes.append(media_size_bytes)
+        if source != self._covered:
+            return None
+        try:
+            return Mp4IndexSensor(self._index, self._metadata, sensor_timestamps_ns=sensor_timestamps_ns)
+        except IndexRecordUnusableError:
+            return None
+
+
+def _comparable(results: list[CheckResult]) -> list[tuple[object, ...]]:
+    """Reduce each result to the values a store row and a report line are built from."""
+    return [(r.name, r.status, r.reason, r.measurement, r.evaluation) for r in results]
+
+
+def test_an_indexed_stream_is_measured_without_opening_the_video(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """The timeline comes from the index, proven by deleting the file after building it."""
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+    lookup = _StubLookup(str(clip), video_bytes)
+    clip.unlink()
+
+    _results, info, _cfg = run_checks(str(clip), expected_hz=None, index_lookup=lookup)  # type: ignore[arg-type]
+
+    assert info.num_samples == 30
+    assert info.timestamp_source is TimestampSource.CONTAINER_DTS
+    assert lookup.asked == [str(clip)]
+
+
+def test_an_unindexed_stream_falls_back_to_opening_the_video(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """Only part of a dataset is ever indexed, so a miss has to stay an ordinary check."""
+    covered = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    covered.write_bytes(video_bytes)
+    other = tmp_path / "rear.mp4"
+    other.write_bytes(h264_video(frames=20))
+
+    _results, info, _cfg = run_checks(
+        str(other),
+        expected_hz=None,
+        index_lookup=_StubLookup(str(covered), video_bytes),  # type: ignore[arg-type]
+    )
+
+    assert info.num_samples == 20, "the fallback measured the index's video instead of this one"
+
+
+def test_the_index_is_not_consulted_for_a_stream_it_cannot_describe(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """A manifest row is keyed by file, not by track, so it cannot answer for stream 1."""
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+    lookup = _StubLookup(str(clip), video_bytes)
+
+    with pytest.raises(IndexError):
+        run_checks(str(clip), expected_hz=None, stream_idx=1, index_lookup=lookup)  # type: ignore[arg-type]
+
+    assert lookup.asked == [], "the index answered for a stream it does not describe"
+
+
+def test_a_sensor_timeline_is_still_preferred_over_the_indexed_one(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """A recorder's own clock beats the container's whichever way the container was read.
+
+    The index supplies the frame count the sidecar is checked against, so this keeps
+    sensor provenance without opening the video.
+    """
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+    sensor_ns = _SENSOR_EPOCH_NS + np.arange(30, dtype=np.int64) * 33_333_333
+    _write_sensor_timeline(clip, sensor_ns)
+    lookup = _StubLookup(str(clip), video_bytes)
+    clip.unlink()
+
+    _results, info, _cfg = run_checks(str(clip), expected_hz=None, index_lookup=lookup)  # type: ignore[arg-type]
+
+    assert info.timestamp_source is TimestampSource.SENSOR
+    assert info.start_ns == int(sensor_ns[0])
+    assert info.end_ns == int(sensor_ns[-1])
+
+
+def test_a_sidecar_the_index_cannot_account_for_falls_back_to_the_video(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """The index counts every sample while a timeline has one entry per displayable frame.
+
+    The frame index has no ``is_discard`` column, so a mismatch means the record cannot
+    answer and the video decides whether the sidecar fits.
+    """
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+    _write_sensor_timeline(clip, _SENSOR_EPOCH_NS + np.arange(29, dtype=np.int64) * 33_333_333)
+
+    with pytest.raises(ValueError, match="29 observations but the stream has 30 displayable frames"):
+        run_checks(str(clip), expected_hz=None, index_lookup=_StubLookup(str(clip), video_bytes))  # type: ignore[arg-type]
+
+
+def test_a_stream_without_reordering_measures_identically_either_way(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """With no composition offsets, decode timestamps are the presentation timestamps.
+
+    So the index has to produce the same timeline, bounds, and verdicts as the walk.
+    """
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+
+    walked_results, walked_info, walked_cfg = run_checks(str(clip), expected_hz=None)
+    indexed_results, indexed_info, indexed_cfg = run_checks(
+        str(clip),
+        expected_hz=None,
+        index_lookup=_StubLookup(str(clip), video_bytes),  # type: ignore[arg-type]
+    )
+
+    # Everything but the clock's name, which differs by design.
+    assert indexed_info.timestamp_source is TimestampSource.CONTAINER_DTS
+    assert walked_info.timestamp_source is TimestampSource.CONTAINER_PTS
+    assert attrs.evolve(indexed_info, timestamp_source=walked_info.timestamp_source) == walked_info
+    assert indexed_cfg == walked_cfg
+    # Compared field by field rather than as whole CheckResults: the frozen measurements
+    # are attrs classes with eq=False, so two separately computed ones are never equal
+    # however identical their values. These fields are what the store and the report
+    # read, and they compare by value.
+    assert _comparable(indexed_results) == _comparable(walked_results)
+
+
+def test_a_stream_with_b_frames_measures_identically_too(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """The divergence B-frames cause is narrower than "DTS is not PTS" suggests.
+
+    This clip's ``ctts`` is one constant delay that its ``elst`` cancels exactly -- the
+    shape common encoders emit -- so the presentation timestamps are the decode
+    timestamps and every verdict matches. Only the clock's name differs.
+    """
+    clip = tmp_path / "bframes.mp4"
+    video_bytes = h264_video(bframes=2)
+    clip.write_bytes(video_bytes)
+
+    walked_results, walked_info, _walked_cfg = run_checks(str(clip), expected_hz=None)
+    indexed_results, indexed_info, _indexed_cfg = run_checks(
+        str(clip),
+        expected_hz=None,
+        index_lookup=_StubLookup(str(clip), video_bytes),  # type: ignore[arg-type]
+    )
+
+    # Every frame carries the same nonzero offset, and both sides still say True:
+    # libavcodec's flag is the reorder-buffer depth the SPS declares, not an
+    # observation that frames moved, so testing these offsets for variance rather than
+    # presence would make the index answer False where CameraSensor answers True.
+    offsets = _index_for(video_bytes)[0].composition_offset_ticks
+    assert offsets is not None
+    assert len(np.unique(offsets)) == 1, "the fixture is the uniform-offset case, not per-frame offsets"
+    assert offsets[0] != 0
+    assert walked_info.has_bframes is True
+    assert indexed_info.has_bframes is True, "composition offsets are how the index sees reordering"
+    assert indexed_info.timestamp_source is TimestampSource.CONTAINER_DTS
+    assert attrs.evolve(indexed_info, timestamp_source=walked_info.timestamp_source) == walked_info
+    assert _comparable(indexed_results) == _comparable(walked_results)
+    assert np.all(np.diff(_index_for(video_bytes)[0].dts_ns) > 0), "why ordering goes quiet"
+
+
+def test_the_index_is_told_how_large_the_video_is_now(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """Without this the staleness guard has nothing to compare against and would never fire."""
+    clip = tmp_path / "front.mp4"
+    video_bytes = h264_video(frames=30)
+    clip.write_bytes(video_bytes)
+    lookup = _StubLookup(str(clip), video_bytes)
+
+    run_checks(str(clip), expected_hz=None, index_lookup=lookup)  # type: ignore[arg-type]
+
+    assert lookup.sizes == [len(video_bytes)]
+
+
+def test_a_local_video_is_sized_without_being_read(tmp_path: pathlib.Path) -> None:
+    """One ``os.stat``, which is the local arm of the guard's single metadata lookup."""
+    clip = tmp_path / "front.mp4"
+    clip.write_bytes(b"0123456789")
+
+    assert observed_size_bytes(str(clip)) == 10
+
+
+def test_a_video_that_cannot_be_sized_reports_nothing_rather_than_raising(tmp_path: pathlib.Path) -> None:
+    """Being unable to decide is an answer: the caller reads the video, as it would with no index."""
+    assert observed_size_bytes(str(tmp_path / "absent.mp4")) is None

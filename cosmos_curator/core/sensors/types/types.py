@@ -56,12 +56,18 @@ class TimestampSource(enum.Enum):
     per file, so a timeline from this source can be a metronome that says nothing about
     what the hardware did.
 
-    Reported so a reader can tell those two apart, because their timing numbers do not
+    ``CONTAINER_DTS`` -- the container's decode timestamps, read from a stored frame
+    index. These carry the same caveat as ``CONTAINER_PTS``. They are also always
+    increasing, because decode order is, so the ordering metric cannot report a problem
+    against them.
+
+    Reported so a reader can tell these apart, because their timing numbers do not
     mean the same thing and nothing in the numbers themselves gives it away.
     """
 
     SENSOR = "sensor"
     CONTAINER_PTS = "container_pts"
+    CONTAINER_DTS = "container_dts"
 
 
 class VideoIndexCreationMethod(enum.Enum):

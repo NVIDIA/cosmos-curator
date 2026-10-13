@@ -25,6 +25,10 @@ functions sit in the recipe rather than beside the metrics they call.
 
 Both entry points build on :func:`run_checks`: the single-video ``di-check`` CLI
 (:mod:`.cli`) and the concurrent session runner (:mod:`.session_runner`).
+
+Given an ``mp4-index`` manifest, a stream the manifest covers takes its timeline from
+the index instead of being opened (:mod:`.index_source`). Every other stream is opened
+as usual, whether the manifest has no row for it or the row it has cannot be used.
 """
 
 import pathlib
@@ -45,6 +49,8 @@ from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
 from cosmos_curator.core.utils.storage_cli import open_storage_source
+from cosmos_curator.next.recipes.data_integrity import storage_io
+from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 
 
 def _as_data_source(stream: BinaryIO) -> DataSource:
@@ -359,6 +365,32 @@ def read_sensor_timestamps(
     return sensor_timestamps_ns
 
 
+def observed_size_bytes(
+    source: str,
+    *,
+    s3_profile_name: str | None = None,
+    azure_profile_name: str = "default",
+    endpoint_url: str | None = None,
+) -> int | None:
+    """Return how many bytes sit at *source* now, or ``None`` if the size cannot be read.
+
+    Costs one metadata lookup: a ``HEAD`` for a cloud object, an ``os.stat`` for a file.
+    Both are best effort, and the caller opens the video when the answer is ``None``.
+    """
+    if is_remote_path(source):
+        stat = storage_io.object_stat(
+            source,
+            s3_profile_name=s3_profile_name,
+            azure_profile_name=azure_profile_name,
+            endpoint_url=endpoint_url,
+        )
+        return None if stat is None else stat.size_bytes
+    try:
+        return pathlib.Path(source).stat().st_size
+    except OSError:
+        return None
+
+
 def run_checks(  # noqa: PLR0913
     source: str,
     *,
@@ -371,8 +403,9 @@ def run_checks(  # noqa: PLR0913
     endpoint_url: str | None = None,
     stats: dict[str, float] | None = None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
+    index_lookup: Mp4IndexLookup | None = None,
 ) -> tuple[list[CheckResult], VideoInfo, ResolvedConfig]:
-    """Open ``source``, build a :class:`CameraSensor`, and run every metric on it.
+    """Open ``source``, build a sensor over it, and run every metric on it.
 
     The I/O wrapper around :func:`~cosmos_curator.core.sensors.data_integrity.engine.run_metrics`:
     it resolves the local path or cloud stream, constructs the sensor, and delegates
@@ -403,6 +436,11 @@ def run_checks(  # noqa: PLR0913
         stream_wrapper: optional wrapper applied to every stream this opens -- the
             sensor timeline as well as the video (e.g. a byte-counting reader for
             progress), for local paths as well as cloud URIs.
+        index_lookup: optional opened ``mp4-index`` manifest. When it holds a usable row
+            for ``source``, the timeline comes from that row instead of from the video;
+            otherwise the video is opened. Costs one metadata lookup per stream, to
+            confirm the row still describes the bytes there. Consulted only for
+            ``stream_idx`` 0, since a manifest row is keyed by file, not by track.
 
     Returns:
         The tuple returned by ``run_metrics``.
@@ -434,6 +472,26 @@ def run_checks(  # noqa: PLR0913
             f"so it cannot be applied to stream_idx {stream_idx}; only stream 0 is defined"
         )
         raise ValueError(msg)
+    # A manifest row is keyed by file, not by track, so it only describes the stream
+    # the indexer chose. Any other stream_idx is opened instead.
+    if index_lookup is not None and stream_idx == 0:
+        t0 = time.perf_counter()
+        indexed = index_lookup.sensor_for(
+            source,
+            media_size_bytes=observed_size_bytes(
+                source,
+                s3_profile_name=s3_profile_name,
+                azure_profile_name=azure_profile_name,
+                endpoint_url=endpoint_url,
+            ),
+            sensor_timestamps_ns=sensor_timestamps_ns,
+        )
+        if indexed is not None:
+            if stats is not None:
+                stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
+            return run_metrics(
+                indexed, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats
+            )
     with open_source(
         source,
         s3_profile_name=s3_profile_name,

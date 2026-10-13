@@ -341,6 +341,11 @@ class McapCameraSensor:
         return decoder.video_metadata(frame, timeline_ns=np.array(timeline_ns, dtype=np.int64))
 
     @property
+    def avg_frame_rate(self) -> Fraction:
+        """Nominal frame rate derived from the topic's timeline, or ``Fraction(0)`` if indeterminate."""
+        return self.video_metadata.avg_frame_rate
+
+    @property
     def start_ns(self) -> int:
         """Earliest frame time on this topic, in nanoseconds."""
         return self._mcap.start_ns

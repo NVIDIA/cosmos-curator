@@ -42,6 +42,8 @@ from contextlib import contextmanager
 from typing import BinaryIO, cast
 
 from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, MAX_PERCENT, Thresholds
+from cosmos_curator.core.utils.storage_cli import StorageCliError
+from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 
 # Shared process exit codes for both CLIs. Keep them together so a wrapper can
 # depend on one contract: PASS / FAIL / ERROR / interrupted, never two variants
@@ -296,6 +298,43 @@ def available_cpu_count() -> int:
     if sched_getaffinity is not None:
         return max(1, len(sched_getaffinity(0)))
     return max(1, os.cpu_count() or 1)
+
+
+def add_index_args(parser: argparse.ArgumentParser) -> None:
+    """Add the flag pointing a run at an ``mp4-index`` manifest."""
+    parser.add_argument(
+        "--index-manifest",
+        type=non_empty_str,
+        default=None,
+        metavar="URI",
+        help=(
+            "Read frame timestamps from this mp4-index manifest.lance instead of opening "
+            "each video. Timestamps read this way are the container's decode timestamps, "
+            "and are reported as such. A stream the manifest does not cover, or whose video "
+            "no longer matches the indexed size, is opened and checked as usual. If the "
+            "manifest exists but cannot be read, the run fails."
+        ),
+    )
+
+
+def open_index_manifest(
+    manifest_uri: str | None,
+    *,
+    s3_profile_name: str | None,
+    endpoint_url: str | None,
+) -> Mp4IndexLookup | None:
+    """Open the manifest a CLI was pointed at, or return ``None`` if it was given none.
+
+    Raises :class:`StorageCliError` if the manifest cannot be opened, so both CLIs
+    report the manifest as the failure instead of the session or video.
+    """
+    if manifest_uri is None:
+        return None
+    try:
+        return Mp4IndexLookup.open(manifest_uri, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
+    except Exception as exc:
+        msg = f"--index-manifest {manifest_uri} could not be read: {exc}"
+        raise StorageCliError(msg) from exc
 
 
 def add_threshold_args(parser: argparse.ArgumentParser) -> None:

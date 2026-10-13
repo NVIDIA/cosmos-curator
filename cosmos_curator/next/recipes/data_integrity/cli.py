@@ -64,10 +64,12 @@ from cosmos_curator.core.utils.storage_cli import (
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     FAIL_EXIT_CODE,
     PASS_EXIT_CODE,
+    add_index_args,
     add_threshold_args,
     cancellable_reader,
     interrupt_guard,
     non_negative_int,
+    open_index_manifest,
     positive_finite_float,
     raise_if_interrupted,
     report_error,
@@ -209,6 +211,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Emit per-phase wall-clock timings to stderr after the report.",
     )
+    add_index_args(parser)
     add_threshold_args(parser)
     add_store_args(parser)
     add_storage_credential_args(parser)
@@ -241,6 +244,9 @@ def _run(args: argparse.Namespace, stats: dict[str, float] | None, interrupted: 
         validate_source(args.source)
         thresholds = thresholds_from_args(args)
         endpoint_url = resolve_s3_endpoint_url(args.endpoint_url)
+        index_lookup = open_index_manifest(
+            args.index_manifest, s3_profile_name=args.s3_profile_name, endpoint_url=endpoint_url
+        )
         results, video_info, resolved_cfg = run_checks(
             args.source,
             expected_hz=args.expected_hz,
@@ -252,6 +258,7 @@ def _run(args: argparse.Namespace, stats: dict[str, float] | None, interrupted: 
             endpoint_url=endpoint_url,
             stats=stats,
             stream_wrapper=lambda stream: cancellable_reader(stream, interrupted),
+            index_lookup=index_lookup,
         )
         # Checked after a *successful* run too: libav can swallow the abort and finish
         # off a truncated source, and a report the operator has already walked away

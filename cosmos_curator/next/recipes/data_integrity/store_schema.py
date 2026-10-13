@@ -80,6 +80,10 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #: canonical ``"sensor"`` value. Current enum readers normalize ``"capture"`` to
 #: ``"sensor"``, and writers emit only ``"sensor"``. This vocabulary migration
 #: does not change Arrow layout, so it deliberately does not bump this version.
+#:
+#: ``stream.lance.timestamp_source`` also gained ``"container_dts"``, for a stream read
+#: from an ``mp4-index`` manifest instead of from the media. ``session.lance`` keeps its
+#: three values: a ``"container_dts"`` stream counts as ``"container_pts"`` there.
 STORE_SCHEMA_VERSION = 3
 
 STREAM_DATASET = "stream.lance"

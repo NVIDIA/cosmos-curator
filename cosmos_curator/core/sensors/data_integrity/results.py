@@ -31,13 +31,13 @@ first -- otherwise the store ends up importing the CLI to learn what a verdict i
 import enum
 import math
 from collections.abc import Iterable, Iterator
+from fractions import Fraction
 from typing import Protocol
 
 import attrs
 import numpy as np
 from numpy.typing import NDArray
 
-from cosmos_curator.core.sensors.data.video import VideoMetadata
 from cosmos_curator.core.sensors.data_integrity import identity
 from cosmos_curator.core.sensors.data_integrity.evaluation import EvaluationResult
 from cosmos_curator.core.sensors.data_integrity.metrics import Measurement
@@ -80,8 +80,8 @@ class ExpectedHzSource(enum.Enum):
     Variants, in fallback priority:
 
     * ``USER`` -- user-supplied ``--expected-hz``; the authoritative baseline.
-    * ``HEADER`` -- from :attr:`VideoMetadata.avg_frame_rate`; best-effort only,
-      and not a sound basis for the rate check (see :func:`resolve_expected_hz`).
+    * ``HEADER`` -- from the sensor's :attr:`IntegritySensor.avg_frame_rate`; best-effort
+      only, and not a sound basis for the rate check (see :func:`resolve_expected_hz`).
     * ``UNAVAILABLE`` -- neither is usable; rate-dependent metrics SKIP.
 
     Reported alongside the rate itself so a reader can tell which of those three
@@ -105,7 +105,9 @@ class SessionTimestampSource(enum.Enum):
 
     * ``SENSOR`` -- every contributing stream reported real sensor times. The only
       value on which a cross-sensor comparison means anything.
-    * ``CONTAINER_PTS`` -- every contributing stream was measured on container PTS.
+    * ``CONTAINER_PTS`` -- no stream reported sensor times. Every one was measured on a
+      clock the container supplied, either presentation or decode timestamps. Both have
+      the same defect; the per-stream rows record which one each stream used.
     * ``MIXED`` -- the streams disagree. Not a lesser ``SENSOR``: comparing a rig's
       real sensor times against another camera's synthesized grid produces a spread
       that is an artifact of the mux, which is the same defect as ``CONTAINER_PTS``
@@ -146,7 +148,9 @@ def session_timestamp_source(sources: Iterable[TimestampSource]) -> SessionTimes
         return None
     if distinct == {TimestampSource.SENSOR}:
         return SessionTimestampSource.SENSOR
-    if distinct == {TimestampSource.CONTAINER_PTS}:
+    # Test for the absence of SENSOR rather than listing the container clocks, so a
+    # session read partly from an index and partly from files is not reported as MIXED.
+    if TimestampSource.SENSOR not in distinct:
         return SessionTimestampSource.CONTAINER_PTS
     return SessionTimestampSource.MIXED
 
@@ -283,8 +287,8 @@ class IntegritySensor(Protocol):  # pragma: no cover
         ...
 
     @property
-    def video_metadata(self) -> VideoMetadata:
-        """Scalar stream metadata (carries the nominal ``avg_frame_rate``)."""
+    def avg_frame_rate(self) -> Fraction:
+        """Nominal sample rate the container declares, or ``Fraction(0)`` if it declares none."""
         ...
 
     def stream_timestamps(self, batch_size: int = 0) -> Iterator[NDArray[np.int64]]:

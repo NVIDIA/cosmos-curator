@@ -274,6 +274,9 @@ def test_errored_stream_omits_the_timestamp_source_line() -> None:
         ([TimestampSource.SENSOR, TimestampSource.SENSOR], "sensor"),
         ([TimestampSource.CONTAINER_PTS, TimestampSource.CONTAINER_PTS], "container_pts"),
         ([TimestampSource.SENSOR, TimestampSource.CONTAINER_PTS], "mixed"),
+        # Two container clocks, so the heading says the one thing true of both.
+        ([TimestampSource.CONTAINER_DTS, TimestampSource.CONTAINER_PTS], "container_pts"),
+        ([TimestampSource.SENSOR, TimestampSource.CONTAINER_DTS], "mixed"),
     ],
 )
 def test_render_text_reports_the_clock_the_session_as_a_whole_was_measured_on(

@@ -43,6 +43,7 @@ Transient transport failures are retried inside
 """
 
 import datetime
+import functools
 import pickle
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -53,6 +54,7 @@ from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, Stre
 from cosmos_curator.next.recipes.data_integrity import store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
+from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 from cosmos_curator.next.recipes.data_integrity.session_runner import (
     InfrastructureError,
     run_one_stream,
@@ -271,6 +273,37 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
     return rows
 
 
+@functools.cache
+def _mp4_lookup_index_open(
+    manifest_uri: str,
+    *,
+    s3_profile_name: str | None = None,
+    endpoint_url: str | None = None,
+) -> Mp4IndexLookup | None:
+    return Mp4IndexLookup.open(manifest_uri, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
+
+
+def _session_index_lookup(config: ResolvedDataIntegrityConfig) -> Mp4IndexLookup | None:
+    """Open the configured mp4-index manifest, or return ``None`` if there is none.
+
+    Warns and returns ``None`` when the manifest cannot be opened; the run then opens
+    the videos instead.
+    """
+    uri = config.input.index_manifest_uri
+    if uri is None:
+        return None
+    try:
+        return _mp4_lookup_index_open(
+            uri,
+            s3_profile_name=config.execution.s3_profile_name,
+            endpoint_url=config.execution.endpoint_url,
+        )
+    except Exception as exc:  # noqa: BLE001 - see above
+        logger.opt(exception=True).debug("data-integrity index manifest unusable at {}", uri)
+        logger.warning("index manifest {} could not be used, checking videos directly: {}", uri, exc)
+        return None
+
+
 def check_session(
     record: dict[str, str],
     *,
@@ -330,6 +363,7 @@ def check_session(
             ),
         )
 
+    index_lookup = _session_index_lookup(config)
     rows: dict[str, list[dict[str, object]]] = {}
     results: list[StreamResult] = []
     unreadable = 0
@@ -347,6 +381,7 @@ def check_session(
                 endpoint_url=config.execution.endpoint_url,
                 max_attempts=config.execution.stream_attempts,
                 raise_infrastructure_errors=True,
+                index_lookup=index_lookup,
             )
         except InfrastructureError as exc:
             # Counted, not recorded: see InfrastructureError for why a row here would

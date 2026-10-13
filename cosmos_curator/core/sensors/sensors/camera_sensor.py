@@ -316,6 +316,11 @@ class CameraSensor:
         """
         return self._video_metadata.has_bframes
 
+    @property
+    def avg_frame_rate(self) -> Fraction:
+        """The container's nominal frame rate, or ``Fraction(0)`` when it declares none."""
+        return self._video_metadata.avg_frame_rate
+
     def supports_sampling_policy(self, policy: object) -> bool:
         """Return whether this sensor can sample with *policy*."""
         return isinstance(policy, NearestTimestampPolicy)

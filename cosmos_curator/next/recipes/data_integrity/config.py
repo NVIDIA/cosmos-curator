@@ -40,6 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cosmos_curator.core.sensors.data_integrity.instruments import MAX_PERCENT, Thresholds
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.utils.uris import normalize_location
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -106,11 +107,26 @@ class DataIntegrityInputConfig(BaseModel):
         ),
         examples=[["recorder-*/*"]],
     )
+    index_manifest_uri: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "An mp4-index manifest.lance. Read each covered stream's timeline from the "
+            "manifest instead of opening the video; check the rest as usual. Sessions are "
+            "still discovered by listing, so a partly indexed dataset is fine."
+        ),
+        examples=["s3://example-bucket/mp4-index/manifest.lance"],
+    )
 
     @field_validator("sessions", "session_roots", "stream_globs", mode="before")
     @classmethod
     def _coerce_sequence(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("index_manifest_uri")
+    @classmethod
+    def _normalize_manifest_uri(cls, uri: str | None) -> str | None:
+        return None if uri is None else normalize_location(uri)
 
     @field_validator("sessions", "session_roots", "stream_globs")
     @classmethod

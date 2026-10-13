@@ -21,7 +21,10 @@ import pickle
 from collections.abc import Callable
 from typing import Any
 
+import lance
+import pyarrow as pa
 import pytest
+from loguru import logger
 
 from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, SESSION_INSTRUMENTS
 from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
@@ -121,6 +124,35 @@ def test_listing_honours_the_configured_stream_globs(session: pathlib.Path) -> N
     )
 
     assert processing.discover_session(str(session), config=config) == [str(session / "recorder-00" / "front.mp4")]
+
+
+def test_no_configured_manifest_means_no_lookup(session: pathlib.Path) -> None:
+    """The index is opt-in: an unconfigured run must not reach for a dataset at all."""
+    assert processing._session_index_lookup(_config(session)) is None
+
+
+def test_a_manifest_that_cannot_be_opened_falls_back_to_reading_the_videos(session: pathlib.Path) -> None:
+    """The index makes checks cheaper, so losing it must cost speed rather than the session."""
+    config = ResolvedDataIntegrityConfig.model_validate(
+        {
+            "schema_version": 1,
+            "kind": "data-integrity",
+            "input": {"sessions": [str(session)], "index_manifest_uri": str(session / "not-a-manifest.lance")},
+            "output": {"store_root": str(session.parent / "di-store")},
+        }
+    )
+    # A real dataset that is not a manifest, so opening it raises rather than returning
+    # None, which absence would and which is already a quiet fallback.
+    lance.write_dataset(pa.table({"unrelated": [1]}), session / "not-a-manifest.lance")
+    processing._mp4_lookup_index_open.cache_clear()
+    warnings: list[str] = []
+    sink_id = logger.add(warnings.append, level="WARNING")
+
+    try:
+        assert processing._session_index_lookup(config) is None
+    finally:
+        logger.remove(sink_id)
+    assert any("checking videos directly" in warning for warning in warnings)
 
 
 def test_a_session_that_cannot_be_listed_is_reported_rather_than_raised(tmp_path: pathlib.Path) -> None:

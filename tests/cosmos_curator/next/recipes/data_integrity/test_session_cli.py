@@ -34,7 +34,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
 from cosmos_curator.core.utils.storage_cli import StorageCliError
-from cosmos_curator.next.recipes.data_integrity import session_cli
+from cosmos_curator.next.recipes.data_integrity import cli_support, session_cli
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     DEFAULT_THRESHOLDS,
     ERROR_EXIT_CODE,
@@ -263,6 +263,29 @@ def test_render_failure_exits_error(monkeypatch: pytest.MonkeyPatch, capsys: pyt
     monkeypatch.setattr(session_cli, "render_text", _boom)
     assert session_cli.main(["--session-path", "s"]) == ERROR_EXIT_CODE
     assert "error:" in capsys.readouterr().err
+
+
+def test_an_unreadable_manifest_is_reported_as_the_manifest_failing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The session is not what failed, and "could not check session" reads as a data finding."""
+
+    def _explode(*_args: object, **_kwargs: object) -> object:
+        msg = "manifest.lance has 3 row(s) at a record_schema_version other than 5"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(cli_support.Mp4IndexLookup, "open", staticmethod(_explode))
+    monkeypatch.setattr(session_cli, "run_session", lambda *_a, **_k: pytest.fail("measured anyway"))
+
+    exit_code = session_cli.main(
+        ["--session-path", "s3://bucket/session", "--index-manifest", "s3://bucket/mp4-index/manifest.lance"]
+    )
+
+    assert exit_code == ERROR_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "--index-manifest s3://bucket/mp4-index/manifest.lance could not be read" in stderr
+    assert "record_schema_version" in stderr, "the underlying reason has to survive the rewrap"
+    assert "could not check session" not in stderr
 
 
 def test_exit_code_error_on_empty_session(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -159,7 +159,7 @@ def resolve_expected_hz(user_hz: float | None, sensor: IntegritySensor) -> Resol
     user_hz = validate_expected_hz(user_hz)
     if user_hz is not None:
         return ResolvedConfig(expected_hz=user_hz, expected_hz_source=ExpectedHzSource.USER)
-    nominal = sensor.video_metadata.avg_frame_rate
+    nominal = sensor.avg_frame_rate
     if nominal.numerator == 0:
         return ResolvedConfig(expected_hz=None, expected_hz_source=ExpectedHzSource.UNAVAILABLE)
     return ResolvedConfig(expected_hz=float(nominal), expected_hz_source=ExpectedHzSource.HEADER)
