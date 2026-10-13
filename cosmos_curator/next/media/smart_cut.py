@@ -49,6 +49,7 @@ import argparse
 import bisect
 import functools
 import json
+import re
 import subprocess
 import tempfile
 import time
@@ -180,9 +181,9 @@ class _Index:
         self.den = den
         self.pts = pts  # frame i -> PTS ticks, presentation order
         self.stream_copy_safe = stream_copy_safe
-        # Keyframe (IDR) frame indices in presentation order. Valid ONLY when smart_cut_safe
-        # (packets already in presentation order, no duplicate PTS); otherwise file order would
-        # not equal frame order and these indices would be wrong, so they are left empty.
+        # Keyframe frame indices in presentation order, mapped by PTS so they stay valid under
+        # B-frame reordering. Decode seeks may use these; packet COPYING still needs
+        # smart_cut_safe, since that depends on file order rather than presentation order.
         self.keyframes = keyframes
         self.smart_cut_safe = smart_cut_safe
 
@@ -193,6 +194,16 @@ class _Index:
         """Return first keyframe index >= *frame*, or None if there is none at/after it."""
         i = bisect.bisect_left(self.keyframes, frame)
         return self.keyframes[i] if i < len(self.keyframes) else None
+
+    def keyframe_at_or_before(self, frame: int) -> int | None:
+        """Return the last keyframe index <= *frame*, or None when there is none.
+
+        A re-encode decodes from here so the frames *frame* depends on are present. Seeking at
+        the frame's own timestamp instead loses the reference on MPEG-TS, where the demuxer
+        starts at that packet and decoding silently resumes at the NEXT keyframe.
+        """
+        i = bisect.bisect_right(self.keyframes, frame) - 1
+        return self.keyframes[i] if i >= 0 else None
 
 
 def _is_one_packet_per_frame(codec_name: str, field_order: str, format_name: str) -> bool:
@@ -258,6 +269,15 @@ def _prefix_packet_and_frame_counts(source: str, seconds: int) -> tuple[int, int
             n_pk += 1
     n_fr = sum(1 for line in fr.stdout.splitlines() if line.strip())
     return n_pk, n_fr
+
+
+def _unambiguous_keyframes(pts: list[int], keyframes: tuple[int, ...]) -> tuple[int, ...]:
+    """Keep only keyframes whose timestamp is unique, so seeking to one is unambiguous."""
+    return tuple(
+        frame
+        for frame in keyframes
+        if (frame == 0 or pts[frame] != pts[frame - 1]) and (frame + 1 == len(pts) or pts[frame] != pts[frame + 1])
+    )
 
 
 def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C901, PLR0912, PLR0915
@@ -391,7 +411,11 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         den,
         pts,
         stream_copy_safe=all_intra and smart_cut_safe,
-        keyframes=tuple(keyframe_rows) if smart_cut_safe else (),
+        # Mapped through PTS so the indices are presentation-order positions even when packets
+        # are in decode order; duplicate timestamps invalidate only their own seek positions.
+        keyframes=_unambiguous_keyframes(
+            pts, tuple(sorted(bisect.bisect_left(pts, file_pts[row]) for row in keyframe_rows))
+        ),
         smart_cut_safe=smart_cut_safe,
     )
 
@@ -401,10 +425,26 @@ def _seconds(ticks: float, num: int, den: int) -> str:
     return f"{ticks * num / den:.9f}"
 
 
+def _keyframe_seek_seconds(pts: int, num: int, den: int) -> str:
+    """Return an ``-ss`` value that lands at or before the keyframe at *pts*.
+
+    ffmpeg parses ``-ss`` into whole microseconds, discarding finer digits, then rescales
+    that to source ticks with nearest rounding. Flooring to a whole microsecond here means
+    the rounding can only pull the seek earlier, never past the keyframe -- landing past it
+    would start decoding without the reference the requested frames depend on, which is how
+    MPEG-TS cuts silently resumed at the FOLLOWING keyframe. Seeking early is free of
+    correctness risk and costs only decode work: ``trim=start_pts`` still selects the exact
+    frames, so the seek never decides which frames are kept.
+    """
+    micros = pts * num * 1_000_000 // den
+    return f"{micros // 1_000_000}.{micros % 1_000_000:06d}"
+
+
 def _encode_cmd(  # noqa: PLR0913
     source: str,
     output: str,
-    ss: str,
+    index: _Index,
+    start: int,
     nframes: int,
     bitrate: str,
     threads: int,
@@ -412,6 +452,11 @@ def _encode_cmd(  # noqa: PLR0913
     gpu: bool = False,
 ) -> list[str]:
     """Build the ffmpeg re-encode command for a single clip.
+
+    Decodes from a keyframe at or before *start* and selects the range by integer source PTS.
+    The input seek only bounds decode work -- it is deliberately inexact -- while the ``trim``
+    owns which frames are kept, so a seek that lands earlier than predicted cannot shift the
+    clip. Seeking at the frame's own timestamp instead loses the reference keyframe on MPEG-TS.
 
     When *gpu* is True the NVIDIA NVENC hardware encoder (``h264_nvenc``) is
     used instead of libopenh264, which offloads encoding to the GPU's dedicated
@@ -425,10 +470,23 @@ def _encode_cmd(  # noqa: PLR0913
     encoder = "h264_nvenc" if use_nvenc else "libopenh264"
     # h264_nvenc uses -rc cbr for constant bitrate; libopenh264 uses -b:v directly.
     extra: list[str] = ["-rc", "cbr"] if use_nvenc else []
+    # Seek to a keyframe at/before start, floored to whole microseconds so rounding can only
+    # land earlier. With no trusted keyframe, decode from the beginning rather than guess.
+    seek: list[str] = []
+    kf = index.keyframe_at_or_before(start)
+    if kf is not None and index.pts[kf] >= 0:
+        seek = ["-ss", _keyframe_seek_seconds(index.pts[kf], index.num, index.den)]
+    # settb puts the filter graph on the source timebase so start_pts is in source ticks.
+    # showinfo logs each selected frame's source PTS BEFORE setpts discards it, which is what
+    # _selected_source_pts_match checks -- a same-length substitution passes a frame count.
+    vf = (
+        f"settb=expr={index.num}/{index.den},trim=start_pts={index.pts[start]},"
+        f"trim=end_frame={nframes},showinfo@source=checksum=0,setpts=PTS-STARTPTS"
+    )
     return [
-        "ffmpeg", "-y", "-nostdin", "-v", "error", "-seek_timestamp", "1",
-        "-ss", ss, "-i", source, "-map", "0:v:0", "-an",
-        "-frames:v", str(nframes), "-vf", "setpts=PTS-STARTPTS",
+        "ffmpeg", "-y", "-nostdin", "-nostats", "-v", "info", "-copyts", "-seek_timestamp", "1",
+        *seek, "-noaccurate_seek", "-i", source, "-map", "0:v:0", "-an",
+        "-frames:v", str(nframes), "-vf", vf,
         "-c:v", encoder, *extra, "-b:v", bitrate, "-pix_fmt", "yuv420p",
         *([] if use_nvenc else ["-threads", str(threads)]),
         *_timing_flags(), output,
@@ -472,6 +530,58 @@ def _run_ff(cmd: list[str], errf: IO[bytes]) -> bool:
     )
 
 
+def _error_tail(errf: IO[bytes], limit: int = 600) -> str:
+    """Return the tail of the ffmpeg log without the per-frame ``showinfo`` trace.
+
+    The encode runs at ``-v info`` so the source PTS are observable (see :func:`_encode_cmd`).
+    That trace is one line per selected frame, so an unfiltered tail would be nothing but
+    frame dumps and would cut off the ffmpeg error that explains the failure.
+    """
+    errf.seek(0)
+    text = errf.read().decode(errors="replace")
+    return "\n".join(line for line in text.splitlines() if "showinfo@source" not in line).strip()[-limit:]
+
+
+def _selected_source_pts_match(errf: IO[bytes], log_start: int, expected_pts: list[int]) -> bool:
+    """Verify the decoded frames' source PTS before lossy encoding and the timestamp reset.
+
+    A wrong-but-same-length selection passes every frame count and timestamp check, so identity
+    has to be confirmed while the source PTS are still observable -- which is what the showinfo
+    pass in :func:`_encode_cmd` logs.
+    """
+    errf.seek(log_start)
+    selected: list[int] = []
+    for line in errf:
+        if b"showinfo@source" in line:
+            m = re.search(rb"\bn:\s*\d+\s+pts:\s*(-?\d+)", line)
+            if m is not None:
+                selected.append(int(m.group(1)))
+    errf.seek(0, 2)
+    return selected == expected_pts
+
+
+def _run_encode(  # noqa: PLR0913
+    source: str,
+    output: str,
+    index: _Index,
+    start: int,
+    nframes: int,
+    bitrate: str,
+    threads: int,
+    errf: IO[bytes],
+    *,
+    gpu: bool = False,
+) -> bool:
+    """Re-encode [start, start+nframes-1], rejecting the run if the wrong frames were selected."""
+    log_start = errf.tell()
+    if not _run_ff(_encode_cmd(source, output, index, start, nframes, bitrate, threads, gpu=gpu), errf):
+        return False
+    if not _selected_source_pts_match(errf, log_start, index.pts[start : start + nframes]):
+        errf.write(b"\nDecoded source PTS do not match the requested frame range\n")
+        return False
+    return True
+
+
 def _smartcut(  # noqa: PLR0913
     source: str,
     output: str,
@@ -499,9 +609,8 @@ def _smartcut(  # noqa: PLR0913
         head = str(Path(_tmpdir) / "head.mp4")
         body = str(Path(_tmpdir) / "body.mp4")
         lst = str(Path(_tmpdir) / "concat.txt")
-        # Head: re-encode [start, kf-1]. Seek half a tick before start so -ss keeps frame `start`.
-        head_ss = _seconds((index.pts[start] - 0.5) if start > 0 else index.pts[start], index.num, index.den)
-        if not _run_ff(_encode_cmd(source, head, head_ss, kf - start, bitrate, threads, gpu=gpu), errf):
+        # Head: re-encode [start, kf-1], decoding from an earlier keyframe and selecting by PTS.
+        if not _run_encode(source, head, index, start, kf - start, bitrate, threads, errf, gpu=gpu):
             return False
         # Body: stream-copy [kf, end]. kf is a keyframe, so +0.25 tick lands exactly on it.
         body_ss = _seconds(index.pts[kf] + 0.25, index.num, index.den)
@@ -600,11 +709,9 @@ def _cut_one(  # noqa: C901, PLR0912, PLR0913
 
             # Full re-encode: the default path AND the frame-exact fallback for any fast-path miss.
             rec["mode"] = "encode"
-            # Seek half a tick BEFORE the start frame so it survives the -ss discard.
-            ss = _seconds((start_pts - 0.5) if start > 0 else start_pts, index.num, index.den)
-            if not _run_ff(_encode_cmd(source, output, ss, expected, bitrate, threads, gpu=gpu), errf):
-                errf.seek(0)
-                rec["error"] = f"ffmpeg re-encode failed: {errf.read().decode(errors='replace').strip()[-600:]}"
+            # Decode from an earlier keyframe and select [start, end] by integer source PTS.
+            if not _run_encode(source, output, index, start, expected, bitrate, threads, errf, gpu=gpu):
+                rec["error"] = f"ffmpeg re-encode failed: {_error_tail(errf)}"
                 return rec
             rec["written_frames"] = _output_frame_count(output)
             if rec["written_frames"] != expected:
