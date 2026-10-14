@@ -429,19 +429,11 @@ def ensure_caption_fields(
             # cheap on a large table, and why it cannot create a tombstone.
             dataset.add_columns(CAPTION_FIELDS)
         except OSError as e:
-            # Measured at the locked pylance 10.0.0: a lost widening race is a
-            # bare OSError, and RuntimeError is raised on this path at neither
-            # 10.0.0 nor 11.0.0 (where the same race is CommitConflictError,
-            # itself an OSError). Re-measure on a pylance bump.
+            # At pylance 13.0.0, a lost widening race raises CommitConflictError,
+            # an OSError subtype. Re-measure on a pylance bump.
             #
-            # A deterministic "Invalid user input" fault is the SAME type there,
-            # so the two cannot be told apart by type, and the only thing that
-            # separates them is a human-readable message no code may parse. What
-            # keeps the broad catch acceptable is that both such faults are
-            # unreachable here: this call is gated on the group being absent, so
-            # no column can already exist, and CAPTION_FIELDS is frozen
-            # all-nullable. One arriving anyway still surfaces, as the cause of
-            # the RuntimeError below.
+            # Reopen to detect a concurrent success without parsing error messages.
+            # Any persistent OSError surfaces as the cause of the RuntimeError below.
             last_error = e
             continue
         # add_columns advances THIS handle, so the version logged is the

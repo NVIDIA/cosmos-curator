@@ -97,7 +97,7 @@ _CHECKPOINTS_SEGMENT: Final = "checkpoints"
 #     one, and offsets freed by a delete are not handed to later rows. The second
 #     premise is the one other writers on this table could break, which is why it
 #     is stated rather than left to follow from the first. Both measured at
-#     pylance 10.0.0 and 11.0.0; re-measure on a pylance bump, and bump this
+#     pylance 13.0.0; re-measure on a pylance bump, and bump this
 #     constant if either stops holding;
 #   - the checkpoint surviving a successful Phase A
 #     (`delete_checkpoint_on_success=False`), without which a resume re-infers

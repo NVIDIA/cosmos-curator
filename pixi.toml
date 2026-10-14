@@ -66,7 +66,7 @@ ngcsdk = "*" # not available on conda-forge
 pillow = ">=12.2.0"  # CVE-2026-40192: patched in Pillow 12.2.0+ (core PyPI dep)
 pyasn1 = ">=0.6.3" # CVE remediation: require 0.6.3+ (fixes vs vulnerable 0.6.2 in default/core envs)
 pybase64 = ">=1.5.0" # SIMD base64 for bulk per-row data-URL encode; matches the version vllm already pins
-pylance = ">=12.0.0,<13.0.0" # conda-forge package is too old
+pylance = ">=13.0.0,<14.0.0" # conda-forge package is too old
 pulp = "*" # conda-forge package is too old
 ray = { version = "==2.59.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
 webdataset = "*" # conda-forge package pulls in pytorch
@@ -247,7 +247,7 @@ tqdm = "*"
 [feature.cuml.pypi-dependencies]
 ngcsdk = "*" # not available on conda-forge
 pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as core)
-pylance = ">=12.0.0,<13.0.0" # conda-forge package is too old
+pylance = ">=13.0.0,<14.0.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
 transformers = ">=5.11.0,<6.0.0" # vLLM 0.30 + native Cosmos3 support require recent Transformers v5
