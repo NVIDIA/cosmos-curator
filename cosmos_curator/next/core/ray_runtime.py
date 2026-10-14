@@ -192,14 +192,13 @@ def _render_resources(resources: Mapping[str, float]) -> str:
 def _log_cluster_snapshot() -> None:
     """Log the resources the connected Ray cluster advertises right now.
 
-    A SNAPSHOT, and the text says so. Slurm releases the driver as soon as the
-    FIRST worker registers (``slurm_ray_runtime._wait_for_first_worker``), so a
-    multi-node job routinely reads its own cluster here while later nodes are
-    still joining::
+    A SNAPSHOT, and the text says so. Managed Slurm releases the driver as soon
+    as compute is available, including on the head, so a multi-node job routinely
+    reads its own cluster here while worker lanes are still joining::
 
-        head up --> first worker joins --> DRIVER STARTS --> workers 2..N join
-                                              ^
-                                              +-- this reading
+        head up --> DRIVER STARTS --> workers 1..N join
+                        ^
+                        +-- this reading
 
     Waiting for a complete picture would trade a diagnostic for a startup stall
     on every recipe, so the count is published with its uncertainty stated rather

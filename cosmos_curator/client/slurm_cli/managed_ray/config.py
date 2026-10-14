@@ -197,7 +197,11 @@ class SlurmRayMount(BaseModel):
 
 
 class SlurmRayAllocationConfig(BaseModel):
-    """Slurm allocation settings common to the head job and every worker lane."""
+    """Independent head and worker allocations share resource fields and defaults.
+
+    By default each allocation takes a whole CPU or GPU node. Set ``exclusive: false`` to request a slice
+    with the configured CPU and memory limits instead.
+    """
 
     model_config = _CONFIG_MODEL
 
@@ -211,6 +215,26 @@ class SlurmRayAllocationConfig(BaseModel):
         ),
     )
 
+    cpus: int = Field(
+        default=16, ge=1, description="Cores per allocation (--cpus-per-task). Ignored when exclusive=true."
+    )
+    memory: str = Field(
+        default="64G",
+        description="Memory per allocation (sbatch --mem format, e.g. 64G). Ignored when exclusive=true.",
+    )
+    exclusive: bool = Field(
+        default=True,
+        description="Take the entire node exclusively (--exclusive --mem=0). Set false to request cpus/memory.",
+    )
+    gpus: int | None = Field(default=None, ge=1, description="Number of GPUs requested per node (--gpus, job-scoped).")
+    gpus_per_node: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "GPUs per node (--gpus-per-node). Use on clusters that prohibit job-scoped GPU requests (e.g. NVL72)."
+        ),
+    )
+
     _normalize_directives = field_validator("partition", "qos", mode="before")(_optional_directive)
     _normalize_time = field_validator("time", mode="before")(_required_directive)
 
@@ -220,65 +244,29 @@ class SlurmRayAllocationConfig(BaseModel):
         slurm_time_seconds(value)
         return value
 
-
-class SlurmRayHeadConfig(SlurmRayAllocationConfig):
-    """Slurm allocation settings for the head job.
-
-    The head shares its node rather than taking one exclusively, so what it needs has to be stated. It advertises
-    no Ray resources of its own, so it is sized for the control plane and driver rather than for the work.
-    Set ``exclusive: true`` to take the whole node (equivalent to ``--exclusive --mem=0``), which avoids
-    per-user memory QOS limits and gives the pipeline driver access to the node's full RAM.
-    """
-
-    cpus: int = Field(default=16, ge=1, description="Cores for the Ray control plane and the pipeline driver.")
-    memory: str = Field(
-        default="64G",
-        description="Memory for the head allocation (sbatch --mem format, e.g. 64G). Ignored when exclusive=true.",
-    )
-    exclusive: bool = Field(
-        default=False,
-        description="Take the entire node exclusively (--exclusive --mem=0). Bypasses per-user memory QOS limits.",
-    )
-
     @field_validator("memory")
     @classmethod
     def _validate_memory(cls, value: str) -> str:
         if not _is_valid_slurm_memory(value):
-            msg = f"slurm.head.memory must be a positive sbatch size such as 64G or 65536M, got {value!r}"
+            msg = f"memory must be a positive sbatch size such as 64G or 65536M, got {value!r}"
             raise ValueError(msg)
         return value
 
+    @model_validator(mode="after")
+    def _validate_gpu_fields(self) -> Self:
+        if self.gpus is not None and self.gpus_per_node is not None:
+            msg = "gpus and gpus_per_node are mutually exclusive; set only one"
+            raise ValueError(msg)
+        return self
+
+
+class SlurmRayHeadConfig(SlurmRayAllocationConfig):
+    """Allocation for the Ray head, pipeline driver, and application tasks."""
+
 
 class SlurmRayWorkerConfig(SlurmRayAllocationConfig):
-    """Slurm allocation settings shared by all Ray worker lanes.
+    """Allocation settings shared by all additional Ray worker lanes."""
 
-    By default a worker takes its accelerator node exclusively, so it states no CPU or memory request: it gets
-    the node. Set ``exclusive: false`` to request a stated slice instead, which suits CPU-only recipes on a
-    shared partition: a whole-node request only fits a wholly free node, while a slice also packs onto partly
-    used ones, and a low-priority slice is far easier for the backfill scheduler to place.
-    """
-
-    cpus: int = Field(
-        default=16, ge=1, description="Cores per worker lane (--cpus-per-task). Ignored when exclusive=true."
-    )
-    memory: str = Field(
-        default="64G",
-        description="Memory per worker lane (sbatch --mem format, e.g. 64G). Ignored when exclusive=true.",
-    )
-    exclusive: bool = Field(
-        default=True,
-        description="Take the entire node exclusively (--exclusive --mem=0). Set false to request cpus/memory.",
-    )
-    gpus: int | None = Field(
-        default=None, ge=1, description="Number of GPUs requested per worker node (--gpus, job-scoped)."
-    )
-    gpus_per_node: int | None = Field(
-        default=None,
-        ge=1,
-        description=(
-            "GPUs per node (--gpus-per-node). Use on clusters that prohibit job-scoped GPU requests (e.g. NVL72)."
-        ),
-    )
     max_lane_allocations: int | None = Field(
         default=None,
         ge=1,
@@ -289,21 +277,6 @@ class SlurmRayWorkerConfig(SlurmRayAllocationConfig):
             "cluster's per-user job quota. The lane may stop renewing before the head completes."
         ),
     )
-
-    @field_validator("memory")
-    @classmethod
-    def _validate_memory(cls, value: str) -> str:
-        if not _is_valid_slurm_memory(value):
-            msg = f"slurm.worker.memory must be a positive sbatch size such as 64G or 65536M, got {value!r}"
-            raise ValueError(msg)
-        return value
-
-    @model_validator(mode="after")
-    def _validate_gpu_fields(self) -> Self:
-        if self.gpus is not None and self.gpus_per_node is not None:
-            msg = "slurm.worker.gpus and slurm.worker.gpus_per_node are mutually exclusive; set only one"
-            raise ValueError(msg)
-        return self
 
 
 def _default_slurm_account() -> str | None:
@@ -438,7 +411,7 @@ class SlurmRayRayConfig(BaseModel):
         default=environment.DEFAULT_CURATOR_IO_SLOTS_PER_NODE,
         ge=1,
         description=(
-            "Per-worker curator_io slots limiting concurrent large-source downloads. "
+            "Per-node curator_io slots on the head and workers limiting concurrent large-source downloads. "
             "Each download task must reserve one slot."
         ),
     )
@@ -458,7 +431,7 @@ class SlurmRayConfig(BaseModel):
 
     schema_version: SchemaVersion
     job_name: str = Field(default="cosmos_curator", min_length=1, max_length=64)
-    worker_lanes: int = Field(default=1, ge=1, description="Initial number of worker lanes.")
+    worker_lanes: int = Field(default=1, ge=0, description="Initial number of worker lanes in addition to the head.")
     slurm: SlurmRaySlurmConfig = Field(default_factory=SlurmRaySlurmConfig)
     runtime: SlurmRayRuntimeConfig = Field(default_factory=SlurmRayRuntimeConfig)
     ray: SlurmRayRayConfig = Field(default_factory=SlurmRayRayConfig)

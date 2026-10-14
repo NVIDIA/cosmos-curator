@@ -185,31 +185,23 @@ def run_dir(runtime_paths: SlurmRayRuntimePaths) -> Path:
     return Path(runtime_paths["run_dir"])
 
 
-def _container_environment_values(
-    config: SlurmRayConfig,
-    *,
-    overrides: dict[str, str] | None = None,
-) -> dict[str, str]:
-    values = _base_container_environment(
+def _container_environment_values(config: SlurmRayConfig) -> dict[str, str]:
+    return _base_container_environment(
         conda_override_cuda=_DEFAULT_CONDA_OVERRIDE_CUDA,
         pixi_envs=config.runtime.pixi_envs,
     )
-    if overrides is not None:
-        values.update(overrides)
-    return values
 
 
 def _container_environment_keys(
     config: SlurmRayConfig,
     runtime_paths: SlurmRayRuntimePaths,
     *,
-    overrides: dict[str, str] | None = None,
     extra: tuple[str, ...] = (),
 ) -> list[str]:
     return list(
         dict.fromkeys(
             [
-                *_container_environment_values(config, overrides=overrides),
+                *_container_environment_values(config),
                 *runtime_paths["forwarded_environment_keys"],
                 "CURATOR_RUN_ID",
                 *_SLURM_ENV_VARS_TO_FORWARD,
@@ -222,10 +214,8 @@ def _container_environment_keys(
 def _render_environment_setup(
     config: SlurmRayConfig,
     runtime_paths: SlurmRayRuntimePaths,
-    *,
-    overrides: dict[str, str] | None = None,
 ) -> list[str]:
-    values = _container_environment_values(config, overrides=overrides)
+    values = _container_environment_values(config)
     lines = [
         f"unset {' '.join((*_PIXI_ACTIVATION_ENV_VARS, *_CONDA_ACTIVATION_ENV_VARS))}",
         (
@@ -239,12 +229,11 @@ def _render_environment_setup(
     return lines
 
 
-def _container_launch_command(  # noqa: PLR0913
+def _container_launch_command(
     config: SlurmRayConfig,
     runtime_paths: SlurmRayRuntimePaths,
     command: list[str],
     *,
-    environment_overrides: dict[str, str] | None = None,
     extra_environment_keys: tuple[str, ...] = (),
     extra_slurm_args: tuple[str, ...] = (),
 ) -> str:
@@ -256,7 +245,6 @@ def _container_launch_command(  # noqa: PLR0913
         container_env_keys=_container_environment_keys(
             config,
             runtime_paths,
-            overrides=environment_overrides,
             extra=extra_environment_keys,
         ),
         command=command,
@@ -295,10 +283,7 @@ def _batch_prelude(
     role: str,
     allocation: SlurmRayAllocationConfig,
 ) -> list[str]:
-    """Render directives shared by head and worker allocations.
-
-    What each role asks for is not shared: each states its own CPU, memory, and exclusivity request.
-    """
+    """Render each role's independently configured Slurm allocation."""
     return [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name(config.job_name, run_id, role)}",
@@ -310,6 +295,15 @@ def _batch_prelude(
         "#SBATCH --ntasks=1",
         "#SBATCH --ntasks-per-node=1",
         "#SBATCH --propagate=NONE",
+        *_slurm_directive("gpus", str(allocation.gpus) if allocation.gpus is not None else None),
+        *_slurm_directive(
+            "gpus-per-node", str(allocation.gpus_per_node) if allocation.gpus_per_node is not None else None
+        ),
+        *(
+            ["#SBATCH --exclusive", "#SBATCH --mem=0"]
+            if allocation.exclusive
+            else [f"#SBATCH --cpus-per-task={allocation.cpus}", f"#SBATCH --mem={allocation.memory}"]
+        ),
     ]
 
 
@@ -318,11 +312,10 @@ def _runtime_setup(
     *,
     run_id: str,
     runtime_paths: SlurmRayRuntimePaths,
-    environment_overrides: dict[str, str] | None = None,
 ) -> list[str]:
     """Render environment and node-local setup shared by head and workers."""
     return [
-        *_render_environment_setup(config, runtime_paths, overrides=environment_overrides),
+        *_render_environment_setup(config, runtime_paths),
         f"export CURATOR_RUN_ID={shlex.quote(run_id)}",
         *(f"mkdir -p -- {shlex.quote(source)}" for source in runtime_paths["prepare_directories"]),
     ]
@@ -335,9 +328,8 @@ def render_head_script(
     runtime_paths: SlurmRayRuntimePaths,
     command: list[str],
 ) -> str:
-    """Render the non-requeueable CPU head batch job."""
+    """Render the non-requeueable head batch job."""
     timeout = startup_timeout_seconds(config.ray.startup_timeout)
-    head_environment = {"NVIDIA_VISIBLE_DEVICES": "void"}
     head_command = [
         "pixi",
         "run",
@@ -351,6 +343,8 @@ def render_head_script(
         _CONTAINER_MANIFEST,
         "--startup-timeout-seconds",
         str(timeout),
+        "--io-slots-per-node",
+        str(config.ray.io_slots_per_node),
     ]
     if runtime_paths["ray_temp_dir"] is not None:
         head_command.extend(["--temp-dir", runtime_paths["ray_temp_dir"]])
@@ -364,8 +358,6 @@ def render_head_script(
             role="head",
             allocation=head,
         ),
-        f"#SBATCH --cpus-per-task={head.cpus}",
-        *(["#SBATCH --exclusive", "#SBATCH --mem=0"] if head.exclusive else [f"#SBATCH --mem={head.memory}"]),
         "#SBATCH --no-requeue",
         _slurm_output_directive(runtime_paths),
         "",
@@ -386,21 +378,14 @@ def render_head_script(
         "trap 'exit 143' TERM",
         "trap 'exit 130' INT",
         "",
-        *_runtime_setup(
-            config,
-            run_id=run_id,
-            runtime_paths=runtime_paths,
-            environment_overrides=head_environment,
-        ),
+        *_runtime_setup(config, run_id=run_id, runtime_paths=runtime_paths),
         "",
         _container_launch_command(
             config,
             runtime_paths,
             head_command,
-            environment_overrides=head_environment,
-            # Since Slurm 22.05 a step does not inherit the batch job's --cpus-per-task, so a step that does not
-            # ask ends up on one core. The head has to state it again or its allocated cores go unused.
-            extra_slurm_args=(f"--cpus-per-task={head.cpus}",),
+            # Whole-node allocations use all cores; sliced allocations must restate the CPU request at the step.
+            extra_slurm_args=() if head.exclusive else (f"--cpus-per-task={head.cpus}",),
         ),
         "",
     ]
@@ -435,7 +420,7 @@ def render_worker_script(
     runtime_paths: SlurmRayRuntimePaths,
     allocations: int,
 ) -> str:
-    """Render the reusable requeueable accelerator worker batch job for one run.
+    """Render the reusable requeueable worker batch job for one run.
 
     ``allocations`` is the lane budget the manifest recorded, passed in rather than derived again here so the
     script's log naming and the submitter's ``--array`` cannot disagree about whether a lane renews.
@@ -467,13 +452,6 @@ def render_worker_script(
             run_id=run_id,
             role="worker",
             allocation=worker,
-        ),
-        *_slurm_directive("gpus", str(worker.gpus) if worker.gpus is not None else None),
-        *_slurm_directive("gpus-per-node", str(worker.gpus_per_node) if worker.gpus_per_node is not None else None),
-        *(
-            ["#SBATCH --exclusive", "#SBATCH --mem=0"]
-            if worker.exclusive
-            else [f"#SBATCH --cpus-per-task={worker.cpus}", f"#SBATCH --mem={worker.memory}"]
         ),
         # Preemption requeues the same allocation rather than consuming one of the lane's, so preemption survival
         # and walltime succession compose instead of competing for the same budget.

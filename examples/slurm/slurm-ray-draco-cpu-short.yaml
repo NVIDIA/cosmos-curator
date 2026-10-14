@@ -20,6 +20,7 @@ slurm:
     # QoS=cpu_short itself, which is where the cpu=960,mem=1811190M cap comes from.
     qos: normal
     time: "04:00:00"
+    exclusive: false
     cpus: 32
     memory: 128G
   worker:

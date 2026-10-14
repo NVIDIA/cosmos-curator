@@ -4,15 +4,16 @@
 
 Cosmos Curator can build a run-scoped Ray cluster from independent Slurm jobs:
 
-- one non-requeueable, node-sharing CPU job hosts the Ray head and pipeline driver
-- each worker lane is one requeueable, exclusive accelerator job
+- one non-requeueable job hosts the Ray head, pipeline driver, and application work
+- each worker lane is one requeueable job providing additional compute capacity
+- head and workers default to exclusive CPU or GPU nodes and can independently request shared-node slices
 - a preempted lane can rejoin the same Ray cluster when Slurm requeues it
 - a lane whose walltime is shorter than the run renews through successive allocations
 - users can add or remove lanes without restarting the driver
 
 `cosmos-curator slurm submit` places a whole Ray cluster inside one multi-node allocation, and remains the simpler
 option when the resources are known and can be scheduled together. Independent allocations exist for when they cannot:
-a single-node head can start while accelerator capacity is still queued, capacity can arrive and leave without ending
+a single-node head can start working while additional capacity is still queued, capacity can arrive and leave without ending
 the run, and worker walltime and preemption no longer bound the cluster. The tradeoff is explicit and pays for all of
 it — worker loss becomes ordinary Ray node loss, which the pipeline has to tolerate. Managed clusters use the separate
 `cosmos-curator slurm ray` command group.
@@ -34,7 +35,7 @@ The first implementation owns the launcher lifecycle:
 
 - validate deployment configuration
 - submit one head and the requested worker lanes
-- start the driver after the first worker joins
+- start the driver when Ray advertises compute resources, including those on the head
 - report status and support manual scale and stop operations
 - allow a requeued lane to rejoin
 - tear down Ray and every recorded Slurm job when the run ends
@@ -61,20 +62,21 @@ the cluster substrate rather than a claim that the pipeline is safe under worker
 Each run has a unique ID, one head job, and zero or more worker lanes. All worker lanes use the same configured node
 shape.
 
-The head runs the Ray control plane, a small supervisor, and the pipeline driver. It advertises no application CPU or
-GPU resources to Ray, so tasks and actors run on worker nodes. It is non-requeueable because losing the Ray head ends
-the cluster.
+The head runs the Ray control plane, a small supervisor, the pipeline driver, and application tasks and actors. Like
+workers, it advertises its allocated CPU and GPU resources and the configured `curator_io` slots to Ray. It is
+non-requeueable because losing the Ray head ends the cluster.
 
-The head asks for a stated slice of a CPU node — cores and memory, both configurable — rather than taking one
-exclusively, because a head that is easy to schedule while accelerator capacity is still queued is the reason for
-splitting the allocations at all. Sharing a node means it cannot assume the well-known Ray ports are free, since
-another run's head may already hold them, so it reserves free ports at startup and publishes them in the run's
-bootstrap record. That reservation has to cover every port Ray would otherwise pick for itself, including the ones
-it defaults to fixed values and the range it hands to its own workers; a head that names only some of them can
-collide with a co-located head, or with Ray's own defaults on a node whose ephemeral port range overlaps them.
-Workers keep fixed ports because they still take their accelerator node whole.
+Head and worker allocations use the same resource fields and defaults, but their configurations are independent:
+changing a worker setting does not change the head. Each defaults to an exclusive whole node with all its memory;
+either can set `exclusive: false` and request a slice with `cpus` and `memory`. The head can use a different node
+shape, partition, QOS, and walltime from the worker lanes, such as a long-lived GPU allocation alongside shorter,
+preemptible GPU allocations.
 
-Each worker lane is an independent requeueable Slurm job on one exclusive accelerator node. Its Slurm job ID remains
+Both roles reserve free ports at startup because a sliced allocation can share a node with another run. The head
+publishes its ports in the run's bootstrap record. The reservation covers every port Ray would otherwise pre-select,
+and Ray worker processes use random ports to avoid collisions with the node's ephemeral port range.
+
+Each worker lane is an independent requeueable Slurm job on one node. Its Slurm job ID remains
 stable across requeues even though a new incarnation may run on a different physical node. A restarted incarnation
 joins as a fresh Ray node and carries no worker-local state from its predecessor.
 
@@ -91,18 +93,18 @@ low-priority or preemptible partition, while the higher-priority partition caps 
 Renewal lets a run take the higher-priority partition without ending when its first allocation expires. It has no
 setting of its own: it is what a worker walltime shorter than the head's means, so the default pair of equal
 walltimes is the plain one-allocation-per-lane shape. Renewal also makes worker churn routine, since every lane goes
-dark for a scheduling gap each time its walltime expires. A period with no workers stalls the run rather than ending
-it, because the head holds the driver and the Ray control plane in a separate long-lived allocation — but it does
-make the compatibility requirements below load-bearing rather than theoretical.
+dark for a scheduling gap each time its walltime expires. When no worker lanes are available, the head can continue
+work that fits its resources. Stages requiring resources available only on the workers stall until a lane returns.
+The compatibility requirements below therefore remain load-bearing.
 
 Lanes are not offset from one another to spread their renewals out: a timed dependency would leave later lanes
 ineligible rather than merely lower priority, unable to take capacity that freed up during the offset.
 
-The head starts the driver after one worker joins. It does not wait for every requested lane: pending workers are a
-normal scheduler condition, and later workers should be able to contribute after they arrive. The head continues
-waiting when no first worker is available; its Slurm walltime or an explicit stop bounds that wait operationally.
+The head starts the driver as soon as Ray advertises compute resources on the head or a worker. It does not wait for
+worker lanes to join: pending workers are a normal scheduler condition, and later workers contribute after they
+arrive. A run can start with `worker_lanes: 0` and use only the head, then add lanes through `scale` if needed.
 
-Heterogeneous worker shapes would be a separate design.
+Different shapes among the additional worker lanes would be a separate design.
 
 ## Ownership and Invariants
 
@@ -150,9 +152,9 @@ SUBMITTING -> STARTING -> ACTIVE -> STOPPING -> SUCCEEDED | FAILED | STOPPED
 The first two states divide work the launcher owns from work the cluster owns. `SUBMITTING` covers only the
 launcher's own recording and ends when every initial job ID is recorded, so it lasts seconds and names the one window
 in which a vanished client can strand a run. `STARTING` means every job ID is recorded and the run is waiting on the
-cluster: the head may still be queued, Ray may still be coming up, or worker lanes may be pending behind other jobs.
+cluster: the head may still be queued or Ray may still be coming up.
 That is a normal condition and can last as long as the queue does, so it must not be reported as though submission were
-still in progress. `ACTIVE` means a worker joined and the driver is running.
+still in progress. `ACTIVE` means the driver is running, even if every worker lane is still pending.
 
 `SUCCEEDED` and `FAILED` reflect the driver or launcher outcome. `STOPPED` means an explicit user stop. If cleanup
 finishes but the final manifest write does not, a later status request can reconcile the terminal state from the
@@ -216,7 +218,7 @@ argument vector after `--`, keeping deployment and pipeline configuration compos
 The config covers:
 
 - initial worker-lane count and optional display name
-- head and worker Slurm selections, including the head's cores and memory
+- independent head and worker Slurm selections, exclusivity, CPU, memory, and GPU requests
 - common container image, source, mounts, credentials, environment, and Pixi settings
 - optional node-local Ray storage
 
@@ -228,21 +230,23 @@ Both walltimes are always stated and must be finite. The head's walltime is the 
 two decides how many allocations a lane renews through, so neither is left to a partition default the launcher cannot
 see; a config that omits one gets the launcher's own default rather than the site's.
 
-The head's cores and memory are stated for the same reason: it shares a node, so what it does not ask for it does not
-get, and a default that asked for the whole node would be the exclusive allocation this avoids. Worker lanes have no
-such settings, because a lane takes its accelerator node whole.
+Both roles default to `exclusive: true`, which requests `--exclusive --mem=0`. Setting `exclusive: false` uses the
+role's `cpus` and `memory` instead, defaulting to 16 CPUs and 64G. CPU and memory settings are ignored for exclusive
+allocations. Each role can request GPUs with either `gpus` or `gpus_per_node`; the two fields are mutually exclusive.
+Omitted head fields use their own defaults, regardless of the worker configuration.
 
 ```yaml
+schema_version: 1
 worker_lanes: 2
 slurm:
   head:
-    partition: cpu_long
+    partition: gpu_long
     time: 7-00:00:00      # bounds the run; the head cannot be renewed
-    cpus: 16              # control plane and driver only; no Ray tasks land here
-    memory: 64G
+    gpus: 8              # application work also runs on the head
   worker:
     partition: batch      # higher priority, 4-hour cap
     time: "04:00:00"      # 42 allocations per lane cover the head's 7 days
+    gpus: 8
 ```
 
 The config model is strict, generates JSON Schema, supports small `--set` overrides, and can render the canonical
@@ -338,7 +342,7 @@ pipelines that permanently size themselves from startup resources are outside th
 
 A supported site provides:
 
-- a shared CPU partition whose walltime can cover the whole run, and homogeneous full-node accelerator workers
+- a head partition/QOS whose policy and walltime support the whole run, plus CPU or GPU capacity for worker lanes
 - preemption policy that requeues eligible worker jobs
 - job arrays, when worker allocations are shorter than the run and lanes have to renew
 - shared storage with reliable advisory locking and atomic rename

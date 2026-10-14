@@ -49,7 +49,7 @@ from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_runtime import
     _start_worker_ray,
     _stop_process,
     _terminate_process_group,
-    _wait_for_first_worker,
+    _wait_for_compute,
 )
 from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_state import (
     atomic_write_json,
@@ -321,24 +321,25 @@ def test_a_worker_avoids_ports_another_lane_still_holds() -> None:
             sock.close()
 
 
-def test_runtime_ray_commands_keep_work_off_the_head() -> None:
-    """The runtime advertises no application resources on the CPU head."""
+def test_runtime_ray_commands_advertise_resources_on_both_roles() -> None:
+    """The head and workers expose CPUs, GPUs, and the configured download capacity."""
     ports = _reserve_head_ports()
-    head = _ray_head_command("head-node", ports, None)
+    head = _ray_head_command("head-node", ports, None, io_slots_per_node=9)
     worker = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, io_slots_per_node=9)
 
-    assert head[head.index("--num-cpus") + 1] == "0"
-    assert head[head.index("--num-gpus") + 1] == "0"
     assert head[head.index("--dashboard-host") + 1] == "127.0.0.1"
     assert "--block" in head
     assert worker[worker.index("--address") + 1] == "head-node:6379"
-    assert json.loads(worker[worker.index("--resources") + 1]) == {"curator_io": 9}
-    assert "--resources" not in head
     assert "--block" in worker
+    for command in (head, worker):
+        assert json.loads(command[command.index("--resources") + 1]) == {"curator_io": 9}
+        # Whole-node allocations let Ray detect CPUs and the GPUs exposed by Slurm.
+        assert "--num-cpus" not in command
+        assert "--num-gpus" not in command
 
 
 def test_head_reserves_distinct_free_ports_so_two_heads_can_share_a_node() -> None:
-    """The head shares its node, so it cannot assume the well-known Ray ports are free."""
+    """The head can share its node, so it cannot assume the well-known Ray ports are free."""
     first = _reserve_head_ports()
     second = _reserve_head_ports()
 
@@ -350,8 +351,8 @@ def test_head_reserves_distinct_free_ports_so_two_heads_can_share_a_node() -> No
     assert set(first.values()) <= {int(argument) for argument in command if argument.isdigit()}
 
 
-def test_first_worker_wait_has_no_scheduling_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A pending worker may join after an arbitrarily long scheduler wait."""
+def test_compute_wait_accepts_resources_after_registration() -> None:
+    """The driver waits until Ray reports an alive node with compute resources."""
     ray_module = Mock()
     ray_module.nodes.side_effect = [
         [{"Alive": True, "Resources": {"CPU": 0.0, "GPU": 0.0}}],
@@ -363,10 +364,8 @@ def test_first_worker_wait_has_no_scheduling_deadline(monkeypatch: pytest.Monkey
     stop_signal = Mock()
     stop_signal.is_set.return_value = False
     stop_signal.wait.return_value = False
-    monotonic = Mock(side_effect=AssertionError("worker scheduling must not use a bootstrap deadline"))
-    monkeypatch.setattr(f"{RUNTIME_MODULE}.time.monotonic", monotonic)
 
-    _wait_for_first_worker(
+    _wait_for_compute(
         ray_module,
         head_process=head_process,
         stop_signal=stop_signal,
@@ -374,7 +373,6 @@ def test_first_worker_wait_has_no_scheduling_deadline(monkeypatch: pytest.Monkey
 
     assert ray_module.nodes.call_count == 3
     assert stop_signal.wait.call_count == 2
-    monotonic.assert_not_called()
 
 
 def _head_args(tmp_path: Path) -> Namespace:
@@ -382,6 +380,7 @@ def _head_args(tmp_path: Path) -> Namespace:
         manifest=str(tmp_path / "manifest.json"),
         run_id="cc-ray-deadbeef",
         startup_timeout_seconds=60,
+        io_slots_per_node=9,
         temp_dir=None,
         command=["python", "-m", "pipeline"],
     )
@@ -391,7 +390,7 @@ def _mock_head_startup(
     monkeypatch: pytest.MonkeyPatch,
     manifest: dict[str, object],
     *,
-    wait_for_worker: object | None = None,
+    wait_for_compute: object | None = None,
 ) -> tuple[Mock, list[dict[str, object]]]:
     """Stub out Ray startup and drive the supervisor's manifest writes through the real state machine."""
     status_writer = Mock()
@@ -407,8 +406,8 @@ def _mock_head_startup(
     monkeypatch.setattr(f"{RUNTIME_MODULE}._state.atomic_write_json", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(f"{RUNTIME_MODULE}._StatusWriter", lambda **_kwargs: status_writer)
     monkeypatch.setattr(
-        f"{RUNTIME_MODULE}._wait_for_first_worker",
-        wait_for_worker if wait_for_worker is not None else (lambda *_args, **_kwargs: None),
+        f"{RUNTIME_MODULE}._wait_for_compute",
+        wait_for_compute if wait_for_compute is not None else (lambda *_args, **_kwargs: None),
     )
     monkeypatch.setattr(f"{RUNTIME_MODULE}._mutate", mutate)
     monkeypatch.setattr(f"{RUNTIME_MODULE}._stop_ray", Mock())
@@ -416,12 +415,12 @@ def _mock_head_startup(
 
 
 @pytest.mark.parametrize("driver_status", [0, 7])
-def test_head_supervisor_records_driver_result(
+def test_head_supervisor_runs_driver_with_only_head_and_records_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     driver_status: int,
 ) -> None:
-    """The head records the driver outcome but leaves terminal publication to the outer wrapper."""
+    """Head resources suffice to run the driver and record its outcome while lanes are pending."""
     manifest = make_active_manifest(make_config())
     manifest["state"] = "STARTING"
     head_process = Mock()
@@ -430,6 +429,11 @@ def test_head_supervisor_records_driver_result(
     driver_process.poll.return_value = driver_status
     driver_process.wait.return_value = driver_status
     status_writer, mutations = _mock_head_startup(monkeypatch, manifest)
+    ray_module = Mock()
+    ray_module.nodes.return_value = [{"Alive": True, "NodeID": "head", "Resources": {"CPU": 32.0, "curator_io": 9.0}}]
+    monkeypatch.setattr(f"{RUNTIME_MODULE}._connect_to_ray", lambda *_args, **_kwargs: ray_module)
+    monkeypatch.setattr(f"{RUNTIME_MODULE}._wait_for_compute", _wait_for_compute)
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "32")
     cleanup_states: list[tuple[str, object]] = []
     status_writer.stop.side_effect = lambda: cleanup_states.append(("status", manifest["state"]))
 
@@ -438,11 +442,16 @@ def test_head_supervisor_records_driver_result(
 
     monkeypatch.setattr(f"{RUNTIME_MODULE}._stop_ray", stop_ray)
     monkeypatch.setenv("SLURM_JOB_ID", "100")
-    monkeypatch.setattr(f"{RUNTIME_MODULE}.subprocess.Popen", Mock(side_effect=[head_process, driver_process]))
+    popen = Mock(side_effect=[head_process, driver_process])
+    monkeypatch.setattr(f"{RUNTIME_MODULE}.subprocess.Popen", popen)
 
     result = _run_head(_head_args(tmp_path))
 
     assert result == driver_status
+    ray_module.nodes.assert_called_once_with()
+    head_command = popen.call_args_list[0].args[0]
+    assert head_command[head_command.index("--num-cpus") + 1] == "32"
+    assert json.loads(head_command[head_command.index("--resources") + 1]) == {"curator_io": 9}
     assert mutations == [
         {"operation": "activate"},
         {"operation": "record-driver-exit", "exit_status": driver_status},
@@ -565,7 +574,7 @@ def test_head_supervisor_stops_when_the_run_left_submitting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A run stopped while its first worker was pending never starts the driver."""
+    """A run stopped during Ray startup never starts the driver."""
     manifest = make_active_manifest(make_config())
     manifest["state"] = "STOPPING"
     head_process = Mock()
@@ -594,12 +603,12 @@ def test_head_supervisor_honors_shutdown_signal_before_driver_start(
     head_process.poll.return_value = None
     handlers: dict[int, object] = {}
 
-    def wait_for_worker(*_args: object, **_kwargs: object) -> None:
+    def wait_for_compute(*_args: object, **_kwargs: object) -> None:
         handler = handlers[signal.SIGTERM]
         assert callable(handler)
         handler(signal.SIGTERM, None)
 
-    status_writer, mutations = _mock_head_startup(monkeypatch, manifest, wait_for_worker=wait_for_worker)
+    status_writer, mutations = _mock_head_startup(monkeypatch, manifest, wait_for_compute=wait_for_compute)
     monkeypatch.setattr(f"{RUNTIME_MODULE}.signal.signal", lambda number, handler: handlers.update({number: handler}))
     monkeypatch.setenv("SLURM_JOB_ID", "100")
     popen = Mock(return_value=head_process)
@@ -626,36 +635,40 @@ def test_process_shutdown_escalates_after_terminate_timeout() -> None:
     assert process.wait.call_args_list == [call(timeout=15), call(timeout=5)]
 
 
-def test_sliced_worker_advertises_its_allocation_not_the_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A lane that shares a node must tell Ray its slice, not the machine's core count.
+@pytest.mark.parametrize("role", ["head", "worker"])
+def test_sliced_allocation_advertises_its_cpus(monkeypatch: pytest.MonkeyPatch, role: str) -> None:
+    """An allocation that shares a node must tell Ray its slice, not the machine's core count.
 
     Ray autodetects CPUs from the host, so three 32-core lanes on a 96-core node would each advertise 96 and
     let the scheduler place three times the work the allocation can actually run.
     """
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "32")
 
-    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+    command = (
+        _ray_head_command("head-node", _reserve_head_ports(), None, 8, _allocated_cpus())
+        if role == "head"
+        else _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+    )
 
     assert command[command.index("--num-cpus") + 1] == "32"
 
 
-@pytest.mark.parametrize("value", ["", "   ", "not-a-number", "0", "-4"])
-def test_worker_lets_ray_autodetect_when_slurm_gives_no_usable_cpu_count(
-    monkeypatch: pytest.MonkeyPatch, value: str
+@pytest.mark.parametrize("role", ["head", "worker"])
+@pytest.mark.parametrize("value", [None, "", "   ", "not-a-number", "0", "-4"])
+def test_allocation_lets_ray_autodetect_when_slurm_gives_no_usable_cpu_count(
+    monkeypatch: pytest.MonkeyPatch, role: str, value: str | None
 ) -> None:
-    """Whole-node lanes and non-Slurm runs must keep Ray's autodetection rather than get a bogus --num-cpus."""
-    monkeypatch.setenv("SLURM_CPUS_PER_TASK", value)
+    """Whole-node allocations and non-Slurm runs keep Ray's autodetection."""
+    if value is None:
+        monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+    else:
+        monkeypatch.setenv("SLURM_CPUS_PER_TASK", value)
 
-    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
-
-    assert "--num-cpus" not in command
-
-
-def test_worker_lets_ray_autodetect_when_slurm_cpus_per_task_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The variable is absent outside Slurm entirely."""
-    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
-
-    command = _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+    command = (
+        _ray_head_command("head-node", _reserve_head_ports(), None, 8, _allocated_cpus())
+        if role == "head"
+        else _ray_worker_command("head-node:6379", _reserve_worker_ports(), None, 8, _allocated_cpus())
+    )
 
     assert "--num-cpus" not in command
 

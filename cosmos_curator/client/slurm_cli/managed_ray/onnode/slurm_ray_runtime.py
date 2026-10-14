@@ -77,7 +77,7 @@ _DEFAULT_IO_SLOTS_PER_NODE = 16
 # node cannot use: the client server at 10001, the dashboard agent's HTTP listener at 52365, and the whole
 # 10002-19999 worker range. The worker range is the one that bites even with a single head, because a node whose
 # ``ip_local_port_range`` starts below 20000 hands out reserved ports inside it; the head asks for random worker
-# ports instead, which costs nothing because it runs no tasks.
+# ports instead.
 _HEAD_PORT_NAMES = (
     "gcs",
     "dashboard",
@@ -116,9 +116,8 @@ def _configure_logging() -> None:
 def _reserve_ports(names: tuple[str, ...]) -> dict[str, int]:
     """Reserve one free TCP port per named service.
 
-    Neither role can assume the well-known Ray ports are free. The head shares its node with whatever else the
-    partition scheduled there, including another run's head. A worker shares its node whenever it asks for a
-    slice rather than the whole machine, and two raylets that both pre-select the same port make the second one
+    Neither role can assume the well-known Ray ports are free. Both the head and workers can request a slice
+    rather than the whole machine, and two raylets that both pre-select the same port make the second one
     die with "Address already in use". Every socket is held open until all of them are assigned, which is what
     keeps the ports distinct from each other. A port lost between closing the socket and Ray binding fails
     startup.
@@ -145,7 +144,13 @@ def _reserve_worker_ports() -> dict[str, int]:
     return _reserve_ports(_WORKER_PORT_NAMES)
 
 
-def _ray_head_command(head_node: str, ports: dict[str, int], temp_dir: Path | None) -> list[str]:
+def _ray_head_command(
+    head_node: str,
+    ports: dict[str, int],
+    temp_dir: Path | None,
+    io_slots_per_node: int = _DEFAULT_IO_SLOTS_PER_NODE,
+    num_cpus: int | None = None,
+) -> list[str]:
     command = [
         "ray",
         "start",
@@ -155,10 +160,6 @@ def _ray_head_command(head_node: str, ports: dict[str, int], temp_dir: Path | No
         head_node,
         "--port",
         str(ports["gcs"]),
-        "--num-cpus",
-        "0",
-        "--num-gpus",
-        "0",
         "--object-manager-port",
         str(ports["object_manager"]),
         "--node-manager-port",
@@ -182,19 +183,23 @@ def _ray_head_command(head_node: str, ports: dict[str, int], temp_dir: Path | No
         "--max-worker-port",
         _RANDOM_WORKER_PORTS,
         "--disable-usage-stats",
+        "--resources",
+        json.dumps({_CURATOR_IO_RESOURCE_NAME: io_slots_per_node}),
     ]
+    if num_cpus is not None:
+        command.extend(["--num-cpus", str(num_cpus)])
     if temp_dir is not None:
         command.extend(["--temp-dir", str(temp_dir)])
     return command
 
 
 def _allocated_cpus() -> int | None:
-    """CPUs Slurm gave this lane, or None when it did not say.
+    """CPUs Slurm gave this allocation, or None when it did not say.
 
-    A lane that asks for a slice shares its node, so Ray must advertise the allocation rather than the machine:
+    An allocation that asks for a slice shares its node, so Ray must advertise the allocation rather than the machine:
     autodetection reports the host's cores, and three 32-core lanes on a 96-core node would each claim 96 and
     let the scheduler place three times the work the allocation can run. Returning None leaves Ray to
-    autodetect, which is right for a whole-node lane and for anything started outside Slurm.
+    autodetect, which is right for a whole-node allocation and for anything started outside Slurm.
     """
     raw = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
     if not raw:
@@ -355,15 +360,16 @@ def _live_ray_nodes(ray_module: Any) -> list[dict[str, Any]]:  # noqa: ANN401
     return [node for node in ray_module.nodes() if node.get("Alive") is True]
 
 
-def _wait_for_first_worker(
+def _wait_for_compute(
     ray_module: Any,  # noqa: ANN401
     *,
     head_process: subprocess.Popen[bytes],
     stop_signal: threading.Event,
 ) -> None:
+    """Wait for application resources on the head or a worker."""
     while not stop_signal.is_set():
         if head_process.poll() is not None:
-            msg = f"Ray head exited while waiting for a worker with status {head_process.returncode}"
+            msg = f"Ray head exited while waiting for compute resources with status {head_process.returncode}"
             raise RuntimeError(msg)
         for node in _live_ray_nodes(ray_module):
             resources = node.get("Resources", {})
@@ -387,7 +393,7 @@ class _StatusWriter:
         status_path: Path,
         head_node: str,
     ) -> None:
-        self.driver_state = "WAITING_FOR_WORKER"
+        self.driver_state = "WAITING_FOR_RESOURCES"
         self._ray = ray_module
         self._status_path = status_path
         self._head_node = head_node
@@ -490,7 +496,7 @@ def _run_head(args: argparse.Namespace) -> int:
 
 
 def _supervise_head(args: argparse.Namespace, manifest_path: Path, teardown: ExitStack) -> int:
-    """Start Ray, run the driver once a worker joins, and persist its outcome.
+    """Start Ray, run the driver once compute is available, and persist its outcome.
 
     Head resources are registered with ``teardown`` as they are created. The manifest stays ``STOPPING`` until those
     resources have been released and the outer batch wrapper has canceled the worker lanes.
@@ -511,7 +517,7 @@ def _supervise_head(args: argparse.Namespace, manifest_path: Path, teardown: Exi
     # start_new_session puts `ray start` and everything it spawns in their own process group, which is what
     # lets teardown kill this allocation's Ray and nothing else -- see _stop_ray.
     head_process = subprocess.Popen(  # noqa: S603
-        _ray_head_command(head_node, ports, temp_dir), start_new_session=True
+        _ray_head_command(head_node, ports, temp_dir, args.io_slots_per_node, _allocated_cpus()), start_new_session=True
     )
     teardown.callback(_stop_process, head_process)
     ray_module = _connect_to_ray(address, head_process, args.startup_timeout_seconds)
@@ -529,7 +535,7 @@ def _supervise_head(args: argparse.Namespace, manifest_path: Path, teardown: Exi
     status_writer.start()
     teardown.callback(status_writer.stop)
 
-    _wait_for_first_worker(ray_module, head_process=head_process, stop_signal=stop_signal)
+    _wait_for_compute(ray_module, head_process=head_process, stop_signal=stop_signal)
     if stop_signal.is_set():
         return _TERMINATED_STATUS
     if _state.run_state(_mutate(manifest_path, args.run_id, {"operation": "activate"})) != "ACTIVE":
@@ -902,6 +908,7 @@ def _parser() -> argparse.ArgumentParser:
     head.add_argument("--run-id", required=True)
     head.add_argument("--manifest", required=True)
     head.add_argument("--startup-timeout-seconds", required=True, type=int)
+    head.add_argument("--io-slots-per-node", type=_positive_int, default=_DEFAULT_IO_SLOTS_PER_NODE)
     head.add_argument("--temp-dir")
     head.add_argument("command", nargs=argparse.REMAINDER)
 

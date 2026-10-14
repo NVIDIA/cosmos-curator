@@ -63,9 +63,10 @@ MODULE = "cosmos_curator.client.slurm_cli.managed_ray.lifecycle"
 REMOTE_MODULE = "cosmos_curator.client.slurm_cli.managed_ray.remote"
 
 
-def test_submit_records_each_returned_job_id_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("worker_lanes", [0, 2])
+def test_submit_records_each_returned_job_id_immediately(monkeypatch: pytest.MonkeyPatch, worker_lanes: int) -> None:
     """Initial submission persists head and lane IDs before advancing to STARTING."""
-    config = make_config(environment=["HOST_ONLY"])
+    config = make_config(worker_lanes=worker_lanes, environment=["HOST_ONLY"])
     connection = FakeConnection()
     snapshots: list[dict[str, object]] = []
     submitted_paths: list[Path] = []
@@ -104,26 +105,21 @@ def test_submit_records_each_returned_job_id_immediately(monkeypatch: pytest.Mon
     )
 
     assert result.head_job_id == "100"
-    assert result.lane_job_ids == ["101", "102"]
+    lane_job_ids = [str(101 + lane) for lane in range(worker_lanes)]
+    assert result.lane_job_ids == lane_job_ids
     assert result.slurm_cluster_name == "test-cluster"
     assert result.log_dir == f"{result.state_dir}/{result.run_id}/logs"
     assert result.json_payload()["log_dir"] == result.log_dir
     assert runtime_module_uploads == [Path(result.manifest_path).parent]
-    assert [path.name for path in submitted_paths] == ["head.sbatch", "worker.sbatch", "worker.sbatch"]
-    assert submitted_options[1]["options"] == ("--dependency=after:100",)
-    assert submitted_options[1]["arguments"] == (result.run_id, "100", "0")
-    assert submitted_options[2]["arguments"] == (result.run_id, "100", "1")
+    assert [path.name for path in submitted_paths] == ["head.sbatch", *["worker.sbatch"] * worker_lanes]
+    for lane in range(worker_lanes):
+        assert submitted_options[lane + 1]["options"] == ("--dependency=after:100",)
+        assert submitted_options[lane + 1]["arguments"] == (result.run_id, "100", str(lane))
+        assert [record["job_id"] for record in snapshots[lane + 1]["lanes"]] == lane_job_ids[: lane + 1]  # type: ignore[index]
     assert snapshots[0]["head_job_id"] == "100"
     assert snapshots[0]["slurm_cluster_name"] == "test-cluster"
-    assert snapshots[1]["lanes"] == [
-        {
-            "lane": 0,
-            "job_id": "101",
-            "submitted_at": snapshots[1]["lanes"][0]["submitted_at"],  # type: ignore[index]
-        }
-    ]
     assert snapshots[-1]["state"] == "STARTING"
-    assert [lane["job_id"] for lane in snapshots[-1]["lanes"]] == ["101", "102"]  # type: ignore[index]
+    assert [lane["job_id"] for lane in snapshots[-1]["lanes"]] == lane_job_ids  # type: ignore[index]
     environment_upload = next(upload for upload in uploaded_files if upload[1].name == "environment.sh")
     assert "export HOST_ONLY='secret value'" in environment_upload[0]
     assert environment_upload[2] == 0o600

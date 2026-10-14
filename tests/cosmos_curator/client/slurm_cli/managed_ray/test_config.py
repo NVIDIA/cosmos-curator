@@ -152,10 +152,52 @@ def test_explicit_null_account_uses_slurm_default(monkeypatch: pytest.MonkeyPatc
     assert config.slurm.account is None
 
 
+@pytest.mark.parametrize(("role", "other_role"), [("head", "worker"), ("worker", "head")])
+def test_allocation_settings_are_independent(role: str, other_role: str) -> None:
+    """Changing either role's allocation leaves the other role at its own defaults."""
+    defaults = resolve_slurm_ray_config_data({"schema_version": 1})
+    config = resolve_slurm_ray_config_data(
+        {
+            "schema_version": 1,
+            "slurm": {
+                role: {
+                    "partition": "gpu-shared",
+                    "qos": "normal",
+                    "time": "04:00:00",
+                    "exclusive": False,
+                    "cpus": 24,
+                    "memory": "48G",
+                    "gpus_per_node": 2,
+                }
+            },
+        },
+        overrides=[f"slurm.{role}.cpus=32"],
+    )
+
+    allocation = getattr(config.slurm, role)
+    assert allocation.cpus == 32
+    assert allocation.memory == "48G"
+    assert allocation.gpus_per_node == 2
+    assert allocation.exclusive is False
+    assert getattr(config.slurm, other_role) == getattr(defaults.slurm, other_role)
+
+
+@pytest.mark.parametrize("role", ["head", "worker"])
+@pytest.mark.parametrize(
+    "resources",
+    [{"gpus": "8"}, {"gpus": 0}, {"gpus_per_node": 0}, {"gpus": 8, "gpus_per_node": 8}],
+)
+def test_gpu_allocation_rejects_invalid_or_conflicting_requests(role: str, resources: dict[str, object]) -> None:
+    """Both roles validate GPU requests before generating an sbatch script."""
+    with pytest.raises(ValidationError):
+        resolve_slurm_ray_config_data({"schema_version": 1, "slurm": {role: resources}})
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         {"schema_version": 1, "unknown": True},
+        {"schema_version": 1, "worker_lanes": -1},
         {
             "schema_version": 1,
             "slurm": {"worker": {"gpus": "8"}},
@@ -190,7 +232,7 @@ def test_explicit_null_account_uses_slurm_default(monkeypatch: pytest.MonkeyPatc
             "schema_version": 1,
             "slurm": {"head": {"cpus": 0}},
         },
-        # "0" is how sbatch spells "all of the node", which is what the head must not ask for.
+        # Request the whole node with exclusive=true rather than memory="0".
         {
             "schema_version": 1,
             "slurm": {"head": {"memory": "0"}},
@@ -280,10 +322,15 @@ def test_template_schema_validate_and_render_cli(tmp_path: Path, monkeypatch: py
     assert template["schema_version"] == 1
     assert "state_dir" not in template
     assert template["slurm"]["worker"]["gpus"] is None
+    worker_defaults = template["slurm"]["worker"].copy()
+    assert worker_defaults.pop("max_lane_allocations") is None
+    assert template["slurm"]["head"] == worker_defaults
+    assert template["slurm"]["head"]["exclusive"] is True
     assert schema_result.exit_code == 0
     schema = json.loads(schema_result.stdout)
     assert schema["title"] == "SlurmRayConfig"
     assert "gpus" in schema["$defs"]["SlurmRayWorkerConfig"]["properties"]
+    assert "gpus" in schema["$defs"]["SlurmRayHeadConfig"]["properties"]
     assert validate_result.exit_code == 0
     assert json.loads(validate_result.stdout)["config"]["worker_lanes"] == 3
     assert render_result.exit_code == 0

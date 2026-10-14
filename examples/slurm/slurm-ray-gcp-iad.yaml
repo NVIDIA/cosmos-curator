@@ -7,6 +7,7 @@ slurm:
     partition: cpu
     qos: cpu-long
     time: 2-00:00:00
+    exclusive: false
     cpus: 64
     memory: 128G
   worker:

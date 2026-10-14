@@ -73,15 +73,13 @@ def test_rendered_jobs_ask_for_what_each_role_needs(tmp_path: Path) -> None:
         ("/remote/home/slurm-ray/cc-ray-deadbeef", "/run/cosmos-curator/slurm-ray"),
     }
     assert "#SBATCH --partition=cpu" in head_script
-    # The head shares a CPU node, and the step restates --cpus-per-task because Slurm does not inherit it.
-    assert "#SBATCH --exclusive" not in head_script
-    assert "#SBATCH --cpus-per-task=16" in head_script
-    assert "#SBATCH --mem=64G" in head_script
-    assert "--cpus-per-task=16" in head_script.split("srun", maxsplit=1)[1]
+    assert "#SBATCH --exclusive" in head_script
+    assert "#SBATCH --mem=0" in head_script
+    assert "--cpus-per-task" not in head_script
+    assert "#SBATCH --gpus" not in head_script
     assert "#SBATCH --no-requeue" in head_script
     assert "source /remote/home/slurm-ray/cc-ray-deadbeef/environment.sh" in head_script
-    assert "export NVIDIA_VISIBLE_DEVICES=void" in head_script
-    assert "NVIDIA_VISIBLE_DEVICES" in head_script.split("--container-env", maxsplit=1)[1]
+    assert "NVIDIA_VISIBLE_DEVICES" not in head_script
     assert "HOST_ONLY" in head_script.split("--container-env", maxsplit=1)[1]
     assert "CURATOR_RUN_ID" in head_script.split("--container-env", maxsplit=1)[1]
     assert "--num-cpus 0" not in head_script
@@ -93,7 +91,7 @@ def test_rendered_jobs_ask_for_what_each_role_needs(tmp_path: Path) -> None:
     assert "scancel" not in head_script
     assert "#SBATCH --partition=gpu" in worker_script
     assert "#SBATCH --gpus=8" in worker_script
-    # A worker takes its accelerator node whole, which is what keeps its fixed Ray ports safe.
+    # Workers use the same allocation defaults but keep their own GPU request and lifecycle.
     assert "#SBATCH --exclusive" in worker_script
     assert "#SBATCH --mem=0" in worker_script
     assert "#SBATCH --requeue" in worker_script
@@ -183,6 +181,9 @@ def test_launcher_owned_node_local_sources_are_always_created() -> None:
         forwarded_environment_keys=[],
     )
     script = render_worker_script(config, run_id="cc-ray-deadbeef", runtime_paths=runtime_paths, allocations=1)
+    head_script = render_head_script(
+        config, run_id="cc-ray-deadbeef", runtime_paths=runtime_paths, command=["python", "-m", "pipeline"]
+    )
 
     assert "/raid/ray" in {mount["source"] for mount in runtime_paths["mounts"]}
     # prepare_node_local_mounts is off by default, so only the launcher's own source is created.
@@ -190,6 +191,7 @@ def test_launcher_owned_node_local_sources_are_always_created() -> None:
     assert "mkdir -p -- /raid/ray" in script
     assert "mkdir -p -- /raid/scratch" not in script
     assert "--io-slots-per-node 9" in script
+    assert "--io-slots-per-node 9" in head_script
 
 
 def test_configured_node_local_mounts_are_created_on_request() -> None:
@@ -234,8 +236,9 @@ def test_capture_forwarded_environment_silently_skips_unset_logging_variables(
     ]
 
 
-def test_worker_requests_a_slice_when_not_exclusive() -> None:
-    """A non-exclusive worker states cpus/memory instead of claiming the whole node.
+@pytest.mark.parametrize("role", ["head", "worker"])
+def test_allocation_requests_a_slice_when_not_exclusive(role: str) -> None:
+    """A non-exclusive allocation states cpus/memory instead of claiming the whole node.
 
     A whole-node request only fits a wholly free node; a slice also packs onto partly used ones,
     which is what a CPU-only recipe on a shared partition needs.
@@ -247,8 +250,7 @@ def test_worker_requests_a_slice_when_not_exclusive() -> None:
             "worker_lanes": 2,
             "slurm": {
                 "account": "acct",
-                "head": {"partition": "cpu", "qos": "normal", "time": "1-00:00:00"},
-                "worker": {
+                role: {
                     "partition": "cpu",
                     "qos": "cpu-free",
                     "time": "04:00:00",
@@ -271,19 +273,24 @@ def test_worker_requests_a_slice_when_not_exclusive() -> None:
         forwarded_environment_keys=[],
     )
 
-    worker_script = render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
+    script = (
+        render_head_script(config, run_id=run_id, runtime_paths=runtime_paths, command=["python", "-m", "pipeline"])
+        if role == "head"
+        else render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
+    )
 
-    assert "#SBATCH --cpus-per-task=24" in worker_script
-    assert "#SBATCH --mem=48G" in worker_script
-    assert "#SBATCH --exclusive" not in worker_script
-    assert "#SBATCH --mem=0" not in worker_script
+    assert "#SBATCH --cpus-per-task=24" in script
+    assert "#SBATCH --mem=48G" in script
+    assert "#SBATCH --exclusive" not in script
+    assert "#SBATCH --mem=0" not in script
     # Since Slurm 22.05 the step does not inherit --cpus-per-task, so it must be restated or the
     # step lands on a single core while the rest of the allocation idles.
-    assert "--cpus-per-task=24" in worker_script.split("srun")[-1]
+    assert "--cpus-per-task=24" in script.split("srun")[-1]
 
 
-def test_worker_takes_whole_node_by_default() -> None:
-    """Default behaviour is unchanged: an accelerator lane still claims its node."""
+@pytest.mark.parametrize("role", ["head", "worker"])
+def test_allocation_takes_whole_node_by_default(role: str) -> None:
+    """Both roles use the whole node without limiting the step to the sliced CPU default."""
     config = make_config()
     run_id = "cc-ray-deadbeef"
     runtime_paths = resolve_runtime_paths(
@@ -295,8 +302,46 @@ def test_worker_takes_whole_node_by_default() -> None:
         forwarded_environment_keys=[],
     )
 
+    script = (
+        render_head_script(config, run_id=run_id, runtime_paths=runtime_paths, command=["python", "-m", "pipeline"])
+        if role == "head"
+        else render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
+    )
+
+    assert "#SBATCH --exclusive" in script
+    assert "#SBATCH --mem=0" in script
+    assert "--cpus-per-task" not in script
+
+
+@pytest.mark.parametrize("gpu_field", ["gpus", "gpus_per_node"])
+def test_head_and_worker_gpu_requests_are_independent(gpu_field: str) -> None:
+    """A GPU head keeps its requested GPUs visible and uses its own partition and GPU count."""
+    config = resolve_slurm_ray_config_data(
+        {
+            "schema_version": 1,
+            "slurm": {
+                "head": {"partition": "gpu-long", gpu_field: 4},
+                "worker": {"partition": "gpu-batch", gpu_field: 8},
+            },
+        }
+    )
+    run_id = "cc-ray-deadbeef"
+    runtime_paths = resolve_runtime_paths(
+        config,
+        home=Path("/remote/home"),
+        run_id=run_id,
+        state_dir="~/slurm-ray",
+        host_path_exists=lambda _path: True,
+        forwarded_environment_keys=[],
+    )
+    head_script = render_head_script(
+        config, run_id=run_id, runtime_paths=runtime_paths, command=["python", "-m", "pipeline"]
+    )
     worker_script = render_worker_script(config, run_id=run_id, runtime_paths=runtime_paths, allocations=1)
 
-    assert "#SBATCH --exclusive" in worker_script
-    assert "#SBATCH --mem=0" in worker_script
-    assert "#SBATCH --cpus-per-task" not in worker_script
+    flag = gpu_field.replace("_", "-")
+    assert f"#SBATCH --{flag}=4" in head_script
+    assert "#SBATCH --partition=gpu-long" in head_script
+    assert "NVIDIA_VISIBLE_DEVICES" not in head_script
+    assert f"#SBATCH --{flag}=8" in worker_script
+    assert "#SBATCH --partition=gpu-batch" in worker_script
