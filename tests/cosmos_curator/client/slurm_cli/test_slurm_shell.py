@@ -79,6 +79,10 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     monkeypatch.setenv("HOST_ONLY", "host-value")
     monkeypatch.setenv("PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
     monkeypatch.setenv("PIXI_PROJECT_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_WORKSPACE_MANIFEST", str(repo / "pixi.toml"))
+    monkeypatch.setenv("PIXI_WORKSPACE_NAME", "cosmos-curator")
+    monkeypatch.setenv("PIXI_WORKSPACE_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_WORKSPACE_VERSION", "1.0.0")
     monkeypatch.setenv("PIXI_ENVIRONMENT_NAME", "cluster")
     monkeypatch.setenv("PIXI_IN_SHELL", "1")
     monkeypatch.setenv("CONDA_PREFIX", str(repo / ".pixi" / "envs" / "cluster"))
@@ -189,6 +193,10 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     assert subprocess_env["HOST_ONLY"] == "host-value"
     assert "PIXI_PROJECT_MANIFEST" not in subprocess_env
     assert "PIXI_PROJECT_ROOT" not in subprocess_env
+    assert "PIXI_WORKSPACE_MANIFEST" not in subprocess_env
+    assert "PIXI_WORKSPACE_NAME" not in subprocess_env
+    assert "PIXI_WORKSPACE_ROOT" not in subprocess_env
+    assert "PIXI_WORKSPACE_VERSION" not in subprocess_env
     assert "PIXI_ENVIRONMENT_NAME" not in subprocess_env
     assert "PIXI_IN_SHELL" not in subprocess_env
     assert "CONDA_PREFIX" not in subprocess_env

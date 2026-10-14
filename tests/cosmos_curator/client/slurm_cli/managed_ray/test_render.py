@@ -111,6 +111,11 @@ def test_rendered_jobs_ask_for_what_each_role_needs(tmp_path: Path) -> None:
     ]:
         assert "#SBATCH --propagate=NONE" in script
         assert "--propagate=NONE" in script.split("srun", maxsplit=1)[1]
+        unset_line = next(line for line in script.splitlines() if line.startswith("unset PIXI_ENVIRONMENT_NAME"))
+        for prefix in ("PIXI_PROJECT", "PIXI_WORKSPACE"):
+            for suffix in ("MANIFEST", "NAME", "ROOT", "VERSION"):
+                assert f"{prefix}_{suffix}" in unset_line
+        assert script.index(unset_line) < script.index("source ")
         script_path = tmp_path / name
         script_path.write_text(script, encoding="utf-8")
         subprocess.run(["bash", "-n", str(script_path)], check=True)  # noqa: S603,S607

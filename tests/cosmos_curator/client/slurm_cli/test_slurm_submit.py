@@ -63,6 +63,10 @@ def _assert_launcher_env_scrubbed_from_submit(env_vars: dict[str, str], sbatch_s
     launcher_env_vars = (
         "PIXI_PROJECT_MANIFEST",
         "PIXI_PROJECT_ROOT",
+        "PIXI_WORKSPACE_MANIFEST",
+        "PIXI_WORKSPACE_NAME",
+        "PIXI_WORKSPACE_ROOT",
+        "PIXI_WORKSPACE_VERSION",
         "PIXI_ENVIRONMENT_NAME",
         "PIXI_IN_SHELL",
         "CONDA_PREFIX",
@@ -78,6 +82,10 @@ def _assert_launcher_env_scrubbed_from_submit(env_vars: dict[str, str], sbatch_s
     )
     assert unset_line is not None, "Expected 'unset PIXI_ENVIRONMENT_NAME' line in sbatch script"
     assert "PIXI_PROJECT_MANIFEST" in unset_line
+    assert "PIXI_WORKSPACE_MANIFEST" in unset_line
+    assert "PIXI_WORKSPACE_NAME" in unset_line
+    assert "PIXI_WORKSPACE_ROOT" in unset_line
+    assert "PIXI_WORKSPACE_VERSION" in unset_line
     assert "PIXI_ENVIRONMENT_NAME" in unset_line
     assert "CONDA_PREFIX" in unset_line
     assert "CONDA_DEFAULT_ENV" in unset_line
@@ -91,6 +99,10 @@ def _assert_launcher_env_scrubbed_from_submit(env_vars: dict[str, str], sbatch_s
 def _seed_launcher_activation_env(monkeypatch: pytest.MonkeyPatch, repo: pathlib.Path) -> None:
     monkeypatch.setenv("PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
     monkeypatch.setenv("PIXI_PROJECT_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_WORKSPACE_MANIFEST", str(repo / "pixi.toml"))
+    monkeypatch.setenv("PIXI_WORKSPACE_NAME", "cosmos-curator")
+    monkeypatch.setenv("PIXI_WORKSPACE_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_WORKSPACE_VERSION", "1.0.0")
     monkeypatch.setenv("PIXI_ENVIRONMENT_NAME", "cluster")
     monkeypatch.setenv("PIXI_IN_SHELL", "1")
     monkeypatch.setenv("CONDA_PREFIX", str(repo / ".pixi" / "envs" / "cluster"))
