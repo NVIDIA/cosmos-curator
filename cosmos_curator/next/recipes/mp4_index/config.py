@@ -26,7 +26,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
-from cosmos_curator.next.recipes.mp4_index.contracts import KIND
+from cosmos_curator.next.recipes.mp4_index.contracts import KIND, Indexer
 from cosmos_curator.next.utils.identity import canonical_digest
 from cosmos_curator.next.utils.uris import normalize_location
 
@@ -263,25 +263,25 @@ class Mp4IndexRunConfig(BaseModel):
         """Render JSON Schema using this recipe's concrete model."""
         return json.dumps(cls.model_json_schema(), indent=indent, ensure_ascii=False) + "\n"
 
-    @property
-    def extraction_contract(self) -> dict[str, object]:
+    def extraction_contract(self, *, indexer: Indexer) -> dict[str, object]:
         """Describe extraction-time output semantics, independently of execution tuning.
 
         Only fields that change what gets extracted/written for identical input bytes belong
         here -- read-time-only interpretation behavior and execution-only tuning are both
-        excluded, since neither changes the output.
+        excluded, since neither changes the output. *indexer* is ``INDEXER_PYAV`` or
+        ``INDEXER_BOX_WALKER``, whose timestamps and metadata can differ for the same file.
         """
         return {
             "kind": self.kind,
-            "extraction_version": 1,  # bumped manually when extraction semantics change
+            "extraction_version": 2,  # bumped manually when extraction semantics change
+            "indexer": indexer,
             "container_kind": self.input.container_kind,
             "session_id_path_depth": self.execution.session_id_path_depth,
         }
 
-    @property
-    def extraction_contract_id(self) -> str:
-        """Identify compatible extraction work."""
-        return canonical_digest(self.extraction_contract)
+    def extraction_contract_id(self, *, indexer: Indexer) -> str:
+        """Identify compatible extraction work by *indexer*."""
+        return canonical_digest(self.extraction_contract(indexer=indexer))
 
 
 class ResolvedMp4IndexConfig(Mp4IndexRunConfig):

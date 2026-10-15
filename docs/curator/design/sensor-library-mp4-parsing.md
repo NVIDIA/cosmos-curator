@@ -6,6 +6,15 @@ fragmented layouts. Callers can use it independently of an indexing recipe or st
 PyAV and the FFmpeg CLI do not provide a general interface for retrieving arbitrary MP4 UUID
 payloads.
 
+`box_probe.index_from_boxes` is an independent indexer: it indexes a video with PyAV from the
+extracted `moov` and `moof` boxes alone, laid out at their source offsets with zeros in place of
+media, and returns libav's `VideoProbe` with `Mp4Metadata` built from it. It indexes the stream
+libav ranks best, keeps libav's timestamps, reads fragment layouts this parser refuses, and leaves
+null the metadata fields libav does not report; it does not run UUID handlers. The
+underlying per-packet index is `video_probe` in `cosmos_curator.core.sensors.utils.video`, which
+opens a source with FFmpeg's `ignore_editlist` and reports each packet's decode time, unshifted by
+the edit list, with its composition offset, byte range, duration, and keyframe flag in decode order.
+
 The implementation lives in `cosmos_curator.core.sensors.mp4`; its typed metadata and frame-index
 views live in `cosmos_curator.core.sensors.data.mp4`. Callers supply the inputs and decide how to
 store and use the results.

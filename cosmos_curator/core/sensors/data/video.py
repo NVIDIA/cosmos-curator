@@ -22,12 +22,14 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 
-from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
+from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
+from cosmos_curator.core.sensors.utils.helpers import as_optional_readonly_view, as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import (
     INT64_MAX,
     INT64_MIN,
     bool_array,
     int64_array,
+    optional_int64_array,
     strictly_increasing_int64_array,
 )
 
@@ -491,3 +493,94 @@ class VideoMetadata:
             "pix_fmt": self.pix_fmt,
             "bit_rate_bps": str(self.bit_rate_bps),
         }
+
+
+class _HasVideoProbeArrays(Protocol):
+    dts: npt.NDArray[np.int64]
+    composition_offset: npt.NDArray[np.int64] | None
+    is_keyframe: npt.NDArray[np.bool_]
+    offset: npt.NDArray[np.int64]
+    size: npt.NDArray[np.int64]
+    duration: npt.NDArray[np.int64] | None
+
+
+def _probe_array_lengths(instance: _HasVideoProbeArrays, _attribute: object, value: npt.NDArray[np.bool_]) -> None:
+    """Validate that every per-sample array describes the same samples."""
+    lens = {
+        "dts": len(instance.dts),
+        "is_keyframe": len(instance.is_keyframe),
+        "offset": len(instance.offset),
+        "size": len(instance.size),
+        "is_discard": len(value),
+    }
+    if instance.composition_offset is not None:
+        lens["composition_offset"] = len(instance.composition_offset)
+    if instance.duration is not None:
+        lens["duration"] = len(instance.duration)
+    if len(set(lens.values())) != 1:
+        msg = f"All arrays must be the same length: {lens}"
+        raise ValueError(msg)
+
+
+@attrs.define(frozen=True, eq=False)
+class VideoProbe:
+    """One video stream's per-sample packet index and stream properties, as PyAV's demuxer reports them.
+
+    Unlike :class:`VideoIndex`, arrays stay in decode order with one entry per sample, and
+    timestamps stay in stream ticks, unshifted by any edit list. Every value is copied out of
+    PyAV before its container closes; PyAV objects read after that return garbage silently.
+
+    Attributes:
+        index_method: ``FROM_HEADER`` or ``FULL_DEMUX``, whichever built the arrays.
+        time_base: tick duration of ``dts`` and ``composition_offset``, in seconds.
+        dts: decode timestamps.
+        composition_offset: ``pts - dts`` per sample, or ``None`` when every offset is zero
+            or ``index_method`` is ``FROM_HEADER``, which reads no presentation timestamps.
+            PyAV cannot tell an all-zero ``ctts`` from an absent one.
+        is_keyframe: sync-sample flags.
+        offset: byte offset of each sample's data in the file.
+        size: byte size of each sample's data.
+        duration: each packet's duration in stream ticks, ``0`` where the container states none,
+            or ``None`` when ``index_method`` is ``FROM_HEADER``, which reads no packets.
+        is_discard: samples the demuxer marks as decoded but not displayed.
+        codec_name: codec name as reported by libavcodec, e.g. ``'h264'``.
+        extradata: codec configuration record, e.g. the ``avcC`` payload.
+        width: coded frame width in pixels.
+        height: coded frame height in pixels.
+        has_b_frames: whether the decoder signals a frame-reordering delay.
+        avg_frame_rate: nominal container frame rate, ``Fraction(0)`` when unknown.
+        container_format: container format name as reported by libavformat.
+
+    """
+
+    index_method: VideoIndexCreationMethod
+    time_base: Fraction
+    dts: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view, validator=int64_array)
+    composition_offset: npt.NDArray[np.int64] | None = attrs.field(
+        converter=as_optional_readonly_view, validator=optional_int64_array
+    )
+    is_keyframe: npt.NDArray[np.bool_] = attrs.field(converter=as_readonly_view, validator=bool_array)
+    offset: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view, validator=int64_array)
+    size: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view, validator=int64_array)
+    duration: npt.NDArray[np.int64] | None = attrs.field(
+        converter=as_optional_readonly_view, validator=optional_int64_array
+    )
+    is_discard: npt.NDArray[np.bool_] = attrs.field(
+        converter=as_readonly_view, validator=attrs.validators.and_(bool_array, _probe_array_lengths)
+    )
+    codec_name: str
+    extradata: bytes
+    width: int
+    height: int
+    has_b_frames: bool
+    avg_frame_rate: Fraction
+    container_format: str
+
+    def __len__(self) -> int:
+        """Return the sample count."""
+        return len(self.dts)
+
+    @property
+    def keyframe_count(self) -> int:
+        """Return the number of sync samples."""
+        return int(self.is_keyframe.sum())

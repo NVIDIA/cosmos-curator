@@ -33,6 +33,7 @@ from cosmos_curator.core.sensors.data.mp4 import (
     _stream_rate_stats,
     _ticks_to_ns,
 )
+from cosmos_curator.core.sensors.data.video import VideoProbe
 from cosmos_curator.core.sensors.mp4.box_primitives import read_box_header
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.fragment_table import parse_fragment_table
@@ -271,6 +272,53 @@ def test_mp4_metadata_from_video_track_matches_the_real_box_fields() -> None:
     assert metadata.height == 480
     assert metadata.avc_profile_idc == 0x42
     assert metadata.duration_ns == 125_000_000  # 3 samples * 512 ticks each, at timescale=12288
+
+
+def _video_probe(dts: list[int], duration: list[int] | None) -> VideoProbe:
+    count = len(dts)
+    return VideoProbe(
+        index_method=VideoIndexCreationMethod.FULL_DEMUX,
+        time_base=Fraction(1, 1000),
+        dts=np.array(dts, dtype=np.int64),
+        composition_offset=None,
+        is_keyframe=np.array([index == 0 for index in range(count)]),
+        offset=np.arange(count, dtype=np.int64) * 100,
+        size=np.full(count, 100, dtype=np.int64),
+        duration=None if duration is None else np.array(duration, dtype=np.int64),
+        is_discard=np.zeros(count, dtype=np.bool_),
+        codec_name="h264",
+        extradata=b"\x01\x42",
+        width=640,
+        height=480,
+        has_b_frames=False,
+        avg_frame_rate=Fraction(25),
+        container_format="mov,mp4,m4a,3gp,3g2,mj2",
+    )
+
+
+def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_duration() -> None:
+    """Duration, rates, and decoder setup come from libav; fields it does not report are None."""
+    probe = _video_probe([0, 40, 80, 120], [40, 40, 40, 40])
+
+    metadata = Mp4Metadata.from_video_probe(probe, encoder_tag="Lavc libx264", elst_bytes=b"elst")
+
+    assert metadata.duration_ns == 160_000_000
+    assert (metadata.avg_frame_rate_num, metadata.avg_frame_rate_den) == (25, 1)
+    assert metadata.bit_rate_bps == 4 * 100 * 8 * 1000 // 160
+    assert (metadata.time_base_num, metadata.time_base_den) == (1, 1000)
+    assert (metadata.frame_count, metadata.keyframe_count) == (4, 1)
+    assert (metadata.codec_name, metadata.extradata, metadata.width, metadata.height) == ("h264", b"\x01\x42", 640, 480)
+    assert (metadata.encoder_tag, metadata.elst_bytes) == ("Lavc libx264", b"elst")
+    assert metadata.avc_profile_idc is None
+    assert metadata.track_matrix is None
+    assert metadata.movie_creation_time is None
+
+
+def test_mp4_metadata_from_video_probe_spans_only_decode_times_without_packet_durations() -> None:
+    """With no durations reported, the last sample adds nothing to the span."""
+    metadata = Mp4Metadata.from_video_probe(_video_probe([0, 40, 80], None), encoder_tag=None, elst_bytes=None)
+
+    assert metadata.duration_ns == 80_000_000
 
 
 def test_mp4_metadata_from_video_track_tolerates_a_zero_timescale_with_duration_ns_zero() -> None:

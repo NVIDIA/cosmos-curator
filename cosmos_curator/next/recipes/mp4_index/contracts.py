@@ -25,7 +25,7 @@ import pathlib
 import posixpath
 import uuid
 from collections.abc import Iterator
-from typing import IO, Any
+from typing import IO, Any, Final, Literal
 from urllib.parse import urlsplit
 
 import pyarrow as pa
@@ -41,7 +41,13 @@ CONTAINER_KIND_FRAGMENTED = "fragmented"
 CONTAINER_KIND_NONFRAGMENTED = "nonfragmented"
 
 #: VIDEO_MANIFEST_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
-RECORD_SCHEMA_VERSION = 6
+RECORD_SCHEMA_VERSION = 7
+
+#: Which indexer built a video's frames and metadata, part of ``extraction_contract_id``.
+Indexer = Literal["pyav", "box_walker"]
+INDEXER_PYAV: Final[Indexer] = "pyav"
+#: The box walker, which indexes a video whenever an extension decodes its UUID boxes.
+INDEXER_BOX_WALKER: Final[Indexer] = "box_walker"
 
 
 def make_video_id(media_location: str) -> str:
@@ -149,7 +155,7 @@ FRAME_INDEX_SCHEMA = pa.schema(
 )
 
 
-#: Box metadata embedded as a struct in each canonical video record.
+#: Stream metadata embedded as a struct in each canonical video record.
 VIDEO_METADATA_SCHEMA = pa.schema(
     [
         pa.field("codec_name", pa.string(), nullable=False),
@@ -162,6 +168,7 @@ VIDEO_METADATA_SCHEMA = pa.schema(
         pa.field("keyframe_count", pa.int64(), nullable=False),
         pa.field("width", pa.int32(), nullable=False),
         pa.field("height", pa.int32(), nullable=False),
+        # avcC fields, also in extradata: null when PyAV indexed the video
         pa.field("avc_profile_idc", pa.int32(), nullable=True),
         pa.field("avc_constraint_flags", pa.int32(), nullable=True),
         pa.field("avc_level_idc", pa.int32(), nullable=True),
@@ -169,19 +176,21 @@ VIDEO_METADATA_SCHEMA = pa.schema(
         pa.field("chroma_format_idc", pa.int32(), nullable=True),
         pa.field("bit_depth_luma_minus8", pa.int32(), nullable=True),
         pa.field("bit_depth_chroma_minus8", pa.int32(), nullable=True),
-        # btrt -- the encoder's own claimed bitrate, distinct from this schema's own measured bit_rate_bps
+        # btrt -- the encoder's own claimed bitrate, distinct from this schema's own measured bit_rate_bps;
+        # null when PyAV indexed the video
         pa.field("buffer_size_db", pa.int64(), nullable=True),
         pa.field("max_bitrate_bps", pa.int64(), nullable=True),
         pa.field("avg_bitrate_bps", pa.int64(), nullable=True),
-        pa.field("movie_creation_time", pa.int64(), nullable=False),
-        pa.field("movie_modification_time", pa.int64(), nullable=False),
-        pa.field("track_creation_time", pa.int64(), nullable=False),
-        pa.field("track_modification_time", pa.int64(), nullable=False),
-        pa.field("track_matrix", pa.list_(pa.int32()), nullable=False),
+        # mvhd/tkhd fields libav does not report: null when PyAV indexed the video
+        pa.field("movie_creation_time", pa.int64(), nullable=True),
+        pa.field("movie_modification_time", pa.int64(), nullable=True),
+        pa.field("track_creation_time", pa.int64(), nullable=True),
+        pa.field("track_modification_time", pa.int64(), nullable=True),
+        pa.field("track_matrix", pa.list_(pa.int32()), nullable=True),
         # tkhd's own width/height are unsigned 32-bit (16.16 fixed-point) -- int64, not int32,
         # for the same reason as time_base_den above.
-        pa.field("track_display_width", pa.int64(), nullable=False),
-        pa.field("track_display_height", pa.int64(), nullable=False),
+        pa.field("track_display_width", pa.int64(), nullable=True),
+        pa.field("track_display_height", pa.int64(), nullable=True),
         # edts/elst box, verbatim, header included; null when the track has no edit list --
         # query presence directly (IS NOT NULL), no separate bool
         pa.field("elst_bytes", pa.binary(), nullable=True),

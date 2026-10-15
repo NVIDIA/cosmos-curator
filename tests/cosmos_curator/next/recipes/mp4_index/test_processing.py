@@ -18,6 +18,8 @@ Builds real, minimal box layouts (reusing ``_box_fixtures.py``'s
 ``synthetic_moov``/``synthetic_fragmented_moov``/``pack_moof``/``real_traf`` for a real,
 ``get_moov_auto``-locatable ``moov``), since this recipe fetches ``moov``/``moof`` from the video
 file itself on a cache miss. ``container_kind`` is passed in by every test here, not detected.
+PyAV indexes the extracted boxes without reading media, so no file needs decodable samples, only
+an ``mdat`` long enough that every sample's byte range ends inside the file.
 
 The cache-hit/fast-path tests are the real proof the caching guard works: they monkeypatch
 ``box_locate.get_moov_auto``/``walk_moofs`` to raise if called at all, so a wrongly-triggered
@@ -29,18 +31,21 @@ import struct
 import sys
 from typing import Any, Self
 
-import av
 import pyarrow as pa
 import pytest
 import smart_open  # type: ignore[import-untyped]
+from av.container import InputContainer
 
 from cosmos_curator.core.sensors.data.mp4 import InvalidTimeBaseError
-from cosmos_curator.core.sensors.mp4 import box_locate
+from cosmos_curator.core.sensors.data.video import VideoProbe
+from cosmos_curator.core.sensors.mp4 import box_locate, box_probe
 from cosmos_curator.core.sensors.mp4.box_primitives import AmbiguousVideoTrackError, find_box
 from cosmos_curator.core.sensors.mp4.box_traversal import BoxLocation, UuidHandler
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.fragment_table import CompositionOffsetUnsupportedError
 from cosmos_curator.core.sensors.mp4.moov_track import EmptySampleTableError
+from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
+from cosmos_curator.core.sensors.utils.video import probe_open_video_stream
 from cosmos_curator.next.recipes.mp4_index import processing
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
@@ -87,7 +92,10 @@ def _write_synthetic_nonfragmented_mp4(
 def _write_synthetic_fragmented_mp4(
     path: pathlib.Path, *, moof_rows: list[tuple[int, bytes]] | None = None
 ) -> tuple[bytes, list[tuple[int, bytes]]]:
-    """Write a minimal real ftyp/moov/(moof/mdat)* file, return (moov bytes, [(start, moof bytes), ...])."""
+    """Write a minimal real ftyp/moov/(moof/mdat)* file, return (moov bytes, [(start, moof bytes), ...]).
+
+    Each ``mdat`` is long enough that the default ``trun`` sample it follows ends inside the file.
+    """
     moov_box = bf.synthetic_fragmented_moov()
     rows = (
         moof_rows
@@ -146,7 +154,9 @@ def _call(
     container_kind: str,
     session_id_path_depth: int = 2,
     skip_existing_sidecars: bool = True,
+    with_extension: bool = False,
 ) -> dict[str, object]:
+    """Index *media_path* with PyAV, or with the box walker when *with_extension*."""
     config = _config_stub(
         tmp_path,
         container_kind=container_kind,
@@ -157,6 +167,7 @@ def _call(
     return processing.process_one_video(
         {"video_id": make_video_id(str(media_path)), "media_location": str(media_path)},
         config=config,
+        extension_factory=(lambda _media_location: _NoOpExtension()) if with_extension else None,
     )
 
 
@@ -191,7 +202,7 @@ def invalid_fragmented_mp4(fragmented_mp4: pathlib.Path, request: pytest.Fixture
 
 
 @pytest.mark.parametrize("cached", [False, True])
-def test_process_one_video_rejects_invalid_sample_ranges_without_decoding(
+def test_process_one_video_rejects_invalid_sample_ranges_without_demuxing(
     tmp_path: pathlib.Path,
     invalid_fragmented_mp4: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -204,11 +215,15 @@ def test_process_one_video_rejects_invalid_sample_ranges_without_decoding(
     def captured_warning(message: str, *args: object) -> None:
         sys.stderr.write(message.format(*args) + "\n")
 
-    def unexpected_decode(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("Invalid sample ranges must be rejected without decoding")
+    def header_index_only(
+        container: InputContainer, stream_idx: int, index_method: VideoIndexCreationMethod
+    ) -> VideoProbe:
+        if index_method is not VideoIndexCreationMethod.FROM_HEADER:
+            pytest.fail("Invalid sample ranges must be rejected from the header index, without a demux")
+        return probe_open_video_stream(container, stream_idx, index_method)
 
     monkeypatch.setattr(processing.logger, "warning", captured_warning)
-    monkeypatch.setattr(av, "open", unexpected_decode)
+    monkeypatch.setattr(box_probe, "probe_open_video_stream", header_index_only)
     if cached:
         _call(tmp_path, invalid_fragmented_mp4, container_kind=CONTAINER_KIND_FRAGMENTED)
         capfd.readouterr()
@@ -389,49 +404,86 @@ def test_process_one_video_manifest_summary_columns_match_nested_metadata(tmp_pa
     assert result["source_video_codec"] == metadata_row["codec_name"]
 
 
-def test_process_one_video_tolerates_a_zero_timescale_with_zero_rate_and_duration(tmp_path: pathlib.Path) -> None:
-    """A malformed zero mdhd timescale still indexes successfully, matching Mp4Metadata's own tolerance."""
+@pytest.mark.parametrize("timescale", [0, 0x90000000])
+def test_process_one_video_refuses_a_timescale_libav_replaces(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str], timescale: int
+) -> None:
+    """Libav reads mdhd's unsigned timescale as signed and substitutes 1/1, so PyAV cannot index the ticks."""
+    _capture_warnings(monkeypatch)
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(media_path, timescale=timescale)
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == box_probe.UnsupportedTimescaleError.__name__
+    assert f"mdhd timescale {timescale}" in capfd.readouterr().err
+
+
+def test_process_one_video_with_an_extension_tolerates_a_zero_timescale(tmp_path: pathlib.Path) -> None:
+    """The box walker indexes a malformed zero mdhd timescale with zero rate and duration."""
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     _write_synthetic_nonfragmented_mp4(media_path, frame_count=1, keyframe_index=0, timescale=0)
 
-    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, with_extension=True)
 
     assert result["status"] == "success"
     assert result["source_frame_rate"] == 0.0
     assert result["source_duration_ns"] == 0
 
 
-def test_process_one_video_indexes_a_real_unsigned_32_bit_timescale(tmp_path: pathlib.Path) -> None:
-    """A legal mdhd timescale above int32's signed max survives, it isn't refused or truncated.
+def test_process_one_video_with_an_extension_indexes_unsigned_32_bit_box_fields(tmp_path: pathlib.Path) -> None:
+    """The box walker keeps mdhd's timescale and tkhd's display size above int32's signed max.
 
-    mdhd's own timescale field is unsigned 32-bit per ISO/IEC 14496-12; 0x90000000
-    (2_415_919_104) is a real, legal value above int32's signed max (2_147_483_647).
+    Both are unsigned 32-bit per ISO/IEC 14496-12 (tkhd's as 16.16 fixed point).
     """
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
-    _write_synthetic_nonfragmented_mp4(media_path, timescale=0x90000000)
+    _write_synthetic_nonfragmented_mp4(media_path, timescale=0x90000000, tkhd_width=0x90000000, tkhd_height=0x90000000)
 
-    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, with_extension=True)
 
     assert result["status"] == "success"
     _frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert metadata_row["time_base_den"] == 0x90000000
-
-
-def test_process_one_video_indexes_a_real_unsigned_32_bit_tkhd_display_size(tmp_path: pathlib.Path) -> None:
-    """A legal tkhd display width/height above int32's signed max survives, it isn't refused or truncated.
-
-    tkhd's own width/height fields are unsigned 32-bit (16.16 fixed-point) per ISO/IEC
-    14496-12; 0x90000000 is a real, legal value above int32's signed max.
-    """
-    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
-    _write_synthetic_nonfragmented_mp4(media_path, tkhd_width=0x90000000, tkhd_height=0x90000000)
-
-    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
-
-    assert result["status"] == "success"
-    _frame_table, metadata_row = read_video_record(processing.result_table(result))
     assert metadata_row["track_display_width"] == 0x90000000
     assert metadata_row["track_display_height"] == 0x90000000
+
+
+def test_process_one_video_publishes_null_for_metadata_libav_does_not_report(tmp_path: pathlib.Path) -> None:
+    """PyAV rows carry the decoder setup and stream rates; avcC, btrt, mvhd, and tkhd fields are null."""
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(media_path, frame_count=3)
+
+    pyav_result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+    walker_result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, with_extension=True)
+
+    assert pyav_result["status"] == walker_result["status"] == "success"
+    _frames, pyav_metadata = read_video_record(processing.result_table(pyav_result))
+    _frames, walker_metadata = read_video_record(processing.result_table(walker_result))
+    box_only = {
+        "avc_profile_idc",
+        "avc_constraint_flags",
+        "avc_level_idc",
+        "nal_length_size",
+        "chroma_format_idc",
+        "bit_depth_luma_minus8",
+        "bit_depth_chroma_minus8",
+        "buffer_size_db",
+        "max_bitrate_bps",
+        "avg_bitrate_bps",
+        "movie_creation_time",
+        "movie_modification_time",
+        "track_creation_time",
+        "track_modification_time",
+        "track_matrix",
+        "track_display_width",
+        "track_display_height",
+    }
+    assert {name: pyav_metadata[name] for name in box_only} == dict.fromkeys(box_only)
+    assert walker_metadata["track_display_width"] == 640 << 16
+    shared = set(VIDEO_METADATA_SCHEMA.names) - box_only - {"encoder_tag"}
+    assert {name: pyav_metadata[name] for name in shared} == {name: walker_metadata[name] for name in shared}
+    assert pyav_result["extraction_contract_id"] != walker_result["extraction_contract_id"]
 
 
 def test_process_one_video_succeeds_on_an_edit_list_elst_decoding_cannot_apply_to_pts_ns(
@@ -573,8 +625,8 @@ def test_process_one_video_reuses_cached_moov_without_touching_the_source_file(
 
     This is the caching guard's one remaining trust-by-existence path (see process_one_video's
     own module docstring for the accepted risk it carries), still worth proving works: a garbage
-    media_location that would fail immediately if actually read confirms get_moov_auto is never
-    called when the moov sidecar is already present.
+    media_location that would fail immediately if actually read confirms neither get_moov_auto
+    nor PyAV reads it when the moov sidecar is already present. Only its size is used.
     """
     real_media_path = tmp_path / "real" / "video.mp4"
     real_moov_bytes = _write_synthetic_nonfragmented_mp4(real_media_path, frame_count=3, keyframe_index=0)
@@ -676,6 +728,42 @@ def test_process_one_video_does_not_retry_a_fresh_parse_failure_with_caching_sti
     assert len(calls) == 1  # exactly one fetch attempt -- nothing was ever cached to retry against
 
 
+def test_process_one_video_does_not_rewalk_a_fresh_moof_walk_failure_beside_a_cached_moov(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A walk that finds no fragments failed on source bytes; the cached moov beside it is not to blame.
+
+    Retrying would read the whole source a second time, under a warning naming a cache that played
+    no part in the failure.
+    """
+    _capture_warnings(monkeypatch)
+    media_path = tmp_path / "session-a" / "unit-00" / "extra" / "video-1.mp4"
+    moov_box = _write_synthetic_nonfragmented_mp4(media_path)
+    write_bytes_sidecar(moov_box, str(tmp_path / "moov" / f"{make_video_id(str(media_path))}.moov"))
+    moof_walks = _count_calls(monkeypatch, processing, "walk_moofs")
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "NoFragmentsFoundError"
+    assert len(moof_walks) == 1
+    captured = capfd.readouterr().err
+    assert "no moof boxes found" in captured
+    assert "invalid cached boxes" not in captured
+
+
+def _count_calls(monkeypatch: pytest.MonkeyPatch, owner: object, name: str) -> list[None]:
+    calls: list[None] = []
+    original = getattr(owner, name)
+
+    def counting(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, counting)
+    return calls
+
+
 def test_process_one_video_always_rebuilds_frame_index_and_metadata_even_when_already_present(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -749,10 +837,11 @@ def test_process_one_video_skip_existing_sidecars_false_forces_a_full_rebuild(
     assert calls == [1]  # moov was genuinely refetched, not read back from its own cached sidecar
 
 
-def test_process_one_video_nonfragmented_ambiguous_track_fails(tmp_path: pathlib.Path) -> None:
-    """A box-format refusal from the non-fragmented path lands as a failed result, same error type."""
-    import struct  # noqa: PLC0415
-
+def test_process_one_video_with_an_extension_fails_an_ambiguous_track(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The box walker's refusal of two video traks lands as a failed result, same error type."""
+    _capture_warnings(monkeypatch)
     video_entry = struct.pack(">6sH", b"\x00" * 6, 1) + b"\x00" * 78
     video_stsd = bf.pack_box("stsd", struct.pack(">II", 0, 1) + bf.pack_box("avc1", video_entry))
     video_trak = bf.pack_box(
@@ -763,15 +852,30 @@ def test_process_one_video_nonfragmented_ambiguous_track_fails(tmp_path: pathlib
     media_path.parent.mkdir(parents=True, exist_ok=True)
     media_path.write_bytes(bf.pack_box("ftyp", b"isom") + moov + bf.pack_box("mdat", b"data"))
 
-    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, with_extension=True)
 
     assert result["status"] == "failed"
     assert result["error_type"] == AmbiguousVideoTrackError.__name__
     assert set(VIDEO_MANIFEST_SCHEMA.names) <= set(result)
+    assert "could not be indexed" in capfd.readouterr().err
 
 
-def test_process_one_video_fragmented_unproven_shape_fails(tmp_path: pathlib.Path) -> None:
-    """A box-format refusal from the fragmented path (fragment_table.py's own) lands as a failed result."""
+class _NoOpExtension:
+    """An extension that registers no UUID decoders and contributes one null column."""
+
+    uuid_handlers = ()
+    frame_schema = pa.schema([pa.field("eof_ns", pa.int64())])
+
+    def frame_columns(self, extraction: processing.Mp4Extraction) -> pa.RecordBatch:
+        return pa.RecordBatch.from_arrays(
+            [pa.nulls(len(extraction.video_track.size), type=pa.int64())], schema=self.frame_schema
+        )
+
+
+def test_process_one_video_indexes_fragment_composition_offsets_only_without_an_extension(
+    tmp_path: pathlib.Path,
+) -> None:
+    """PyAV indexes a fragment shape the box walker refuses; an extension still needs the walker to read it."""
     media_path = tmp_path / "session-a" / "unit-00" / "extra" / "video-1.mp4"
     _write_synthetic_fragmented_mp4(
         media_path,
@@ -779,30 +883,86 @@ def test_process_one_video_fragmented_unproven_shape_fails(tmp_path: pathlib.Pat
             (0, bf.pack_moof(bf.real_traf(decode_time=0, data_offset=32, sample_size=500, composition_offset=100))),
         ],
     )
+    config = _config_stub(tmp_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+    row = {"video_id": make_video_id(str(media_path)), "media_location": str(media_path)}
 
-    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+    indexed = processing.process_one_video(row, config=config)
+    with_extension = processing.process_one_video(
+        row, config=config, extension_factory=lambda _media_location: _NoOpExtension()
+    )
 
-    assert result["status"] == "failed"
-    assert result["error_type"] == CompositionOffsetUnsupportedError.__name__
+    assert indexed["status"] == "success"
+    frame_table, _metadata_row = read_video_record(processing.result_table(indexed))
+    assert frame_table.column("composition_offset_ticks").to_pylist() == [100]
+    assert with_extension["status"] == "failed"
+    assert with_extension["error_type"] == CompositionOffsetUnsupportedError.__name__
+
+
+def test_process_one_video_never_runs_the_box_walker_without_an_extension(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PyAV alone builds the standard frame index; the walker runs only when an extension decodes UUID boxes."""
+
+    def unexpected_walk(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("the box walker must not run without an extension")
+
+    monkeypatch.setattr(processing, "parse_video_track", unexpected_walk)
+    monkeypatch.setattr(processing, "parse_fragment_table", unexpected_walk)
+    nonfragmented = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(nonfragmented, frame_count=3)
+    fragmented = tmp_path / "session-a" / "unit-00" / "extra" / "video-1.mp4"
+    _write_synthetic_fragmented_mp4(fragmented)
+
+    assert _call(tmp_path, nonfragmented, container_kind=CONTAINER_KIND_NONFRAGMENTED)["status"] == "success"
+    fragmented_result = _call(tmp_path, fragmented, container_kind=CONTAINER_KIND_FRAGMENTED, session_id_path_depth=3)
+    assert fragmented_result["status"] == "success"
+
+
+def test_process_one_video_with_an_extension_never_runs_pyav(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The box walker alone indexes a video when an extension decodes its UUID boxes."""
+
+    def unexpected_index(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("PyAV must not index a video an extension reads")
+
+    monkeypatch.setattr(processing, "index_from_boxes", unexpected_index)
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    _write_synthetic_nonfragmented_mp4(media_path, frame_count=3)
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED, with_extension=True)
+
+    assert result["status"] == "success"
+
+
+def _capture_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route expected warnings through the current capture stream, including in -s runs."""
+
+    def captured_warning(message: str, *args: object) -> None:
+        sys.stderr.write(message.format(*args) + "\n")
+
+    monkeypatch.setattr(processing.logger, "warning", captured_warning)
 
 
 def test_process_one_video_metadata_construction_failure_is_a_failed_row_not_a_crash(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """A VideoTrack that parses fine but fails Mp4Metadata's own construction is one failed row, not a crash."""
+    """A probe that indexes fine but fails Mp4Metadata's own construction is one failed row, not a crash."""
+    _capture_warnings(monkeypatch)
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     _write_synthetic_nonfragmented_mp4(media_path)
 
-    def _raise_invalid_time_base(video_track: object) -> None:  # noqa: ARG001 -- signature-compatible stand-in
+    def _raise_invalid_time_base(*_args: object, **_kwargs: object) -> None:
         msg = "time base denominator is 0"
         raise InvalidTimeBaseError(msg)
 
-    monkeypatch.setattr(processing.Mp4Metadata, "from_video_track", _raise_invalid_time_base)
+    monkeypatch.setattr(processing.Mp4Metadata, "from_video_probe", _raise_invalid_time_base)
 
     result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
 
     assert result["status"] == "failed"
     assert result["error_type"] == InvalidTimeBaseError.__name__
+    assert "time base denominator is 0" in capfd.readouterr().err
 
 
 def test_process_one_video_arrow_construction_failure_is_a_failed_row_not_a_crash(

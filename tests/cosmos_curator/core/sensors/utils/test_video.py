@@ -23,12 +23,15 @@ from types import SimpleNamespace
 from typing import Any, BinaryIO
 from unittest.mock import MagicMock, PropertyMock, patch
 
+import attrs
 import av
 import numpy as np
 import numpy.typing as npt
 import pytest
 
-from cosmos_curator.core.sensors.data.video import VIDEO_METADATA_VERSION, VideoIndex, VideoMetadata
+from cosmos_curator.core.sensors.data.mp4 import video_track_sample_arrays
+from cosmos_curator.core.sensors.data.video import VIDEO_METADATA_VERSION, VideoIndex, VideoMetadata, VideoProbe
+from cosmos_curator.core.sensors.mp4.moov_track import VideoTrack
 from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.io import open_file
 from cosmos_curator.core.sensors.utils.video import (
@@ -37,15 +40,20 @@ from cosmos_curator.core.sensors.utils.video import (
     GpuVideoDecodeConfig,
     GpuVideoDecoder,
     HeaderIndexUnavailableError,
+    IncompletePacketError,
     _get_video_index_from_header,
     _has_composition_offset,
+    _probe_full_demux,
     _resolve_auto_index_method,
     iter_video_frames,
     make_decode_plan,
     make_index_and_metadata,
     open_video_container,
+    probe_open_video_stream,
     pts_to_ns,
+    video_probe,
 )
+from tests.cosmos_curator.core.sensors.mp4 import _real_fixtures as real_mp4
 
 # synthetic_video fixture configuration
 SYNTHETIC_VIDEO_NUM_FRAMES = 10
@@ -2207,3 +2215,229 @@ def test_a_forward_walk_decodes_with_the_threads_it_was_configured_for() -> None
 
         assert str(seen["stream"].thread_type) == "ThreadType.SLICE"
         assert seen["stream"].thread_count == 3
+
+
+_PROBE_DECODE_ORDER_FIELDS = ("dts", "is_keyframe", "offset", "size", "is_discard")
+
+
+def _assert_probe_matches_walker(probe: VideoProbe, track: VideoTrack) -> None:
+    dts, composition_offsets, is_keyframe = video_track_sample_arrays(track)
+    if composition_offsets is not None and not composition_offsets.any():
+        # PyAV reports pts == dts for both an all-zero ctts and none at all.
+        composition_offsets = None
+
+    np.testing.assert_array_equal(probe.dts, dts)
+    if composition_offsets is None:
+        assert probe.composition_offset is None
+    else:
+        assert probe.composition_offset is not None
+        np.testing.assert_array_equal(probe.composition_offset, composition_offsets)
+    np.testing.assert_array_equal(probe.is_keyframe, is_keyframe)
+    np.testing.assert_array_equal(probe.offset, track.offset)
+    np.testing.assert_array_equal(probe.size, track.size)
+    assert not probe.is_discard.any()
+    assert probe.time_base == Fraction(1, track.timescale)
+    assert probe.extradata == track.sample_description.extradata
+
+
+@pytest.mark.parametrize("clip", real_mp4.REAL_CLIPS, ids=lambda clip: clip.name)
+def test_video_probe_matches_the_box_walker_on_real_clips(clip: Path) -> None:
+    """Each decode-order field, extradata, and the time base agree with the walker's ``moov`` sample table."""
+    _assert_probe_matches_walker(video_probe(clip), real_mp4.walker_track(clip.read_bytes()))
+
+
+def test_video_probe_matches_the_fragment_walker_on_a_fragmented_remux() -> None:
+    """Samples spread across one ``moof`` per frame agree with ``parse_fragment_table``'s reading."""
+    data = real_mp4.fragmented_clip()
+    _assert_probe_matches_walker(video_probe(data), real_mp4.walker_track(data))
+
+
+def test_video_probe_auto_reads_the_header_unless_composition_offsets_need_full_demux() -> None:
+    """The header index carries no pts, so only a full demux can report B-frame composition offsets."""
+    plain = video_probe(real_mp4.CLIP)
+    bframes = video_probe(real_mp4.BFRAME_CLIP)
+
+    assert plain.index_method is VideoIndexCreationMethod.FROM_HEADER
+    assert plain.composition_offset is None
+    assert bframes.index_method is VideoIndexCreationMethod.FULL_DEMUX
+    assert bframes.has_b_frames
+    assert bframes.composition_offset is not None
+    assert bframes.composition_offset.any()
+
+
+def test_video_probe_reports_stored_dts_rather_than_edit_list_shifted_dts() -> None:
+    """FFmpeg shifts dts by an edit list unless told to ignore it; the probe must report the stored ticks."""
+    track = real_mp4.walker_track(real_mp4.BFRAME_CLIP.read_bytes())
+    with av.open(str(real_mp4.BFRAME_CLIP)) as container:
+        edit_list_shifted = [packet.dts for packet in container.demux(video=0) if packet.dts is not None]
+
+    probe = video_probe(real_mp4.BFRAME_CLIP)
+
+    assert track.elst_bytes is not None
+    np.testing.assert_array_equal(probe.dts, track.dts_ticks)
+    assert probe.dts.tolist() != edit_list_shifted
+
+
+@pytest.mark.parametrize("clip", [real_mp4.CLIP, real_mp4.BFRAME_CLIP], ids=lambda clip: clip.name)
+def test_video_probe_header_and_full_demux_agree_on_decode_order_fields(clip: Path) -> None:
+    """Choosing the cheaper method changes what is read, not what is reported, apart from composition offsets."""
+    header = video_probe(clip, index_method=VideoIndexCreationMethod.FROM_HEADER)
+    full = video_probe(clip, index_method=VideoIndexCreationMethod.FULL_DEMUX)
+
+    assert header.composition_offset is None
+    for name in _PROBE_DECODE_ORDER_FIELDS:
+        np.testing.assert_array_equal(getattr(header, name), getattr(full, name))
+
+
+@pytest.mark.parametrize("clip", [real_mp4.CLIP, real_mp4.BFRAME_CLIP], ids=lambda clip: clip.name)
+def test_probe_open_video_stream_reads_the_header_index_without_consuming_packets(clip: Path) -> None:
+    """A full demux after the header index, on the same container, still indexes every sample."""
+    expected_header = video_probe(clip, index_method=VideoIndexCreationMethod.FROM_HEADER)
+    expected_full = video_probe(clip, index_method=VideoIndexCreationMethod.FULL_DEMUX)
+
+    with (
+        clip.open("rb") as stream,
+        open_video_container(stream, options={"ignore_editlist": "1"}) as (container, _video_stream),
+    ):
+        header = probe_open_video_stream(container, 0, VideoIndexCreationMethod.FROM_HEADER)
+        full = probe_open_video_stream(container, 0, VideoIndexCreationMethod.FULL_DEMUX)
+
+    for actual, expected in ((header, expected_header), (full, expected_full)):
+        for name, value in attrs.asdict(expected, recurse=False).items():
+            if isinstance(value, np.ndarray):
+                np.testing.assert_array_equal(getattr(actual, name), value, err_msg=name)
+            else:
+                assert getattr(actual, name) == value, name
+
+
+def test_probe_open_video_stream_leaves_an_unavailable_header_index_to_the_caller() -> None:
+    """Unlike :func:`video_probe`, a missing header index is raised rather than replaced by a demux."""
+    with (
+        real_mp4.CLIP.open("rb") as stream,
+        open_video_container(stream) as (container, _video_stream),
+        patch(
+            "cosmos_curator.core.sensors.utils.video._get_video_index_from_header",
+            side_effect=HeaderIndexUnavailableError("stream header index is empty"),
+        ),
+        patch("cosmos_curator.core.sensors.utils.video._probe_full_demux") as full_demux,
+        pytest.raises(HeaderIndexUnavailableError, match="header index is empty"),
+    ):
+        probe_open_video_stream(container, 0, VideoIndexCreationMethod.FROM_HEADER)
+
+    full_demux.assert_not_called()
+
+
+def test_probe_open_video_stream_refuses_auto() -> None:
+    """``AUTO`` is resolved by :func:`video_probe`; an open container is indexed by a resolved method."""
+    with (
+        real_mp4.CLIP.open("rb") as stream,
+        open_video_container(stream) as (container, _video_stream),
+        pytest.raises(ValueError, match="unsupported index_method"),
+    ):
+        probe_open_video_stream(container, 0, VideoIndexCreationMethod.AUTO)
+
+
+def test_video_probe_reads_a_caller_owned_stream_like_a_path() -> None:
+    """A stream the caller opened is read in place and left open for the caller to close."""
+    from_path = video_probe(real_mp4.CLIP)
+    stream = io.BytesIO(real_mp4.CLIP.read_bytes())
+
+    from_stream = video_probe(stream)
+
+    assert not stream.closed
+    for name in _PROBE_DECODE_ORDER_FIELDS:
+        np.testing.assert_array_equal(getattr(from_stream, name), getattr(from_path, name))
+    assert from_stream.extradata == from_path.extradata
+
+
+def test_video_probe_reopens_when_the_auto_probe_already_consumed_packets() -> None:
+    """A ``ctts`` without B-frames reaches FULL_DEMUX only after the probe demuxed; no packet may be lost to it."""
+
+    def consume_then_route_to_full_demux(
+        container: av.container.InputContainer, _video_stream: object, stream_idx: int = 0
+    ) -> tuple[VideoIndexCreationMethod, bool]:
+        next(iter(container.demux(video=stream_idx)))
+        return VideoIndexCreationMethod.FULL_DEMUX, True
+
+    with patch(
+        "cosmos_curator.core.sensors.utils.video._resolve_auto_index_method",
+        side_effect=consume_then_route_to_full_demux,
+    ):
+        probe = video_probe(real_mp4.CLIP)
+
+    assert probe.index_method is VideoIndexCreationMethod.FULL_DEMUX
+    _assert_probe_matches_walker(probe, real_mp4.walker_track(real_mp4.CLIP.read_bytes()))
+
+
+def test_video_probe_values_survive_their_container_closing() -> None:
+    """PyAV index entries read after close are silently garbage, so every array must own a copy."""
+    probe = video_probe(real_mp4.CLIP)
+    expected = {name: np.array(getattr(probe, name)) for name in _PROBE_DECODE_ORDER_FIELDS}
+    extradata = bytes(probe.extradata)
+
+    # Reopening reuses freed libav memory, which an uncopied index entry would now read.
+    for clip in real_mp4.REAL_CLIPS * 2:
+        video_probe(clip, index_method=VideoIndexCreationMethod.FULL_DEMUX)
+
+    for name, values in expected.items():
+        array = getattr(probe, name)
+        np.testing.assert_array_equal(array, values)
+        assert array.base is not None
+        assert array.base.flags.owndata
+    assert probe.extradata == extradata
+
+
+def _packet(**overrides: object) -> SimpleNamespace:
+    fields = {"size": 10, "dts": 0, "pts": 0, "pos": 48, "duration": 512, "is_keyframe": True, "is_discard": False}
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+_FLUSH_PACKET = _packet(size=0, dts=None, pts=None, pos=None, is_keyframe=False)
+
+
+@pytest.mark.parametrize("missing", ["dts", "pts", "pos"])
+def test_video_probe_refuses_a_packet_missing_a_timestamp_or_position(missing: str) -> None:
+    """Dropping such a packet would shift every later sample's row, so it fails the stream instead."""
+    packets = [_packet(), _packet(**{missing: None}), _FLUSH_PACKET]
+    container = SimpleNamespace(demux=lambda **_: iter(packets))
+
+    with pytest.raises(IncompletePacketError, match=rf"packet 1 has .*{missing}=None"):
+        _probe_full_demux(container, 0)  # type: ignore[arg-type]
+
+
+def test_video_probe_skips_the_end_of_stream_flush_packet() -> None:
+    """PyAV's empty, untimed end-of-stream packet is not a sample and is not refused as an incomplete one."""
+    container = SimpleNamespace(demux=lambda **_: iter([_packet(), _FLUSH_PACKET]))
+
+    columns = _probe_full_demux(container, 0)  # type: ignore[arg-type]
+
+    assert columns == ([0], [0], [48], [10], [512], [True], [False])
+
+
+def test_video_probe_reports_an_unstated_packet_duration_as_zero() -> None:
+    """Libav leaves a packet's duration unset when the container states none; the probe keeps a dense array."""
+    container = SimpleNamespace(demux=lambda **_: iter([_packet(duration=None), _FLUSH_PACKET]))
+
+    _dts, _pts, _offset, _size, duration, _is_keyframe, _is_discard = _probe_full_demux(container, 0)  # type: ignore[arg-type]
+
+    assert duration == [0]
+
+
+def test_video_probe_reports_packet_durations_only_from_a_full_demux() -> None:
+    """The header index carries no durations; a full demux reports each sample's ``stts`` delta."""
+    header = video_probe(real_mp4.CLIP, index_method=VideoIndexCreationMethod.FROM_HEADER)
+    full = video_probe(real_mp4.CLIP, index_method=VideoIndexCreationMethod.FULL_DEMUX)
+
+    assert header.duration is None
+    assert full.duration is not None
+    np.testing.assert_array_equal(full.duration[:-1], np.diff(full.dts))
+    walker_duration = real_mp4.walker_track(real_mp4.CLIP.read_bytes()).duration
+    assert int(full.dts[-1] - full.dts[0] + full.duration[-1]) == walker_duration
+
+
+def test_video_probe_refuses_per_sample_arrays_of_unequal_length() -> None:
+    """Every per-sample array indexes the same samples, so a length disagreement is refused at construction."""
+    probe = video_probe(real_mp4.CLIP)
+
+    with pytest.raises(ValueError, match="same length"):
+        attrs.evolve(probe, size=probe.size[:-1])

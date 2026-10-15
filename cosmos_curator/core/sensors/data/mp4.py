@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MP4 frame indexes and metadata built from parsed tracks or published Arrow records."""
+"""MP4 frame indexes and metadata built from parsed tracks, PyAV probes, or published Arrow records."""
 
 import struct
 from fractions import Fraction
@@ -25,6 +25,7 @@ import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from cosmos_curator.core.sensors.data.video import VideoProbe
 from cosmos_curator.core.sensors.mp4.box_primitives import VIDEO_FOURCC_CODEC_NAMES
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.moov_track import VideoTrack
@@ -364,7 +365,11 @@ class Mp4FrameIndex:
 
 @attrs.define(frozen=True)
 class Mp4Metadata:
-    """Typed mirror of one ``VIDEO_METADATA_SCHEMA`` row -- purely what the box states about the stream."""
+    """Typed mirror of one ``VIDEO_METADATA_SCHEMA`` row -- what the container states about the stream.
+
+    Fields libav does not report are ``None`` when PyAV built the row; the box walker fills them
+    from ``stsd``, ``mvhd``, and ``tkhd``.
+    """
 
     codec_name: str
     extradata: bytes
@@ -384,15 +389,15 @@ class Mp4Metadata:
     buffer_size_db: int | None
     max_bitrate_bps: int | None
     avg_bitrate_bps: int | None
-    movie_creation_time: int
-    movie_modification_time: int
-    track_creation_time: int
-    track_modification_time: int
+    movie_creation_time: int | None
+    movie_modification_time: int | None
+    track_creation_time: int | None
+    track_modification_time: int | None
     # VIDEO_METADATA_SCHEMA's own list<int32> comes back from a Lance/pyarrow row as a plain
     # list -- converted to a tuple here so a frozen Mp4Metadata is actually immutable.
-    track_matrix: tuple[int, ...] = attrs.field(converter=tuple)
-    track_display_width: int
-    track_display_height: int
+    track_matrix: tuple[int, ...] | None = attrs.field(converter=attrs.converters.optional(tuple))
+    track_display_width: int | None
+    track_display_height: int | None
     elst_bytes: bytes | None
     avg_frame_rate_num: int
     avg_frame_rate_den: int
@@ -458,4 +463,51 @@ class Mp4Metadata:
             bit_rate_bps=bit_rate_bps,
             duration_ns=duration_ns,
             encoder_tag=None,
+        )
+
+    @classmethod
+    def from_video_probe(cls, probe: VideoProbe, *, encoder_tag: str | None, elst_bytes: bytes | None) -> Self:
+        """Build from libav's reading of one stream; fields libav does not report are ``None``.
+
+        The duration spans the decode times plus the last packet's duration, both as libav
+        reports them, so a final sample stored with no duration takes libav's estimate.
+        """
+        time_base_num, time_base_den = probe.time_base.numerator, probe.time_base.denominator
+        last_duration = int(probe.duration[-1]) if probe.duration is not None and len(probe) else 0
+        duration_ticks = int(probe.dts[-1] - probe.dts[0]) + last_duration if len(probe) else 0
+        avg_frame_rate, bit_rate_bps = _stream_rate_stats(
+            len(probe), probe.size, duration_ticks * time_base_num, time_base_den
+        )
+        return cls(
+            codec_name=probe.codec_name,
+            extradata=probe.extradata,
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+            frame_count=len(probe),
+            keyframe_count=probe.keyframe_count,
+            width=probe.width,
+            height=probe.height,
+            avc_profile_idc=None,
+            avc_constraint_flags=None,
+            avc_level_idc=None,
+            nal_length_size=None,
+            chroma_format_idc=None,
+            bit_depth_luma_minus8=None,
+            bit_depth_chroma_minus8=None,
+            buffer_size_db=None,
+            max_bitrate_bps=None,
+            avg_bitrate_bps=None,
+            movie_creation_time=None,
+            movie_modification_time=None,
+            track_creation_time=None,
+            track_modification_time=None,
+            track_matrix=None,
+            track_display_width=None,
+            track_display_height=None,
+            elst_bytes=elst_bytes,
+            avg_frame_rate_num=avg_frame_rate.numerator,
+            avg_frame_rate_den=avg_frame_rate.denominator,
+            bit_rate_bps=bit_rate_bps,
+            duration_ns=int(_ticks_to_ns(np.array([duration_ticks], dtype=np.int64), time_base_num, time_base_den)[0]),
+            encoder_tag=encoder_tag,
         )

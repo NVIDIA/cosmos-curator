@@ -41,6 +41,7 @@ from cosmos_curator.core.utils import environment
 from cosmos_curator.next.recipes.mp4_index import config, pipeline
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     ERROR_SCHEMA,
+    INDEXER_PYAV,
     RECORD_SCHEMA_VERSION,
     VIDEO_MANIFEST_SCHEMA,
     VIDEO_METADATA_SCHEMA,
@@ -193,7 +194,7 @@ def test_run_config_skips_already_committed_videos_without_starting_ray(
             "moof_table_location": None,
             "container_kind": "nonfragmented",
             "record_schema_version": RECORD_SCHEMA_VERSION,
-            "extraction_contract_id": cfg.extraction_contract_id,
+            "extraction_contract_id": cfg.extraction_contract_id(indexer=INDEXER_PYAV),
         },
         manifest_lance_uri,
     )

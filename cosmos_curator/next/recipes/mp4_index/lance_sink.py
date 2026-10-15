@@ -99,7 +99,7 @@ def validate_committed_versions(
     if mismatched_contract:
         msg = (
             f"Manifest table contains {mismatched_contract} row(s) with extraction_contract_id other than "
-            f"{extraction_contract_id!r} (the current run's own container_kind/session_id_path_depth/"
+            f"{extraction_contract_id!r} (the current run's own indexer/container_kind/session_id_path_depth/"
             "extraction_version). Recreate the table and rerun, or backfill the stale rows, before "
             "continuing."
         )

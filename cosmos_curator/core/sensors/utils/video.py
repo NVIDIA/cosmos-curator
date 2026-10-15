@@ -39,7 +39,7 @@ from av.container import InputContainer
 from loguru import logger
 
 from cosmos_curator.core.sensors.data.camera_data import MotionVectorData, MotionVectorFrameData
-from cosmos_curator.core.sensors.data.video import VideoIndex, VideoMetadata
+from cosmos_curator.core.sensors.data.video import VideoIndex, VideoMetadata, VideoProbe
 from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.io import open_data_source
 
@@ -509,6 +509,7 @@ def open_video_container(
     stream: BinaryIO,
     stream_idx: int = 0,
     video_format: str | None = None,
+    options: dict[str, str] | None = None,
 ) -> Generator[tuple[InputContainer, av.video.stream.VideoStream]]:
     """Context manager for an already-open binary stream containing video data.
 
@@ -521,6 +522,7 @@ def open_video_container(
         stream_idx: PyAv index of the video stream to decode, usually 0.
         video_format: Format of the video stream, like "mp4", "mkv", etc.
             None is probably best
+        options: libavformat demuxer options, e.g. ``{"ignore_editlist": "1"}``.
 
     Yields:
         Tuple of ``(container, video_stream)``.
@@ -545,7 +547,7 @@ def open_video_container(
     # load helper for PIL).
     if stream.seekable():
         stream.seek(0)
-    with av.open(stream, format=video_format) as container:
+    with av.open(stream, format=video_format, options=options) as container:
         container = cast("InputContainer", container)
         video_stream = container.streams.video[stream_idx]
         yield container, video_stream
@@ -916,7 +918,6 @@ def _build_index_and_metadata(
 
     duration_s = (pts_ns_np[-1] - pts_ns_np[0]) / 1_000_000_000.0
     bit_rate_bps = int(size_np.sum() * 8 / duration_s) if duration_s > 0 else 0
-    avg_rate = video_stream.average_rate
 
     metadata = VideoMetadata(
         codec_name=video_stream.codec_context.name,
@@ -925,17 +926,224 @@ def _build_index_and_metadata(
         container_format=container.format.name,
         height=video_stream.height,
         width=video_stream.width,
-        # Defensive code, denominator should never be zero, handle it anyway
-        avg_frame_rate=(
-            Fraction(avg_rate.numerator, avg_rate.denominator)
-            if avg_rate and avg_rate.denominator != 0
-            else Fraction(0)
-        ),
+        avg_frame_rate=_average_frame_rate(video_stream),
         pix_fmt=str(video_stream.codec_context.pix_fmt) if video_stream.codec_context.pix_fmt else "",
         bit_rate_bps=bit_rate_bps,
     )
 
     return index, metadata
+
+
+def _average_frame_rate(video_stream: av.video.stream.VideoStream) -> Fraction:
+    """Return the stream's nominal frame rate, or ``Fraction(0)`` when unknown."""
+    avg_rate = video_stream.average_rate
+    # Defensive code, denominator should never be zero, handle it anyway
+    if avg_rate and avg_rate.denominator != 0:
+        return Fraction(avg_rate.numerator, avg_rate.denominator)
+    return Fraction(0)
+
+
+class IncompletePacketError(ValueError):
+    """A demuxed packet lacks its decode timestamp, presentation timestamp, or byte position.
+
+    :func:`video_probe` refuses the stream rather than dropping the packet: an index with
+    one row per sample would silently misdescribe every sample after a dropped one.
+    """
+
+
+def _probe_full_demux(
+    container: InputContainer, stream_idx: int
+) -> tuple[list[int], list[int], list[int], list[int], list[int], list[bool], list[bool]]:
+    """Collect ``(dts, pts, offset, size, duration, is_keyframe, is_discard)`` lists from every demuxed packet.
+
+    Raises:
+        IncompletePacketError: see that class's own docstring.
+
+    """
+    dts: list[int] = []
+    pts: list[int] = []
+    offset: list[int] = []
+    size: list[int] = []
+    duration: list[int] = []
+    is_keyframe: list[bool] = []
+    is_discard: list[bool] = []
+    for packet in container.demux(video=stream_idx):
+        # PyAV ends each stream with an empty flush packet carrying no timestamps.
+        if packet.size == 0 and packet.dts is None:
+            continue
+        if packet.dts is None or packet.pts is None or packet.pos is None:
+            msg = (
+                f"video stream {stream_idx} packet {len(dts)} has dts={packet.dts}, pts={packet.pts}, "
+                f"pos={packet.pos}; every sample needs all three"
+            )
+            raise IncompletePacketError(msg)
+        dts.append(packet.dts)
+        pts.append(packet.pts)
+        offset.append(packet.pos)
+        size.append(packet.size)
+        duration.append(packet.duration or 0)
+        is_keyframe.append(packet.is_keyframe)
+        is_discard.append(packet.is_discard)
+    return dts, pts, offset, size, duration, is_keyframe, is_discard
+
+
+def _make_video_probe(  # noqa: PLR0913 -- one argument per per-sample array, all independent
+    container: InputContainer,
+    video_stream: av.video.stream.VideoStream,
+    index_method: VideoIndexCreationMethod,
+    *,
+    dts: list[int],
+    composition_offset: npt.NDArray[np.int64] | None,
+    offset: list[int],
+    size: list[int],
+    duration: list[int] | None,
+    is_keyframe: list[bool],
+    is_discard: list[bool],
+) -> VideoProbe:
+    """Copy one stream's index and properties out of PyAV while its container is still open."""
+    if video_stream.time_base is None:
+        msg = f"Time base is None for video stream {video_stream.index}"
+        raise ValueError(msg)
+    codec_context = video_stream.codec_context
+    return VideoProbe(
+        index_method=index_method,
+        time_base=video_stream.time_base,
+        dts=np.array(dts, dtype=np.int64),
+        composition_offset=composition_offset,
+        is_keyframe=np.array(is_keyframe, dtype=np.bool_),
+        offset=np.array(offset, dtype=np.int64),
+        size=np.array(size, dtype=np.int64),
+        duration=None if duration is None else np.array(duration, dtype=np.int64),
+        is_discard=np.array(is_discard, dtype=np.bool_),
+        codec_name=codec_context.name,
+        extradata=bytes(codec_context.extradata or b""),
+        width=video_stream.width,
+        height=video_stream.height,
+        has_b_frames=bool(codec_context.has_b_frames),
+        avg_frame_rate=_average_frame_rate(video_stream),
+        container_format=container.format.name,
+    )
+
+
+def probe_open_video_stream(
+    container: InputContainer, stream_idx: int, index_method: VideoIndexCreationMethod
+) -> VideoProbe:
+    """Index one video stream of an already-open container as :func:`video_probe` does, without fallback.
+
+    ``FROM_HEADER`` reads the header index and consumes no packets, so a ``FULL_DEMUX`` of the
+    same container afterwards still sees every packet. ``FULL_DEMUX`` needs the demuxer still at
+    the first packet. Open the container with ``ignore_editlist`` for :func:`video_probe`'s stored
+    timestamps.
+
+    Args:
+        container: already-open container holding the stream.
+        stream_idx: index of the stream among the container's video streams.
+        index_method: ``FROM_HEADER`` or ``FULL_DEMUX``.
+
+    Returns:
+        A :class:`VideoProbe` whose values are copies, safe to use after the container closes.
+
+    Raises:
+        HeaderIndexUnavailableError: ``FROM_HEADER`` and the stream's header index is missing or empty.
+        IncompletePacketError: a demuxed packet lacks dts, pts, or byte position.
+        ValueError: *index_method* is neither ``FROM_HEADER`` nor ``FULL_DEMUX``.
+        av.FFmpegError: libav cannot demux the stream.
+
+    """
+    video_stream = container.streams.video[stream_idx]
+    match index_method:
+        case VideoIndexCreationMethod.FROM_HEADER:
+            offset, size, dts, is_keyframe, is_discard = _get_video_index_from_header(video_stream)
+            return _make_video_probe(
+                container,
+                video_stream,
+                index_method,
+                dts=dts,
+                composition_offset=None,
+                offset=offset,
+                size=size,
+                duration=None,
+                is_keyframe=is_keyframe,
+                is_discard=is_discard,
+            )
+        case VideoIndexCreationMethod.FULL_DEMUX:
+            dts, pts, offset, size, duration, is_keyframe, is_discard = _probe_full_demux(container, stream_idx)
+            composition_offset = np.array(pts, dtype=np.int64) - np.array(dts, dtype=np.int64)
+            return _make_video_probe(
+                container,
+                video_stream,
+                index_method,
+                dts=dts,
+                composition_offset=composition_offset if composition_offset.any() else None,
+                offset=offset,
+                size=size,
+                duration=duration,
+                is_keyframe=is_keyframe,
+                is_discard=is_discard,
+            )
+        case _:
+            msg = f"unsupported index_method: {index_method!r}"
+            raise ValueError(msg)
+
+
+def video_probe(
+    data: DataSource,
+    stream_idx: int = 0,
+    index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.AUTO,
+) -> VideoProbe:
+    """Index every sample of one video stream in decode order, with raw container timestamps.
+
+    Named after ``ffprobe``: it reports what the demuxer reads, one entry per sample, without
+    reordering or decoding. Unlike :func:`make_index_and_metadata`, nothing is sorted into
+    presentation order and decode timestamps are kept. The container is opened with
+    ``ignore_editlist`` so timestamps are the stored ticks rather than ticks FFmpeg has
+    shifted by an edit list.
+
+    ``AUTO`` resolves exactly as it does for :func:`make_index_and_metadata`. ``FROM_HEADER``
+    reads no presentation timestamps, so its ``composition_offset`` is ``None``; that is
+    exact only when ``AUTO`` chose it, having found no B-frames and no composition offset in
+    a bounded packet prefix. ``FULL_DEMUX`` reads every packet and reports ``pts - dts``.
+
+    Args:
+        data: Video data source. See
+            :data:`cosmos_curator.core.sensors.types.types.DataSource`.
+            Cloud-backed inputs must be wrapped as a
+            :class:`io.BufferedIOBase` by the caller.
+        stream_idx: index of the video stream to use (default: 0).
+        index_method: how to collect per-sample fields; see :class:`VideoIndexCreationMethod`.
+            An unavailable header index falls back to ``FULL_DEMUX``.
+
+    Returns:
+        A :class:`VideoProbe` whose values are copies, safe to use after the source closes.
+
+    Raises:
+        IncompletePacketError: a demuxed packet lacks dts, pts, or byte position.
+        av.FFmpegError: libav cannot open or demux the source.
+
+    """
+    with (
+        open_data_source(data, mode="rb") as stream,
+        open_video_container(stream, stream_idx=stream_idx, options={"ignore_editlist": "1"}) as (
+            container,
+            video_stream,
+        ),
+    ):
+        probe_consumed_packets = False
+        if index_method == VideoIndexCreationMethod.AUTO:
+            index_method, probe_consumed_packets = _resolve_auto_index_method(container, video_stream, stream_idx)
+
+        if index_method == VideoIndexCreationMethod.FROM_HEADER:
+            try:
+                return probe_open_video_stream(container, stream_idx, index_method)
+            except HeaderIndexUnavailableError as e:
+                logger.warning("FROM_HEADER unavailable for stream {} ({}); using FULL_DEMUX", stream_idx, e)
+                index_method = VideoIndexCreationMethod.FULL_DEMUX
+
+        if not probe_consumed_packets:
+            return probe_open_video_stream(container, stream_idx, index_method)
+
+    # AUTO's composition-offset probe consumed packets FULL_DEMUX must index; reopen once.
+    return video_probe(data, stream_idx=stream_idx, index_method=VideoIndexCreationMethod.FULL_DEMUX)
 
 
 def _validate_decode_plan_timestamp_inputs(

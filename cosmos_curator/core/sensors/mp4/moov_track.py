@@ -56,14 +56,20 @@ else:
     AttrsAttribute = attrs.Attribute
 
 
+def trak_track_id(buf: bytes, trak_start: int, trak_end: int) -> int:
+    """Return the track ID in the ``tkhd`` of the ``trak`` whose content spans [*trak_start*, *trak_end*)."""
+    tkhd_start, _tkhd_end = find_box(buf, ("tkhd",), trak_start, trak_end)
+    track_id_offset = tkhd_start + (20 if buf[tkhd_start] == 1 else 12)
+    track_id: int = struct.unpack_from(">I", buf, track_id_offset)[0]
+    return track_id
+
+
 def video_track_scopes(buf: bytes, moov_scope: BoxScope) -> tuple[BoxScope, BoxScope, BoxScope, str]:
     """Select the video track and identify its sample-table scopes before dispatch."""
     trak_start, trak_end, stbl_start, stbl_end, stsd_start, stsd_end, fourcc = find_video_trak(
         buf, moov_scope.start, moov_scope.end
     )
-    tkhd_start, _tkhd_end = find_box(buf, ("tkhd",), trak_start, trak_end)
-    track_id_offset = tkhd_start + (20 if buf[tkhd_start] == 1 else 12)
-    track_id = struct.unpack_from(">I", buf, track_id_offset)[0]
+    track_id = trak_track_id(buf, trak_start, trak_end)
     trak_scope = BoxScope(trak_start, trak_end, (*moov_scope.path, "trak"), track_id=track_id)
     stbl_scope = BoxScope(stbl_start, stbl_end, (*trak_scope.path, "mdia", "minf", "stbl"), track_id=track_id)
     stsd_scope = BoxScope(stsd_start, stsd_end, (*stbl_scope.path, "stsd"), track_id=track_id)

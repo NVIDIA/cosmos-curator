@@ -23,6 +23,7 @@ non-fragmented (:func:`synthetic_moov` and its own helpers -- ``avc1_stsd``,
 """
 
 import struct
+from collections.abc import Sequence
 
 #: The real, hand-decoded High-profile avcC bytes from a real corpus file's own extradata --
 #: SPS/PPS content is never decoded by moov.py, so their bytes are arbitrary here; only the
@@ -294,6 +295,7 @@ def synthetic_moov(
     keyframe_index: int | None,
     ctts_offset: int | None,
     ctts_sample_count: int | None = None,
+    ctts_entries: Sequence[tuple[int, int]] | None = None,
     fourcc: str = "avc1",
     extradata: bytes | None = None,
     stsd_extra_children: bytes = b"",
@@ -340,7 +342,11 @@ def synthetic_moov(
     stco = pack_full_box("stco", 0, struct.pack(">I", 1) + struct.pack(">I", 5000))
 
     stbl_children = stsd + stts + stss + stsz + stsc + stco
-    if ctts_offset is not None:
+    if ctts_entries is not None:
+        # (sample_count, sample_offset) runs, for a ctts whose offsets vary; version 1 makes them signed.
+        entries = b"".join(struct.pack(">Ii", count, offset) for count, offset in ctts_entries)
+        stbl_children += pack_full_box("ctts", 1, struct.pack(">I", len(ctts_entries)) + entries)
+    elif ctts_offset is not None:
         # ctts_sample_count defaults to frame_count (a conformant file); a caller
         # passes a different value deliberately, to build a non-conformant one.
         entry_sample_count = frame_count if ctts_sample_count is None else ctts_sample_count

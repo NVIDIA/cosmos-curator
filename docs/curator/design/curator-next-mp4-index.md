@@ -20,6 +20,11 @@ extraction orchestration, and publication only.
 - **Metadata and frame indexes are canonical Lance fields.** One video row contains
   `metadata: struct<…>` and `frames: large_list<struct<…>>`, published together with identity
   and provenance. There is no derived metadata/index sidecar.
+- **PyAV builds the frame index from the extracted boxes.** Every sample field comes from libav's
+  reading of the `moov`/`moof` boxes alone, on cold and warm runs alike, so indexing never reads
+  media. When an extension decodes UUID boxes, the box walker indexes the video instead, and the
+  contract id records which indexer ran. The published schema does not depend on it. See
+  "Frame indexing" below.
 - **Extraction-affecting settings are hashed into one contract id**, stamped on every manifest row and
   checked whole-table before reconciliation starts -- refusing a run against a stale-contract table
   rather than silently skipping or reprocessing it.
@@ -42,13 +47,14 @@ falls back to a single full listing.
 | --- | --- |
 | `video_id` | Hash of the normalized `media_location`. Deliberately stable: changing it would orphan every already-extracted `moov`/`moof` sidecar on disk. |
 | `session_camera_id` | Hash of `(source_session_id, camera_key)`, derived from `media_location`'s path `execution.session_id_path_depth` directories up (default 2). Two distinct `video_id`s deriving the same `session_camera_id` refuse the whole run upfront (`SessionCameraIdCollisionError`), before any Ray dispatch. Consumers can query this logical key in Lance. |
-| `extraction_contract_id` | Hash of `{kind, extraction_version, container_kind, session_id_path_depth}` -- see "Reconciliation" below. |
+| `extraction_contract_id` | Hash of `{kind, extraction_version, indexer, container_kind, session_id_path_depth}` -- see "Reconciliation" below. |
 
 One row per video in `manifest.lance`
 ([`VIDEO_MANIFEST_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
 
-The record schema version is 6. Version 5 lacks the nullable EOF/SOF/MOE frame fields;
-existing version-5 datasets require a fresh output dataset. Moov/moof caches can be reused.
+The record schema version is 7. Version 6 requires the `mvhd` and `tkhd` metadata fields that
+PyAV leaves null, and version 5 lacks the nullable EOF/SOF/MOE frame fields; existing datasets
+from either require a fresh output dataset. Moov/moof caches can be reused.
 
 | Field | Nullable | Notes |
 | --- | --- | --- |
@@ -95,17 +101,71 @@ not the canonical metadata/index output. Source media remains in its original st
 Failures append to `errors.lance` (`ERROR_SCHEMA`): `video_id`, `media_location`, `error_type`,
 `error_message`, `attempted_at`.
 
+## Frame indexing
+
+PyAV is the reference indexer: the published frames and timestamps are libav's reading of the
+video, with as little reinterpretation as possible.
+[`box_probe.index_from_boxes`](../../../cosmos_curator/core/sensors/mp4/box_probe.py) lays one
+video's extracted boxes out as a file the size of its source: `moov` at offset 0, each `moof` at its
+source offset (a `trun` data offset may be relative to it), a `free` or `mdat` header spanning each
+gap, and zeros in place of media. libav takes each sample's decode time, composition offset, byte
+range, and duration from the boxes, so a full demux of that file reports the source's packets
+without reading the source. libav also derives a demuxed packet's key flag from its payload, so
+zero-filled media demuxes with no keyframes. Keyframes therefore come from libav's header index,
+built from `stss` or `trun` sample flags, which must agree with the demux on every sample's decode
+time and byte range. The demux reads one zero byte per source byte from memory, about 0.16 s for a
+102 MB fragmented camera recording.
+
+The indexed stream is the one libav ranks best (`container.streams.best("video")`). Decode times
+and composition offsets (`pts - dts`) are libav's, and the duration spans the decode times plus the
+last packet's duration as libav reports it, for fragmented and nonfragmented tracks alike. libav
+substitutes a 1/1 time base for an `mdhd` timescale of 0 or 2^31 and above without rescaling the
+ticks, so such a video fails with `UnsupportedTimescaleError`. A gap of 1-7 bytes between boxes
+cannot hold a filler header and fails with `BoxLayoutUnsupportedError`.
+
+Metadata comes from the same stream: codec name, full `extradata` (the `avcC`/`hvcC` record a
+decoder needs), time base, dimensions, frame and keyframe counts, duration, frame rate, and bit
+rate. `encoder_tag` is the stream's `encoder` tag, and `elst_bytes` is copied verbatim from the
+indexed trak's `edts/elst`, matched by track ID. libav does not report the `avcC` fields,
+`nal_length_size`, chroma format and bit depths, `btrt`, `mvhd`/`tkhd` creation and modification
+times, `track_matrix`, or the `tkhd` display size, so these are null; decoders read the same
+values from `extradata`.
+
+PyAV does not read UUID boxes. When the caller passes an extension, the box walker indexes the
+video alone, running the extension's UUID handlers as it lists the samples, and every metadata
+field comes from its own box parsing. Its frames are checked against the source size like PyAV's.
+The contract ID records which indexer built a row, so one manifest table never mixes the two.
+
+The two indexers are known to differ on:
+
+- Negative composition offsets: libav raises every offset by one shift so none is negative, and
+  lowers a nonfragmented track's decode times by the same amount; the walker keeps the stored values.
+- Duration: where the container states no duration for the final sample, libav estimates one.
+  The walker takes a nonfragmented track's from `mdhd` and adds a fragmented track's stored final
+  duration to its decode-time span.
+- Stream selection: libav ranks streams by its own heuristics, which can choose a different video
+  track than the walker's, as in the MJPEG-then-H.264 test clip.
+- Metadata: the fields above are null on PyAV rows and populated on walker rows.
+- Layouts: the walker refuses some fragment layouts PyAV indexes, including composition offsets in
+  fragments, several `traf` or `trun` boxes per `moof`, and samples in `moov` beside fragments.
+
+For training data, encode without B-frames, frame reordering, or edit lists. Those are what make
+decode order, presentation order, and stored timestamps diverge, and so where indexers, decoders,
+and players disagree.
+
 ## Reconciliation, caching, and failure policy
 
 Reconciliation keys on `video_id` alone, which is permanent once committed -- so a fix to how a video is
 extracted needs a separate signal to find rows it predates.
 [`ResolvedMp4IndexConfig.extraction_contract`](../../../cosmos_curator/next/recipes/mp4_index/config.py)
-hashes exactly the settings that change what gets extracted for identical input bytes:
+hashes exactly the settings that change what gets extracted for identical input bytes, including
+which indexer the run uses:
 
 ```python
 {
     "kind": config.kind,
-    "extraction_version": 1,  # bumped manually when extraction semantics change
+    "extraction_version": 2,  # bumped manually when extraction semantics change
+    "indexer": indexer,  # "pyav", or "box_walker" when an extension runs
     "container_kind": config.input.container_kind,
     "session_id_path_depth": config.execution.session_id_path_depth,
 }
@@ -125,8 +185,10 @@ run never attempts it automatically.
 
 Before fetching/walking a video's `moov`/`moof` (`execution.skip_existing_sidecars`, default on), the
 deterministic sidecar path is checked first and read back instead of refetched, atomically on both
-local and `s3://` backends. A cache entry that writes completely but fails to parse retries once with
-caching off, treated as a cache miss rather than a video failure. For uncommitted videos, the metadata/index record is always
+local and `s3://` backends. A cache entry that writes completely but fails to parse or index retries
+once with caching off, treated as a cache miss rather than a video failure. A failure fetching boxes
+from the source, such as a fresh `moof` walk beside a cached `moov`, is the source's own and does not
+retry. For uncommitted videos, the metadata/index record is always
 rebuilt -- cheap once `moov`/`moof` bytes are in hand. **Known gap**: the guard trusts a
 sidecar's mere existence, not whether `media_location`'s content still matches what produced it -- a
 source file replaced in place between two runs would read back stale bytes.
@@ -134,14 +196,16 @@ source file replaced in place between two runs would read back stale bytes.
 | Outcome | Where it lands |
 | --- | --- |
 | `UnindexableVideoError` (box-format refusal) | `errors.lance`, per-video |
+| `BoxProbeReadError`, `BoxProbeMismatchError`, `BoxLayoutUnsupportedError`, `UnsupportedTimescaleError`, `InvalidFrameByteRangeError` (PyAV cannot index the boxes; `UnindexableVideoError`s) | `errors.lance`, per-video |
 | `UnresolvableMediaLocationError` (path too shallow for session/camera derivation) | `errors.lance`, per-video |
 | `FileNotFoundError` (an explicit `uris` entry that's missing -- no upfront `HEAD`) | `errors.lance`, per-video |
 | Manifest table has rows from a different contract/schema version | Whole run refuses before dispatch |
 | Extension contract violations or unexpected extension errors | Whole run fails; no per-video error row |
 
-Before assembling a successful video record, the recipe checks every frame's byte range against
-the source file size. Negative offsets or sizes and ranges extending past EOF produce an
-`InvalidFrameByteRangeError` per-video failure without decoding frames.
+Before the demux, every frame's byte range in libav's header index is checked against the source
+file size, as is every range the box walker lists when an extension runs. Negative offsets or
+sizes and ranges extending past EOF, as in a truncated source, produce an
+`InvalidFrameByteRangeError` per-video failure without demuxing or decoding frames.
 
 Extensions report malformed source data through explicit `UnindexableVideoError` subclasses.
 Refusals from extension construction or handler registration become per-video failures without

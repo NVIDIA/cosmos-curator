@@ -21,12 +21,15 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import attrs
+import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
 import smart_open  # type: ignore[import-untyped]
 from loguru import logger  # type: ignore[import-untyped]
 
 from cosmos_curator.core.sensors.data.mp4 import Mp4Metadata, video_track_sample_arrays
 from cosmos_curator.core.sensors.mp4 import box_locate
+from cosmos_curator.core.sensors.mp4.box_probe import check_frame_byte_ranges, index_from_boxes
 from cosmos_curator.core.sensors.mp4.box_traversal import UuidCallbackError, UuidHandler
 from cosmos_curator.core.sensors.mp4.byte_range import FetchRange
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
@@ -46,9 +49,12 @@ from cosmos_curator.next.recipes.mp4_index.config import Mp4IndexRunConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     CONTAINER_KIND_FRAGMENTED,
     FRAME_INDEX_SCHEMA,
+    INDEXER_BOX_WALKER,
+    INDEXER_PYAV,
     RECORD_SCHEMA_VERSION,
     VIDEO_MANIFEST_SCHEMA,
     VIDEO_METADATA_SCHEMA,
+    Indexer,
     UnresolvableMediaLocationError,
     derive_session_and_camera,
     make_session_camera_id,
@@ -60,10 +66,6 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
 
 #: Every VIDEO_MANIFEST_SCHEMA field a failed video carries as None.
 _VIDEO_ONLY_FIELDS = tuple(set(VIDEO_MANIFEST_SCHEMA.names) - {"video_id", "media_location"})
-
-
-class InvalidFrameByteRangeError(UnindexableVideoError):
-    """An indexed frame's byte range lies outside the source media."""
 
 
 def failed_result(row: dict[str, Any], error: Exception) -> dict[str, Any]:
@@ -88,30 +90,22 @@ def _file_size(media_location: str, storage_client: StorageClient | None) -> int
     return pathlib.Path(media_location).stat().st_size
 
 
-def _validate_frame_byte_ranges(video_track: VideoTrack, file_size: int) -> None:
-    """Reject out-of-file ranges before assembling a successful video record."""
-    # Subtract from the file size to avoid overflowing int64 when a range extends past EOF.
-    remaining = file_size - video_track.offset.clip(min=0)
-    invalid = (video_track.offset < 0) | (video_track.size < 0) | (video_track.size > remaining)
-    if invalid.any():
-        index = int(invalid.argmax())
-        offset = int(video_track.offset[index])
-        size = int(video_track.size[index])
-        msg = f"Frame {index} has byte range [{offset}, {offset + size}) outside media size {file_size}"
-        raise InvalidFrameByteRangeError(msg)
-
-
-def _standard_frame_columns(video_track: VideoTrack) -> pa.RecordBatch:
+def _standard_frame_columns(
+    dts: npt.NDArray[np.int64],
+    composition_offsets: npt.NDArray[np.int64] | None,
+    keyframes: npt.NDArray[np.bool_],
+    offset: npt.NDArray[np.int64],
+    size: npt.NDArray[np.int64],
+) -> pa.RecordBatch:
     """Build the frame columns owned by standard MP4 indexing."""
-    dts, composition_offsets, keyframes = video_track_sample_arrays(video_track)
     arrays = {
         "dts_ticks": pa.array(dts, type=pa.int64()),
         "composition_offset_ticks": pa.nulls(len(dts), type=pa.int64())
         if composition_offsets is None
         else pa.array(composition_offsets),
         "is_keyframe": pa.array(keyframes),
-        "offset": pa.array(video_track.offset),
-        "size": pa.array(video_track.size),
+        "offset": pa.array(offset),
+        "size": pa.array(size),
     }
     return pa.RecordBatch.from_arrays(
         list(arrays.values()), schema=pa.schema([FRAME_INDEX_SCHEMA.field(name) for name in arrays])
@@ -300,6 +294,9 @@ class Mp4Extraction:
 class Mp4IndexExtension(Protocol):
     """Register UUID decoders and contribute columns within the existing frame schema.
 
+    PyAV does not read UUID boxes, so a run with an extension indexes with the box walker,
+    which runs the decoders while it lists the track's samples.
+
     Report malformed source data through explicit ``UnindexableVideoError``
     subclasses. Contract violations and other unexpected errors fail the run.
     """
@@ -330,6 +327,11 @@ def _extension_frame_columns(extension: Mp4IndexExtension, extraction: Mp4Extrac
     return columns
 
 
+def indexer_for(extension_factory: Mp4ExtensionFactory | None) -> Indexer:
+    """Return the indexer a run uses: the box walker exactly when an extension decodes UUID boxes."""
+    return INDEXER_PYAV if extension_factory is None else INDEXER_BOX_WALKER
+
+
 def _parse_mp4(
     media_location: str,
     moov_bytes: bytes,
@@ -337,10 +339,17 @@ def _parse_mp4(
     extension_factory: Mp4ExtensionFactory | None,
     *,
     file_size: int,
-) -> tuple[Mp4Extraction, pa.LargeListArray]:
+) -> tuple[Mp4Metadata, pa.LargeListArray]:
+    if extension_factory is None:
+        index = index_from_boxes(file_size, moov_bytes, moof_rows or ())
+        probe = index.probe
+        standard = _standard_frame_columns(
+            probe.dts, probe.composition_offset, probe.is_keyframe, probe.offset, probe.size
+        )
+        return index.metadata, _frame_index_array(standard)
     try:
-        extension = extension_factory(media_location) if extension_factory is not None else None
-        handlers = extension.uuid_handlers if extension else ()
+        extension = extension_factory(media_location)
+        handlers = extension.uuid_handlers
     except UnindexableVideoError as exc:
         raise _ExtensionSetupError(exc) from exc
     except Exception as exc:
@@ -355,11 +364,9 @@ def _parse_mp4(
         if isinstance(exc.error, UnindexableVideoError):
             raise exc.error from exc
         raise _ExtensionContractError(exc.error) from exc
-    _validate_frame_byte_ranges(track, file_size)
+    check_frame_byte_ranges(track.offset, track.size, file_size)
     extraction = Mp4Extraction(media_location, track, moov_bytes, moof_rows)
-    standard = _standard_frame_columns(track)
-    if extension is None:
-        return extraction, _frame_index_array(standard)
+    standard = _standard_frame_columns(*video_track_sample_arrays(track), track.offset, track.size)
     try:
         columns = _extension_frame_columns(extension, extraction)
         frames = _frame_index_array(standard, columns)
@@ -367,7 +374,7 @@ def _parse_mp4(
         raise
     except Exception as exc:
         raise _ExtensionContractError(exc) from exc
-    return extraction, frames
+    return Mp4Metadata.from_video_track(track), frames
 
 
 def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing settings
@@ -383,13 +390,13 @@ def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing s
     input_transport_params: dict[str, Any] | None,
     output_transport_params: dict[str, Any] | None,
     extension_factory: Mp4ExtensionFactory | None = None,
-) -> tuple[Mp4Extraction, pa.LargeListArray]:
+) -> tuple[Mp4Metadata, pa.LargeListArray]:
     """Parse standard and extension fields, refetching invalid cached boxes once."""
     for attempt in range(2):
         use_cache = skip_existing_sidecars and attempt == 0
-        served_from_cache = False
+        moov_from_cache = moof_from_cache = parsing = False
         try:
-            moov_bytes, served_from_cache = _ensure_moov(
+            moov_bytes, moov_from_cache = _ensure_moov(
                 media_location,
                 moov_sidecar_location,
                 file_size=file_size,
@@ -410,12 +417,14 @@ def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing s
                     input_transport_params=input_transport_params,
                     output_transport_params=output_transport_params,
                 )
-                served_from_cache = served_from_cache or moof_from_cache
+            parsing = True
             return _parse_mp4(media_location, moov_bytes, moof_rows, extension_factory, file_size=file_size)
         except _ExtensionSetupError as exc:
             raise exc.error from exc
         except (UnindexableVideoError, pa.ArrowInvalid, OverflowError, _CachedBoxReadError) as exc:
-            if attempt == 0 and (served_from_cache or isinstance(exc, _CachedBoxReadError)):
+            # A failure fetching boxes from the source is the source's own, whatever else came from cache.
+            cache_at_fault = isinstance(exc, _CachedBoxReadError) or (parsing and (moov_from_cache or moof_from_cache))
+            if attempt == 0 and cache_at_fault:
                 logger.warning("mp4-index: {} has invalid cached boxes; refetching from the source", media_location)
                 continue
             if isinstance(exc, _CachedBoxReadError):
@@ -434,6 +443,10 @@ def process_one_video(
     extension_factory: Mp4ExtensionFactory | None = None,
 ) -> dict[str, Any]:
     """Extract or reuse moov/moof sidecars and build one complete video record.
+
+    PyAV indexes the frames from those boxes alone, so a video whose sidecars are cached is
+    indexed without reading its media. With *extension_factory*, the box walker indexes
+    instead, so the extension's UUID decoders run.
 
     Returns manifest fields plus ``status``, ``error_type``, and ``error_message``.
     ``metadata`` and ``frames`` are single-row Arrow arrays whose buffers are retained
@@ -455,7 +468,7 @@ def process_one_video(
     moov_sidecar_root = config.output.moov_sidecar_root
     moof_table_root = config.output.moof_table_root
     skip_existing_sidecars = config.execution.skip_existing_sidecars
-    extraction_contract_id = config.extraction_contract_id
+    extraction_contract_id = config.extraction_contract_id(indexer=indexer_for(extension_factory))
 
     media_location = row["media_location"]
     video_id = row["video_id"]
@@ -479,7 +492,7 @@ def process_one_video(
         file_size = _file_size(media_location, input_storage_client)
         moov_sidecar_location = f"{moov_sidecar_root.rstrip('/')}/{video_id}.moov"
         moof_table_location = f"{moof_table_root.rstrip('/')}/{video_id}.arrow"
-        extraction, frames = _extract_mp4(
+        metadata, frames = _extract_mp4(
             media_location,
             moov_sidecar_location,
             moof_table_location,
@@ -492,9 +505,6 @@ def process_one_video(
             output_transport_params=output_transport_params,
             extension_factory=extension_factory,
         )
-        video_track = extraction.video_track
-        metadata = Mp4Metadata.from_video_track(video_track)
-
         metadata_array = pa.array([attrs.asdict(metadata)], type=pa.struct(VIDEO_METADATA_SCHEMA))
     except _ExtensionContractError as exc:
         raise exc.error from exc

@@ -39,7 +39,7 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     make_video_id,
 )
 from cosmos_curator.next.recipes.mp4_index.discovery import resolve_input_selection
-from cosmos_curator.next.recipes.mp4_index.processing import Mp4ExtensionFactory, _ProcessOneVideo
+from cosmos_curator.next.recipes.mp4_index.processing import Mp4ExtensionFactory, _ProcessOneVideo, indexer_for
 
 _BYTES_PER_GIB = 1024**3
 
@@ -143,7 +143,7 @@ def _run_manifest(
     )
     lance_sink.validate_committed_versions(
         manifest_dataset,
-        extraction_contract_id=config.extraction_contract_id,
+        extraction_contract_id=config.extraction_contract_id(indexer=indexer_for(extension_factory)),
         record_schema_version=RECORD_SCHEMA_VERSION,
     )
 

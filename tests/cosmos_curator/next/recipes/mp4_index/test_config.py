@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 from cosmos_curator.next.recipes.mp4_index import config
+from cosmos_curator.next.recipes.mp4_index.contracts import INDEXER_BOX_WALKER, INDEXER_PYAV
 
 _MINIMAL_URIS_CONFIG: dict[str, object] = {
     "schema_version": 1,
@@ -391,7 +392,7 @@ def test_extraction_contract_id_is_stable_for_the_same_settings(tmp_path: pathli
     first = config.resolve_config(_write(tmp_path, _MINIMAL_URIS_CONFIG, "a.yaml"))
     second = config.resolve_config(_write(tmp_path, _MINIMAL_URIS_CONFIG, "b.yaml"))
 
-    assert first.extraction_contract_id == second.extraction_contract_id
+    assert first.extraction_contract_id(indexer=INDEXER_PYAV) == second.extraction_contract_id(indexer=INDEXER_PYAV)
 
 
 def test_extraction_contract_id_changes_with_container_kind(tmp_path: pathlib.Path) -> None:
@@ -403,7 +404,18 @@ def test_extraction_contract_id_changes_with_container_kind(tmp_path: pathlib.Pa
     }  # type: ignore[dict-item]
     fragmented = config.resolve_config(_write(tmp_path, fragmented_payload, "b.yaml"))
 
-    assert nonfragmented.extraction_contract_id != fragmented.extraction_contract_id
+    assert nonfragmented.extraction_contract_id(indexer=INDEXER_PYAV) != fragmented.extraction_contract_id(
+        indexer=INDEXER_PYAV
+    )
+
+
+def test_extraction_contract_id_changes_with_indexer(tmp_path: pathlib.Path) -> None:
+    """PyAV and the box walker can publish different timestamps and metadata for the same file."""
+    resolved = config.resolve_config(_write(tmp_path, _MINIMAL_URIS_CONFIG))
+
+    assert resolved.extraction_contract_id(indexer=INDEXER_PYAV) != resolved.extraction_contract_id(
+        indexer=INDEXER_BOX_WALKER
+    )
 
 
 def test_extraction_contract_id_changes_with_session_id_path_depth(tmp_path: pathlib.Path) -> None:
@@ -412,7 +424,7 @@ def test_extraction_contract_id_changes_with_session_id_path_depth(tmp_path: pat
     depth_3_payload = {**_MINIMAL_URIS_CONFIG, "execution": {"session_id_path_depth": 3}}
     depth_3 = config.resolve_config(_write(tmp_path, depth_3_payload, "b.yaml"))
 
-    assert depth_2.extraction_contract_id != depth_3.extraction_contract_id
+    assert depth_2.extraction_contract_id(indexer=INDEXER_PYAV) != depth_3.extraction_contract_id(indexer=INDEXER_PYAV)
 
 
 def test_extraction_contract_id_is_unaffected_by_execution_tuning(tmp_path: pathlib.Path) -> None:
@@ -424,4 +436,6 @@ def test_extraction_contract_id_is_unaffected_by_execution_tuning(tmp_path: path
     }
     retuned = config.resolve_config(_write(tmp_path, retuned_payload, "b.yaml"))
 
-    assert default_tuning.extraction_contract_id == retuned.extraction_contract_id
+    assert default_tuning.extraction_contract_id(indexer=INDEXER_PYAV) == retuned.extraction_contract_id(
+        indexer=INDEXER_PYAV
+    )
