@@ -2,9 +2,83 @@
 
 ## Latest
 
+## [2.9.0]
+
+### Released
+
+- 2026-10-15
+
+### Breaking Changes
+
+- Replace `multimodal-embedding`'s `video.camera_key` with `video.camera_keys`, accepting a
+  nonempty list or `all` (the default). Results now include camera names in their keys by default;
+  select one camera and set `output.tag_camera_key: false` to retain untagged field names.
+  Earlier episode-only staging and checkpoints are not migrated.
+- Move `mp4-index` metadata and frame indexes from Arrow sidecars into `manifest.lance`, with
+  record schema version 7. Update consumers to read the nested `metadata` and `frames` fields
+  and allow null box metadata that PyAV does not report. Create a fresh manifest dataset for
+  existing outputs; existing `moov`/`moof` caches remain reusable.
+- Rename `video-transcode`'s `execution.spans_per_checkpoint` to `execution.parquet_rows_per_file`.
+  Shared recovery changes transcode field metadata and publication receipts, and replaces both
+  transcode and `video-embed` staging layouts. Existing transcode outputs and earlier recovery
+  workspaces have no automatic migration; rebuild affected outputs with fresh staging.
+- Default managed Slurm Ray head allocations to exclusive nodes and advertise their allocated
+  resources for application work. Set `slurm.head.exclusive: false` to retain shared-node CPU
+  and memory requests; `cpus` and `memory` are ignored for exclusive allocations.
+
+### Added
+
+- Embed multiple cameras in one `multimodal-embedding` run through shared model actors, with
+  per-camera checkpoints and one atomic publication of all selected camera results. Adding a
+  camera reuses already-published results for other cameras.
+- Extend fragmented MP4 indexing to multiple frames per fragment. Add custom UUID-box parsing
+  hooks, optional camera timing fields, and validation of frame byte ranges against source size.
+- Add `input.index_manifest_uri` to `data-integrity` and `--index-manifest` to its standalone
+  CLIs to reuse `mp4-index` timelines without scanning each covered video. Record container
+  decode-timestamp provenance when sensor timestamps are absent, and fall back to media reads
+  for missing, unusable, or size-mismatched index records.
+- Add `HesaiLidarParser` for calibrated Pandar128E3X UDP decoding into full-sweep point clouds,
+  including intensity, ring IDs, and per-point sensor timestamps.
+- Run managed Ray workloads on the Slurm head, including GPU work, and allow `worker_lanes: 0`
+  for head-only runs that can add workers later. Head and worker resource requests are independent.
+- Accept registry image references in managed Slurm Ray configs and add
+  `slurm.worker.max_lane_allocations` to cap renewal arrays on clusters with job-count limits.
+- Add opt-in OTLP metrics export around config-backed pipeline runs through
+  `COSMOS_CURATOR_OTLP_METRICS_PUSH`, with a configurable push interval.
+
+### Fixed
+
+- Select re-encoded `robot-action-split` frames by source presentation timestamps and verify
+  the selected range, preventing shifted clips when seeking MPEG-TS sources or reordered frames.
+- Resolve local `file://` paths consistently in `multimodal-split` preflight, discovery, and
+  sensor reads, including `file://localhost` paths.
+- Validate GPS protobuf fields without the removed `FieldDescriptor.label` API, restoring
+  compatibility with current protobuf descriptors.
+- Clear inherited `PIXI_WORKSPACE_*` activation variables in Slurm launches so container
+  commands do not use the launcher's host workspace.
+
 ### Changed
 
+- Adopt shared checkpointing and recovery for `video-transcode` and `video-embed`. Resume saved
+  selections across fresh clusters, appended fragments, and unrelated enrichment commits;
+  retry publication from durable results without repeating checkpointed encoding or inference.
+- Publish MP4 metadata, frame indexes, source summaries, and provenance together in Lance,
+  allowing consumers to query video summaries without loading full frame arrays.
+- Build `mp4-index` frame indexes with PyAV from extracted `moov`/`moof` boxes, supporting
+  additional fragmented layouts without rereading source media when the boxes are cached.
+  Stream selection, timestamps, and durations follow PyAV; UUID extensions retain box-walker
+  indexing, with distinct extraction contracts for the two indexers.
 - Upgrade Ray to 2.59.0. Local clusters started with `ray.init()` now enable token authentication by default.
+- Upgrade Lance (`pylance`) to 13.0.0 and Pixi in runtime images to 0.82.0.
+
+### Documentation
+
+- Add a VITRA / EPIC-KITCHENS public sample guide, an annotation-to-LeRobot converter, and an
+  example `robot-action-split` config for an end-to-end egocentric workflow.
+- Document shared checkpoint recovery, multicamera embedding, PyAV frame indexing, MP4
+  extensions and schemas, and managed Slurm Ray head execution.
+- Refresh the quickstart around Curator Next recipes and canonical Lance outputs, and clarify
+  pipeline execution and robot-action split configuration.
 
 ## [2.8.0]
 
