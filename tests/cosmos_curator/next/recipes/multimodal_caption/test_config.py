@@ -284,13 +284,13 @@ def test_explicit_null_tag_is_rejected(tmp_path: Path) -> None:
         resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"output": {"tag_camera_key": None}})
 
 
-def test_all_three_models_are_supported(tmp_path: Path) -> None:
+def test_supported_models_are_accepted(tmp_path: Path) -> None:
     """The recipe accepts its exact model set and rejects unknown keys."""
     raw = _raw(str(tmp_path / "episodes.lance"))
     assert {
         resolve_config_data(raw | {"model": {"variant": variant}}).model.variant
-        for variant in ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano")
-    } == {"qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"}
+        for variant in ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super")
+    } == {"qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super"}
     with pytest.raises(ValidationError):
         resolve_config_data(raw | {"model": {"variant": "future_model"}})
 

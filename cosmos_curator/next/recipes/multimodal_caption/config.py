@@ -23,7 +23,7 @@ _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 SchemaVersion = Literal[1]
 MultimodalCaptionKind = Literal["multimodal-caption"]
 ContextVariant = Literal["video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses"]
-ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano"]
+ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super"]
 PromptMode = Literal["default", "custom"]
 
 

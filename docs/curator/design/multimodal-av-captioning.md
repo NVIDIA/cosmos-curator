@@ -12,22 +12,25 @@ same episode table for selected cameras or all cameras in one run. It reads came
 and Ego prompt context are not inputs to those vectors. See the
 [end-to-end guide](../guides/multimodal-av-e2e.md) for the combined workflow and example configs.
 
-Each invocation selects a model, context, prompt, and result identity. Model compatibility is the fixed product of
-three model bindings and three context modes, for nine supported execution combinations:
+Each invocation selects a model, context, prompt, and result identity. Model and context are independent selections:
 
 | Axis | Supported values | Owner |
 |---|---|---|
-| Model | `qwen3_8_27b_fp8`, `qwen3_8_27b`, `cosmos3_nano` | Recipe-owned model runtime |
+| Model | `qwen3_8_27b_fp8`, `qwen3_8_27b`, `cosmos3_nano`, `cosmos3_super` | Recipe-owned model runtime |
 | Context | `video_only`, `ego_trajectory_summary`, `ego_trajectory_absolute_poses` | Context representation and default prompt |
 | Prompt/result | Required `default` or `custom` prompt selection; `output.result_key` defaults to `default` | Caller |
 
-The count of nine covers model × context only. Prompt selection and result identity are per-invocation settings, so
-each model/context combination can publish multiple independently keyed field pairs.
+Prompt selection and result identity are per-invocation settings, so each model/context combination can publish
+multiple independently keyed field pairs.
 
-There is no model/context pair registry. Every model works with every context. Qwen samples video at 2 FPS;
-`cosmos3_nano` samples at 4 FPS, uses the native Cosmos3 vLLM executor, and supplies its closed-reasoning assistant
-prefill. Each model binding owns its fixed 32,768-token model-length ceiling. Contexts do not own or configure model
-runtime.
+There is no model/context pair registry. Any supported model may be combined with any context. Qwen samples video at 2 FPS;
+`cosmos3_nano` and `cosmos3_super` share the same runtime binding: 4 FPS video sampling, the native Cosmos3 vLLM
+executor, and a closed-reasoning assistant prefill. Each model binding owns its fixed 32,768-token model-length
+ceiling. Contexts do not own or configure model runtime.
+
+Tensor parallelism defaults to 1 and remains configurable through `execution.tensor_parallel_size`. Callers choose GPU
+placement and batching. Configuration values are validated, but the recipe does not check whether the selected model
+and execution settings fit available GPU memory.
 
 The recipe uses the current `video-caption` complete-MP4 inference, checkpoint, staging, and fragment-atomic Lance
 publication engine. `video-caption` keeps its clip schema, fields, literal contract digests, prompt, and runtime; the
@@ -244,11 +247,13 @@ Prompt mode is provenance in resolved configuration and the run summary only. Th
 template—not the mode—is persisted in terminal metadata and bound into the normalized contract and its digest.
 
 `output.staging_root_uri` defaults to `<episodes.lance parent>/staging/multimodal-caption`. Model weights must already
-exist under the standard model mount on every inference worker; the recipe never downloads them. `cosmos3_nano` is not
-in the default weight set and must be staged explicitly when used:
+exist under the standard model mount on every inference worker; the recipe never downloads them. Cosmos3 Nano and
+Super use their pinned BF16 registry entries, are outside the default weight set, and must be staged explicitly when
+used. Download the selected Cosmos3 model:
 
 ```bash
 pixi run --as-is model-download --models cosmos3_nano
+pixi run --as-is model-download --models cosmos3_super
 ```
 
 ## Result contract

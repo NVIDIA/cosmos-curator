@@ -181,6 +181,21 @@ class _CaptionModelBinding:
     inference: CaptionInferenceBindings
 
 
+_COSMOS3_MODEL_BINDING: Final = _CaptionModelBinding(
+    inference=CaptionInferenceBindings(
+        assistant_prefill=_COSMOS3_CLOSED_THINKING_PREFILL,
+        # Ray detects a final assistant turn and supplies
+        # ``continue_final_message=True`` itself. Supplying it here would
+        # pass the argument twice to Transformers.
+        chat_template_kwargs={},
+        video_fps=_COSMOS3_VIDEO_FPS,
+        prepare_model_config_kwargs=_COSMOS3_PREPARE_MODEL_CONFIG_KWARGS,
+        request_mm_processor_kwargs={},
+        sampling_params=_COSMOS3_SAMPLING_PARAMS,
+        engine_kwargs=_COSMOS3_ENGINE_KWARGS,
+    ),
+)
+
 _MODEL_BINDINGS: Final[dict[ModelVariant, _CaptionModelBinding]] = {
     "qwen3_8_27b_fp8": _CaptionModelBinding(
         inference=CaptionInferenceBindings(engine_kwargs={"max_model_len": 32_768}),
@@ -188,20 +203,8 @@ _MODEL_BINDINGS: Final[dict[ModelVariant, _CaptionModelBinding]] = {
     "qwen3_8_27b": _CaptionModelBinding(
         inference=CaptionInferenceBindings(engine_kwargs={"max_model_len": 32_768}),
     ),
-    "cosmos3_nano": _CaptionModelBinding(
-        inference=CaptionInferenceBindings(
-            assistant_prefill=_COSMOS3_CLOSED_THINKING_PREFILL,
-            # Ray detects a final assistant turn and supplies
-            # ``continue_final_message=True`` itself. Supplying it here would
-            # pass the argument twice to Transformers.
-            chat_template_kwargs={},
-            video_fps=_COSMOS3_VIDEO_FPS,
-            prepare_model_config_kwargs=_COSMOS3_PREPARE_MODEL_CONFIG_KWARGS,
-            request_mm_processor_kwargs={},
-            sampling_params=_COSMOS3_SAMPLING_PARAMS,
-            engine_kwargs=_COSMOS3_ENGINE_KWARGS,
-        ),
-    ),
+    "cosmos3_nano": _COSMOS3_MODEL_BINDING,
+    "cosmos3_super": _COSMOS3_MODEL_BINDING,
 }
 
 

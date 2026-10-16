@@ -4,12 +4,13 @@
 """Tests for compositional multimodal caption contracts."""
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, get_args
 
 import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.recipes.multimodal_caption.config import ContextVariant, ModelVariant
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     ABSOLUTE_POSES_SERIALIZATION,
     CONTEXT_DEFINITIONS,
@@ -18,6 +19,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     EGO_CONTEXT_MAX_NEAREST_POSE_DELTA_NS,
     EGO_PROMPT_SENTINEL,
     EGO_REQUIRED_TIMESTAMP_SOURCE,
+    FIELD_SET_METADATA,
     SUMMARY_SERIALIZATION,
     CaptionContextDefinition,
     CaptionInputProfile,
@@ -47,7 +49,7 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
 )
 from cosmos_curator.next.recipes.video_caption.inference import caption_llm_preprocess
 
-_MODELS = ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano")
+_MODELS = ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super")
 _CONTEXTS = ("video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses")
 
 
@@ -69,10 +71,13 @@ def _identity(variant: str = "video_only", model_key: str = "qwen3_8_27b_fp8") -
     return model, definition, ego, prompt, digest
 
 
-def test_exact_three_by_three_product_composes_without_pair_registry() -> None:
+def test_independent_model_and_context_selections_compose() -> None:
     """Each independent model and context choice yields one complete contract."""
     assert tuple(CONTEXT_DEFINITIONS) == _CONTEXTS
-    identities = set()
+    assert get_args(ModelVariant) == _MODELS
+    assert get_args(ContextVariant) == _CONTEXTS
+    field_names = set()
+    digests = set()
     for model_key in _MODELS:
         for variant in _CONTEXTS:
             model, definition, ego, prompt, digest = _identity(variant, model_key)
@@ -82,8 +87,43 @@ def test_exact_three_by_three_product_composes_without_pair_registry() -> None:
             assert contract["context_variant"] == variant
             assert contract["model"]["id"] == model.model_id
             assert len(digest) == 64
-            identities.add((names, digest))
-    assert len(identities) == 9
+            field_names.update(names)
+            digests.add(digest)
+    combinations = len(_MODELS) * len(_CONTEXTS)
+    assert len(field_names) == combinations * 2
+    assert len(digests) == combinations
+
+
+def _normalize_model_identity(contract: dict[str, Any], model_key: str) -> dict[str, Any]:
+    normalized = deepcopy(contract)
+    normalized["model"]["id"] = "<model-id>"
+    normalized["model"]["revision"] = "<model-revision>"
+    for field in normalized["fields"]:
+        field["name"] = field["name"].replace(model_key, "<model-key>")
+        metadata = field["metadata"]
+        ownership_key = FIELD_SET_METADATA.decode()
+        metadata[ownership_key] = metadata[ownership_key].replace(model_key, "<model-key>")
+    return normalized
+
+
+@pytest.mark.parametrize("variant", _CONTEXTS)
+def test_cosmos3_contracts_differ_only_in_model_identity(variant: str) -> None:
+    """Nano and Super retain the same complete contract apart from their identities."""
+    contracts = []
+    for model_key in ("cosmos3_nano", "cosmos3_super"):
+        model, definition, ego, prompt, _ = _identity(variant, model_key)
+        contract = normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
+        contracts.append(_normalize_model_identity(contract, model_key))
+    assert contracts[0] == contracts[1]
+
+
+def test_super_uses_pinned_bf16_registry_identity() -> None:
+    """Super resolves the existing pinned registry entry without a recipe override."""
+    model = resolve_model("cosmos3_super")
+    assert model.key == "cosmos3_super"
+    assert model.model_id == "nvidia/Cosmos3-Super"
+    assert model.revision == "3965ceeee07a23751d4f5625c6bee0635d24ecd2"
+    assert model.precision == "BF16"
 
 
 def test_unknown_model_and_context_fail_independently() -> None:
@@ -278,9 +318,10 @@ def test_shared_sampling_matches_runtime_and_both_contracts() -> None:
     assert clip_contract["sampling"] == episode_contract["sampling"] == request["sampling_params"]
 
 
-def test_cosmos3_contract_binds_native_runtime_and_closed_thinking() -> None:
+@pytest.mark.parametrize("model_key", ["cosmos3_nano", "cosmos3_super"])
+def test_cosmos3_contract_binds_native_runtime_and_closed_thinking(model_key: str) -> None:
     """Cosmos3 identity records its native vLLM launch and assistant prefill."""
-    model, definition, ego, prompt, _ = _identity("video_only", "cosmos3_nano")
+    model, definition, ego, prompt, _ = _identity("video_only", model_key)
     runtime = caption_inference_bindings(model.key)
     request = caption_llm_preprocess(
         {"video_data_url": "data:video/mp4;base64,AAAA", "download_error_type": None},
@@ -329,16 +370,21 @@ def test_contract_is_deterministic_and_sensitive_to_every_public_axis() -> None:
     assert "prompt_mode" not in normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
 
 
-def test_contract_runtime_mappings_are_fresh_copies() -> None:
+@pytest.mark.parametrize("model_key", ["cosmos3_nano", "cosmos3_super"])
+def test_contract_runtime_mappings_are_fresh_copies(model_key: str) -> None:
     """A caller cannot mutate static Cosmos3 bindings through a returned contract."""
-    model, definition, ego, prompt, _ = _identity("video_only", "cosmos3_nano")
+    model, definition, ego, prompt, _ = _identity("video_only", model_key)
     contract = normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
-    changed = deepcopy(contract)
-    changed["model_runtime"]["prepare_model_config_kwargs"]["hf_overrides"]["architectures"].append("Mutated")
-    fresh = normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
-    assert fresh["model_runtime"]["prepare_model_config_kwargs"]["hf_overrides"] == {
-        "architectures": ["Cosmos3ForConditionalGeneration"]
-    }
+    original = deepcopy(contract)
+    contract["model_runtime"]["prepare_model_config_kwargs"]["hf_overrides"]["architectures"].append("Mutated")
+    contract["model_runtime"]["engine_kwargs"]["limit_mm_per_prompt"]["video"] = 99
+    contract["sampling"]["temperature"] = 99
+    contract["chat_template"]["kwargs"]["mutated"] = True
+    contract["video"]["request_mm_processor_kwargs"]["mutated"] = True
+    for fresh_key in ("cosmos3_nano", "cosmos3_super"):
+        fresh_model = resolve_model(fresh_key)
+        fresh = normalized_caption_contract(fresh_model, "front_wide", definition, ego, prompt, "default")
+        assert _normalize_model_identity(fresh, fresh_key) == _normalize_model_identity(original, model_key)
 
 
 def test_terminal_row_repeats_identity_and_sensor_binding() -> None:
