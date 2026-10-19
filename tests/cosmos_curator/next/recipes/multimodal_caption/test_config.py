@@ -26,7 +26,7 @@ from cosmos_curator.next.recipes.multimodal_split.config import resolve_config a
 _OMITTED = object()
 
 
-def _raw(uri: str) -> dict[str, object]:
+def _unresolved_config(uri: str) -> dict[str, object]:
     return {
         "schema_version": 1,
         "kind": "multimodal-caption",
@@ -39,7 +39,7 @@ def _raw(uri: str) -> dict[str, object]:
 
 def test_required_selections_and_defaults_are_resolved(tmp_path: Path) -> None:
     """Required selections survive resolution while model and output identity default."""
-    config = resolve_config_data(_raw(str(tmp_path / "episodes.lance")))
+    config = resolve_config_data(_unresolved_config(str(tmp_path / "episodes.lance")))
 
     assert config.context.camera_key == "front_wide"
     assert config.context.variant == "video_only"
@@ -52,22 +52,22 @@ def test_required_selections_and_defaults_are_resolved(tmp_path: Path) -> None:
 @pytest.mark.parametrize("missing", ["context", "inference"])
 def test_context_and_prompt_are_required(missing: str, tmp_path: Path) -> None:
     """Every invocation explicitly selects context and prompt mode."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw.pop(missing)
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config.pop(missing)
     with pytest.raises(ValidationError, match="Field required"):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
 
 def test_omitted_empty_and_explicit_default_output_resolve_identically(tmp_path: Path) -> None:
     """All default-output spellings produce one canonical output and workspace."""
     uri = str(tmp_path / "episodes.lance")
-    omitted = _raw(uri)
+    omitted = _unresolved_config(uri)
     omitted.pop("output")
-    empty = _raw(uri)
+    empty = _unresolved_config(uri)
     empty["output"] = {}
-    explicit = _raw(uri)
+    explicit = _unresolved_config(uri)
 
-    resolved = [resolve_config_data(raw).output for raw in (omitted, empty, explicit)]
+    resolved = [resolve_config_data(unresolved_config).output for unresolved_config in (omitted, empty, explicit)]
 
     assert resolved[0] == resolved[1] == resolved[2]
     assert resolved[0].result_key == "default"
@@ -76,10 +76,10 @@ def test_omitted_empty_and_explicit_default_output_resolve_identically(tmp_path:
 
 def test_explicit_null_output_is_invalid(tmp_path: Path) -> None:
     """An optional output block may be omitted but is never nullable."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["output"] = None
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["output"] = None
     with pytest.raises(ValidationError):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
 
 @pytest.mark.parametrize(
@@ -93,43 +93,43 @@ def test_explicit_null_output_is_invalid(tmp_path: Path) -> None:
 )
 def test_required_camera_variant_and_strict_shape(change: dict[str, object], tmp_path: Path) -> None:
     """The public model rejects missing, retired, and unknown input."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw.update(change)
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config.update(change)
     with pytest.raises(ValidationError):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
 
 def test_video_only_forbids_ego_config(tmp_path: Path) -> None:
     """The context-free mode cannot accept dormant Ego settings."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["context"] = {
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["context"] = {
         "variant": "video_only",
         "camera_key": "front_wide",
         "ego": {"sensor_key": "ego", "topic": "/ego", "frame": "world"},
     }
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
 
 @pytest.mark.parametrize("variant", ["ego_trajectory_summary", "ego_trajectory_absolute_poses"])
 def test_ego_variants_require_exact_source_config(variant: str, tmp_path: Path) -> None:
     """Both Ego contexts expose only sensor key, topic, and frame."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["context"] = {"variant": variant, "camera_key": "front_wide"}
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["context"] = {"variant": variant, "camera_key": "front_wide"}
     with pytest.raises(ValidationError, match="Field required"):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
-    raw["context"] = {
+    unresolved_config["context"] = {
         "variant": variant,
         "camera_key": "front_wide",
         "ego": {"sensor_key": "ego", "topic": "/ego", "frame": "world"},
     }
-    assert resolve_config_data(raw).context.ego is not None  # type: ignore[union-attr]
+    assert resolve_config_data(unresolved_config).context.ego is not None  # type: ignore[union-attr]
 
     for forbidden in ("schema_name", "protobuf_mapping", "cadence_period_ns", "max_delta_ns"):
-        invalid = dict(raw)
-        invalid["context"] = dict(raw["context"])  # type: ignore[arg-type]
-        invalid["context"]["ego"] = dict(raw["context"]["ego"], **{forbidden: "override"})  # type: ignore[index]
+        invalid = dict(unresolved_config)
+        invalid["context"] = dict(unresolved_config["context"])  # type: ignore[arg-type]
+        invalid["context"]["ego"] = dict(unresolved_config["context"]["ego"], **{forbidden: "override"})  # type: ignore[index]
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             resolve_config_data(invalid)
 
@@ -154,36 +154,36 @@ def test_prompt_mode_and_result_namespace_are_strict(
     prompt: dict[str, str], result_key: object, expected: str | None, tmp_path: Path
 ) -> None:
     """Custom prompts cannot claim any base key beginning with default."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["inference"] = {"prompt": prompt}
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["inference"] = {"prompt": prompt}
     if result_key is _OMITTED:
-        raw.pop("output")
+        unresolved_config.pop("output")
     else:
-        raw["output"] = {"result_key": result_key}
+        unresolved_config["output"] = {"result_key": result_key}
     if expected is not None:
-        config = resolve_config_data(raw)
+        config = resolve_config_data(unresolved_config)
         assert config.output.result_key == expected
     else:
         with pytest.raises(ValidationError):
-            resolve_config_data(raw)
+            resolve_config_data(unresolved_config)
 
 
 @pytest.mark.parametrize("result_key", ["Default", "9result", "has-dash", "a" * 49, None, 7])
 def test_result_key_formula_segment_is_validated(result_key: object, tmp_path: Path) -> None:
     """Result keys are safe deterministic field-name segments."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["output"] = {"result_key": result_key}
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["output"] = {"result_key": result_key}
     with pytest.raises(ValidationError):
-        resolve_config_data(raw)
+        resolve_config_data(unresolved_config)
 
 
 def test_custom_prompt_bytes_are_preserved(tmp_path: Path) -> None:
     """Configuration parsing does not trim or normalize a custom prompt."""
     template = "  exact {braces}\nsecond line  "
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    raw["inference"] = {"prompt": {"mode": "custom", "template": template}}
-    raw["output"] = {"result_key": "custom_prompt"}
-    config = resolve_config_data(raw)
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    unresolved_config["inference"] = {"prompt": {"mode": "custom", "template": template}}
+    unresolved_config["output"] = {"result_key": "custom_prompt"}
+    config = resolve_config_data(unresolved_config)
     assert config.inference.prompt.template == template  # type: ignore[union-attr]
 
 
@@ -220,7 +220,7 @@ def test_camera_tagging_preserves_reloadable_base_key(base: object, tmp_path: Pa
     output: dict[str, object] = {"tag_camera_key": tag}
     if base is not _OMITTED:
         output["result_key"] = base
-    config = resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"output": output})
+    config = resolve_config_data(_unresolved_config(str(tmp_path / "episodes.lance")) | {"output": output})
     expected_base = "default" if base is _OMITTED else base
     assert config.output.result_key == expected_base
     assert config.effective_result_key == (f"{expected_base}_front_wide" if tag else expected_base)
@@ -232,7 +232,7 @@ def test_camera_tagging_preserves_reloadable_base_key(base: object, tmp_path: Pa
 def test_tagging_resolves_after_cli_overrides(tmp_path: Path) -> None:
     """Overrides choose the camera and base before validating the effective key."""
     config = resolve_config_data(
-        _raw(str(tmp_path / "episodes.lance")),
+        _unresolved_config(str(tmp_path / "episodes.lance")),
         overrides=["output.tag_camera_key=true", "output.result_key=run2", "context.camera_key=rear_fisheye"],
     )
     assert config.effective_result_key == "run2_rear_fisheye"
@@ -241,23 +241,26 @@ def test_tagging_resolves_after_cli_overrides(tmp_path: Path) -> None:
 @pytest.mark.parametrize("camera", ["Front", "front.wide", "front-wide", "x" * 41])
 def test_tagging_rejects_invalid_effective_keys_with_guidance(camera: str, tmp_path: Path) -> None:
     """Wider camera alphabets remain usable through explicit untagged keys."""
-    raw = _raw(str(tmp_path / "episodes.lance")) | {
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance")) | {
         "context": {"variant": "video_only", "camera_key": camera},
         "output": {"tag_camera_key": True},
     }
     with pytest.raises(ValidationError, match="Turn tag_camera_key off"):
-        resolve_config_data(raw)
-    assert resolve_config_data(raw | {"output": {"result_key": "camera_run"}}).effective_result_key == "camera_run"
+        resolve_config_data(unresolved_config)
+    assert (
+        resolve_config_data(unresolved_config | {"output": {"result_key": "camera_run"}}).effective_result_key
+        == "camera_run"
+    )
 
 
 def test_effective_key_length_boundary_and_staging_only_default(tmp_path: Path) -> None:
     """The composed key accepts 48 characters; staging-only output keeps default naming."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
-    config = resolve_config_data(raw | {"output": {"result_key": "a" * 37, "tag_camera_key": True}})
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
+    config = resolve_config_data(unresolved_config | {"output": {"result_key": "a" * 37, "tag_camera_key": True}})
     assert len(config.effective_result_key) == 48
     with pytest.raises(ValidationError, match="48 characters"):
-        resolve_config_data(raw | {"output": {"result_key": "a" * 38, "tag_camera_key": True}})
-    config = resolve_config_data(raw | {"output": {"staging_root_uri": str(tmp_path / "stage")}})
+        resolve_config_data(unresolved_config | {"output": {"result_key": "a" * 38, "tag_camera_key": True}})
+    config = resolve_config_data(unresolved_config | {"output": {"staging_root_uri": str(tmp_path / "stage")}})
     assert config.effective_result_key == "default"
 
 
@@ -268,31 +271,31 @@ def test_custom_prefix_is_rejected_before_tagging(base: object, tmp_path: Path, 
     output: dict[str, object] = {"tag_camera_key": tag}
     if base is not _OMITTED:
         output["result_key"] = base
-    raw = _raw(str(tmp_path / "episodes.lance")) | {
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance")) | {
         "output": output,
         "inference": {"prompt": {"mode": "custom", "template": "Describe."}},
     }
     with pytest.raises(ValidationError, match="does not start with 'default'"):
-        resolve_config_data(raw)
-    config = resolve_config_data(raw | {"output": {"result_key": "custom", "tag_camera_key": tag}})
+        resolve_config_data(unresolved_config)
+    config = resolve_config_data(unresolved_config | {"output": {"result_key": "custom", "tag_camera_key": tag}})
     assert config.effective_result_key == ("custom_front_wide" if tag else "custom")
 
 
 def test_explicit_null_tag_is_rejected(tmp_path: Path) -> None:
     """The tagging flag is a strict non-null boolean."""
     with pytest.raises(ValidationError):
-        resolve_config_data(_raw(str(tmp_path / "episodes.lance")) | {"output": {"tag_camera_key": None}})
+        resolve_config_data(_unresolved_config(str(tmp_path / "episodes.lance")) | {"output": {"tag_camera_key": None}})
 
 
 def test_supported_models_are_accepted(tmp_path: Path) -> None:
     """The recipe accepts its exact model set and rejects unknown keys."""
-    raw = _raw(str(tmp_path / "episodes.lance"))
+    unresolved_config = _unresolved_config(str(tmp_path / "episodes.lance"))
     assert {
-        resolve_config_data(raw | {"model": {"variant": variant}}).model.variant
+        resolve_config_data(unresolved_config | {"model": {"variant": variant}}).model.variant
         for variant in ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super")
     } == {"qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super"}
     with pytest.raises(ValidationError):
-        resolve_config_data(raw | {"model": {"variant": "future_model"}})
+        resolve_config_data(unresolved_config | {"model": {"variant": "future_model"}})
 
 
 def test_multicamera_examples_resolve() -> None:

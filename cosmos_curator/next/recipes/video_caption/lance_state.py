@@ -17,6 +17,10 @@ from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_
 from cosmos_curator.next.utils.identity import canonical_digest
 
 
+class ResultFieldMismatchError(ValueError):
+    """Every expected result field exists, but at least one differs in schema or metadata."""
+
+
 class FragmentCaptionState(StrEnum):
     """The only two compatible states; every other shape raises."""
 
@@ -271,4 +275,6 @@ def _assert_present_fields_match(dataset: lance.LanceDataset, bindings: CaptionR
     ]
     if mismatched:
         msg = f"Existing caption field set {result.caption_field_name!r} is incompatible: {', '.join(mismatched)}"
+        if all(expected.name in dataset.schema.names for expected in result.fields):
+            raise ResultFieldMismatchError(msg)
         raise ValueError(msg)

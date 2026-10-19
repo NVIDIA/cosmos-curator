@@ -73,7 +73,11 @@ from cosmos_curator.next.recipes.video_caption.bindings import (
 )
 from cosmos_curator.next.recipes.video_caption.contracts import CHECKPOINT_ADAPTER_VERSION, WORKSPACE_SCHEMA_VERSION
 from cosmos_curator.next.recipes.video_caption.inference import CaptionExecutionConfig, run_inference_phase
-from cosmos_curator.next.recipes.video_caption.lance_state import capture_attempt, ensure_caption_fields
+from cosmos_curator.next.recipes.video_caption.lance_state import (
+    ResultFieldMismatchError,
+    capture_attempt,
+    ensure_caption_fields,
+)
 from cosmos_curator.next.recipes.video_caption.publication import publish_staged_results
 from cosmos_curator.next.recipes.video_caption.workspace import (
     cleanup_workspace,
@@ -245,29 +249,17 @@ def _preflight_and_register(
             bindings=bindings,
             attempts=config.execution.commit_attempts,
         )
-    except ValueError as exc:
-        # Schema metadata is the contract authority, including for still-null results.
-        try:
-            current = lance.dataset(uri, storage_options=storage_options)
-            validate_episode_table(current, uri=uri)
-            fields = bindings.result.fields
-            collision = all(field.name in current.schema.names for field in fields) and any(
-                not current.schema.field(field.name).equals(field, check_metadata=True) for field in fields
-            )
-        except Exception:  # noqa: BLE001 -- failed diagnostic checks must preserve the registration error
-            raise exc from None
-        if collision:
-            action = (
-                "Choose a new base result_key."
-                if config.output.tag_camera_key
-                else "Choose a new result_key, or set tag_camera_key: true if you are captioning another camera."
-            )
-            msg = (
-                f"{exc} This result key is bound to a different contract "
-                f"(camera, prompt, model revision, or context settings). {action}"
-            )
-            raise ValueError(msg) from exc
-        raise
+    except ResultFieldMismatchError as exc:
+        action = (
+            "Choose a new base result_key."
+            if config.output.tag_camera_key
+            else "Choose a new result_key, or set tag_camera_key: true if you are captioning another camera."
+        )
+        msg = (
+            f"{exc} This result key is bound to a different contract "
+            f"(camera, prompt, model revision, or context settings). {action}"
+        )
+        raise ValueError(msg) from exc
     return lance.dataset(uri, storage_options=storage_options), representative_camera_uri, representative_ego_uri
 
 

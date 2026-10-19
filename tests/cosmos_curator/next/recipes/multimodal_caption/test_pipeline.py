@@ -280,7 +280,7 @@ def test_ambiguous_tagged_keys_reject_incompatible_camera(
             )
         ]
     )
-    raw = {
+    unresolved_config = {
         "schema_version": 1,
         "kind": "multimodal-caption",
         "input": {"episodes_lance_uri": uri},
@@ -294,10 +294,10 @@ def test_ambiguous_tagged_keys_reject_incompatible_camera(
 
     monkeypatch.setattr(pipeline, "ensure_workspace", stop_before_inference)
     with pytest.raises(InterruptedError):
-        pipeline.run_config(resolve_config_data(raw))
+        pipeline.run_config(resolve_config_data(unresolved_config))
     version = lance.dataset(uri).version
     other = resolve_config_data(
-        raw
+        unresolved_config
         | {
             "context": {"variant": "video_only", "camera_key": "b_c"},
             "output": {"result_key": "a", "tag_camera_key": True},
@@ -309,46 +309,29 @@ def test_ambiguous_tagged_keys_reject_incompatible_camera(
     assert lance.dataset(uri).version == version
 
 
-@pytest.mark.parametrize("failure", ["partial", "base_schema", "unrelated", "reopen"])
-def test_registration_errors_without_established_collision_keep_diagnostic(
-    failure: str,
+def test_plain_registration_value_error_propagates_unchanged(
     tmp_path: Path,
     episode_factory: Callable[..., dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Neither partial fields nor invalid base schemas justify a collision hint."""
+    """An unrelated registration error retains its identity and diagnostic text."""
     config = _config(tmp_path, "video_only")
-    caption_name, _ = result_field_names("video_only", "default", "qwen3_8_27b_fp8")
-    schema = EPISODE_SCHEMA
-    if failure == "partial":
-        schema = schema.append(pa.field(caption_name, pa.string()))
-    elif failure == "base_schema":
-        schema = schema.remove(schema.get_field_index("source_id"))
-        for name in result_field_names("video_only", "default", "qwen3_8_27b_fp8"):
-            schema = schema.append(pa.field(name, pa.string()))
     lance.write_dataset(
-        pa.Table.from_pylist([episode_factory(0)], schema=schema),
+        pa.Table.from_pylist([episode_factory(0)], schema=EPISODE_SCHEMA),
         str(tmp_path / "episodes.lance"),
         data_storage_version="2.2",
     )
     monkeypatch.setattr(pipeline, "validate_episode_input", lambda *_a, **_k: None)
-    original = ValueError(f"original {failure} diagnostic")
+    original = ValueError("original registration diagnostic")
 
     def reject(*_args: object, **_kwargs: object) -> None:
-        if failure == "reopen":
-
-            def unavailable(*_a: object, **_k: object) -> None:
-                msg = "table temporarily unavailable"
-                raise OSError(msg)
-
-            monkeypatch.setattr(pipeline.lance, "dataset", unavailable)
         raise original
 
     monkeypatch.setattr(pipeline, "ensure_caption_fields", reject)
-    with pytest.raises(ValueError, match=f"original {failure} diagnostic") as caught:
+    with pytest.raises(ValueError, match="original registration diagnostic") as caught:
         pipeline.run_config(config)  # type: ignore[arg-type]
     assert caught.value is original
-    assert str(caught.value) == f"original {failure} diagnostic"
+    assert str(caught.value) == "original registration diagnostic"
 
 
 def test_combined_ego_preflight_precedes_registration(monkeypatch: pytest.MonkeyPatch) -> None:

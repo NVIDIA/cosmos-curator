@@ -16,6 +16,8 @@ from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec
 from cosmos_curator.next.recipes.video_caption.lance_state import (
     CaptionAttempt,
     FragmentCaptionState,
+    ResultFieldMismatchError,
+    _assert_present_fields_match,
     capture_attempt,
     classify_fragment,
     ensure_caption_fields,
@@ -102,8 +104,12 @@ def test_partial_or_conflicting_field_sets_fail(
     """A field set cannot be partial or reuse owned names with different types."""
     partial_uri, partial = clip_dataset_factory()
     partial.add_columns(pa.schema([caption_spec.caption_field]))
-    with pytest.raises(ValueError, match="partially present"):
+    with pytest.raises(ValueError, match="partially present") as caught:
         ensure_caption_fields(partial_uri, storage_options=None, bindings=caption_bindings, attempts=1)
+    assert not isinstance(caught.value, ResultFieldMismatchError)
+    with pytest.raises(ValueError, match="incompatible") as caught:
+        _assert_present_fields_match(partial, caption_bindings)
+    assert not isinstance(caught.value, ResultFieldMismatchError)
 
     conflict_uri, conflict = clip_dataset_factory()
     conflict.add_columns(
@@ -114,7 +120,7 @@ def test_partial_or_conflicting_field_sets_fail(
             ]
         )
     )
-    with pytest.raises(ValueError, match="incompatible"):
+    with pytest.raises(ResultFieldMismatchError, match="incompatible"):
         ensure_caption_fields(conflict_uri, storage_options=None, bindings=caption_bindings, attempts=1)
 
 
