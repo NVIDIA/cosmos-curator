@@ -36,10 +36,6 @@ from cosmos_curator.core.sensors.mp4.moov import parse_video_track
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader
-from cosmos_curator.next.recipes.data_integrity.index_source import (
-    IndexRecordUnusableError,
-    Mp4IndexSensor,
-)
 from cosmos_curator.next.recipes.data_integrity.session_runner import is_infrastructure_error
 from cosmos_curator.next.recipes.data_integrity.sources import (
     SOURCE_SENSOR_TIMESTAMPS_SUFFIX,
@@ -522,32 +518,28 @@ class _StubLookup:
     """An Mp4IndexLookup stand-in holding one prebuilt record, keyed by the path it covers.
 
     These tests are about which sensor ``run_checks`` chooses; the manifest read itself
-    is covered in ``test_index_source``. ``media_size_bytes`` is recorded and not acted
+    is covered in ``test_index_lookup``. ``media_size_bytes`` is recorded and not acted
     on, which is what lets these tests prove "the video was never opened" by deleting
     it -- the real guard needs the object there to size it.
     """
 
     def __init__(self, covered: str, video_bytes: bytes) -> None:
         self._covered = covered
-        self._index, self._metadata = _index_for(video_bytes)
+        self._record = _index_for(video_bytes)
         self.asked: list[str] = []
         self.sizes: list[int | None] = []
 
-    def sensor_for(
+    def index_for(
         self,
         source: str,
         *,
         media_size_bytes: int | None,
-        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None,
-    ) -> Mp4IndexSensor | None:
+    ) -> tuple[Mp4FrameIndex, Mp4Metadata] | None:
         self.asked.append(source)
         self.sizes.append(media_size_bytes)
         if source != self._covered:
             return None
-        try:
-            return Mp4IndexSensor(self._index, self._metadata, sensor_timestamps_ns=sensor_timestamps_ns)
-        except IndexRecordUnusableError:
-            return None
+        return self._record
 
 
 def _comparable(results: list[CheckResult]) -> list[tuple[object, ...]]:

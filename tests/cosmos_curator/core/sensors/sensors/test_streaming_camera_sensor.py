@@ -17,17 +17,26 @@
 import gc
 import itertools
 import pathlib
+from fractions import Fraction
+from typing import Any
 
 import av
 import numpy as np
 import psutil
+import pyarrow as pa
 import pytest
 
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.group import SensorGroup
-from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
+    IndexRecordUnusableError,
+    StreamingCameraSensor,
+)
+from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.recipes.mp4_index.contracts import FRAME_INDEX_SCHEMA
 
 _DATA = pathlib.Path(__file__).resolve().parents[3] / "pipelines" / "video" / "data"
 _CLIP = _DATA / "test_clip_10s.mp4"
@@ -526,3 +535,248 @@ def test_a_missed_exposure_is_served_by_repeating_its_neighbour() -> None:
     assert abs(served[missed] - int(references[missed])) == min(
         abs(candidate - int(references[missed])) for candidate in bracketing
     )
+
+
+#: Ticks per second for the index fixtures. Deliberately not a divisor of 1e9 -- one tick
+#: is 81380.2... ns -- so the tick-to-nanosecond conversion has to actually happen for
+#: these timestamps to come out right, rather than passing under an evenly dividing scale.
+_INDEX_TIME_BASE_DEN = 12288
+
+#: One frame interval at the index fixtures' nominal 30 fps, in ticks.
+_INDEX_FRAME_TICKS = _INDEX_TIME_BASE_DEN // 30
+
+
+def _metadata_row(**overrides: object) -> dict[str, Any]:
+    """One VIDEO_METADATA_SCHEMA row, with the fields these tests vary pulled to the front."""
+    row: dict[str, Any] = {
+        "codec_name": "h264",
+        "extradata": b"\x01\x64\x00\x1f",
+        "time_base_num": 1,
+        "time_base_den": _INDEX_TIME_BASE_DEN,
+        "frame_count": 3,
+        "keyframe_count": 1,
+        "width": 640,
+        "height": 480,
+        "avc_profile_idc": 100,
+        "avc_constraint_flags": 0,
+        "avc_level_idc": 31,
+        "nal_length_size": 4,
+        "chroma_format_idc": 1,
+        "bit_depth_luma_minus8": 0,
+        "bit_depth_chroma_minus8": 0,
+        "buffer_size_db": None,
+        "max_bitrate_bps": None,
+        "avg_bitrate_bps": None,
+        "movie_creation_time": 0,
+        "movie_modification_time": 0,
+        "track_creation_time": 0,
+        "track_modification_time": 0,
+        "track_matrix": [0] * 9,
+        "track_display_width": 0,
+        "track_display_height": 0,
+        "elst_bytes": None,
+        "avg_frame_rate_num": 30,
+        "avg_frame_rate_den": 1,
+        "bit_rate_bps": 1000,
+        "duration_ns": 1_000_000_000,
+        "encoder_tag": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _frame_rows(count: int = 3, *, composition_offset_ticks: int | None = None) -> list[dict[str, Any]]:
+    """``count`` evenly spaced frames in decode order, all sharing one composition offset."""
+    return [
+        {
+            "dts_ticks": position * _INDEX_FRAME_TICKS,
+            "composition_offset_ticks": composition_offset_ticks,
+            "is_keyframe": position == 0,
+            "offset": position * 100,
+            "size": 100,
+        }
+        for position in range(count)
+    ]
+
+
+def _frame_index(rows: list[dict[str, Any]], metadata: Mp4Metadata) -> Mp4FrameIndex:
+    return Mp4FrameIndex.from_frame_index_table(
+        pa.Table.from_pylist(rows, schema=FRAME_INDEX_SCHEMA),
+        time_base_num=metadata.time_base_num,
+        time_base_den=metadata.time_base_den,
+    )
+
+
+def _from_index(rows: list[dict[str, Any]] | None = None, **metadata_overrides: object) -> StreamingCameraSensor:
+    """Build an index-backed sensor over *rows*, with no media behind it."""
+    frames = _frame_rows() if rows is None else rows
+    metadata = Mp4Metadata.from_row(_metadata_row(frame_count=len(frames), **metadata_overrides))
+    return StreamingCameraSensor.from_index(_frame_index(frames, metadata), metadata)
+
+
+def _indexed_ns(tick: int) -> int:
+    return tick * _NS_PER_SECOND // _INDEX_TIME_BASE_DEN
+
+
+def test_an_index_timeline_is_the_decode_timestamps_in_nanoseconds() -> None:
+    """The reported timeline is dts_ticks on the track's time base, not raw ticks."""
+    sensor = _from_index()
+
+    assert sensor.timestamps_ns.dtype == np.int64
+    assert sensor.timestamps_ns.tolist() == [_indexed_ns(position * _INDEX_FRAME_TICKS) for position in range(3)]
+    assert sensor.start_ns == 0
+    assert sensor.end_ns == _indexed_ns(2 * _INDEX_FRAME_TICKS)
+
+
+def test_an_index_timeline_is_reported_as_decode_time() -> None:
+    """Not merely "a container clock": decode order ascends, so an in-order finding is a tautology."""
+    assert _from_index().timestamp_source is TimestampSource.CONTAINER_DTS
+
+
+def test_scalar_container_facts_come_off_the_metadata_struct() -> None:
+    """Codec and nominal rate are read from the row rather than inferred from the frames."""
+    sensor = _from_index(codec_name="hevc", avg_frame_rate_num=30000, avg_frame_rate_den=1001)
+
+    assert sensor.codec_name == "hevc"
+    assert sensor.avg_frame_rate == Fraction(30000, 1001)
+
+
+def test_a_declared_rate_of_zero_stays_zero_rather_than_raising() -> None:
+    """Fraction(0) is the library's "no usable header rate" sentinel, which makes rate metrics skip."""
+    assert _from_index(avg_frame_rate_num=0, avg_frame_rate_den=1).avg_frame_rate == Fraction(0)
+
+
+def test_a_zero_denominator_degrades_to_the_same_sentinel() -> None:
+    """A denominator the writer cannot actually emit still skips rather than raising ZeroDivisionError."""
+    assert _from_index(avg_frame_rate_den=0).avg_frame_rate == Fraction(0)
+
+
+def test_an_absent_composition_offset_column_means_no_reordering() -> None:
+    """All-null offsets mean the ctts box is absent, so the container signals no reordering."""
+    assert _from_index(_frame_rows(composition_offset_ticks=None)).has_bframes is False
+
+
+def test_an_explicitly_zero_composition_offset_also_means_no_reordering() -> None:
+    """A present-but-zero ctts box states there is no reordering, which is not the same as absent."""
+    assert _from_index(_frame_rows(composition_offset_ticks=0)).has_bframes is False
+
+
+def test_a_non_zero_composition_offset_signals_reordering() -> None:
+    """A populated ctts offset is the container saying decode order and display order come apart."""
+    assert _from_index(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS)).has_bframes is True
+
+
+def test_composition_offsets_never_move_an_index_timeline() -> None:
+    """Where DTS and PTS do come apart, this serves DTS and does not split the difference.
+
+    No ``elst`` is applied, since an edit list never shifts decode timestamps, so the
+    timeline is the same either way and :attr:`timestamp_source` reports which it is.
+    """
+    delayed = _from_index(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS))
+
+    assert delayed.has_bframes is True
+    assert delayed.timestamps_ns.tolist() == _from_index().timestamps_ns.tolist()
+    assert delayed.start_ns == 0
+
+
+def test_an_index_with_no_frames_is_refused_as_unusable() -> None:
+    """Typed so the recipe falls back to the media; a bare ValueError would fail the stream."""
+    with pytest.raises(IndexRecordUnusableError, match="no frames"):
+        _from_index([])
+
+
+def test_a_sensor_timeline_replaces_the_indexed_one_and_says_so() -> None:
+    """A recorder's own clock beats the container's, and the index contributes only the scalars."""
+    recorded = np.array([5_000, 15_000, 25_000], dtype=np.int64)
+    metadata = Mp4Metadata.from_row(_metadata_row())
+
+    sensor = StreamingCameraSensor.from_index(
+        _frame_index(_frame_rows(), metadata),
+        metadata,
+        sensor_timestamps_ns=recorded,
+    )
+
+    assert sensor.timestamps_ns.tolist() == recorded.tolist()
+    assert sensor.timestamp_source is TimestampSource.SENSOR
+    assert sensor.codec_name == "h264"
+
+
+def test_a_sensor_timeline_of_the_wrong_length_makes_the_record_unusable() -> None:
+    """Matched by position, so a disagreeing count means the alignment is unknown, not partial."""
+    metadata = Mp4Metadata.from_row(_metadata_row())
+
+    with pytest.raises(IndexRecordUnusableError, match="2 observations but the frame index has 3 frames"):
+        StreamingCameraSensor.from_index(
+            _frame_index(_frame_rows(), metadata),
+            metadata,
+            sensor_timestamps_ns=np.array([5_000, 15_000], dtype=np.int64),
+        )
+
+
+def test_streaming_without_a_batch_size_yields_the_whole_timeline_at_once() -> None:
+    """batch_size 0 means one batch, matching CameraSensor's contract."""
+    batches = list(_from_index().stream_timestamps())
+
+    assert len(batches) == 1
+    assert batches[0].tolist() == _from_index().timestamps_ns.tolist()
+
+
+def test_streaming_splits_into_consecutive_batches_with_a_short_tail() -> None:
+    """Batches partition the timeline in order, so streaming and one-shot see the same samples."""
+    batches = list(_from_index(_frame_rows(5)).stream_timestamps(batch_size=2))
+
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert np.concatenate(batches).tolist() == _from_index(_frame_rows(5)).timestamps_ns.tolist()
+
+
+def test_streaming_rejects_a_negative_batch_size() -> None:
+    """Mirrors CameraSensor rather than silently treating a negative size as "all"."""
+    with pytest.raises(ValueError, match="batch_size must be non-negative"):
+        list(_from_index().stream_timestamps(batch_size=-1))
+
+
+def test_an_index_backed_sensor_reports_the_index_and_metadata_it_was_built_from() -> None:
+    """The two accessors are the supported way to reach what from_index was handed."""
+    sensor = _from_index()
+
+    assert len(sensor.index) == 3
+    assert sensor.metadata.codec_name == "h264"
+
+
+def test_a_sensor_built_over_media_has_no_index_to_report() -> None:
+    """Reading an index off a sensor that never had one is a programming error, not an empty answer."""
+    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+
+    with pytest.raises(RuntimeError, match="no frame index"):
+        _ = sensor.index
+
+    with pytest.raises(RuntimeError, match="no container metadata"):
+        _ = sensor.metadata
+
+
+def test_sampling_a_sensor_with_no_media_raises_rather_than_yielding_nothing() -> None:
+    """An index-backed sensor can answer timeline questions, but it has no packets to decode."""
+    sensor = _from_index()
+
+    with pytest.raises(RuntimeError, match="no media to decode"):
+        sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS))
+
+
+def test_an_out_of_order_timeline_is_constructible_but_not_samplable() -> None:
+    """Ordering is a measurement the integrity checks report, so it cannot fail at construction.
+
+    The checks build a sensor over whatever the recording claims and then ask it
+    about itself. Refusing a descending timeline in the constructor would turn a
+    finding they are there to publish into a stream that never got measured.
+    Sampling such a timeline is still meaningless, so that is where it raises.
+    """
+    timeline = np.array([30, 20, 10], dtype=np.int64)
+
+    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=timeline)
+
+    assert sensor.timestamps_ns.tolist() == [30, 20, 10]
+    assert sensor.start_ns == 30
+    assert sensor.end_ns == 10
+
+    with pytest.raises(ValueError, match="strictly sorted in ascending order"):
+        sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS))

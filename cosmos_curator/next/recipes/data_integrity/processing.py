@@ -54,12 +54,12 @@ from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, Stre
 from cosmos_curator.next.recipes.data_integrity import store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
-from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 from cosmos_curator.next.recipes.data_integrity.session_runner import (
     InfrastructureError,
     run_one_stream,
     session_metrics,
 )
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 STREAM_DATASET = store_schema.STREAM_DATASET
 EVALUATION_DATASET = store_schema.EVALUATION_DATASET

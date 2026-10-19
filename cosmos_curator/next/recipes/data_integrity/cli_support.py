@@ -43,7 +43,7 @@ from typing import BinaryIO, cast
 
 from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, MAX_PERCENT, Thresholds
 from cosmos_curator.core.utils.storage_cli import StorageCliError
-from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 # Shared process exit codes for both CLIs. Keep them together so a wrapper can
 # depend on one contract: PASS / FAIL / ERROR / interrupted, never two variants

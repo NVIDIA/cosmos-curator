@@ -61,8 +61,8 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader, raise_if_interrupted
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
-from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
 from cosmos_curator.next.recipes.data_integrity.sources import error_code, http_status, run_checks
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 
 def run_stream(

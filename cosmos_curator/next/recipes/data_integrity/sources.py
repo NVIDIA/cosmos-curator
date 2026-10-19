@@ -27,8 +27,10 @@ Both entry points build on :func:`run_checks`: the single-video ``di-check`` CLI
 (:mod:`.cli`) and the concurrent session runner (:mod:`.session_runner`).
 
 Given an ``mp4-index`` manifest, a stream the manifest covers takes its timeline from
-the index instead of being opened (:mod:`.index_source`). Every other stream is opened
-as usual, whether the manifest has no row for it or the row it has cannot be used.
+the index instead of being opened
+(:mod:`cosmos_curator.next.recipes.mp4_index.index_lookup`). Every other stream is
+opened as usual, whether the manifest has no row for it or the row it has cannot be
+used.
 """
 
 import pathlib
@@ -41,16 +43,21 @@ import numpy as np
 import numpy.typing as npt
 from loguru import logger
 
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.data_integrity.engine import run_metrics
 from cosmos_curator.core.sensors.data_integrity.instruments import DEFAULT_THRESHOLDS, Thresholds
 from cosmos_curator.core.sensors.data_integrity.results import CheckResult, ResolvedConfig, VideoInfo
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
+    IndexRecordUnusableError,
+    StreamingCameraSensor,
+)
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
 from cosmos_curator.core.utils.storage_cli import open_storage_source
 from cosmos_curator.next.recipes.data_integrity import storage_io
-from cosmos_curator.next.recipes.data_integrity.index_source import Mp4IndexLookup
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 
 def _as_data_source(stream: BinaryIO) -> DataSource:
@@ -391,6 +398,27 @@ def observed_size_bytes(
         return None
 
 
+def _indexed_sensor(
+    source: str,
+    record: tuple[Mp4FrameIndex, Mp4Metadata] | None,
+    sensor_timestamps_ns: npt.NDArray[np.int64] | None,
+) -> StreamingCameraSensor | None:
+    """Build a sensor over *record*, or return ``None`` so the caller opens the video.
+
+    A row that cannot describe this stream is expected rather than exceptional -- a
+    sensor timeline counts displayable frames where the index counts samples -- so it
+    is logged at debug and answered by reading the media instead.
+    """
+    if record is None:
+        return None
+    index, metadata = record
+    try:
+        return StreamingCameraSensor.from_index(index, metadata, sensor_timestamps_ns=sensor_timestamps_ns)
+    except IndexRecordUnusableError:
+        logger.opt(exception=True).debug("mp4-index row for {} cannot answer; opening the video", source)
+        return None
+
+
 def run_checks(  # noqa: PLR0913
     source: str,
     *,
@@ -476,7 +504,7 @@ def run_checks(  # noqa: PLR0913
     # the indexer chose. Any other stream_idx is opened instead.
     if index_lookup is not None and stream_idx == 0:
         t0 = time.perf_counter()
-        indexed = index_lookup.sensor_for(
+        record = index_lookup.index_for(
             source,
             media_size_bytes=observed_size_bytes(
                 source,
@@ -484,8 +512,8 @@ def run_checks(  # noqa: PLR0913
                 azure_profile_name=azure_profile_name,
                 endpoint_url=endpoint_url,
             ),
-            sensor_timestamps_ns=sensor_timestamps_ns,
         )
+        indexed = _indexed_sensor(source, record, sensor_timestamps_ns)
         if indexed is not None:
             if stats is not None:
                 stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
