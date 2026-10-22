@@ -54,7 +54,7 @@ uvicorn = "*"
 websockets = "<16"
 
 [feature.core.pypi-dependencies]
-cosmos-xenna = "==0.5.11"
+cosmos-xenna = "==0.5.12"
 foxglove-schemas-protobuf = "*"
 google-genai = ">=1.59.0"
 ngcsdk = "*"
