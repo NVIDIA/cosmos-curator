@@ -28,9 +28,10 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 - [Artifact Transport Guide](reference/artifact-transport.md) - local and remote artifact delivery.
 - [Caption Quality Stats](reference/caption-quality-stats.md) - run-level caption structural-health counters artifact.
 - [Distributed Tracing Guide](reference/distributed-tracing.md) - tracing API, configuration, and output.
+- [Multimodal Input Formats](reference/multimodal-input-formats.md) - formats, schemas, and contracts accepted by sensor readers and AV recipes.
+- [Reference Image Pipeline](reference/image-pipeline.md) - image pipeline behavior, options, and outputs.
 - [Reference Video Pipelines](reference/video-pipelines.md) - video pipeline behavior, options, and outputs.
 - [Split Pipeline Stage Overview](reference/split-pipeline-stages.md) - stage-by-stage split-annotate pipeline catalog.
-- [Reference Image Pipeline](reference/image-pipeline.md) - image pipeline behavior, options, and outputs.
 
 ## Design
 
