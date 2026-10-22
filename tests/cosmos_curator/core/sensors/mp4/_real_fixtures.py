@@ -132,6 +132,26 @@ def audio_then_two_video_tracks_clip() -> bytes:
     return buffer.getvalue()
 
 
+@functools.cache
+def mpeg4_part2_clip(movflags: str = "") -> bytes:
+    """Encode 24 black 64x48 frames as MPEG-4 Part 2 (``mp4v``), a keyframe every 8, muxed with *movflags*.
+
+    libav learns an ``mp4v`` frame size only from frame data.
+    """
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format="mp4", options={"movflags": movflags} if movflags else {}) as sink:
+        stream = sink.add_stream("mpeg4", rate=24)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.codec_context.gop_size = 8
+        black = av.VideoFrame.from_ndarray(np.zeros((48, 64, 3), dtype=np.uint8), format="rgb24")
+        for index in range(24):
+            frame = black.reformat(format="yuv420p")
+            frame.pts = index
+            sink.mux(stream.encode(frame))
+        sink.mux(stream.encode(None))
+    return buffer.getvalue()
+
+
 def _remux(clip: pathlib.Path, movflags: str, **muxer_options: str) -> bytes:
     buffer = io.BytesIO()
     options = {"movflags": movflags, **muxer_options}

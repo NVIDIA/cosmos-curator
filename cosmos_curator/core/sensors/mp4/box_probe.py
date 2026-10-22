@@ -55,6 +55,9 @@ _ZEROS = bytes(1 << 20)
 #: libav reads ``mdhd``'s unsigned timescale as a signed int and replaces one it cannot hold, 0 or
 #: 2**31 and above, with 1, leaving the ticks counted in the original.
 _LIBAV_TIMESCALE_LIMIT = 1 << 31
+#: ``stsd``'s version, flags, and entry count (8), then its first VisualSampleEntry's box header (8),
+#: reserved and data reference index (8), and pre_defined/reserved (16), before width and height.
+_STSD_FRAME_SIZE_OFFSET = 40
 
 
 class BoxLayoutUnsupportedError(UnindexableVideoError):
@@ -202,10 +205,25 @@ def check_frame_byte_ranges(offset: npt.NDArray[np.int64], size: npt.NDArray[np.
 class _TrakBoxes:
     timescale: int
     elst_bytes: bytes | None
+    frame_size: tuple[int, int] | None
+
+
+def _sample_entry_frame_size(moov_bytes: bytes, trak_start: int, trak_end: int) -> tuple[int, int] | None:
+    """Return the width and height of a ``trak``'s first ``stsd`` sample entry, or None if unreadable."""
+    try:
+        stsd_start, stsd_end = find_box(moov_bytes, ("mdia", "minf", "stbl", "stsd"), trak_start, trak_end)
+    except (BoxNotFoundError, MalformedBoxHeaderError, struct.error):
+        return None
+    if stsd_end - stsd_start < _STSD_FRAME_SIZE_OFFSET + 4:
+        return None
+    width, height = struct.unpack_from(">HH", moov_bytes, stsd_start + _STSD_FRAME_SIZE_OFFSET)
+    return width, height
 
 
 def _trak_boxes(moov_bytes: bytes, track_id: int) -> _TrakBoxes:
     """Return the ``mdhd`` timescale and ``edts/elst`` box of the ``trak`` whose ``tkhd`` has *track_id*.
+
+    Also returns that ``trak``'s :func:`_sample_entry_frame_size`.
 
     Raises:
         BoxProbeMismatchError: no ``trak``, or more than one, has *track_id*.
@@ -232,7 +250,11 @@ def _trak_boxes(moov_bytes: bytes, track_id: int) -> _TrakBoxes:
             elst_bytes = None
         else:
             elst_bytes = find_box_bytes(moov_bytes, "elst", edts_start, edts_end)
-        return _TrakBoxes(MediaHeader.parse(moov_bytes, mdhd_start, mdhd_end).timescale, elst_bytes)
+        return _TrakBoxes(
+            MediaHeader.parse(moov_bytes, mdhd_start, mdhd_end).timescale,
+            elst_bytes,
+            _sample_entry_frame_size(moov_bytes, trak_start, trak_end),
+        )
     except (struct.error, IndexError) as exc:
         msg = f"moov buffer ({len(moov_bytes)} byte(s)) ran out mid-parse -- truncated or corrupt: {exc}"
         raise MalformedBoxHeaderError(msg) from exc
@@ -272,7 +294,10 @@ def _index_best_video_stream(container: InputContainer, file_size: int, moov_byt
         if not np.array_equal(getattr(header, name), getattr(demux, name)):
             msg = f"libav's header index and demux of the extracted boxes disagree on {name}"
             raise BoxProbeMismatchError(msg)
-    probe = attrs.evolve(demux, is_keyframe=header.is_keyframe)
+    width, height = demux.width, demux.height
+    if not (width and height) and trak.frame_size is not None:
+        width, height = trak.frame_size
+    probe = attrs.evolve(demux, is_keyframe=header.is_keyframe, width=width, height=height)
     metadata = Mp4Metadata.from_video_probe(
         probe, track_id=stream.id, encoder_tag=stream.metadata.get("encoder"), elst_bytes=trak.elst_bytes
     )
@@ -293,7 +318,8 @@ def index_from_boxes(file_size: int, moov_bytes: bytes, moof_rows: Sequence[tupl
     The metadata is
     :meth:`~cosmos_curator.core.sensors.data.mp4.Mp4Metadata.from_video_probe`'s, apart from the
     stream's ``edts/elst`` box, copied verbatim from its ``trak``: libav is opened without reading
-    the edit list, so that decode times are the stored ones.
+    the edit list, so that decode times are the stored ones. When libav reports a width or height
+    of 0, both come from the first sample entry of that ``trak``'s ``stsd``, if it has one.
 
     Raises:
         BoxLayoutUnsupportedError: see :func:`boxes_only_stream`.

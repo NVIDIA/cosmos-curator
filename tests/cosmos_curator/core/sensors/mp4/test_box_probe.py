@@ -43,6 +43,7 @@ from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.video import (
     HeaderIndexUnavailableError,
     IncompletePacketError,
+    make_index_and_metadata,
     probe_open_video_stream,
     video_probe,
 )
@@ -92,6 +93,22 @@ def test_index_from_boxes_reads_the_samples_a_full_demux_of_the_source_reads(nam
     from_source = video_probe(data, index_method=VideoIndexCreationMethod.FULL_DEMUX)
 
     _assert_same_samples(_probe(*_boxes(data)), from_source)
+
+
+@pytest.mark.parametrize(
+    "movflags", ["", "frag_keyframe+empty_moov+default_base_moof"], ids=["nonfragmented", "fragmented"]
+)
+def test_index_from_boxes_takes_an_mpeg4_part2_frame_size_from_the_sample_entry(movflags: str) -> None:
+    """Libav learns an ``mp4v`` frame size only from frame data, which the boxes lack; ``stsd`` states it."""
+    data = real_mp4.mpeg4_part2_clip(movflags)
+    _source_index, source_metadata = make_index_and_metadata(data)
+
+    index = index_from_boxes(*_boxes(data))
+
+    assert index.metadata.codec_name == "mpeg4"
+    assert (index.probe.width, index.probe.height) == (source_metadata.width, source_metadata.height)
+    assert (index.metadata.width, index.metadata.height) == (source_metadata.width, source_metadata.height)
+    _assert_same_samples(index.probe, video_probe(data, index_method=VideoIndexCreationMethod.FULL_DEMUX))
 
 
 def test_index_from_boxes_publishes_libavs_timestamps_for_negative_ctts() -> None:

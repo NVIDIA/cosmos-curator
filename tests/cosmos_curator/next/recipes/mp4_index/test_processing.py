@@ -58,6 +58,7 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     write_bytes_sidecar,
 )
 from tests.cosmos_curator.core.sensors.mp4 import _box_fixtures as bf
+from tests.cosmos_curator.core.sensors.mp4 import _real_fixtures as real_mp4
 from tests.cosmos_curator.core.utils.storage.conftest import FakeStorageClient
 
 
@@ -402,6 +403,18 @@ def test_process_one_video_manifest_summary_columns_match_nested_metadata(tmp_pa
     assert result["source_frame_count"] == metadata_row["frame_count"]
     assert result["source_duration_ns"] == metadata_row["duration_ns"]
     assert result["source_video_codec"] == metadata_row["codec_name"]
+
+
+def test_process_one_video_publishes_an_mpeg4_part2_frame_size(tmp_path: pathlib.Path) -> None:
+    """An ``mp4v`` row carries its sample entry's frame size, which libav cannot read from the boxes alone."""
+    media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(real_mp4.mpeg4_part2_clip())
+
+    result = _call(tmp_path, media_path, container_kind=CONTAINER_KIND_NONFRAGMENTED)
+
+    assert result["status"] == "success"
+    assert (result["source_width"], result["source_height"]) == (64, 48)
 
 
 @pytest.mark.parametrize("timescale", [0, 0x90000000])

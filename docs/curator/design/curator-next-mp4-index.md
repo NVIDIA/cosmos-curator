@@ -127,7 +127,9 @@ cannot hold a filler header and fails with `BoxLayoutUnsupportedError`.
 Metadata comes from the same stream: native MP4 `track_id`, codec name, full `extradata` (the `avcC`/`hvcC` record a
 decoder needs), time base, dimensions, frame and keyframe counts, duration, frame rate, and bit
 rate. `encoder_tag` is the stream's `encoder` tag, and `elst_bytes` is copied verbatim from the
-indexed trak's `edts/elst`, matched by track ID. libav does not report the `avcC` fields,
+indexed trak's `edts/elst`, matched by track ID. When libav reports no frame size, as for MPEG-4
+Part 2, whose size it learns only from frame data that the zero-filled layout lacks, the width and
+height come from that trak's first `stsd` sample entry. libav does not report the `avcC` fields,
 `nal_length_size`, chroma format and bit depths, `btrt`, `mvhd`/`tkhd` creation and modification
 times, `track_matrix`, or the `tkhd` display size, so these are null; decoders read the same
 values from `extradata`. The required `track_id` identifies the selected MP4 track, independently
@@ -152,6 +154,7 @@ The two indexers are known to differ on:
 - Metadata: the fields above are null on PyAV rows and populated on walker rows.
 - Layouts: the walker refuses some fragment layouts PyAV indexes, including composition offsets in
   fragments, several `traf` or `trun` boxes per `moof`, and samples in `moov` beside fragments.
+- Codecs: the walker supports only H.264 and HEVC sample entries (`avc1`/`avc3`/`hev1`/`hvc1`).
 
 For training data, encode without B-frames, frame reordering, or edit lists. Those are what make
 decode order, presentation order, and stored timestamps diverge, and so where indexers, decoders,
