@@ -52,6 +52,7 @@ _BFRAMES_MP4 = (
 )
 
 _METADATA_ROW = {
+    "track_id": 1,
     "codec_name": "h264",
     "extradata": b"\x01\x64\x00\x1f",
     "time_base_num": 1,
@@ -126,6 +127,13 @@ def test_mp4_metadata_from_row_raises_on_a_row_missing_a_field() -> None:
     """A row out of sync with the schema (a stale producer, a bad join) fails loudly, not partially."""
     with pytest.raises(KeyError):
         Mp4Metadata.from_row({"video_id": "x", "codec_name": "h264"})
+
+
+@pytest.mark.parametrize("track_id", [None, "1", 0, -1])
+def test_mp4_metadata_rejects_an_unusable_track_id(track_id: object) -> None:
+    """A missing or invalid stored ID must not turn into decoding video stream 0."""
+    with pytest.raises((TypeError, ValueError), match="track_id"):
+        Mp4Metadata.from_row({**_METADATA_ROW, "track_id": track_id})
 
 
 def test_mp4_frame_index_from_table_matches_the_source_rows() -> None:
@@ -300,8 +308,9 @@ def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_d
     """Duration, rates, and decoder setup come from libav; fields it does not report are None."""
     probe = _video_probe([0, 40, 80, 120], [40, 40, 40, 40])
 
-    metadata = Mp4Metadata.from_video_probe(probe, encoder_tag="Lavc libx264", elst_bytes=b"elst")
+    metadata = Mp4Metadata.from_video_probe(probe, track_id=3, encoder_tag="Lavc libx264", elst_bytes=b"elst")
 
+    assert metadata.track_id == 3
     assert metadata.duration_ns == 160_000_000
     assert (metadata.avg_frame_rate_num, metadata.avg_frame_rate_den) == (25, 1)
     assert metadata.bit_rate_bps == 4 * 100 * 8 * 1000 // 160
@@ -316,7 +325,9 @@ def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_d
 
 def test_mp4_metadata_from_video_probe_spans_only_decode_times_without_packet_durations() -> None:
     """With no durations reported, the last sample adds nothing to the span."""
-    metadata = Mp4Metadata.from_video_probe(_video_probe([0, 40, 80], None), encoder_tag=None, elst_bytes=None)
+    metadata = Mp4Metadata.from_video_probe(
+        _video_probe([0, 40, 80], None), track_id=1, encoder_tag=None, elst_bytes=None
+    )
 
     assert metadata.duration_ns == 80_000_000
 

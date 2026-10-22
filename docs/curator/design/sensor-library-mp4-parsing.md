@@ -77,6 +77,10 @@ to the recipe.
 These readers consume Arrow tables and metadata rows supplied by the caller. They do not open
 datasets or depend on a storage client.
 
+`Mp4Metadata.track_id` is the selected track's native unsigned MP4 ID, preserved by both indexers.
+`StreamingCameraSensor.from_index()` uses it to select the video track when decoding; an absent
+track is an error. Unindexed streaming sensors continue to select by video-stream position.
+
 ## UUID handlers during traversal
 
 Both parsing entry points accept `uuid_handlers`, a sequence of `UuidHandler` registrations.

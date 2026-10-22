@@ -324,8 +324,9 @@ class MovieHeader:
 
 @attrs.define(frozen=True)
 class TrackHeader:
-    """``tkhd``: this specific track's own creation/modification time, transform, and display size."""
+    """``tkhd``: this track's identity, creation/modification time, transform, and display size."""
 
+    track_id: int
     creation_time: int
     modification_time: int
     matrix: tuple[int, ...]
@@ -345,16 +346,21 @@ class TrackHeader:
         """
         version = buf[start]
         if version == 1:
-            creation_time, modification_time = struct.unpack_from(">QQ", buf, start + 4)
+            creation_time, modification_time, track_id = struct.unpack_from(">QQI", buf, start + 4)
             after_duration = start + 4 + 8 + 8 + 4 + 4 + 8  # +track_ID(4)+reserved(4)+duration(8)
         else:
-            creation_time, modification_time = struct.unpack_from(">II", buf, start + 4)
+            creation_time, modification_time, track_id = struct.unpack_from(">III", buf, start + 4)
             after_duration = start + 4 + 4 + 4 + 4 + 4 + 4  # +track_ID(4)+reserved(4)+duration(4)
         matrix_start = after_duration + _TKHD_FIXED_TAIL_BYTES
         matrix = struct.unpack_from(">9i", buf, matrix_start)
         width, height = struct.unpack_from(">II", buf, matrix_start + _TKHD_MATRIX_BYTES)
         return cls(
-            creation_time=creation_time, modification_time=modification_time, matrix=matrix, width=width, height=height
+            track_id=track_id,
+            creation_time=creation_time,
+            modification_time=modification_time,
+            matrix=matrix,
+            width=width,
+            height=height,
         )
 
 

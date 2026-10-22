@@ -397,7 +397,12 @@ class StreamingCameraSensor:
         Split from :meth:`sample` so that method's checks run when it is called
         rather than when its first payload is pulled.
         """
-        frames = iter_video_frames(source, self._stream_idx, self._decode_config)
+        frames = iter_video_frames(
+            source,
+            self._stream_idx,
+            self._decode_config,
+            track_id=None if self._metadata is None else self._metadata.track_id,
+        )
         cursor = _Cursor(frames, timeline_ns=self._timestamps_ns)
         state = _WindowValidationState()
         sequence = itertools.count()

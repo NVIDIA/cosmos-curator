@@ -274,7 +274,7 @@ def _index_best_video_stream(container: InputContainer, file_size: int, moov_byt
             raise BoxProbeMismatchError(msg)
     probe = attrs.evolve(demux, is_keyframe=header.is_keyframe)
     metadata = Mp4Metadata.from_video_probe(
-        probe, encoder_tag=stream.metadata.get("encoder"), elst_bytes=trak.elst_bytes
+        probe, track_id=stream.id, encoder_tag=stream.metadata.get("encoder"), elst_bytes=trak.elst_bytes
     )
     return BoxIndex(probe=probe, metadata=metadata)
 

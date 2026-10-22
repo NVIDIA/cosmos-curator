@@ -108,6 +108,30 @@ def mjpeg_then_h264_clip() -> bytes:
     return buffer.getvalue()
 
 
+@functools.cache
+def audio_then_two_video_tracks_clip() -> bytes:
+    """Mux audio before MJPEG and a preferred H.264 track, separating track IDs from stream positions."""
+    buffer = io.BytesIO()
+    with av.open(io.BytesIO(mjpeg_then_h264_clip())) as source, av.open(buffer, mode="w", format="mp4") as sink:
+        audio = sink.add_stream("aac", rate=48000)
+        audio.layout = "mono"
+        targets = {}
+        for stream in source.streams.video:
+            target = sink.add_stream_from_template(stream)
+            target.disposition = int(stream.codec_context.name == "h264")
+            targets[stream.index] = target
+        silence = av.AudioFrame.from_ndarray(np.zeros((1, 1024), dtype=np.float32), format="fltp", layout="mono")
+        silence.sample_rate = 48000
+        silence.pts = 0
+        sink.mux(audio.encode(silence))
+        sink.mux(audio.encode(None))
+        for packet in source.demux():
+            if packet.dts is not None:
+                packet.stream = targets[packet.stream.index]
+                sink.mux(packet)
+    return buffer.getvalue()
+
+
 def _remux(clip: pathlib.Path, movflags: str, **muxer_options: str) -> bytes:
     buffer = io.BytesIO()
     options = {"movflags": movflags, **muxer_options}

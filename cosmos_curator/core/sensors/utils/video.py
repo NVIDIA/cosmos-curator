@@ -510,6 +510,8 @@ def open_video_container(
     stream_idx: int = 0,
     video_format: str | None = None,
     options: dict[str, str] | None = None,
+    *,
+    track_id: int | None = None,
 ) -> Generator[tuple[InputContainer, av.video.stream.VideoStream]]:
     """Context manager for an already-open binary stream containing video data.
 
@@ -523,6 +525,7 @@ def open_video_container(
         video_format: Format of the video stream, like "mp4", "mkv", etc.
             None is probably best
         options: libavformat demuxer options, e.g. ``{"ignore_editlist": "1"}``.
+        track_id: Native MP4 track ID to select instead of a video-stream position.
 
     Yields:
         Tuple of ``(container, video_stream)``.
@@ -549,7 +552,14 @@ def open_video_container(
         stream.seek(0)
     with av.open(stream, format=video_format, options=options) as container:
         container = cast("InputContainer", container)
-        video_stream = container.streams.video[stream_idx]
+        video_stream: av.video.stream.VideoStream | None
+        if track_id is None:
+            video_stream = container.streams.video[stream_idx]
+        else:
+            video_stream = next((video for video in container.streams.video if video.id == track_id), None)
+            if video_stream is None:
+                msg = f"Video track ID {track_id} not found"
+                raise ValueError(msg)
         yield container, video_stream
 
 
@@ -1269,6 +1279,8 @@ def iter_video_frames(
     source: DataSource,
     stream_idx: int = 0,
     config: CpuVideoDecodeConfig = DEFAULT_VIDEO_DECODE_CONFIG,
+    *,
+    track_id: int | None = None,
 ) -> Generator[tuple[int, npt.NDArray[np.uint8]]]:
     """Decode ``source`` from the beginning, yielding ``(pts_ns, frame)`` in presentation order.
 
@@ -1297,6 +1309,7 @@ def iter_video_frames(
         config: Decoder backend configuration. Threading matters most: a
             single-threaded walk of 4K footage measured 10.5s against 2.8s at the
             default four threads.
+        track_id: Native MP4 track ID to decode instead of a video-stream position.
 
     Yields:
         ``(pts_ns, frame)``, where ``pts_ns`` is the frame's presentation
@@ -1309,7 +1322,7 @@ def iter_video_frames(
     """
     with (
         open_data_source(source, mode="rb") as stream,
-        open_video_container(stream, stream_idx=stream_idx) as (container, video_stream),
+        open_video_container(stream, stream_idx=stream_idx, track_id=track_id) as (container, video_stream),
     ):
         if video_stream.time_base is None:
             msg = "Time base is None for the opened video stream"

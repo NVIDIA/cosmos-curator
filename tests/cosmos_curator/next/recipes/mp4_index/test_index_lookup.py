@@ -46,6 +46,7 @@ INDEXED_SIZE_BYTES = 1234
 def _metadata(**overrides: object) -> dict[str, Any]:
     """One VIDEO_METADATA_SCHEMA row, with the fields these tests vary pulled to the front."""
     row: dict[str, Any] = {
+        "track_id": 1,
         "codec_name": "h264",
         "extradata": b"\x01\x64\x00\x1f",
         "time_base_num": 1,

@@ -325,6 +325,19 @@ def test_parse_video_track_movie_and_track_header_version_1() -> None:
     assert table.track_header.height == 480 << 16
 
 
+@pytest.mark.parametrize("version", [0, 1])
+def test_track_header_preserves_unsigned_track_id(version: int) -> None:
+    """Native track IDs use all 32 bits, independently of the header's time-field version."""
+    moov = bytearray(bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None, tkhd_version=version))
+    start, _end = find_box(moov, ("moov", "trak", "tkhd"), 0, len(moov))
+    track_id = 0xF0000001
+    struct.pack_into(">I", moov, start + (20 if version == 1 else 12), track_id)
+
+    track = st.parse_video_track(bytes(moov))
+
+    assert track.track_header.track_id == track_id
+
+
 def test_parse_video_track_moov_extension_boxes_captures_direct_children_only() -> None:
     """Two moov-level uuid boxes are both captured; a stsd-level one is not double-counted into this list."""
     uuid_a = bf.uuid_box(b"a" * 16, b"1111")

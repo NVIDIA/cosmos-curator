@@ -21,12 +21,19 @@ import io
 import pathlib
 from typing import Any
 
+import attrs
+import av
+import lance
 import numpy as np
 import pyarrow as pa
 import pytest
 import smart_open  # type: ignore[import-untyped]
 
 from cosmos_curator.core.sensors.data.video import VideoProbe
+from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
+from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
+from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
 from cosmos_curator.core.sensors.types.types import VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.video import video_probe
 from cosmos_curator.next.recipes.mp4_index import processing
@@ -37,6 +44,7 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     make_video_id,
     read_video_record,
 )
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from tests.cosmos_curator.core.sensors.mp4 import _real_fixtures as real_mp4
 from tests.cosmos_curator.core.utils.storage.conftest import FakeStorageClient
 
@@ -83,6 +91,8 @@ def _assert_frames_match_the_source(result: dict[str, Any], data: bytes) -> None
     probe: VideoProbe = video_probe(data, index_method=VideoIndexCreationMethod.FULL_DEMUX)
     assert result["status"] == "success", result["error_message"]
     frame_table, metadata_row = read_video_record(processing.result_table(result))
+    with av.open(io.BytesIO(data)) as container:
+        assert metadata_row["track_id"] == container.streams.video[0].id
     np.testing.assert_array_equal(frame_table.column("dts_ticks").to_numpy(), probe.dts)
     composition_offsets = frame_table.column("composition_offset_ticks")
     if probe.composition_offset is None:
@@ -120,6 +130,52 @@ def test_process_one_video_indexes_a_real_clip_as_pyav_demuxes_the_source(
     )
 
     _assert_frames_match_the_source(result, data)
+
+
+@pytest.mark.parametrize("with_extension", [False, True], ids=["pyav", "box_walker"])
+def test_indexed_track_survives_lance_and_selects_the_decoded_video(
+    tmp_path: pathlib.Path, *, with_extension: bool
+) -> None:
+    """The stored native track ID selects the indexed pixels, even with audio and an earlier video track."""
+    data = real_mp4.audio_then_two_video_tracks_clip()
+    with av.open(io.BytesIO(data)) as container:
+        selected = container.streams.video[1]
+        assert container.streams.best("video") is selected
+        assert selected.id != selected.index != 1
+        track_id = selected.id
+        expected_shape = (selected.height, selected.width, 3)
+    extension_factory = (lambda _media_location: _NoOpExtension()) if with_extension else None
+    media_location = _write(tmp_path, data)
+    result = _process(
+        tmp_path, media_location, container_kind=CONTAINER_KIND_NONFRAGMENTED, extension_factory=extension_factory
+    )
+    assert result["status"] == "success", result["error_message"]
+    manifest_uri = str(tmp_path / "manifest.lance")
+    lance.write_dataset(processing.result_table(result), manifest_uri)
+    lookup = Mp4IndexLookup.open(manifest_uri)
+    assert lookup is not None
+    record = lookup.index_for(media_location, media_size_bytes=len(data))
+    assert record is not None
+    index, metadata = record
+    assert metadata.track_id == track_id
+    sensor = StreamingCameraSensor.from_index(index, metadata, source=data)
+    timestamps = sensor.timestamps_ns[:2]
+    start_ns, end_ns = int(timestamps[0]), int(timestamps[-1]) + 1
+    spec = SamplingSpec(
+        grid=SamplingGrid(start_ns, end_ns, timestamps, stride_ns=end_ns - start_ns, duration_ns=end_ns - start_ns)
+    )
+    frames = [
+        frame
+        for window in sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
+        for _reference_ns, _timestamp_ns, frame in window.frames()
+    ]
+    assert [frame.shape for frame in frames] == [expected_shape] * 2
+
+    missing_track = attrs.evolve(metadata, track_id=track_id + 100)
+    sensor = StreamingCameraSensor.from_index(index, missing_track, source=data)
+    window = next(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0)))
+    with pytest.raises(ValueError, match=r"track.*not found"):
+        list(window.frames())
 
 
 def test_process_one_video_indexes_a_real_fragment_layout_the_box_walker_refuses(tmp_path: pathlib.Path) -> None:

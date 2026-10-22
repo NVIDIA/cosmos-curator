@@ -52,9 +52,10 @@ falls back to a single full listing.
 One row per video in `manifest.lance`
 ([`VIDEO_MANIFEST_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
 
-The record schema version is 7. Version 6 requires the `mvhd` and `tkhd` metadata fields that
-PyAV leaves null, and version 5 lacks the nullable EOF/SOF/MOE frame fields; existing datasets
-from either require a fresh output dataset. Moov/moof caches can be reused.
+The record schema version is 8. Version 7 lacks the selected MP4 `track_id`; version 6 also
+requires the `mvhd` and `tkhd` metadata fields that PyAV leaves null, and version 5 lacks the
+nullable EOF/SOF/MOE frame fields. Older manifests require rebuilding into a fresh output
+dataset. Moov/moof caches can be reused; old frame records must not assume track 0.
 
 | Field | Nullable | Notes |
 | --- | --- | --- |
@@ -123,13 +124,16 @@ substitutes a 1/1 time base for an `mdhd` timescale of 0 or 2^31 and above witho
 ticks, so such a video fails with `UnsupportedTimescaleError`. A gap of 1-7 bytes between boxes
 cannot hold a filler header and fails with `BoxLayoutUnsupportedError`.
 
-Metadata comes from the same stream: codec name, full `extradata` (the `avcC`/`hvcC` record a
+Metadata comes from the same stream: native MP4 `track_id`, codec name, full `extradata` (the `avcC`/`hvcC` record a
 decoder needs), time base, dimensions, frame and keyframe counts, duration, frame rate, and bit
 rate. `encoder_tag` is the stream's `encoder` tag, and `elst_bytes` is copied verbatim from the
 indexed trak's `edts/elst`, matched by track ID. libav does not report the `avcC` fields,
 `nal_length_size`, chroma format and bit depths, `btrt`, `mvhd`/`tkhd` creation and modification
 times, `track_matrix`, or the `tkhd` display size, so these are null; decoders read the same
-values from `extradata`.
+values from `extradata`. The required `track_id` identifies the selected MP4 track, independently
+of its position among all streams or video streams and independently of the logical `camera_key`.
+Index-backed decoding selects this exact track and fails if it is absent. One manifest row still
+describes one automatically selected track per file; there is no track-selection configuration.
 
 PyAV does not read UUID boxes. When the caller passes an extension, the box walker indexes the
 video alone, running the extension's UUID handlers as it lists the samples, and every metadata

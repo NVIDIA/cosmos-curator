@@ -371,6 +371,9 @@ class Mp4Metadata:
     from ``stsd``, ``mvhd``, and ``tkhd``.
     """
 
+    track_id: int = attrs.field(
+        validator=attrs.validators.and_(attrs.validators.instance_of(int), attrs.validators.gt(0))
+    )
     codec_name: str
     extradata: bytes
     time_base_num: int
@@ -427,6 +430,7 @@ class Mp4Metadata:
             else int(_ticks_to_ns(np.array([video_track.duration], dtype=np.int64), 1, video_track.timescale)[0])
         )
         return cls(
+            track_id=video_track.track_header.track_id,
             codec_name=VIDEO_FOURCC_CODEC_NAMES[sd.fourcc],
             extradata=sd.extradata,
             time_base_num=1,
@@ -466,7 +470,9 @@ class Mp4Metadata:
         )
 
     @classmethod
-    def from_video_probe(cls, probe: VideoProbe, *, encoder_tag: str | None, elst_bytes: bytes | None) -> Self:
+    def from_video_probe(
+        cls, probe: VideoProbe, *, track_id: int, encoder_tag: str | None, elst_bytes: bytes | None
+    ) -> Self:
         """Build from libav's reading of one stream; fields libav does not report are ``None``.
 
         The duration spans the decode times plus the last packet's duration, both as libav
@@ -479,6 +485,7 @@ class Mp4Metadata:
             len(probe), probe.size, duration_ticks * time_base_num, time_base_den
         )
         return cls(
+            track_id=track_id,
             codec_name=probe.codec_name,
             extradata=probe.extradata,
             time_base_num=time_base_num,

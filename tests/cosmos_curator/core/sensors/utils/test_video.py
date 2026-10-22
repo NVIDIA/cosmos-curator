@@ -2202,8 +2202,8 @@ def test_a_forward_walk_decodes_with_the_threads_it_was_configured_for() -> None
     opened = open_video_container
 
     @contextmanager
-    def spy(stream: object, *, stream_idx: int = 0) -> Iterator[Any]:
-        with opened(stream, stream_idx=stream_idx) as (container, video_stream):
+    def spy(stream: object, *, stream_idx: int = 0, track_id: int | None = None) -> Iterator[Any]:
+        with opened(stream, stream_idx=stream_idx, track_id=track_id) as (container, video_stream):
             seen["stream"] = video_stream
             yield container, video_stream
 

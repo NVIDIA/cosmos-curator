@@ -41,7 +41,7 @@ CONTAINER_KIND_FRAGMENTED = "fragmented"
 CONTAINER_KIND_NONFRAGMENTED = "nonfragmented"
 
 #: VIDEO_MANIFEST_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
-RECORD_SCHEMA_VERSION = 7
+RECORD_SCHEMA_VERSION = 8
 
 #: Which indexer built a video's frames and metadata, part of ``extraction_contract_id``.
 Indexer = Literal["pyav", "box_walker"]
@@ -158,6 +158,7 @@ FRAME_INDEX_SCHEMA = pa.schema(
 #: Stream metadata embedded as a struct in each canonical video record.
 VIDEO_METADATA_SCHEMA = pa.schema(
     [
+        pa.field("track_id", pa.int64(), nullable=False),  # native unsigned 32-bit MP4 ID, not a stream position
         pa.field("codec_name", pa.string(), nullable=False),
         pa.field("extradata", pa.binary(), nullable=False),
         pa.field("time_base_num", pa.int32(), nullable=False),
