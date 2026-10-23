@@ -81,6 +81,31 @@ datasets or depend on a storage client.
 `StreamingCameraSensor.from_index()` uses it to select the video track when decoding; an absent
 track is an error. Unindexed streaming sensors continue to select by video-stream position.
 
+## Sampling windows and decoded-frame memory
+
+A clip is a logical output span; sampling windows partition delivery of its reference timestamps.
+One clip can be supplied through one window or several consecutive windows. For a fixed source
+timeline, reference grid, and sampling policy, flattening those windows produces identical reference
+timestamps, selected source timestamps, and decoded pixels. Window bounds do not restrict eligible
+source observations: a nearest frame may lie before a window's start or after its end, subject to the
+same `NearestTimestampPolicy.max_delta_ns` tolerance.
+
+`StreamingCameraSensor.sample()` yields one `StreamingCameraData` payload per window. The payloads
+share one forward decode pass, so windows must be non-overlapping and their frames must be consumed
+in order. Creating payloads does not decode their pixels; decoding advances as `payload.frames()`
+is iterated. Callers can feed successive payloads into one clip output. The streaming recipe's current
+one-window-per-clip mapping does not limit this sensor-library behavior.
+
+| Sensor | Decoded-frame retention |
+| --- | --- |
+| `CameraSensor` | Materializes a window's selected frames as a batch. Smaller windows reduce that batch. |
+| `StreamingCameraSensor` | Yields frames lazily. Alignment retains the current frame and one lookahead frame, independently of window length. |
+
+Increasing the number of windows is therefore not a decoded-pixel memory control for streaming
+consumption. This bound does not describe total actor memory: codec and I/O buffers, indexes,
+timestamp arrays, output handling, and frames retained by the caller all add to it. Collecting
+`payload.frames()` into a list retains those decoded frames and gives up the streaming memory benefit.
+
 ## UUID handlers during traversal
 
 Both parsing entry points accept `uuid_handlers`, a sequence of `UuidHandler` registrations.

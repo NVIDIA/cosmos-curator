@@ -15,8 +15,10 @@
 """Tests for the forward-only streaming camera sensor."""
 
 import gc
+import hashlib
 import itertools
 import pathlib
+from collections.abc import Iterator
 from fractions import Fraction
 from typing import Any
 
@@ -139,6 +141,70 @@ def test_bframe_clip_needs_no_index() -> None:
     assert len(set(pts_ns)) == _SOURCE_FRAME_COUNT
 
 
+@pytest.mark.parametrize("clip", [_CLIP, _BFRAME_CLIP], ids=["no-bframes", "bframes"])
+@pytest.mark.parametrize("windows_per_clip", [2, 5])
+def test_window_count_does_not_change_selected_timestamps_or_pixels(clip: pathlib.Path, windows_per_clip: int) -> None:
+    """Window boundaries group references without restricting eligible source frames."""
+    start_ns = _DEVICE_ORIGIN_NS + 20_000_000
+    duration_ns = 3 * _ONE_SECOND_NS
+    references_ns = np.array([start_ns + round(i * _ONE_SECOND_NS / 30) for i in range(90)], dtype=np.int64)
+    signatures = []
+    for window_count in (1, windows_per_clip):
+        width_ns = duration_ns // window_count
+        spec = SamplingSpec(
+            grid=SamplingGrid(start_ns, start_ns + duration_ns, references_ns, stride_ns=width_ns, duration_ns=width_ns)
+        )
+        sensor = StreamingCameraSensor(clip, timestamps_ns=_timeline(clip, _DEVICE_ORIGIN_NS))
+        payloads = list(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=21_000_000)))
+
+        assert len(payloads) == window_count
+        assert [len(payload.align_timestamps_ns) for payload in payloads] == [90 // window_count] * window_count
+        if window_count > 1:
+            # The next source frame is outside tolerance at these edges; the preceding frame must remain eligible.
+            assert any(payload.sensor_timestamps_ns[0] < payload.align_timestamps_ns[0] for payload in payloads[1:])
+        rows = [
+            (reference_ns, source_ns, hashlib.sha256(frame.tobytes()).digest())
+            for payload in payloads
+            for reference_ns, source_ns, frame in payload.frames()
+        ]
+        assert [reference_ns for reference_ns, _, _ in rows] == references_ns.tolist()
+        signatures.append(rows)
+
+    assert signatures[0] == signatures[1]
+
+
+@pytest.mark.parametrize("window_count", [1, 5])
+def test_window_payloads_decode_lazily_with_one_frame_of_lookahead(
+    monkeypatch: pytest.MonkeyPatch, window_count: int
+) -> None:
+    """Requesting windows decodes nothing; pulling a row advances only the shared cursor."""
+    decoded_count = 0
+    timestamps_ns = np.arange(30, dtype=np.int64) * 10
+
+    def decoded_frames(*_args: object, **_kwargs: object) -> Iterator[tuple[int, np.ndarray]]:
+        nonlocal decoded_count
+        for index, timestamp_ns in enumerate(timestamps_ns):
+            decoded_count += 1
+            yield int(timestamp_ns), np.full((1, 1, 3), index, dtype=np.uint8)
+
+    monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames", decoded_frames)
+    sensor = StreamingCameraSensor(b"video", timestamps_ns=timestamps_ns)
+    width_ns = 300 // window_count
+    spec = SamplingSpec(grid=SamplingGrid(0, 300, timestamps_ns, stride_ns=width_ns, duration_ns=width_ns))
+    payloads = list(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0)))
+
+    assert len(payloads) == window_count
+    assert decoded_count == 0
+    rows = (row for payload in payloads for row in payload.frames())
+    row_count = 0
+    for index, (reference_ns, source_ns, frame) in enumerate(rows):
+        assert decoded_count == min(index + 2, len(timestamps_ns))
+        assert reference_ns == source_ns == timestamps_ns[index]
+        assert frame[0, 0, 0] == index
+        row_count += 1
+    assert row_count == len(timestamps_ns)
+
+
 def test_one_source_frame_serves_several_reference_timestamps() -> None:
     """Sampling faster than the source rate repeats the nearest frame, without re-decoding it."""
     sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
@@ -169,7 +235,7 @@ def test_frame_farther_away_than_the_tolerance_raises() -> None:
 
 
 def test_peak_memory_stays_flat_over_a_long_walk() -> None:
-    """Resident memory must not grow with stream length: the walk holds ~one frame.
+    """Resident memory must not grow with stream length: consume frames without retaining them.
 
     Walks 720 frames of 854x480 in one pass -- 0.9 GB of pixels if any of it
     were retained -- and compares peak RSS against a baseline taken once the
@@ -184,7 +250,9 @@ def test_peak_memory_stays_flat_over_a_long_walk() -> None:
     baseline_rss = 0
     peak_rss = 0
 
-    for _align_ns, _pts_ns, frame in _walk(sensor, 24.0, _ONE_MS_NS, _LONG_CLIP_FRAME_COUNT):
+    spec = _whole_clip(24.0, _LONG_CLIP_FRAME_COUNT)
+    payloads = sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=_ONE_MS_NS))
+    for _align_ns, _pts_ns, frame in (row for payload in payloads for row in payload.frames()):
         assert frame.shape == (480, 854, 3)
         rows += 1
         if rows == warmup_rows:

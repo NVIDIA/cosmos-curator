@@ -135,17 +135,16 @@ def _validate_next_window(window: SamplingWindow, state: _WindowValidationState)
 class StreamingCameraSensor:
     """A forward-only camera sensor that yields frames as the caller pulls them.
 
-    ``CameraSensor`` indexes the video up front and seeks to a keyframe per
-    target, so sampling a window materializes that window's frames all at once.
-    This walks the container once from the first frame and hands over one frame
-    at a time, holding peak at a frame rather than a window.
+    Unlike ``CameraSensor``, which materializes a window's frames, this walks the
+    container once. Alignment retains the current frame and one lookahead frame,
+    independently of window length; codec buffers, timestamps, indexes, and
+    caller-retained outputs contribute additional memory.
 
-    Selection is unchanged: the reference timestamps come from ``spec.grid``, and
-    each is served by its nearest source frame, which is what the indexed sensor
-    picks too. The walk needs one frame of lookahead to know whether the current
-    frame or the next is nearer.
-
-    Windows must not overlap, which a forward-only walk cannot serve.
+    Each reference timestamp in ``spec.grid`` selects its nearest source frame,
+    even outside the window's bounds. With the same source timeline, reference
+    grid, and policy, changing window boundaries preserves selected timestamps
+    and pixels. Windows must not overlap, and their payloads must be consumed in
+    order through the shared decode pass; several windows can supply one logical clip.
 
     Two ways to build one, and they answer different amounts. The constructor
     takes a source and a timeline, which is everything sampling needs, and leaves

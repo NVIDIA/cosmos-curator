@@ -29,10 +29,9 @@ type StreamingFrame = tuple[int, int, npt.NDArray[np.uint8]]
 class StreamingCameraData:
     """One window of camera data, delivered a frame at a time.
 
-    Holds no pixels. It states which timestamps it will serve, and which source
-    observation serves each, before anything is decoded; the frames themselves
-    arrive only as :meth:`frames` is iterated, so memory stays at one frame
-    rather than one window.
+    Pixels are decoded lazily as :meth:`frames` is iterated, without collecting
+    the window's frames. Payloads from one sampling call share a forward decode
+    pass and must be consumed in order.
 
     Attributes:
         align_timestamps_ns: the reference timestamps this window asked for.
