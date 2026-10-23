@@ -607,8 +607,8 @@ def test_a_sensor_timeline_is_still_preferred_over_the_indexed_one(
 ) -> None:
     """A recorder's own clock beats the container's whichever way the container was read.
 
-    The index supplies the frame count the sidecar is checked against, so this keeps
-    sensor provenance without opening the video.
+    External timelines retain the existing CameraSensor reader instead of being
+    relabeled as an EOF/SOF/MOE field on the index.
     """
     clip = tmp_path / "front.mp4"
     video_bytes = h264_video(frames=30)
@@ -616,7 +616,6 @@ def test_a_sensor_timeline_is_still_preferred_over_the_indexed_one(
     sensor_ns = _SENSOR_EPOCH_NS + np.arange(30, dtype=np.int64) * 33_333_333
     _write_sensor_timeline(clip, sensor_ns)
     lookup = _StubLookup(str(clip), video_bytes)
-    clip.unlink()
 
     _results, info, _cfg = run_checks(str(clip), expected_hz=None, index_lookup=lookup)  # type: ignore[arg-type]
 

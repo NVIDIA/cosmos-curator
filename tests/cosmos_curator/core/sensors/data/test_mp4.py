@@ -411,7 +411,7 @@ _REAL_MP4_FIXTURES = (
 
 @pytest.mark.parametrize("mp4_path", _REAL_MP4_FIXTURES, ids=lambda p: p.name)
 def test_mp4_frame_index_matches_pyav_on_real_fixtures(mp4_path: pathlib.Path) -> None:
-    """offset/size/is_keyframe/pts_ns match PyAV's own make_index_and_metadata, sample for sample, on real files.
+    """Byte ranges, keyframes, and edited PTS match PyAV on real files.
 
     Every other parser test in this package uses hand-packed synthetic boxes, which checks this
     reader against our own reading of the spec, not against real files. This checks it against
@@ -434,7 +434,7 @@ def test_mp4_frame_index_matches_pyav_on_real_fixtures(mp4_path: pathlib.Path) -
             for o, s, k, p in zip(offset.tolist(), size.tolist(), is_keyframe.tolist(), pts_ns.tolist(), strict=True)
         }
 
-    ours = _by_offset(frame_index.offset, frame_index.size, frame_index.is_keyframe, frame_index.pts_ns)
+    ours = _by_offset(frame_index.offset, frame_index.size, frame_index.is_keyframe, frame_index.edited_pts_ns)
     pyav = _by_offset(pyav_index.offset, pyav_index.size, pyav_index.is_keyframe, pyav_index.pts_ns)
     assert ours == pyav
 
@@ -448,8 +448,8 @@ def test_mp4_frame_index_keyframe_indices_matches_hand_computed_flatnonzero() ->
     assert np.array_equal(frame_index.keyframe_indices, np.sort(frame_index.keyframe_indices))
 
 
-def test_mp4_frame_index_pts_ns_matches_hand_computed_dts_plus_composition_offset_minus_edit_list_shift() -> None:
-    """pts_ns = dts_ns + (composition_offset_ns or 0) - edit_list_shift_ns, computed once, real B-frame data.
+def test_media_and_edited_pts_match_their_distinct_formulas() -> None:
+    """Media PTS retains the composition delay; edited PTS subtracts the real edit-list shift.
 
     This clip's own elst has a single normal-rate entry with media_time=1024 ticks at a
     12288 timescale -- 83_333_333 ns, hand-verified directly against its own bytes.
@@ -458,9 +458,10 @@ def test_mp4_frame_index_pts_ns_matches_hand_computed_dts_plus_composition_offse
 
     assert frame_index.composition_offset_ns is not None  # a real B-frame clip has a nonzero ctts
     edit_list_shift_ns = 1024 * 1_000_000_000 // 12288
-    expected_pts_ns = frame_index.dts_ns + frame_index.composition_offset_ns - edit_list_shift_ns
-    assert np.array_equal(frame_index.pts_ns, expected_pts_ns)
-    assert frame_index.pts_ns[0] == 0  # the clip's first frame is exactly the edit list's own trim point
+    expected_pts_ns = frame_index.dts_ns + frame_index.composition_offset_ns
+    np.testing.assert_array_equal(frame_index.pts_ns, expected_pts_ns)
+    np.testing.assert_array_equal(frame_index.edited_pts_ns, expected_pts_ns - edit_list_shift_ns)
+    assert frame_index.edited_pts_ns[0] == 0
 
 
 def test_mp4_frame_index_pts_sort_order_is_a_valid_permutation_that_sorts_pts_ns() -> None:
@@ -483,8 +484,8 @@ def test_mp4_frame_index_pts_ns_equals_dts_ns_when_no_composition_offset() -> No
     assert np.array_equal(frame_index.pts_ns, frame_index.dts_ns)
 
 
-def test_mp4_frame_index_pts_ns_shifts_by_a_single_normal_rate_edit_lists_own_media_time() -> None:
-    """A single-entry, normal-rate elst shifts pts_ns back by media_time, converted to ns -- dts_ns untouched."""
+def test_edited_pts_shifts_by_a_single_normal_rate_edit_lists_own_media_time() -> None:
+    """A supported edit shifts edited PTS while media PTS and DTS keep their own timelines."""
     elst_content = bf.edit_list_box(entries=[(4 * 512, 256, 1, 0)])  # media_time=256 ticks at a 12288 timescale
     moov = bf.synthetic_moov(
         frame_count=4, keyframe_index=0, ctts_offset=None, include_elst=True, elst_content=elst_content
@@ -494,7 +495,8 @@ def test_mp4_frame_index_pts_ns_shifts_by_a_single_normal_rate_edit_lists_own_me
     frame_index = Mp4FrameIndex.from_video_track(video_track)
 
     expected_shift_ns = 256 * 1_000_000_000 // 12288
-    assert np.array_equal(frame_index.pts_ns, frame_index.dts_ns - expected_shift_ns)
+    np.testing.assert_array_equal(frame_index.edited_pts_ns, frame_index.pts_ns - expected_shift_ns)
+    np.testing.assert_array_equal(frame_index.pts_ns, frame_index.dts_ns)
     assert np.array_equal(frame_index.dts_ns, _ticks_to_ns(video_track.dts_ticks, 1, 12288))
 
 
@@ -509,7 +511,7 @@ def test_mp4_frame_index_pts_ns_unaffected_by_a_zero_media_time_edit_list() -> N
 
 
 def test_mp4_frame_index_raises_on_a_multi_entry_edit_list() -> None:
-    """More than one elst entry is refused, not silently reduced to the first."""
+    """Multiple track timeline segments are rejected during construction."""
     elst_content = bf.edit_list_box(entries=[(1000, 0, 1, 0), (1000, 512, 1, 0)])
     moov = bf.synthetic_moov(
         frame_count=4, keyframe_index=0, ctts_offset=None, include_elst=True, elst_content=elst_content
@@ -520,7 +522,7 @@ def test_mp4_frame_index_raises_on_a_multi_entry_edit_list() -> None:
         Mp4FrameIndex.from_video_track(video_track)
 
 
-def test_mp4_frame_index_raises_on_an_empty_edit_list_entry() -> None:
+def test_mp4_frame_index_raises_on_an_empty_edit() -> None:
     """media_time=-1 (an empty edit -- "insert a gap here") is refused, not treated as a zero shift."""
     elst_content = bf.edit_list_box(entries=[(1000, -1, 1, 0)])
     moov = bf.synthetic_moov(
@@ -532,7 +534,7 @@ def test_mp4_frame_index_raises_on_an_empty_edit_list_entry() -> None:
         Mp4FrameIndex.from_video_track(video_track)
 
 
-def test_mp4_frame_index_raises_on_a_non_normal_rate_edit_list() -> None:
+def test_mp4_frame_index_raises_on_a_non_normal_rate_edit() -> None:
     """A media_rate other than 1x (a real, spec-legal slow-motion/fast-forward edit) is refused."""
     elst_content = bf.edit_list_box(entries=[(1000, 0, 2, 0)])
     moov = bf.synthetic_moov(
@@ -544,7 +546,7 @@ def test_mp4_frame_index_raises_on_a_non_normal_rate_edit_list() -> None:
         Mp4FrameIndex.from_video_track(video_track)
 
 
-def test_mp4_frame_index_raises_on_a_version_1_edit_list_with_an_unsupported_shape() -> None:
+def test_mp4_frame_index_raises_on_an_unsupported_version_1_edit() -> None:
     """A version-1 (64-bit) elst decodes its own wider fields -- and still refuses an empty edit."""
     elst_content = bf.edit_list_box(entries=[(1000, -1, 1, 0)], version=1)
     moov = bf.synthetic_moov(
@@ -562,7 +564,7 @@ def test_unsupported_edit_list_error_is_an_unindexable_video_error() -> None:
 
 
 def test_mp4_frame_index_raises_on_a_truncated_edit_list() -> None:
-    """A real elst box's bytes cut short mid-entry fails loudly as UnsupportedEditListError, not a struct.error."""
+    """An elst cut short mid-entry raises its parsing error during construction."""
     moov = bf.synthetic_moov(frame_count=4, keyframe_index=0, ctts_offset=None)
     video_track = parse_video_track(moov)
     truncated_elst_bytes = bf.elst_box()[:14]  # cuts off before entry_count's own 4 bytes can be read in full
@@ -761,7 +763,8 @@ def test_mp4_frame_index_preserves_recorder_clock_with_presentation_reordering_a
         elst_bytes=bf.edit_list_box(entries=[(1000, 5, 1, 0)]),
     )
     assert index.dts_ns.tolist() == [0, 10_000, 20_000]
-    assert index.pts_ns.tolist() == [25_000, 5_000, 10_000]
+    assert index.pts_ns.tolist() == [30_000, 10_000, 15_000]
+    assert index.edited_pts_ns.tolist() == [25_000, 5_000, 10_000]
     assert index.pts_sort_order.tolist() == [1, 2, 0]
     assert index.eof_ns is not None
     assert index.eof_ns.dtype == np.int64
@@ -847,3 +850,42 @@ def test_camera_timing_field_validation_preserves_values_and_optional_columns(fi
     assert without_optional.sof_ns is without_optional.moe_ns is None
     ordinary = attrs.evolve(without_optional, eof_ns=None)
     assert ordinary.eof_ns is ordinary.sof_ns is ordinary.moe_ns is None
+
+
+def test_stored_frame_index_raises_on_an_unsupported_edit() -> None:
+    """Stored records reject unsupported edits even when EOF is populated."""
+    table = _frame_table_with_timing(pa.Table.from_pylist(_ROWS_WITH_SOF_MOE, schema=FRAME_INDEX_SCHEMA))
+    with pytest.raises(UnsupportedEditListError, match="entries"):
+        Mp4FrameIndex.from_frame_index_table(
+            table,
+            time_base_num=1,
+            time_base_den=1_000_000,
+            elst_bytes=bf.edit_list_box(entries=[(1000, 0, 1, 0), (1000, 512, 1, 0)]),
+        )
+
+
+@pytest.mark.parametrize("ctts_offset", [None, 0, 512])
+@pytest.mark.parametrize("edit_ticks", [None, 0, 256])
+def test_timestamp_buffers_share_only_for_no_op_transforms(ctts_offset: int | None, edit_ticks: int | None) -> None:
+    """Identical timelines share read-only buffers; nonzero transforms retain independent values."""
+    track = parse_video_track(
+        bf.synthetic_moov(
+            frame_count=4,
+            keyframe_index=0,
+            ctts_offset=ctts_offset,
+            include_elst=edit_ticks is not None,
+            elst_content=None if edit_ticks is None else bf.edit_list_box(entries=[(2048, edit_ticks, 1, 0)]),
+        )
+    )
+    index = Mp4FrameIndex.from_video_track(track)
+    assert np.shares_memory(index.pts_ns, index.dts_ns) == (ctts_offset in (None, 0))
+    assert np.shares_memory(index.edited_pts_ns, index.pts_ns) == (edit_ticks in (None, 0))
+    np.testing.assert_array_equal(index.pts_ns, index.dts_ns + (ctts_offset or 0) * 1_000_000_000 // track.timescale)
+    np.testing.assert_array_equal(
+        index.edited_pts_ns,
+        index.pts_ns - (edit_ticks or 0) * 1_000_000_000 // track.timescale,
+    )
+    for timeline in (index.dts_ns, index.pts_ns, index.edited_pts_ns):
+        assert not timeline.flags.writeable
+        with pytest.raises(ValueError, match="read-only"):
+            timeline[0] = 123

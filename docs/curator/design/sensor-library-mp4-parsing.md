@@ -56,7 +56,8 @@ information. `Mp4FrameIndex.from_video_track` expands composition-offset runs, t
 keyframes when `stss` is absent, and computes:
 
 - Decode and composition-offset timestamps in integer nanoseconds.
-- Presentation timestamps from decode time plus composition offset, minus the supported edit-list shift.
+- Media presentation timestamps (`pts_ns`) from decode time plus composition offset.
+- Edited presentation timestamps (`edited_pts_ns`) after the supported edit-list shift.
 - Keyframe indexes and a stable presentation-order permutation.
 
 The frame arrays stay in decode order. `pts_sort_order` maps a presentation-order rank to a
@@ -64,8 +65,38 @@ sample index; it does not reorder the arrays.
 
 The same interpretation is available for stored records through `Mp4Metadata.from_row` and
 `Mp4FrameIndex.from_frame_index_table`. The latter accepts an Arrow table plus the video's time base
-and optional edit list. EOF/SOF/MOE are independently optional; recipes decide which timestamps are
-required. It represents entirely null optional columns as `None`. Partially missing
+and optional edit list. The index retains its time base and edit-list bytes. Both `pts_ns` and
+`edited_pts_ns` are computed during construction and remain in decode order. Unsupported edits
+raise `UnsupportedEditListError` during construction. `pts_sort_order` is computed from media PTS,
+because supported edits shift every presentation timestamp equally and cannot change sample ordering.
+
+The three container timelines expose read-only NumPy views. Absent or all-zero composition offsets
+let `pts_ns` share the `dts_ns` buffer. An absent edit list or zero edit shift lets `edited_pts_ns`
+share the `pts_ns` buffer. Nonzero transformations allocate separate arrays.
+
+`StreamingCameraSensor` takes a source and an `alignment_field` selected from
+`VideoFrameAlignmentField`: `PTS_NS` (the default), `EDITED_PTS_NS`, `DTS_NS`, `EOF_NS`, `SOF_NS`, or
+`MOE_NS`. Its `timestamps_ns` property reports the selected index timestamps. Absent or partially
+missing timestamps raise an error; selecting SOF or MOE does not substitute EOF or infer values.
+Decoded frames always stream in presentation order. Alignment retains the current frame and one
+lookahead frame; windows do not collect decoded pixels. DTS remains readable in decode order for
+integrity checks. Sampling with DTS raises when decode and presentation order differ, since
+reordering decoded frames would require an additional pixel buffer.
+
+The constructor accepts optional `metadata` and `frame_index`, supplied together. Otherwise, accessing
+`metadata`, `frame_index`, or `timestamps_ns` builds and stores both objects from the source once.
+`Mp4Indexer.PYAV` is the default backend; `Mp4Indexer.CUSTOM` uses the box parser. Neither backend requires
+extracted artifacts: the source reader fetches `moov` and `moof` boxes and seeks past media payloads.
+Custom indexing supports one video track at `stream_idx=0`; PyAV selects the requested video stream.
+PyAV does not interpret recorder-specific UUID timestamps, so selecting EOF/SOF/MOE requires a supplied
+index containing those values or suitable timestamp extraction.
+
+Data-integrity checks select `DTS_NS` explicitly for stored indexes. Legacy external timestamp files
+continue through `CameraSensor`; they are not relabeled as EOF/SOF/MOE. Required manifest reads propagate
+unsupported-edit errors; optional manifest reads retain their existing fallback to opening the media.
+
+EOF/SOF/MOE are independently optional; recipes decide which timestamps are
+required. The frame-index reader represents entirely null optional columns as `None`. Partially missing
 SOF/MOE columns become NumPy masked arrays with `int64` values and an independent boolean mask:
 `True` means that frame's timestamp is unavailable. Valid timestamps retain their exact nanoseconds,
 including values beyond float64 precision. Fully populated columns remain ordinary NumPy arrays.
@@ -78,8 +109,9 @@ These readers consume Arrow tables and metadata rows supplied by the caller. The
 datasets or depend on a storage client.
 
 `Mp4Metadata.track_id` is the selected track's native unsigned MP4 ID, preserved by both indexers.
-`StreamingCameraSensor.from_index()` uses it to select the video track when decoding; an absent
-track is an error. Unindexed streaming sensors continue to select by video-stream position.
+`StreamingCameraSensor(source, metadata=metadata, frame_index=frame_index)` decodes the track identified
+by `metadata.track_id`; a missing track is an error. Without a supplied pair, `stream_idx` selects the
+video stream for lazy indexing, and the resulting metadata identifies the track to decode.
 
 ## Sampling windows and decoded-frame memory
 

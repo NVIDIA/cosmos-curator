@@ -23,9 +23,8 @@ short clips.
 
 import hashlib
 import io
-import itertools
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,7 @@ import pyarrow as pa
 import cosmos_curator.core.sensors as cosmos_sensors
 from cosmos_curator.core.sensors.alignment.gps import align_gps
 from cosmos_curator.core.sensors.data.gps_data import GpsData
+from cosmos_curator.core.sensors.data.streaming_camera_data import StreamingCameraData
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.policy import (
     GpsInterpolationPolicy,
@@ -44,10 +44,13 @@ from cosmos_curator.core.sensors.sampling.policy import (
 )
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.gps_sensor import GpsSensor
-from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor, stream_camera_windows
+from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.core.sensors.utils.validation import require_nondecreasing
+from cosmos_curator.core.sensors.utils.video import iter_video_frames
 from cosmos_curator.next.media.spans import Span
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.recipes.multimodal_split.config import (
     ALIGNED_SENSOR_TYPES,
     COPIED_SENSOR_TYPES,
@@ -56,7 +59,7 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
 )
 from cosmos_curator.next.recipes.multimodal_split.cpu_video_encode import encode_frames_to_path
 from cosmos_curator.next.recipes.multimodal_split.gps_streams import GpsClipWriter
-from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, sampling_grid_ns, sampling_spec
+from cosmos_curator.next.recipes.multimodal_split.grids import sampling_grid_ns, sampling_spec
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import McapSpanWriter, SpanCut
 from cosmos_curator.next.recipes.multimodal_split.reports import failure, write_sensor_errors
 from cosmos_curator.next.recipes.multimodal_split.storage import (
@@ -69,11 +72,6 @@ from cosmos_curator.next.recipes.multimodal_split.uris import (
     timestamps_sidecar_uri,
 )
 from cosmos_curator.next.utils.storage import write_media
-
-# One clip's frames. The span and the row count come from planning, so a
-# provider decides only where pixels come from -- never which span is written
-# or how many rows it holds.
-FrameProvider = Callable[[Span, int, list[int]], Iterator[npt.NDArray[np.uint8]]]
 
 SENSOR_OUTCOME_SCHEMA = pa.schema(
     [
@@ -154,11 +152,19 @@ def split_session(
         with open_sensor_source(
             sensor_uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
         ) as source:
-            clips, walk_failures = _stream_clips(
+            windows = _open_camera_windows(
                 source,
+                sensor_uri,
+                spans,
+                timeline_ns,
+                config,
+                storage_profile,
+                camera_alignment_field=item.get("camera_alignment_field"),
+            )
+            clips, walk_failures = _stream_clips(
+                windows,
                 spans,
                 clip_ids,
-                timeline_ns,
                 session_id,
                 sensor_key,
                 sensor_type,
@@ -515,7 +521,7 @@ def _sensor_outcome(
 
 
 def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part of one clip's identity
-    provide_frames: FrameProvider,
+    window: StreamingCameraData,
     span: Span,
     clip_id: str,
     session_id: str,
@@ -531,14 +537,16 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
     whoever reads it to ask every row which kind it is.
     """
     destination = clip_media_uri(clip_dir_uri(config.output.path, session_id, clip_id), sensor_key)
-    sensor_timestamps_ns: list[int] = []
     try:
         timeline_ns = sampling_grid_ns(span, config)
+        if not np.array_equal(window.align_timestamps_ns, timeline_ns):
+            msg = "camera window timestamps disagree with the planned clip grid"
+            raise ValueError(msg)  # noqa: TRY301 -- a mismatched window cannot be published
         row_count = len(timeline_ns)
         with tempfile.TemporaryDirectory() as staging:
             local = Path(staging) / f"{clip_id}.mp4"
             written = encode_frames_to_path(
-                provide_frames(span, row_count, sensor_timestamps_ns),
+                _decode_window(window),
                 local,
                 fps=config.clip.sampling_fps,
                 encoder=config.video.encoder.video_encoder,
@@ -559,14 +567,13 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
             # invisible, media without sidecars cannot happen.
             timeline_location, timeline_sha256 = _write_clip_timeline(destination, timeline_ns, storage_profile)
             sensor_timestamps_location, sensor_timestamps_sha256 = _write_clip_sensor_timestamps(
-                destination, sensor_timestamps_ns, storage_profile
+                destination, window.sensor_timestamps_ns, storage_profile
             )
             write_media(destination, video, storage_profile=storage_profile)
             clip_bytes = len(video)
             media_sha256 = hashlib.sha256(video).hexdigest()
     except _StreamEndedError:
-        # The tail was shorter than a whole clip. encode_frames_to_path has
-        # already removed the partial file.
+        # A decoder failure ends the shared pass. The encoder removes its partial file.
         raise
     except Exception as error:  # noqa: BLE001 -- one clip's failure never ends the session
         return None, failure(session_id, sensor_key, span, "sample_and_encode", error, clip_id)
@@ -596,7 +603,7 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
 
 
 def _write_clip_sensor_timestamps(
-    destination: str, sensor_timestamps_ns: list[int], storage_profile: str
+    destination: str, sensor_timestamps_ns: npt.NDArray[np.int64], storage_profile: str
 ) -> tuple[str, str]:
     """Write, for each of the clip's frames, when the camera actually saw it.
 
@@ -644,69 +651,43 @@ def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], s
     return location, hashlib.sha256(payload).hexdigest()
 
 
+def _decode_window(window: StreamingCameraData) -> Iterator[npt.NDArray[np.uint8]]:
+    """Yield pixels while distinguishing decode failures from encoder failures."""
+    try:
+        for _align_ns, _source_ns, frame in window.frames():
+            yield frame
+    except Exception as error:
+        raise _StreamEndedError(str(error)) from error
+
+
 def _stream_clips(  # noqa: PLR0913 -- one argument per part of a session's identity
-    source: io.BufferedIOBase,
+    windows: Iterator[StreamingCameraData],
     spans: tuple[Span, ...],
     clip_ids: list[str],
-    timeline_ns: npt.NDArray[np.int64],
     session_id: str,
     sensor_key: str,
     sensor_type: str,
     config: ResolvedMultimodalSplitConfig,
     storage_profile: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Cut one forward pass over a camera into a clip per planned span.
-
-    The spans come from planning; the end of the video does not. Bounds are what
-    an index is for, and a pass that cuts a new clip every N frames never needs
-    to know where the feed stops, only that it did -- which is what lets this
-    run without one.
-
-    The feed running out is not how a session ends -- it is the media and its
-    source timeline disagreeing. Planning tiles that timeline and drops the tail,
-    so the last planned span always ends inside it, and a container with one frame
-    per timestamp cannot run short. When it does, every span still to
-    come is unproducible for the same reason, and each is recorded: a clip that
-    quietly never appears is worse than one that failed, because nothing in the
-    output says to go looking.
-    """
-    feed = _open_frame_feed(source, spans, timeline_ns, config)
-    provider = _feed_provider(feed)
-
+    """Encode one sampling window per clip, retaining outcomes if decoding ends early."""
     clips: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    expected = 0
     planned = list(zip(spans, clip_ids, strict=True))
     for index, (span, clip_id) in enumerate(planned):
-        expected += len(sampling_grid_ns(span, config))
         try:
-            clip, walk_failure = _process_one_clip(
-                provider, span, clip_id, session_id, sensor_key, sensor_type, config, storage_profile
-            )
-        except _StreamEndedError as error:
-            # This span was never produced either, so it is reported with the
-            # rest rather than being the one the reader has to infer.
+            window = next(windows)
+        except Exception as error:  # noqa: BLE001 -- a missing or invalid window ends the shared pass
             failures.extend(_unproducible(planned[index:], session_id, sensor_key, error))
             break
-        # Recorded before realigning, never after. A clip that failed partway
-        # through a span the stream cannot finish leaves too few frames to catch
-        # up on, so realigning ends the pass -- and the failure that caused it
-        # would go unreported if its record depended on that catching up.
-        _collect(clip, walk_failure, clips, failures)
         try:
-            # Back to the span boundary before the next one starts. A failure
-            # above stopped reading partway, and this pass cannot seek back.
-            feed.realign(expected)
-        except Exception as error:  # noqa: BLE001 -- whatever ended the pass, the spans after it are lost
-            # Any fault here ends the pass, not only the feed running dry. A
-            # container that stops short raises on the way out rather than
-            # simply stopping, and left to propagate that would blame this
-            # camera for failing to open -- one session-level record where there
-            # should be one per span it cost.
-            #
-            # This span already has its outcome; the ones after it never will.
-            failures.extend(_unproducible(planned[index + 1 :], session_id, sensor_key, error))
+            clip, walk_failure = _process_one_clip(
+                window, span, clip_id, session_id, sensor_key, sensor_type, config, storage_profile
+            )
+        except _StreamEndedError as error:
+            failures.extend(_unproducible(planned[index:], session_id, sensor_key, error))
             break
+        _collect(clip, walk_failure, clips, failures)
     return clips, failures
 
 
@@ -716,14 +697,14 @@ def _unproducible(
     sensor_key: str,
     error: BaseException,
 ) -> list[dict[str, Any]]:
-    """Record every planned span the exhausted feed can no longer reach.
+    """Record every planned span the camera can no longer decode.
 
     One per span rather than one for the camera, because the clips already
     written are good and a reader needs to know exactly which moments are
     missing -- the same reason an encode failure names its own span.
     """
     detail = str(error) or "its media holds fewer frames than its sensor timestamps describe"
-    reason = _StreamEndedError(f"the camera ran out of frames before this span: {detail}")
+    reason = _StreamEndedError(f"camera decoding could not complete this span: {detail}")
     return [failure(session_id, sensor_key, span, "stream_ended", reason, clip_id) for span, clip_id in remaining]
 
 
@@ -741,62 +722,7 @@ def _collect(
 
 
 class _StreamEndedError(Exception):
-    """The frame feed ran out partway through a clip.
-
-    Not a failure: it means the tail of the session was shorter than a whole
-    clip, which is exactly what planning drops.
-    """
-
-
-class _FrameFeed:
-    """One forward pass over a camera, handed out a clip's worth of frames at a time.
-
-    Opened once and consumed across every clip, because a forward-only sensor
-    cannot go back: reopening per clip would re-decode the camera from the start
-    each time.
-    """
-
-    def __init__(self, frames: Iterator[tuple[int, int, npt.NDArray[np.uint8]]]) -> None:
-        first = next(frames, None)
-        if first is None:
-            msg = "video stream contains no displayable frames"
-            raise ValueError(msg)
-        self._frames = itertools.chain([first], frames)
-        self.taken = 0
-
-    def take(self, count: int, sensor_timestamps_ns: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
-        """Yield the next ``count`` frames, recording which source frame served each."""
-        for _ in range(count):
-            row = next(self._frames, None)
-            if row is None:
-                raise _StreamEndedError
-            _align_ns, pts_ns, frame = row
-            sensor_timestamps_ns.append(pts_ns)
-            self.taken += 1
-            yield frame
-
-    def realign(self, expected: int) -> None:
-        """Drop frames until the pass has consumed *expected* of them.
-
-        A clip that fails partway through leaves this cursor inside its span:
-        the encoder stopped reading, but the frames it did read are gone. The
-        next span would start mid-clip and every clip after it would hold frames
-        from the wrong moment, written without an error because nothing compares
-        a clip's frames against the span it claims.
-
-        Nothing to do when a clip succeeded, which is the common case: it
-        consumed exactly what it asked for.
-
-        Each dropped frame arrives already converted to RGB, and that cost is
-        accepted rather than overlooked. The walk exists to feed a dense
-        transcode, so the library converts on the way past; skipping the
-        conversion for a frame nobody reads would mean a second entry point
-        there, to save at most one span of conversions per failed clip.
-        """
-        while self.taken < expected:
-            if next(self._frames, None) is None:
-                raise _StreamEndedError
-            self.taken += 1
+    """Frame iteration failed and the shared camera pass cannot continue."""
 
 
 def _spec_for_spans(spans: tuple[Span, ...], config: ResolvedMultimodalSplitConfig) -> SamplingSpec:
@@ -804,10 +730,10 @@ def _spec_for_spans(spans: tuple[Span, ...], config: ResolvedMultimodalSplitConf
 
     The streaming sensor serves a grid rather than inventing a timeline, so the
     spans a session was planned into become its windows. One window per clip
-    means one payload per clip, which is what the provider hands out.
+    means one payload per clip; gaps between planned clips have empty windows.
     """
     timestamps = np.concatenate([sampling_spec(span, config).grid.timestamps_ns for span in spans]).astype(np.int64)
-    duration_ns = clip_duration_ns(config)
+    duration_ns = spans[0].duration_ns
     return SamplingSpec(
         grid=SamplingGrid(
             spans[0].start_ns,
@@ -819,23 +745,47 @@ def _spec_for_spans(spans: tuple[Span, ...], config: ResolvedMultimodalSplitConf
     )
 
 
-def _open_frame_feed(
+def _open_camera_sensor(  # noqa: PLR0913 -- source, planned clock/timeline, and indexed storage location
     source: io.BufferedIOBase,
+    sensor_uri: str,
+    timeline_ns: npt.NDArray[np.int64],
+    mp4_index_uri: str,
+    storage_profile: str,
+    alignment_field: str,
+) -> StreamingCameraSensor:
+    """Build a streaming sensor from the configured manifest record."""
+    lookup = Mp4IndexLookup.open_required(mp4_index_uri, storage_profile=storage_profile)
+    frame_index, metadata = lookup.require_index_for(sensor_uri, storage_profile=storage_profile)
+    sensor = StreamingCameraSensor(
+        source, metadata=metadata, frame_index=frame_index, alignment_field=VideoFrameAlignmentField(alignment_field)
+    )
+    if not np.array_equal(sensor.timestamps_ns, timeline_ns):
+        msg = "indexed camera timestamps changed since planning"
+        raise ValueError(msg)
+    return sensor
+
+
+def _open_camera_windows(  # noqa: PLR0913 -- source, planned spans/timeline, and storage configuration
+    source: io.BufferedIOBase,
+    sensor_uri: str,
     spans: tuple[Span, ...],
     timeline_ns: npt.NDArray[np.int64],
     config: ResolvedMultimodalSplitConfig,
-) -> _FrameFeed:
-    """Open one forward pass over a camera, serving the planned spans in order."""
-    sensor = StreamingCameraSensor(source, timestamps_ns=timeline_ns)
+    storage_profile: str,
+    *,
+    camera_alignment_field: str | None,
+) -> Iterator[StreamingCameraData]:
+    """Serve planned spans using indexed timestamps or the legacy external timeline."""
     policy = NearestTimestampPolicy(max_delta_ns=config.video.max_delta_ns)
-    payloads = sensor.sample(_spec_for_spans(spans, config), policy=policy)
-    return _FrameFeed(row for payload in payloads for row in payload.frames())
-
-
-def _feed_provider(feed: _FrameFeed) -> FrameProvider:
-    """Serve each clip from the next run of frames in one continuous pass."""
-
-    def provide(_span: Span, row_count: int, sensor_timestamps_ns: list[int]) -> Iterator[npt.NDArray[np.uint8]]:
-        return feed.take(row_count, sensor_timestamps_ns)
-
-    return provide
+    spec = _spec_for_spans(spans, config)
+    if config.input.mp4_index_uri is None:
+        payloads = stream_camera_windows(iter_video_frames(source), timeline_ns, spec, policy=policy)
+    else:
+        if camera_alignment_field is None:
+            msg = "indexed camera plan has no selected camera_alignment_field"
+            raise ValueError(msg)
+        sensor = _open_camera_sensor(
+            source, sensor_uri, timeline_ns, config.input.mp4_index_uri, storage_profile, camera_alignment_field
+        )
+        payloads = sensor.sample(spec, policy=policy)
+    return (window for window in payloads if window.align_timestamps_ns.size)

@@ -18,17 +18,20 @@ import gc
 import hashlib
 import itertools
 import pathlib
+import struct
 from collections.abc import Iterator
 from fractions import Fraction
 from typing import Any
+from unittest.mock import Mock
 
+import attrs
 import av
 import numpy as np
 import psutil
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata, UnsupportedEditListError
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
@@ -37,7 +40,7 @@ from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
     IndexRecordUnusableError,
     StreamingCameraSensor,
 )
-from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.core.sensors.types.types import TimestampSource, VideoFrameAlignmentField
 from cosmos_curator.next.recipes.mp4_index.contracts import FRAME_INDEX_SCHEMA
 
 _DATA = pathlib.Path(__file__).resolve().parents[3] / "pipelines" / "video" / "data"
@@ -55,6 +58,20 @@ _ONE_SECOND_NS = 1_000_000_000
 # A recorder's uptime clock, taken from real footage: nowhere near a container's zero.
 _DEVICE_ORIGIN_NS = 3_517_693_838_000
 _NS_PER_SECOND = 1_000_000_000
+
+
+def _sensor_with_eof(source: pathlib.Path, timeline: np.ndarray) -> StreamingCameraSensor:
+    """Build a supplied index with synthetic EOF values for sampling tests."""
+    indexed = StreamingCameraSensor(source)
+    metadata, frame_index = indexed.metadata, indexed.frame_index
+    if len(timeline) != len(frame_index):
+        metadata = attrs.evolve(metadata, frame_count=len(timeline))
+        frame_index = _frame_index(_frame_rows(len(timeline)), metadata)
+    inverse_order = np.argsort(frame_index.pts_sort_order)
+    frame_index = attrs.evolve(frame_index, eof_ns=timeline[inverse_order])
+    return StreamingCameraSensor(
+        source, metadata=metadata, frame_index=frame_index, alignment_field=VideoFrameAlignmentField.EOF_NS
+    )
 
 
 def _whole_clip(hz: float, count: int, origin_ns: int = 0) -> SamplingSpec:
@@ -109,7 +126,7 @@ def _starting_late(source: pathlib.Path, destination: pathlib.Path, offset_ns: i
 
 def test_walks_the_clip_at_the_requested_rate() -> None:
     """Reference timestamps start at the first frame's PTS and step at 1/hz."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
 
     rows = [(align_ns, pts_ns) for align_ns, pts_ns, _ in _walk(sensor, 24.0, _ONE_MS_NS)]
 
@@ -130,9 +147,9 @@ def test_walks_the_clip_at_the_requested_rate() -> None:
     assert max(abs(a - p) for a, p in rows) < 1000
 
 
-def test_bframe_clip_needs_no_index() -> None:
-    """B-frame video decodes forward-only, in presentation order, with nothing prebuilt."""
-    sensor = StreamingCameraSensor(_BFRAME_CLIP, timestamps_ns=_timeline(_BFRAME_CLIP))
+def test_bframe_clip_builds_its_index_lazily() -> None:
+    """A video can be decoded without supplying a prebuilt index."""
+    sensor = StreamingCameraSensor(_BFRAME_CLIP, alignment_field=VideoFrameAlignmentField.EDITED_PTS_NS)
 
     pts_ns = [pts for _, pts, _ in _walk(sensor, 24.0, _ONE_MS_NS)]
 
@@ -154,7 +171,7 @@ def test_window_count_does_not_change_selected_timestamps_or_pixels(clip: pathli
         spec = SamplingSpec(
             grid=SamplingGrid(start_ns, start_ns + duration_ns, references_ns, stride_ns=width_ns, duration_ns=width_ns)
         )
-        sensor = StreamingCameraSensor(clip, timestamps_ns=_timeline(clip, _DEVICE_ORIGIN_NS))
+        sensor = _sensor_with_eof(clip, _timeline(clip, _DEVICE_ORIGIN_NS))
         payloads = list(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=21_000_000)))
 
         assert len(payloads) == window_count
@@ -188,7 +205,7 @@ def test_window_payloads_decode_lazily_with_one_frame_of_lookahead(
             yield int(timestamp_ns), np.full((1, 1, 3), index, dtype=np.uint8)
 
     monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames", decoded_frames)
-    sensor = StreamingCameraSensor(b"video", timestamps_ns=timestamps_ns)
+    sensor = _sensor_with_eof(_CLIP, timestamps_ns)
     width_ns = 300 // window_count
     spec = SamplingSpec(grid=SamplingGrid(0, 300, timestamps_ns, stride_ns=width_ns, duration_ns=width_ns))
     payloads = list(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0)))
@@ -207,7 +224,7 @@ def test_window_payloads_decode_lazily_with_one_frame_of_lookahead(
 
 def test_one_source_frame_serves_several_reference_timestamps() -> None:
     """Sampling faster than the source rate repeats the nearest frame, without re-decoding it."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
 
     # Four references per source frame, stopping short of the last one: the grid
     # decides where the timeline ends now, and a reference past the final frame is
@@ -227,7 +244,7 @@ def test_one_source_frame_serves_several_reference_timestamps() -> None:
 
 def test_frame_farther_away_than_the_tolerance_raises() -> None:
     """A reference timestamp with no frame within ``max_delta_ns`` is an error."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
 
     with pytest.raises(ValueError, match=r"max_delta_ns=1000000 exceeded"):
         for _ in _walk(sensor, 1000.0, _ONE_MS_NS, 100):
@@ -245,7 +262,7 @@ def test_peak_memory_stays_flat_over_a_long_walk() -> None:
     """
     process = psutil.Process()
     warmup_rows = 60
-    sensor = StreamingCameraSensor(_LONG_CLIP, timestamps_ns=_timeline(_LONG_CLIP))
+    sensor = _sensor_with_eof(_LONG_CLIP, _timeline(_LONG_CLIP))
     rows = 0
     baseline_rss = 0
     peak_rss = 0
@@ -278,7 +295,7 @@ def _grid(start_ns: int, *, stride_ns: int, duration_ns: int, count: int, hz: fl
 
 def test_sample_yields_one_payload_per_window() -> None:
     """SensorGroup advances every sensor once per window, so a payload per window is the contract."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
     spec = _grid(0, stride_ns=_ONE_SECOND_NS, duration_ns=_ONE_SECOND_NS, count=3, hz=24.0)
 
     payloads = list(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=_ONE_MS_NS)))
@@ -295,7 +312,7 @@ def test_an_empty_window_still_yields_a_payload() -> None:
     SensorGroup walks every sensor in lockstep; a sensor that skipped a window
     would hand the next window's frames to the wrong one.
     """
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
     step = round(1e9 / 24.0)
     # Second window covers a stretch the grid places no timestamps in.
     timestamps = np.array([0, step, 3 * _ONE_SECOND_NS], dtype=np.int64)
@@ -316,7 +333,7 @@ def test_overlapping_windows_are_rejected() -> None:
     avoid, so overlap is refused rather than absorbed. McapCameraSensor refuses
     it for the same reason.
     """
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
     spec = _grid(0, stride_ns=_ONE_SECOND_NS // 2, duration_ns=_ONE_SECOND_NS, count=3, hz=24.0)
 
     def drain() -> None:
@@ -335,43 +352,22 @@ def test_a_late_starting_container_reports_its_own_first_pts() -> None:
     assert native_start == 0
 
 
-def test_origin_pins_the_first_frame_of_a_late_starting_container(tmp_path: pathlib.Path) -> None:
-    """``origin_ns`` says where the first frame lands, whatever the container calls it.
-
-    A recording carries its capture clock beside it, not inside it, and the two
-    agree on duration but not on where zero is. The caller knows when recording
-    started; only the sensor knows what PTS the container gave that same frame,
-    so the sensor is what reconciles them. Shifting by ``origin_ns`` instead
-    would land every frame half a second late here, and exactly nowhere on a
-    container that starts at zero -- which is why this needs a late one.
-    """
+def test_unsupported_edits_raise_when_a_lazy_index_is_built(tmp_path: pathlib.Path) -> None:
+    """A multi-entry edit introduced by remuxing is rejected by the frame-index builder."""
     late = _starting_late(_CLIP, tmp_path / "late.mp4", _ONE_SECOND_NS // 2)
-    with av.open(str(late)) as reader:
-        stream = reader.streams.video[0]
-        native_start = int(stream.start_time * stream.time_base * _NS_PER_SECOND)
-    assert native_start > 0, "the remux did not preserve the shift, so this test cannot bite"
-
-    rows = _walk(
-        StreamingCameraSensor(late, timestamps_ns=_timeline(late, _DEVICE_ORIGIN_NS)),
-        24.0,
-        _ONE_MS_NS,
-        origin_ns=_DEVICE_ORIGIN_NS,
-    )
-
-    assert rows[0][1] == _DEVICE_ORIGIN_NS
-    assert rows[0][0] == _DEVICE_ORIGIN_NS
+    sensor = StreamingCameraSensor(late)
+    with pytest.raises(UnsupportedEditListError, match="entries"):
+        _ = sensor.frame_index
 
 
 def test_origin_moves_the_timeline_without_reshaping_it() -> None:
     """Only the origin moves: the gaps between frames are the recording's own."""
-    native = [
-        pts for _, pts, _ in _walk(StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP)), 24.0, _ONE_MS_NS)
-    ]
+    native = [pts for _, pts, _ in _walk(_sensor_with_eof(_CLIP, _timeline(_CLIP)), 24.0, _ONE_MS_NS)]
 
     shifted = [
         pts
         for _, pts, _ in _walk(
-            StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP, _DEVICE_ORIGIN_NS)),
+            _sensor_with_eof(_CLIP, _timeline(_CLIP, _DEVICE_ORIGIN_NS)),
             24.0,
             _ONE_MS_NS,
             origin_ns=_DEVICE_ORIGIN_NS,
@@ -382,7 +378,7 @@ def test_origin_moves_the_timeline_without_reshaping_it() -> None:
 
 
 def _timeline(clip: pathlib.Path, origin_ns: int = 0) -> np.ndarray:
-    """Return the capture times a recorder would have written beside this clip.
+    """Return synthetic sensor timestamps spaced by this clip's frame intervals.
 
     Anchored at ``origin_ns`` and spaced by the container's own intervals, which
     is the shape of the real artifact: when recording started is a fact about the
@@ -407,7 +403,7 @@ def test_it_is_a_sensor_group_member() -> None:
     drive it, so this drives it.
     """
     timeline = _timeline(_CLIP, _DEVICE_ORIGIN_NS)
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=timeline)
+    sensor = _sensor_with_eof(_CLIP, timeline)
     group = SensorGroup({"camera": sensor})
 
     assert group.start_ns == _DEVICE_ORIGIN_NS
@@ -426,7 +422,7 @@ def test_it_is_a_sensor_group_member() -> None:
 def test_a_group_gets_one_payload_for_every_window_it_asks_for() -> None:
     """Lockstep means a window always produces a payload, even one covering nothing."""
     timeline = _timeline(_CLIP, _DEVICE_ORIGIN_NS)
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=timeline)
+    sensor = _sensor_with_eof(_CLIP, timeline)
     group = SensorGroup({"camera": sensor})
     step = _NS_PER_SECOND // 4
     timestamps = np.array([_DEVICE_ORIGIN_NS + index * step for index in range(8)], dtype=np.int64)
@@ -459,7 +455,7 @@ def test_payloads_taken_out_of_order_raise_rather_than_serve_the_wrong_frames() 
     earlier window from the later position would pick real frames for the wrong
     timestamps, which a tolerance check catches only by luck.
     """
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
     payloads = list(sensor.sample(_two_windows(0), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS)))
 
     assert len(list(payloads[1].frames())) == 2
@@ -470,7 +466,7 @@ def test_payloads_taken_out_of_order_raise_rather_than_serve_the_wrong_frames() 
 
 def test_a_payload_cannot_be_resumed_once_a_later_one_has_started() -> None:
     """Interleaving is the same violation, caught at the row rather than at the start."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
+    sensor = _sensor_with_eof(_CLIP, _timeline(_CLIP))
     payloads = list(sensor.sample(_two_windows(0), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS)))
     first = payloads[0].frames()
     next(first)
@@ -489,28 +485,28 @@ def _drain(sensor: StreamingCameraSensor, spec: SamplingSpec) -> list:
 def test_a_timeline_must_be_one_dimensional() -> None:
     """Caught at construction, not at the first property that tries to read a scalar."""
     with pytest.raises(ValueError, match="must be 1-D"):
-        StreamingCameraSensor(_CLIP, timestamps_ns=np.array([[1, 2], [3, 4]], dtype=np.int64))
+        _sensor_with_eof(_CLIP, np.array([[1, 2], [3, 4]], dtype=np.int64))
 
 
 def test_an_ascending_timeline_is_not_rejected_for_being_wide() -> None:
     """Adjacent values are compared, not differenced: a gap can exceed what int64 holds."""
     limits = np.array([np.iinfo(np.int64).min, np.iinfo(np.int64).max], dtype=np.int64)
 
-    assert StreamingCameraSensor(_CLIP, timestamps_ns=limits).start_ns == int(np.iinfo(np.int64).min)
+    assert _sensor_with_eof(_CLIP, limits).start_ns == int(np.iinfo(np.int64).min)
 
 
 def test_a_timeline_that_rounds_differently_from_the_container_still_serves() -> None:
-    """Capture times and presentation timestamps are separate clocks that round apart.
+    """Uniformly spaced sensor timestamps and container PTS round differently.
 
     A container's time base rarely divides a nanosecond evenly: at 1/12288 this
-    clip puts 80 of its 240 frames one nanosecond off where a capture clock at
+    clip puts 80 of its 240 frames one nanosecond off where a sensor timeline at
     the same rate would. That is two representations of one instant, not a
     timeline describing a different recording.
     """
     step = _NS_PER_SECOND / 24.0
     timeline = np.array([round(index * step) for index in range(_SOURCE_FRAME_COUNT)], dtype=np.int64)
 
-    rows = _walk(StreamingCameraSensor(_CLIP, timestamps_ns=timeline), 24.0, _ONE_MS_NS)
+    rows = _walk(_sensor_with_eof(_CLIP, timeline), 24.0, _ONE_MS_NS)
 
     assert len(rows) == _SOURCE_FRAME_COUNT
 
@@ -526,7 +522,7 @@ def test_rows_report_the_timeline_not_the_container() -> None:
     """
     timeline = _timeline(_CLIP, _DEVICE_ORIGIN_NS)
 
-    rows = _walk(StreamingCameraSensor(_CLIP, timestamps_ns=timeline), 24.0, _ONE_MS_NS, origin_ns=_DEVICE_ORIGIN_NS)
+    rows = _walk(_sensor_with_eof(_CLIP, timeline), 24.0, _ONE_MS_NS, origin_ns=_DEVICE_ORIGIN_NS)
 
     assert [pts for _, pts, _ in rows] == [int(value) for value in timeline]
 
@@ -542,7 +538,7 @@ def test_a_container_with_fewer_frames_than_the_timeline_raises() -> None:
     native = _timeline(_CLIP)
     longer = np.concatenate([native, [int(native[-1]) + 1]])
 
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=longer)
+    sensor = _sensor_with_eof(_CLIP, longer)
 
     with pytest.raises(ValueError, match="container ended"):
         _walk(sensor, 24.0, _ONE_SECOND_NS)
@@ -553,14 +549,14 @@ def test_a_container_with_more_frames_than_the_timeline_raises() -> None:
     native = _timeline(_CLIP)
     shorter = native[:-1]
 
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=shorter)
+    sensor = _sensor_with_eof(_CLIP, shorter)
 
     with pytest.raises(ValueError, match="holds more frames"):
         _walk(sensor, 24.0, _ONE_SECOND_NS)
 
 
 def test_a_missed_exposure_is_served_by_repeating_its_neighbour() -> None:
-    """A camera that skips a capture still yields a full clip, with a frame serving twice.
+    """A camera that skips a frame still yields a full clip, with a frame serving twice.
 
     Real footage: one camera on a rig waited two frame periods instead of one,
     18 seconds in. It still wrote as many frames as everyone else, and its
@@ -574,10 +570,10 @@ def test_a_missed_exposure_is_served_by_repeating_its_neighbour() -> None:
     step = _NS_PER_SECOND // 24
     missed = 80
     # One doubled interval, as a missed exposure looks: the camera fired at 79
-    # and again at 81's moment, so nothing was captured for 80's.
+    # and again at 81's moment, so nothing was recorded for 80's.
     gaps = [0] + [step if index != missed else 2 * step for index in range(1, _SOURCE_FRAME_COUNT)]
     timeline = np.cumsum(np.array(gaps, dtype=np.int64))
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=timeline)
+    sensor = _sensor_with_eof(_CLIP, timeline)
     references = np.array([round(index * step) for index in range(_SOURCE_FRAME_COUNT)], dtype=np.int64)
     span = int(references[-1]) + 1
     spec = SamplingSpec(grid=SamplingGrid(0, span, references, stride_ns=span, duration_ns=span))
@@ -673,14 +669,20 @@ def _frame_index(rows: list[dict[str, Any]], metadata: Mp4Metadata) -> Mp4FrameI
         pa.Table.from_pylist(rows, schema=FRAME_INDEX_SCHEMA),
         time_base_num=metadata.time_base_num,
         time_base_den=metadata.time_base_den,
+        elst_bytes=metadata.elst_bytes,
     )
 
 
-def _from_index(rows: list[dict[str, Any]] | None = None, **metadata_overrides: object) -> StreamingCameraSensor:
+def _sensor_from_rows(rows: list[dict[str, Any]] | None = None, **metadata_overrides: object) -> StreamingCameraSensor:
     """Build an index-backed sensor over *rows*, with no media behind it."""
     frames = _frame_rows() if rows is None else rows
     metadata = Mp4Metadata.from_row(_metadata_row(frame_count=len(frames), **metadata_overrides))
-    return StreamingCameraSensor.from_index(_frame_index(frames, metadata), metadata)
+    return StreamingCameraSensor(
+        None,
+        frame_index=_frame_index(frames, metadata),
+        metadata=metadata,
+        alignment_field=VideoFrameAlignmentField.DTS_NS,
+    )
 
 
 def _indexed_ns(tick: int) -> int:
@@ -689,7 +691,7 @@ def _indexed_ns(tick: int) -> int:
 
 def test_an_index_timeline_is_the_decode_timestamps_in_nanoseconds() -> None:
     """The reported timeline is dts_ticks on the track's time base, not raw ticks."""
-    sensor = _from_index()
+    sensor = _sensor_from_rows()
 
     assert sensor.timestamps_ns.dtype == np.int64
     assert sensor.timestamps_ns.tolist() == [_indexed_ns(position * _INDEX_FRAME_TICKS) for position in range(3)]
@@ -699,12 +701,12 @@ def test_an_index_timeline_is_the_decode_timestamps_in_nanoseconds() -> None:
 
 def test_an_index_timeline_is_reported_as_decode_time() -> None:
     """Not merely "a container clock": decode order ascends, so an in-order finding is a tautology."""
-    assert _from_index().timestamp_source is TimestampSource.CONTAINER_DTS
+    assert _sensor_from_rows().timestamp_source is TimestampSource.CONTAINER_DTS
 
 
 def test_scalar_container_facts_come_off_the_metadata_struct() -> None:
     """Codec and nominal rate are read from the row rather than inferred from the frames."""
-    sensor = _from_index(codec_name="hevc", avg_frame_rate_num=30000, avg_frame_rate_den=1001)
+    sensor = _sensor_from_rows(codec_name="hevc", avg_frame_rate_num=30000, avg_frame_rate_den=1001)
 
     assert sensor.codec_name == "hevc"
     assert sensor.avg_frame_rate == Fraction(30000, 1001)
@@ -712,27 +714,27 @@ def test_scalar_container_facts_come_off_the_metadata_struct() -> None:
 
 def test_a_declared_rate_of_zero_stays_zero_rather_than_raising() -> None:
     """Fraction(0) is the library's "no usable header rate" sentinel, which makes rate metrics skip."""
-    assert _from_index(avg_frame_rate_num=0, avg_frame_rate_den=1).avg_frame_rate == Fraction(0)
+    assert _sensor_from_rows(avg_frame_rate_num=0, avg_frame_rate_den=1).avg_frame_rate == Fraction(0)
 
 
 def test_a_zero_denominator_degrades_to_the_same_sentinel() -> None:
     """A denominator the writer cannot actually emit still skips rather than raising ZeroDivisionError."""
-    assert _from_index(avg_frame_rate_den=0).avg_frame_rate == Fraction(0)
+    assert _sensor_from_rows(avg_frame_rate_den=0).avg_frame_rate == Fraction(0)
 
 
 def test_an_absent_composition_offset_column_means_no_reordering() -> None:
     """All-null offsets mean the ctts box is absent, so the container signals no reordering."""
-    assert _from_index(_frame_rows(composition_offset_ticks=None)).has_bframes is False
+    assert _sensor_from_rows(_frame_rows(composition_offset_ticks=None)).has_bframes is False
 
 
 def test_an_explicitly_zero_composition_offset_also_means_no_reordering() -> None:
     """A present-but-zero ctts box states there is no reordering, which is not the same as absent."""
-    assert _from_index(_frame_rows(composition_offset_ticks=0)).has_bframes is False
+    assert _sensor_from_rows(_frame_rows(composition_offset_ticks=0)).has_bframes is False
 
 
 def test_a_non_zero_composition_offset_signals_reordering() -> None:
     """A populated ctts offset is the container saying decode order and display order come apart."""
-    assert _from_index(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS)).has_bframes is True
+    assert _sensor_from_rows(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS)).has_bframes is True
 
 
 def test_composition_offsets_never_move_an_index_timeline() -> None:
@@ -741,91 +743,52 @@ def test_composition_offsets_never_move_an_index_timeline() -> None:
     No ``elst`` is applied, since an edit list never shifts decode timestamps, so the
     timeline is the same either way and :attr:`timestamp_source` reports which it is.
     """
-    delayed = _from_index(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS))
+    delayed = _sensor_from_rows(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS))
 
     assert delayed.has_bframes is True
-    assert delayed.timestamps_ns.tolist() == _from_index().timestamps_ns.tolist()
+    assert delayed.timestamps_ns.tolist() == _sensor_from_rows().timestamps_ns.tolist()
     assert delayed.start_ns == 0
 
 
 def test_an_index_with_no_frames_is_refused_as_unusable() -> None:
     """Typed so the recipe falls back to the media; a bare ValueError would fail the stream."""
     with pytest.raises(IndexRecordUnusableError, match="no frames"):
-        _from_index([])
-
-
-def test_a_sensor_timeline_replaces_the_indexed_one_and_says_so() -> None:
-    """A recorder's own clock beats the container's, and the index contributes only the scalars."""
-    recorded = np.array([5_000, 15_000, 25_000], dtype=np.int64)
-    metadata = Mp4Metadata.from_row(_metadata_row())
-
-    sensor = StreamingCameraSensor.from_index(
-        _frame_index(_frame_rows(), metadata),
-        metadata,
-        sensor_timestamps_ns=recorded,
-    )
-
-    assert sensor.timestamps_ns.tolist() == recorded.tolist()
-    assert sensor.timestamp_source is TimestampSource.SENSOR
-    assert sensor.codec_name == "h264"
-
-
-def test_a_sensor_timeline_of_the_wrong_length_makes_the_record_unusable() -> None:
-    """Matched by position, so a disagreeing count means the alignment is unknown, not partial."""
-    metadata = Mp4Metadata.from_row(_metadata_row())
-
-    with pytest.raises(IndexRecordUnusableError, match="2 observations but the frame index has 3 frames"):
-        StreamingCameraSensor.from_index(
-            _frame_index(_frame_rows(), metadata),
-            metadata,
-            sensor_timestamps_ns=np.array([5_000, 15_000], dtype=np.int64),
-        )
+        _sensor_from_rows([])
 
 
 def test_streaming_without_a_batch_size_yields_the_whole_timeline_at_once() -> None:
     """batch_size 0 means one batch, matching CameraSensor's contract."""
-    batches = list(_from_index().stream_timestamps())
+    batches = list(_sensor_from_rows().stream_timestamps())
 
     assert len(batches) == 1
-    assert batches[0].tolist() == _from_index().timestamps_ns.tolist()
+    assert batches[0].tolist() == _sensor_from_rows().timestamps_ns.tolist()
 
 
 def test_streaming_splits_into_consecutive_batches_with_a_short_tail() -> None:
     """Batches partition the timeline in order, so streaming and one-shot see the same samples."""
-    batches = list(_from_index(_frame_rows(5)).stream_timestamps(batch_size=2))
+    batches = list(_sensor_from_rows(_frame_rows(5)).stream_timestamps(batch_size=2))
 
     assert [len(batch) for batch in batches] == [2, 2, 1]
-    assert np.concatenate(batches).tolist() == _from_index(_frame_rows(5)).timestamps_ns.tolist()
+    assert np.concatenate(batches).tolist() == _sensor_from_rows(_frame_rows(5)).timestamps_ns.tolist()
 
 
 def test_streaming_rejects_a_negative_batch_size() -> None:
     """Mirrors CameraSensor rather than silently treating a negative size as "all"."""
     with pytest.raises(ValueError, match="batch_size must be non-negative"):
-        list(_from_index().stream_timestamps(batch_size=-1))
+        list(_sensor_from_rows().stream_timestamps(batch_size=-1))
 
 
 def test_an_index_backed_sensor_reports_the_index_and_metadata_it_was_built_from() -> None:
-    """The two accessors are the supported way to reach what from_index was handed."""
-    sensor = _from_index()
+    """The two accessors expose the supplied metadata and frame index."""
+    sensor = _sensor_from_rows()
 
-    assert len(sensor.index) == 3
+    assert len(sensor.frame_index) == 3
     assert sensor.metadata.codec_name == "h264"
-
-
-def test_a_sensor_built_over_media_has_no_index_to_report() -> None:
-    """Reading an index off a sensor that never had one is a programming error, not an empty answer."""
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=_timeline(_CLIP))
-
-    with pytest.raises(RuntimeError, match="no frame index"):
-        _ = sensor.index
-
-    with pytest.raises(RuntimeError, match="no container metadata"):
-        _ = sensor.metadata
 
 
 def test_sampling_a_sensor_with_no_media_raises_rather_than_yielding_nothing() -> None:
     """An index-backed sensor can answer timeline questions, but it has no packets to decode."""
-    sensor = _from_index()
+    sensor = _sensor_from_rows()
 
     with pytest.raises(RuntimeError, match="no media to decode"):
         sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS))
@@ -841,7 +804,7 @@ def test_an_out_of_order_timeline_is_constructible_but_not_samplable() -> None:
     """
     timeline = np.array([30, 20, 10], dtype=np.int64)
 
-    sensor = StreamingCameraSensor(_CLIP, timestamps_ns=timeline)
+    sensor = _sensor_with_eof(_CLIP, timeline)
 
     assert sensor.timestamps_ns.tolist() == [30, 20, 10]
     assert sensor.start_ns == 30
@@ -849,3 +812,214 @@ def test_an_out_of_order_timeline_is_constructible_but_not_samplable() -> None:
 
     with pytest.raises(ValueError, match="strictly sorted in ascending order"):
         sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS))
+
+
+def test_indexed_presentation_clock_reads_edited_pts() -> None:
+    """Playback consumes edited PTS; the stored media PTS remains a separate, unshifted timeline."""
+    elst = struct.pack(">I4sIIIihh", 28, b"elst", 0, 1, 1000, _INDEX_FRAME_TICKS, 1, 0)
+    metadata = Mp4Metadata.from_row(_metadata_row(elst_bytes=elst))
+    index = _frame_index(_frame_rows(), metadata)
+    sensor = StreamingCameraSensor(
+        None, frame_index=index, metadata=metadata, alignment_field=VideoFrameAlignmentField.EDITED_PTS_NS
+    )
+    assert sensor.timestamp_source is TimestampSource.CONTAINER_PTS
+    np.testing.assert_array_equal(sensor.timestamps_ns, index.edited_pts_ns[index.pts_sort_order])
+    assert index.pts_ns[0] == 0
+    assert sensor.timestamps_ns[0] == -_indexed_ns(_INDEX_FRAME_TICKS)
+    assert index.dts_ns[0] == 0
+
+
+def test_indexed_sensor_owns_eof_presentation_order() -> None:
+    """Recorded clocks are reordered with decoded frames and are never shifted by container edits."""
+    elst = struct.pack(">I4sIIIihh", 28, b"elst", 0, 1, 1000, _INDEX_FRAME_TICKS, 1, 0)
+    metadata = Mp4Metadata.from_row(_metadata_row(elst_bytes=elst))
+    rows = _frame_rows()
+    ranks = [2, 0, 1]
+    for sample, (row, rank) in enumerate(zip(rows, ranks, strict=True)):
+        row["composition_offset_ticks"] = (rank - sample + 2) * _INDEX_FRAME_TICKS
+        row["eof_ns"] = _DEVICE_ORIGIN_NS + rank * _ONE_SECOND_NS
+    sensor = StreamingCameraSensor(
+        None,
+        frame_index=_frame_index(rows, metadata),
+        metadata=metadata,
+        alignment_field=VideoFrameAlignmentField.EOF_NS,
+    )
+    assert sensor.timestamps_ns.tolist() == [_DEVICE_ORIGIN_NS + i * _ONE_SECOND_NS for i in range(3)]
+    assert sensor.timestamp_source is TimestampSource.SENSOR
+
+
+def test_indexed_decode_clock_is_not_shifted_by_playback_edits() -> None:
+    """Integrity checks retain DTS even when the index has a shifted playback timeline."""
+    elst = struct.pack(">I4sIIIihh", 28, b"elst", 0, 1, 1000, _INDEX_FRAME_TICKS, 1, 0)
+    metadata = Mp4Metadata.from_row(_metadata_row(elst_bytes=elst))
+    index = _frame_index(_frame_rows(), metadata)
+    sensor = StreamingCameraSensor(
+        None, frame_index=index, metadata=metadata, alignment_field=VideoFrameAlignmentField.DTS_NS
+    )
+    assert sensor.timestamp_source is TimestampSource.CONTAINER_DTS
+    np.testing.assert_array_equal(sensor.timestamps_ns, index.dts_ns)
+    assert sensor.timestamps_ns[0] == 0
+    assert index.edited_pts_ns[0] == -_indexed_ns(_INDEX_FRAME_TICKS)
+
+
+@pytest.mark.parametrize(
+    ("timestamp_field", "expected_ns", "timestamp_source", "expected_frames"),
+    [
+        (VideoFrameAlignmentField.PTS_NS, [10, 15, 30], TimestampSource.CONTAINER_PTS, [1, 2, 0]),
+        (VideoFrameAlignmentField.EDITED_PTS_NS, [5, 10, 25], TimestampSource.CONTAINER_PTS, [1, 2, 0]),
+        (VideoFrameAlignmentField.EOF_NS, [100, 200, 300], TimestampSource.SENSOR, [1, 2, 0]),
+        (VideoFrameAlignmentField.SOF_NS, [70, 170, 270], TimestampSource.SENSOR, [1, 2, 0]),
+        (VideoFrameAlignmentField.MOE_NS, [50, 150, 250], TimestampSource.SENSOR, [1, 2, 0]),
+    ],
+)
+def test_indexed_alignment_uses_the_selected_field_for_the_matching_frames(
+    monkeypatch: pytest.MonkeyPatch,
+    timestamp_field: VideoFrameAlignmentField,
+    expected_ns: list[int],
+    timestamp_source: TimestampSource,
+    expected_frames: list[int],
+) -> None:
+    """Clock selection preserves frame associations across decode and presentation order."""
+    metadata = Mp4Metadata.from_row(
+        _metadata_row(
+            time_base_den=_NS_PER_SECOND,
+            elst_bytes=struct.pack(">I4sIIIihh", 28, b"elst", 0, 1, 1000, 5, 1, 0),
+        )
+    )
+    rows = [
+        {
+            **row,
+            "dts_ticks": dts,
+            "composition_offset_ticks": offset,
+            "eof_ns": eof,
+            "sof_ns": eof - 30,
+            "moe_ns": eof - 50,
+        }
+        for row, dts, offset, eof in zip(_frame_rows(), [0, 10, 20], [30, 0, -5], [300, 100, 200], strict=True)
+    ]
+    decoded = [(pts, np.full((1, 1, 3), frame_id, dtype=np.uint8)) for pts, frame_id in [(5, 1), (10, 2), (25, 0)]]
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames",
+        lambda *_args, **_kwargs: iter(decoded),
+    )
+    sensor = StreamingCameraSensor(
+        b"video", frame_index=_frame_index(rows, metadata), metadata=metadata, alignment_field=timestamp_field
+    )
+    assert sensor.timestamp_source is timestamp_source
+    assert sensor.timestamps_ns.tolist() == expected_ns
+    start, end = expected_ns[0], expected_ns[-1] + 1
+    spec = SamplingSpec(
+        grid=SamplingGrid(
+            start,
+            end,
+            np.array(expected_ns, dtype=np.int64),
+            stride_ns=end - start,
+            duration_ns=end - start,
+        )
+    )
+    served = [
+        row
+        for payload in sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
+        for row in payload.frames()
+    ]
+    assert [timestamp for _, timestamp, _ in served] == expected_ns
+    assert [int(frame[0, 0, 0]) for _, _, frame in served] == expected_frames
+
+
+def test_dts_sampling_rejects_reordered_frames_before_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DTS remains readable for integrity checks without buffering pixels to restore decode order."""
+    metadata = Mp4Metadata.from_row(_metadata_row())
+    rows = _frame_rows(composition_offset_ticks=0)
+    rows[0]["composition_offset_ticks"] = 3 * _INDEX_FRAME_TICKS
+    frame_index = _frame_index(rows, metadata)
+    sensor = StreamingCameraSensor(
+        b"video", frame_index=frame_index, metadata=metadata, alignment_field=VideoFrameAlignmentField.DTS_NS
+    )
+    np.testing.assert_array_equal(sensor.timestamps_ns, frame_index.dts_ns)
+    decoder = Mock(side_effect=AssertionError("unexpected decode"))
+    monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames", decoder)
+    with pytest.raises(ValueError, match="matching decode and presentation order"):
+        sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=0))
+    decoder.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "alignment_field",
+    [VideoFrameAlignmentField.PTS_NS, VideoFrameAlignmentField.DTS_NS, VideoFrameAlignmentField.EOF_NS],
+)
+def test_sampling_pulls_only_one_frame_ahead(
+    monkeypatch: pytest.MonkeyPatch, alignment_field: VideoFrameAlignmentField
+) -> None:
+    """Frames retain presentation order and are pulled only as the consumer advances."""
+    count = 32
+    metadata = Mp4Metadata.from_row(_metadata_row(frame_count=count, time_base_den=_NS_PER_SECOND))
+    rows = _frame_rows(count)
+    presentation_order = (
+        list(range(count)) if alignment_field is VideoFrameAlignmentField.DTS_NS else [*range(1, count), 0]
+    )
+    for rank, sample in enumerate(presentation_order):
+        rows[sample]["composition_offset_ticks"] = rank * 10 - rows[sample]["dts_ticks"]
+        rows[sample]["eof_ns"] = 100 + rank * 10
+    decoded_count = 0
+
+    def decoded_frames() -> Iterator[tuple[int, np.ndarray]]:
+        nonlocal decoded_count
+        for rank, sample in enumerate(presentation_order):
+            decoded_count += 1
+            yield rank * 10, np.full((1, 1, 3), sample, dtype=np.uint8)
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames",
+        lambda *_args, **_kwargs: decoded_frames(),
+    )
+    sensor = StreamingCameraSensor(
+        b"video", frame_index=_frame_index(rows, metadata), metadata=metadata, alignment_field=alignment_field
+    )
+    timestamps = sensor.timestamps_ns
+    start, end = int(timestamps[0]), int(timestamps[-1]) + 1
+    spec = SamplingSpec(grid=SamplingGrid(start, end, timestamps, stride_ns=end - start, duration_ns=end - start))
+    payloads = sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
+    assert decoded_count == 0
+    payload = next(payloads)
+    assert decoded_count == 0
+    served_count = 0
+    for rank, (_align_ns, timestamp_ns, frame) in enumerate(payload.frames()):
+        assert timestamp_ns == timestamps[rank]
+        assert int(frame[0, 0, 0]) == presentation_order[rank]
+        assert decoded_count == min(rank + 2, count)
+        served_count += 1
+    assert served_count == count
+
+
+@pytest.mark.parametrize(
+    "timestamp_field",
+    [VideoFrameAlignmentField.EOF_NS, VideoFrameAlignmentField.SOF_NS, VideoFrameAlignmentField.MOE_NS],
+)
+def test_indexed_alignment_rejects_an_absent_field(timestamp_field: VideoFrameAlignmentField) -> None:
+    """Selecting an absent sensor clock cannot silently use a different field."""
+    metadata = Mp4Metadata.from_row(_metadata_row())
+    with pytest.raises(IndexRecordUnusableError, match=timestamp_field.value):
+        _ = StreamingCameraSensor(
+            None, frame_index=_frame_index(_frame_rows(), metadata), metadata=metadata, alignment_field=timestamp_field
+        ).timestamps_ns
+
+
+@pytest.mark.parametrize("timestamp_field", [VideoFrameAlignmentField.SOF_NS, VideoFrameAlignmentField.MOE_NS])
+def test_indexed_alignment_rejects_partial_timestamps(timestamp_field: VideoFrameAlignmentField) -> None:
+    """Missing timestamps cannot label decoded frames or participate in nearest-frame selection."""
+    metadata = Mp4Metadata.from_row(_metadata_row())
+    rows = [{**row, timestamp_field.value: value} for row, value in zip(_frame_rows(), [100, None, 300], strict=True)]
+    with pytest.raises(IndexRecordUnusableError, match=rf"{timestamp_field.value}.*missing"):
+        _ = StreamingCameraSensor(
+            None, frame_index=_frame_index(rows, metadata), metadata=metadata, alignment_field=timestamp_field
+        ).timestamps_ns
+
+
+@pytest.mark.parametrize("timestamp_field", ["", "not_a_timestamp"])
+def test_indexed_alignment_rejects_an_unknown_field(timestamp_field: str) -> None:
+    """Invalid field names cannot silently select the default clock."""
+    metadata = Mp4Metadata.from_row(_metadata_row())
+    with pytest.raises(TypeError, match="VideoFrameAlignmentField"):
+        StreamingCameraSensor(
+            None, frame_index=_frame_index(_frame_rows(), metadata), metadata=metadata, alignment_field=timestamp_field
+        )

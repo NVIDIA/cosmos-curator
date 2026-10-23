@@ -38,6 +38,7 @@ from cosmos_curator.next.core.ray_runtime import (
     configure_ray_data_stability,
     ensure_ray_initialized,
 )
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig, resolve_config
 from cosmos_curator.next.recipes.multimodal_split.discovery import discover_candidate_sessions
 from cosmos_curator.next.recipes.multimodal_split.identities import make_source_id
@@ -73,6 +74,8 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     the whole run in one process, and nothing here needs more than the count.
     """
     started_at = monotonic()
+    if config.input.mp4_index_uri is not None:
+        Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=config.execution.storage_profile)
     sessions = discover_candidate_sessions(config.input, storage_profile=config.execution.storage_profile)
     if sessions.num_rows == 0:
         msg = (

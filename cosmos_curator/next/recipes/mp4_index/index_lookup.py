@@ -13,37 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read one video's frame index back out of a ``manifest.lance`` written by this recipe.
+"""Read video frame indexes from a ``manifest.lance`` written by this recipe.
 
 The reader sits beside :mod:`.lance_sink`, which writes the rows, and hands back the
 sensor library's own :class:`Mp4FrameIndex` and :class:`Mp4Metadata`. Interpreting those
 values is the library's job; unpacking the stored representation is this module's.
+Consumers choose which timestamps to use.
 
-Two things a caller gets from an index that it would not get from the video:
+Source videos and manifests must remain immutable during a run. Size checks catch
+changed-length replacements, not equal-size replacements.
 
-* The timeline is ``dts_ns``, in decode order, where a sensor built over the media
-  serves sorted presentation timestamps. The two agree when the file has no ``ctts``
-  box. When per-frame composition offsets vary, the measured cadence is the decoder's
-  schedule, not the display's. Decode timestamps always increase, so an ordering metric
-  cannot report a problem against them, and a PASS there says less than one taken from
-  the media. Readers tell the two apart by :attr:`TimestampSource.CONTAINER_DTS`.
-* ``FRAME_INDEX_SCHEMA`` has no ``is_discard`` column, so every sample counts as
-  displayable where a media-backed sensor reports only displayable frames. A stream with
-  discarded packets reports more samples here, and that is not detectable from the index
-  alone.
+``FRAME_INDEX_SCHEMA`` has no ``is_discard`` column, so the index includes samples
+that a decoder may discard. This difference cannot be detected from the index alone.
 """
 
 from collections.abc import Iterable
+from typing import Literal, Self, overload
 
 import lance  # type: ignore[import-untyped]
 import pyarrow as pa
 from loguru import logger
 
 from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
-from cosmos_curator.core.utils.storage_cli import get_lance_storage_options
+from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
+from cosmos_curator.core.utils.storage.storage_utils import (
+    get_lance_storage_options,
+    get_storage_client,
+    is_remote_path,
+)
+from cosmos_curator.core.utils.storage_cli import get_lance_storage_options as get_cli_lance_storage_options
 from cosmos_curator.next.recipes.mp4_index.contracts import RECORD_SCHEMA_VERSION, read_video_record
 from cosmos_curator.next.utils.lance_fragment_recovery import sql_string_literal
 from cosmos_curator.next.utils.lance_utils import open_dataset
+from cosmos_curator.next.utils.local_uri import local_path
 from cosmos_curator.next.utils.uris import normalize_location
 
 #: The columns one lookup projects. ``media_size_bytes`` is compared against the
@@ -60,9 +62,8 @@ class Mp4IndexLookup:
     """An open ``manifest.lance``, queried for one video's frame index.
 
     Opened once and held across a session's streams. Each lookup is a point query
-    against the manifest's BTREE index on ``media_location``. Misses are expected, since
-    a dataset is often only partly indexed, so any failure to find a usable row returns
-    ``None`` and the caller opens the media.
+    against the manifest's BTREE index on ``media_location``. Optional lookups return
+    ``None`` for unusable records; required lookups raise.
     """
 
     def __init__(self, dataset: lance.LanceDataset) -> None:
@@ -79,19 +80,22 @@ class Mp4IndexLookup:
         *,
         s3_profile_name: str | None = None,
         endpoint_url: str | None = None,
-    ) -> "Mp4IndexLookup | None":
+        storage_profile: str | None = None,
+    ) -> Self | None:
         """Open *manifest_uri*, or return ``None`` when there is no dataset there.
 
-        A missing manifest is not an error. The index is optional, so a run pointed at
-        one that has not been built yet opens the videos instead.
+        Use :meth:`open_required` when the manifest must exist.
+        ``storage_profile`` selects recipe profiles; otherwise use CLI credentials.
 
         Raises:
             ValueError: if the manifest's rows predate the current
                 ``RECORD_SCHEMA_VERSION``.
 
         """
-        storage_options = get_lance_storage_options(
-            manifest_uri, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
+        storage_options = (
+            get_lance_storage_options(manifest_uri, profile_name=storage_profile)
+            if storage_profile is not None
+            else get_cli_lance_storage_options(manifest_uri, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
         )
         dataset = open_dataset(manifest_uri, storage_options=storage_options)
         if dataset is None:
@@ -99,7 +103,46 @@ class Mp4IndexLookup:
         _reject_stale_schema(dataset, manifest_uri)
         return cls(dataset)
 
-    def index_for(self, source: str, *, media_size_bytes: int | None) -> tuple[Mp4FrameIndex, Mp4Metadata] | None:
+    @classmethod
+    def open_required(
+        cls,
+        manifest_uri: str,
+        *,
+        storage_profile: str = "default",
+    ) -> Self:
+        """Open a required manifest using recipe profiles, raising FileNotFoundError if absent."""
+        lookup = cls.open(normalize_location(manifest_uri), storage_profile=storage_profile)
+        if lookup is None:
+            msg = f"Configured mp4-index manifest does not exist: {manifest_uri}"
+            raise FileNotFoundError(msg)
+        return lookup
+
+    def require_index_for(self, source: str, *, storage_profile: str) -> tuple[Mp4FrameIndex, Mp4Metadata]:
+        """Read the source's current size and require a matching indexed record."""
+        location = normalize_location(source)
+        if is_remote_path(location):
+            client = get_storage_client(location, profile_name=storage_profile)
+            if not isinstance(client, S3Client):
+                msg = f"Cannot check the indexed source size for {source}"
+                raise ValueError(msg)
+            media_size = client.stat(S3Prefix(location)).size_bytes
+        else:
+            media_size = local_path(location).stat().st_size
+        return self.index_for(location, media_size_bytes=media_size, required=True)
+
+    @overload
+    def index_for(
+        self, source: str, *, media_size_bytes: int | None, required: Literal[True]
+    ) -> tuple[Mp4FrameIndex, Mp4Metadata]: ...
+
+    @overload
+    def index_for(
+        self, source: str, *, media_size_bytes: int | None, required: bool = False
+    ) -> tuple[Mp4FrameIndex, Mp4Metadata] | None: ...
+
+    def index_for(
+        self, source: str, *, media_size_bytes: int | None, required: bool = False
+    ) -> tuple[Mp4FrameIndex, Mp4Metadata] | None:
         """Return the frame index for *source*, or ``None`` if the manifest has no usable row.
 
         Args:
@@ -107,6 +150,8 @@ class Mp4IndexLookup:
             media_size_bytes: the object's current size, or ``None`` if it could not be
                 read. Compared against the indexed size, because this recipe keys its
                 rows on location alone, so a replaced video keeps its old row.
+            required: Raise on missing, ambiguous, stale, or invalid records rather
+                than returning None. For consumers that require indexed input.
 
         Returns:
             The video's frame index and box metadata, or ``None`` if there is no row for
@@ -115,18 +160,28 @@ class Mp4IndexLookup:
         """
         key = _manifest_key(source)
         if key is None:
+            if required:
+                msg = f"Cannot look up indexed source {source}"
+                raise ValueError(msg)
             return None
-        # One try block for all three steps: whatever goes wrong here, the answer is to
-        # open the video. Letting a malformed row or a transport error propagate would
-        # record the stream as one whose video could not be read.
+        # Optional consumers can read the media when the stored row is unusable.
+        # Required consumers propagate the original error.
         try:
             table = self._dataset.to_table(columns=list(_PROJECTION), filter=_media_location_filter([key]))
-            if table.num_rows == 0:
+            if table.num_rows != 1:
+                if required:
+                    msg = f"mp4-index must contain exactly one record for {source}; found {table.num_rows}"
+                    raise ValueError(msg)  # noqa: TRY301 -- strict errors propagate; optional reads fall back
                 return None
             if not self._describes_current_bytes(source, table, media_size_bytes):
+                if required:
+                    msg = f"mp4-index size is stale or unverifiable for {source}; re-run mp4-index"
+                    raise ValueError(msg)  # noqa: TRY301 -- strict errors propagate; optional reads fall back
                 return None
             return _unwrap(table)
         except (ValueError, OSError):
+            if required:
+                raise
             # Unexpected: if the manifest fails this way for every row, the run is slow
             # and nothing explains why. Warn so there is something to read.
             logger.opt(exception=True).warning("mp4-index row for {} unusable; opening the video", source)
@@ -177,8 +232,8 @@ def _manifest_key(source: str) -> str | None:
 def _unwrap(table: pa.Table) -> tuple[Mp4FrameIndex, Mp4Metadata]:
     """Convert one manifest row into the sensor library's ``Mp4FrameIndex`` and ``Mp4Metadata``.
 
-    Does not apply the edit list. A caller reading ``dts_ns`` is reading the one timeline
-    an ``elst`` never shifts, so an unsupported edit list must not fail the read.
+    The sensor library computes media and edited PTS; unsupported edits raise
+    during frame-index construction.
     """
     frame_table, metadata_row = read_video_record(table)
     metadata = Mp4Metadata.from_row(metadata_row)
@@ -186,7 +241,7 @@ def _unwrap(table: pa.Table) -> tuple[Mp4FrameIndex, Mp4Metadata]:
         frame_table,
         time_base_num=metadata.time_base_num,
         time_base_den=metadata.time_base_den,
-        elst_bytes=None,
+        elst_bytes=metadata.elst_bytes,
     )
     return index, metadata
 

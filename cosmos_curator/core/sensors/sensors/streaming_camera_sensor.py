@@ -17,19 +17,19 @@
 import itertools
 from collections.abc import Generator, Iterator
 from fractions import Fraction
-from typing import Self
 
 import attrs
 import numpy as np
 import numpy.typing as npt
 
-from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata, TimestampArray
 from cosmos_curator.core.sensors.data.streaming_camera_data import StreamingCameraData, StreamingFrame
+from cosmos_curator.core.sensors.mp4.indexing import Mp4Indexer, index_video
 from cosmos_curator.core.sensors.sampling.grid import SamplingWindow
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
 from cosmos_curator.core.sensors.sampling.sampler import find_closest_indices
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
-from cosmos_curator.core.sensors.types.types import DataSource, TimestampSource
+from cosmos_curator.core.sensors.types.types import DataSource, TimestampSource, VideoFrameAlignmentField
 from cosmos_curator.core.sensors.utils.validation import require_1d, require_strictly_increasing
 from cosmos_curator.core.sensors.utils.video import (
     DEFAULT_VIDEO_DECODE_CONFIG,
@@ -40,12 +40,21 @@ from cosmos_curator.core.sensors.utils.video import (
 _MIN_FOR_AN_INTERVAL = 2
 _INT64_MAX = int(np.iinfo(np.int64).max)
 
+_INDEX_TIMESTAMP_SOURCES: dict[VideoFrameAlignmentField, TimestampSource] = {
+    VideoFrameAlignmentField.DTS_NS: TimestampSource.CONTAINER_DTS,
+    VideoFrameAlignmentField.PTS_NS: TimestampSource.CONTAINER_PTS,
+    VideoFrameAlignmentField.EDITED_PTS_NS: TimestampSource.CONTAINER_PTS,
+    VideoFrameAlignmentField.EOF_NS: TimestampSource.SENSOR,
+    VideoFrameAlignmentField.SOF_NS: TimestampSource.SENSOR,
+    VideoFrameAlignmentField.MOE_NS: TimestampSource.SENSOR,
+}
+
 
 class IndexRecordUnusableError(ValueError):
-    """A frame index exists but cannot describe this stream, so the caller opens the media.
+    """A frame index cannot describe this stream or the selected timeline.
 
-    Raised when the index has no frames, or when its frame count disagrees with the
-    sensor timeline beside the video.
+    Raised when the index has no frames, its frame count disagrees with
+    metadata, or the selected timestamp array has missing values.
     """
 
 
@@ -75,28 +84,12 @@ def _avg_frame_rate(metadata: Mp4Metadata) -> Fraction:
     return Fraction(metadata.avg_frame_rate_num, metadata.avg_frame_rate_den)
 
 
-def _require_matching_length(sensor_timestamps_ns: npt.NDArray[np.int64], frames: int) -> npt.NDArray[np.int64]:
-    """Return *sensor_timestamps_ns* unchanged, or reject the index if it has a different count.
-
-    The counts can differ legitimately: the index counts every sample, while a sensor
-    timeline has one entry per *displayable* frame. Raising
-    :class:`IndexRecordUnusableError` lets the caller open the video instead.
-    """
-    if len(sensor_timestamps_ns) != frames:
-        msg = (
-            f"sensor timeline describes {len(sensor_timestamps_ns)} observations "
-            f"but the frame index has {frames} frames"
-        )
-        raise IndexRecordUnusableError(msg)
-    return sensor_timestamps_ns
-
-
 def _serving_timestamps(
     timeline_ns: npt.NDArray[np.int64], references_ns: npt.NDArray[np.int64]
 ) -> npt.NDArray[np.int64]:
-    """Return the capture timestamp that will serve each reference.
+    """Return the timeline timestamp selected for each reference.
 
-    Which observation serves a reference is decided by capture times alone, so
+    Which observation serves a reference is decided by the supplied timestamps alone, so
     the answer exists before anything is decoded. The walk reaches it by
     stepping and this by lookup, and they agree because ``find_closest_indices``
     is the same rule the indexed sensor samples by.
@@ -132,142 +125,122 @@ def _validate_next_window(window: SamplingWindow, state: _WindowValidationState)
     state.previous_end = int(window.exclusive_end_ns)
 
 
-class StreamingCameraSensor:
-    """A forward-only camera sensor that yields frames as the caller pulls them.
+def _indexed_timeline(index: Mp4FrameIndex, alignment_field: VideoFrameAlignmentField) -> npt.NDArray[np.int64]:
+    """Select an index timeline, using presentation order for frame alignment."""
+    timestamp_field = alignment_field.value
+    timestamps_ns: TimestampArray | None = getattr(index, timestamp_field)
+    if timestamps_ns is None:
+        msg = f"frame index has no {timestamp_field} timestamps"
+        raise IndexRecordUnusableError(msg)
+    if isinstance(timestamps_ns, np.ma.MaskedArray) and np.any(timestamps_ns.mask):
+        msg = f"frame index {timestamp_field} has missing timestamps"
+        raise IndexRecordUnusableError(msg)
+    timeline_ns = np.asarray(timestamps_ns)
+    return timeline_ns if alignment_field is VideoFrameAlignmentField.DTS_NS else timeline_ns[index.pts_sort_order]
 
-    Unlike ``CameraSensor``, which materializes a window's frames, this walks the
-    container once. Alignment retains the current frame and one lookahead frame,
-    independently of window length; codec buffers, timestamps, indexes, and
-    caller-retained outputs contribute additional memory.
+
+class StreamingCameraSensor:
+    """A forward-only camera sensor backed by an MP4 frame index.
+
+    Metadata and the frame index may be supplied together or built lazily from the
+    source. The selected alignment field supplies the frame timestamps.
+    Sampling serves frames in presentation order, keeping the current frame and one
+    lookahead frame independently of window length. Codec buffers, timestamps,
+    indexes, and caller-retained outputs contribute additional memory.
 
     Each reference timestamp in ``spec.grid`` selects its nearest source frame,
     even outside the window's bounds. With the same source timeline, reference
     grid, and policy, changing window boundaries preserves selected timestamps
     and pixels. Windows must not overlap, and their payloads must be consumed in
     order through the shared decode pass; several windows can supply one logical clip.
-
-    Two ways to build one, and they answer different amounts. The constructor
-    takes a source and a timeline, which is everything sampling needs, and leaves
-    the container's scalar facts unknown: :attr:`codec_name`, :attr:`has_bframes`,
-    and :attr:`avg_frame_rate` raise. :meth:`from_index` supplies those from a
-    precomputed index, and may leave the source out entirely, for a caller that
-    measures a recording's timing without reading a frame of it.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- source, indexing, alignment, and precomputed metadata are independent options
         self,
-        source: DataSource | None,
+        source: DataSource | None = None,
         stream_idx: int = 0,
         decode_config: CpuVideoDecodeConfig = DEFAULT_VIDEO_DECODE_CONFIG,
         *,
-        timestamps_ns: npt.NDArray[np.int64],
+        metadata: Mp4Metadata | None = None,
+        frame_index: Mp4FrameIndex | None = None,
+        alignment_field: VideoFrameAlignmentField = VideoFrameAlignmentField.PTS_NS,
+        indexer: Mp4Indexer = Mp4Indexer.PYAV,
     ) -> None:
         """Initialize the streaming camera sensor.
 
         Args:
-            source: Video data source. See
-                :data:`cosmos_curator.core.sensors.types.types.DataSource`.
-                The library accepts no URIs; callers open their own stream.
-                ``None`` only through :meth:`from_index`, which builds a sensor
-                that answers timestamps and refuses to decode.
-            stream_idx: PyAV index of the video stream to decode, usually 0.
-            decode_config: Backend configuration for frame decoding, matching
-                ``CameraSensor``. Its ``thread_count`` is worth choosing against
-                whatever CPU reservation the caller holds.
-            timestamps_ns: The recording's own capture times, one per frame, in
-                ascending int64 nanoseconds. Supplied rather than read, because
-                the only way to learn them from the container is to index it,
-                which is the eager pass this sensor exists to avoid. Ascending
-                order is required to decode but not to construct; see
-                :meth:`sample`.
+            source: Video source, or None for a supplied index used without decoding.
+            stream_idx: Video stream position used for indexing and decoding.
+            decode_config: Frame decoder configuration.
+            metadata: MP4 metadata. Must be supplied together with frame_index.
+            frame_index: MP4 frame index. Must be supplied together with metadata.
+            alignment_field: Frame-index timestamp field used for alignment.
+            indexer: Backend used when metadata and the frame index are not supplied.
 
         Raises:
-            ValueError: If *timestamps_ns* is not a non-empty int64 array of rank
-                one.
+            ValueError: Only one of metadata and frame_index is supplied, or no source
+                is available to build them.
+            TypeError: The alignment field or indexer is not an enum member.
+            IndexRecordUnusableError: The supplied index is empty or disagrees with metadata.
 
         """
+        if (metadata is None) != (frame_index is None):
+            msg = "metadata and frame_index must be supplied together"
+            raise ValueError(msg)
+        if source is None and frame_index is None:
+            msg = "source is required when metadata and frame_index are not supplied"
+            raise ValueError(msg)
+        alignment_value: object = alignment_field
+        indexer_value: object = indexer
+        if not isinstance(alignment_value, VideoFrameAlignmentField):
+            msg = "alignment_field must be a VideoFrameAlignmentField"
+            raise TypeError(msg)
+        if not isinstance(indexer_value, Mp4Indexer):
+            msg = "indexer must be an Mp4Indexer"
+            raise TypeError(msg)
+        if frame_index is not None and metadata is not None:
+            if len(frame_index) == 0:
+                msg = "frame index contains no frames"
+                raise IndexRecordUnusableError(msg)
+            if len(frame_index) != metadata.frame_count:
+                msg = "frame index count disagrees with metadata.frame_count"
+                raise IndexRecordUnusableError(msg)
         self._source = source
         self._stream_idx = stream_idx
         self._decode_config = decode_config
-        self._timestamps_ns = _validate_timeline(timestamps_ns)
-        self._index: Mp4FrameIndex | None = None
-        self._metadata: Mp4Metadata | None = None
-        self._timestamp_source = TimestampSource.SENSOR
+        self._metadata = metadata
+        self._frame_index = frame_index
+        self._alignment_field = alignment_field
+        self._indexer = indexer
 
-    @classmethod
-    def from_index(
-        cls,
-        index: Mp4FrameIndex,
-        metadata: Mp4Metadata,
-        *,
-        source: DataSource | None = None,
-        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None,
-    ) -> Self:
-        """Build a sensor from a frame index computed elsewhere.
-
-        The index carries the timeline and the container's scalar facts, so a
-        sensor built this way answers an integrity check without opening the
-        video at all. Pass *source* to decode from it as well.
-
-        Args:
-            index: The video's frame index, in decode order.
-            metadata: The video's box metadata, for the scalar container facts.
-            source: The video itself, if frames will also be read. ``None``
-                builds a sensor that refuses to decode.
-            sensor_timestamps_ns: The recording's own clock, one entry per frame,
-                or ``None`` to report the container's decode timestamps.
-
-        Returns:
-            A sensor reporting *sensor_timestamps_ns* when given and
-            ``index.dts_ns`` otherwise.
-
-        Raises:
-            IndexRecordUnusableError: If *index* has no frames, or if
-                *sensor_timestamps_ns* describes a different number of frames.
-
-        """
-        # Checked here rather than left to the constructor's non-empty check, so an
-        # empty index is the error callers fall back on and not a plain ValueError.
-        if len(index) == 0:
-            msg = "frame index contains no frames"
-            raise IndexRecordUnusableError(msg)
-        if sensor_timestamps_ns is None:
-            timeline_ns = index.dts_ns
-            timestamp_source = TimestampSource.CONTAINER_DTS
-        else:
-            timeline_ns = _require_matching_length(sensor_timestamps_ns, len(index))
-            timestamp_source = TimestampSource.SENSOR
-        sensor = cls(source, timestamps_ns=timeline_ns)
-        sensor._index = index
-        sensor._metadata = metadata
-        sensor._timestamp_source = timestamp_source
-        return sensor
+    def _ensure_index(self) -> tuple[Mp4Metadata, Mp4FrameIndex]:
+        """Return metadata and the frame index, building both if needed."""
+        metadata, frame_index = self._metadata, self._frame_index
+        if metadata is None or frame_index is None:
+            source = self._source
+            if source is None:
+                msg = "source is required to build metadata and the frame index"
+                raise ValueError(msg)
+            metadata, frame_index = index_video(source, indexer=self._indexer, stream_idx=self._stream_idx)
+            self._metadata, self._frame_index = metadata, frame_index
+        return metadata, frame_index
 
     @property
-    def index(self) -> Mp4FrameIndex:
-        """The frame index this sensor was built from.
-
-        Raises:
-            RuntimeError: If the sensor was not built by :meth:`from_index`.
-
-        """
-        if self._index is None:
-            msg = "this sensor was not built from an index, so it has no frame index to report"
-            raise RuntimeError(msg)
-        return self._index
+    def frame_index(self) -> Mp4FrameIndex:
+        """Return the frame index, building it from the source if needed."""
+        _, frame_index = self._ensure_index()
+        return frame_index
 
     @property
     def metadata(self) -> Mp4Metadata:
-        """The container metadata this sensor was built from.
+        """Return the MP4 metadata, building it from the source if needed."""
+        metadata, _ = self._ensure_index()
+        return metadata
 
-        Raises:
-            RuntimeError: If the sensor was not built by :meth:`from_index`.
-
-        """
-        if self._metadata is None:
-            msg = "this sensor was not built from an index, so it has no container metadata to report"
-            raise RuntimeError(msg)
-        return self._metadata
+    @property
+    def alignment_field(self) -> VideoFrameAlignmentField:
+        """Return the timestamp field selected for alignment."""
+        return self._alignment_field
 
     @property
     def codec_name(self) -> str:
@@ -279,7 +252,7 @@ class StreamingCameraSensor:
         """Whether the container carries composition offsets, i.e. signals frame reordering."""
         # An all-null column means the ctts box is absent; an all-zero one means it is
         # present and says there is no reordering.
-        offsets = self.index.composition_offset_ticks
+        offsets = self.frame_index.composition_offset_ticks
         return offsets is not None and bool(np.any(offsets != 0))
 
     @property
@@ -290,29 +263,34 @@ class StreamingCameraSensor:
     @property
     def timestamp_source(self) -> TimestampSource:
         """Which clock :attr:`timestamps_ns` is on."""
-        return self._timestamp_source
+        return _INDEX_TIMESTAMP_SOURCES[self._alignment_field]
 
     @property
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
-        """The whole timeline in ``int64`` nanoseconds."""
-        return self._timestamps_ns
+        """Return the selected frame-index timestamps in int64 nanoseconds.
+
+        Raises:
+            IndexRecordUnusableError: The selected field is absent or partially missing.
+
+        """
+        return _validate_timeline(_indexed_timeline(self.frame_index, self._alignment_field))
 
     @property
     def start_ns(self) -> int:
-        """Return the first capture timestamp, in nanoseconds."""
-        return int(self._timestamps_ns[0])
+        """Return the first timeline timestamp, in nanoseconds."""
+        return int(self.timestamps_ns[0])
 
     @property
     def end_ns(self) -> int:
-        """Return the last capture timestamp, in nanoseconds."""
-        return int(self._timestamps_ns[-1])
+        """Return the last timeline timestamp, in nanoseconds."""
+        return int(self.timestamps_ns[-1])
 
     def supports_sampling_policy(self, policy: object) -> bool:
         """Return whether this sensor can sample with *policy*."""
         return isinstance(policy, NearestTimestampPolicy)
 
     def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
-        """Yield the recording's capture times in order, without resampling.
+        """Yield timestamps in timeline order, without resampling.
 
         Args:
             batch_size: ``0`` yields every timestamp in one batch; ``> 0`` yields
@@ -329,11 +307,12 @@ class StreamingCameraSensor:
         if batch_size < 0:
             msg = f"batch_size must be non-negative, got {batch_size}"
             raise ValueError(msg)
+        timestamps_ns = self.timestamps_ns
         if batch_size == 0:
-            yield self._timestamps_ns
+            yield timestamps_ns
             return
-        for start in range(0, len(self._timestamps_ns), batch_size):
-            yield self._timestamps_ns[start : start + batch_size]
+        for start in range(0, len(timestamps_ns), batch_size):
+            yield timestamps_ns[start : start + batch_size]
 
     def sample(self, spec: SamplingSpec, *, policy: NearestTimestampPolicy) -> Generator[StreamingCameraData]:
         """Walk the video once, yielding one payload per window of ``spec.grid``.
@@ -370,7 +349,8 @@ class StreamingCameraSensor:
         Raises:
             RuntimeError: If the sensor was built without a source, or if a
                 payload is consumed after a later one has been.
-            ValueError: If ``timestamps_ns`` does not strictly ascend, if the
+            ValueError: If DTS alignment would require changing frame order, if
+                ``timestamps_ns`` does not strictly ascend, if the
                 stream has no displayable frames, if the grid's windows overlap
                 or run backwards, if the recording's origin shifts its
                 timestamps outside signed int64, or if a served frame disagrees
@@ -381,13 +361,20 @@ class StreamingCameraSensor:
         if source is None:
             msg = "this sensor was built from an index and has no media to decode"
             raise RuntimeError(msg)
-        require_strictly_increasing("timestamps_ns", self._timestamps_ns)
-        return self._walk(source, spec, policy=policy)
+        timestamps_ns = self.timestamps_ns
+        require_strictly_increasing("timestamps_ns", timestamps_ns)
+        if self._alignment_field is VideoFrameAlignmentField.DTS_NS:
+            presentation_order = self.frame_index.pts_sort_order
+            if np.any(presentation_order[1:] < presentation_order[:-1]):
+                msg = "DTS_NS sampling requires matching decode and presentation order; select PTS_NS or another field"
+                raise ValueError(msg)
+        return self._walk(source, spec, timestamps_ns, policy=policy)
 
     def _walk(
         self,
         source: DataSource,
         spec: SamplingSpec,
+        timeline_ns: npt.NDArray[np.int64],
         *,
         policy: NearestTimestampPolicy,
     ) -> Generator[StreamingCameraData]:
@@ -396,23 +383,33 @@ class StreamingCameraSensor:
         Split from :meth:`sample` so that method's checks run when it is called
         rather than when its first payload is pulled.
         """
-        frames = iter_video_frames(
-            source,
-            self._stream_idx,
-            self._decode_config,
-            track_id=None if self._metadata is None else self._metadata.track_id,
+        frames: Iterator[tuple[int, npt.NDArray[np.uint8]]] = iter_video_frames(
+            source, self._stream_idx, self._decode_config, track_id=self.metadata.track_id
         )
-        cursor = _Cursor(frames, timeline_ns=self._timestamps_ns)
-        state = _WindowValidationState()
-        sequence = itertools.count()
-        for window in spec.grid:
-            _validate_next_window(window, state)
-            expected_ns = _serving_timestamps(self._timestamps_ns, window.timestamps_ns)
-            yield StreamingCameraData(
-                align_timestamps_ns=window.timestamps_ns,
-                sensor_timestamps_ns=expected_ns,
-                walk=cursor.serve(window, policy.max_delta_ns, next(sequence)),
-            )
+        yield from stream_camera_windows(frames, timeline_ns, spec, policy=policy)
+
+
+def stream_camera_windows(
+    frames: Iterator[tuple[int, npt.NDArray[np.uint8]]],
+    timeline_ns: npt.NDArray[np.int64],
+    spec: SamplingSpec,
+    *,
+    policy: NearestTimestampPolicy,
+) -> Generator[StreamingCameraData]:
+    """Align a decoded frame iterator to reference windows using its supplied timeline."""
+    _validate_timeline(timeline_ns)
+    require_strictly_increasing("timestamps_ns", timeline_ns)
+    cursor = _Cursor(frames, timeline_ns=timeline_ns)
+    state = _WindowValidationState()
+    sequence = itertools.count()
+    for window in spec.grid:
+        _validate_next_window(window, state)
+        expected_ns = _serving_timestamps(timeline_ns, window.timestamps_ns)
+        yield StreamingCameraData(
+            align_timestamps_ns=window.timestamps_ns,
+            sensor_timestamps_ns=expected_ns,
+            walk=cursor.serve(window, policy.max_delta_ns, next(sequence)),
+        )
 
 
 @attrs.define(slots=True)
@@ -445,15 +442,15 @@ class _Cursor:
                 self._current = self._upcoming
                 self._upcoming = self._advance()
 
-            pts_ns, frame = self._current
-            delta_ns = abs(pts_ns - reference)
+            timestamp_ns, frame = self._current
+            delta_ns = abs(timestamp_ns - reference)
             if max_delta_ns is not None and delta_ns > max_delta_ns:
                 msg = (
                     f"max_delta_ns={max_delta_ns} exceeded: "
-                    f"delta was {delta_ns} ns for reference={reference}, pts={pts_ns}"
+                    f"delta was {delta_ns} ns for reference={reference}, timestamp={timestamp_ns}"
                 )
                 raise ValueError(msg)
-            yield reference, pts_ns, frame
+            yield reference, timestamp_ns, frame
 
     def _claim(self, sequence: int) -> None:
         """Refuse a payload that would draw from behind the walk's position.
@@ -506,7 +503,7 @@ class _Cursor:
     def _observed(self, row: tuple[int, npt.NDArray[np.uint8]]) -> tuple[int, npt.NDArray[np.uint8]]:
         """Timestamp one frame from the timeline.
 
-        The nth frame decoded is the nth observation recorded. Nothing compares
+        Each frame is paired with the next selected timestamp. Nothing compares
         their times: a container written at a declared rate spaces its frames
         evenly and cannot express a camera pausing, so a timeline that records
         one disagrees with it by a frame period from then on, while still

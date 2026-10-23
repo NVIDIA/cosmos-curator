@@ -52,7 +52,7 @@ from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
     IndexRecordUnusableError,
     StreamingCameraSensor,
 )
-from cosmos_curator.core.sensors.types.types import DataSource
+from cosmos_curator.core.sensors.types.types import DataSource, VideoFrameAlignmentField
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
 from cosmos_curator.core.utils.storage_cli import open_storage_source
@@ -405,15 +405,19 @@ def _indexed_sensor(
 ) -> StreamingCameraSensor | None:
     """Build a sensor over *record*, or return ``None`` so the caller opens the video.
 
+    External timelines retain the CameraSensor reader; their timestamp field is
+    not recorded, so they cannot be assigned to an EOF/SOF/MOE index field.
     A row that cannot describe this stream is expected rather than exceptional -- a
     sensor timeline counts displayable frames where the index counts samples -- so it
     is logged at debug and answered by reading the media instead.
     """
-    if record is None:
+    if record is None or sensor_timestamps_ns is not None:
         return None
     index, metadata = record
     try:
-        return StreamingCameraSensor.from_index(index, metadata, sensor_timestamps_ns=sensor_timestamps_ns)
+        return StreamingCameraSensor(
+            metadata=metadata, frame_index=index, alignment_field=VideoFrameAlignmentField.DTS_NS
+        )
     except IndexRecordUnusableError:
         logger.opt(exception=True).debug("mp4-index row for {} cannot answer; opening the video", source)
         return None

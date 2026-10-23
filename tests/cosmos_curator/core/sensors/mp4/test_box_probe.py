@@ -141,6 +141,13 @@ def test_index_from_boxes_reads_fragments_the_box_walker_refuses() -> None:
     assert probe.composition_offset is not None
 
 
+@pytest.mark.parametrize("stream_idx", [-1, 1])
+def test_index_from_boxes_rejects_out_of_range_video_streams(stream_idx: int) -> None:
+    """Explicit stream positions must identify a video stream without Python's negative indexing."""
+    with pytest.raises(BoxNotFoundError, match=f"video stream index {stream_idx} is out of range"):
+        index_from_boxes(*_boxes(real_mp4.CLIP.read_bytes()), stream_idx=stream_idx)
+
+
 def test_index_from_boxes_indexes_the_video_stream_libav_ranks_best() -> None:
     """With two video tracks, the index and its metadata are those of libav's best stream."""
     data = real_mp4.mjpeg_then_h264_clip()

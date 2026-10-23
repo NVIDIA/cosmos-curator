@@ -85,8 +85,8 @@ def make_session() -> Callable[..., Path]:
         # round(k * period), not k * round(period): a period that is not a whole
         # number of nanoseconds drifts otherwise, and the drift costs a clip.
         #
-        # Skippable so a test can stand up a session whose camera has no capture
-        # sidecar at all, which is the case ``allow_pts_fallback`` exists for.
+        # Skippable so a test can stand up a session whose camera has no sensor
+        # timestamp sidecar, which requires an explicit container-PTS choice.
         if write_timestamps:
             period_ns = _NS_PER_SECOND / fps
             timestamps_ns = np.array([origin_ns + round(index * period_ns) for index in range(frames)], dtype=np.int64)
@@ -448,7 +448,7 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         camera_key: str = "front",
         cameras: dict[str, str] | None = None,
         optional_cameras: frozenset[str] = frozenset(),
-        pts_fallback_cameras: frozenset[str] = frozenset(),
+        camera_alignment_fields: dict[str, list[str]] | None = None,
         mcap_sensors: dict[str, str] | None = None,
         optional_sensors: frozenset[str] = frozenset(),
         topic: str | None = None,
@@ -482,7 +482,11 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
                             "sensor_type": "camera",
                             "uri_pattern": pattern,
                             "required": key not in optional_cameras,
-                            "allow_pts_fallback": key in pts_fallback_cameras,
+                            **(
+                                {"camera_alignment_fields": camera_alignment_fields[key]}
+                                if camera_alignment_fields is not None and key in camera_alignment_fields
+                                else {}
+                            ),
                         }
                         for key, pattern in camera_map.items()
                     },

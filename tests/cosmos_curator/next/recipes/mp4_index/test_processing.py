@@ -506,7 +506,7 @@ def test_process_one_video_succeeds_on_an_edit_list_elst_decoding_cannot_apply_t
 
     ``ffmpeg -i in.mp4 -c copy -output_ts_offset 0.5 out.mp4`` writes a two-entry elst: an empty
     edit (``media_time=-1``) followed by a normal one -- a real, common pattern PyAV indexes fine,
-    but ``Mp4FrameIndex.from_video_track``'s own eager elst decoding refuses any multi-entry elst.
+    but ``Mp4FrameIndex.pts_ns`` interpretation supports only single-entry playback edits.
     """
     media_path = tmp_path / "session-a" / "unit-00" / "video-1.mp4"
     elst_content = bf.edit_list_box(entries=[(0, -1, 1, 0), (1000, 500, 1, 0)])

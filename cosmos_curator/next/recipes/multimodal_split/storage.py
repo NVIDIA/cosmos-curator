@@ -31,6 +31,8 @@ import numpy as np
 import numpy.typing as npt
 import smart_open
 
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
+from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
 from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
 from cosmos_curator.core.sensors.utils.video import make_index_and_metadata
 from cosmos_curator.core.utils.storage.s3_client import S3Client
@@ -119,25 +121,30 @@ def load_sensor_timestamps_ns(
 
 
 def load_container_pts_ns(
-    sensor_uri: str, *, storage_profile: str = "default", read_buffer_bytes: int | None = None
+    sensor_uri: str,
+    *,
+    storage_profile: str = "default",
+    read_buffer_bytes: int | None = None,
+    alignment_field: VideoFrameAlignmentField = VideoFrameAlignmentField.EDITED_PTS_NS,
 ) -> npt.NDArray[np.int64]:
     """Read a camera's presentation timestamps by indexing its own container.
 
-    The fallback for a camera with no sensor timeline: indexing is the only way
-    to learn a container's PTS, which is the eager pass
-    ``load_sensor_timestamps_ns`` exists to avoid paying when a sensor timeline
-    is already on hand.
+    ``pts_ns`` selects container PTS before playback edits; ``edited_pts_ns``
+    applies supported edit-list shifts. Either requires an eager indexing pass.
 
     Raises:
-        ValueError: If the video stream has no displayable frames. Mirrors
-            ``CameraSensor``'s own check on the same array: an empty timeline
-            would otherwise read as a valid fallback and fail later, wherever
-            something asks it for a first or last timestamp.
+        ValueError: If the field is not a container clock or there are no displayable frames.
 
     """
+    if alignment_field not in (VideoFrameAlignmentField.PTS_NS, VideoFrameAlignmentField.EDITED_PTS_NS):
+        msg = "container timestamps require pts_ns or edited_pts_ns"
+        raise ValueError(msg)
     with open_sensor_source(sensor_uri, storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes) as stream:
-        video_index, _ = make_index_and_metadata(stream)
-        timestamps_ns = video_index.display_pts_ns
+        if alignment_field is VideoFrameAlignmentField.PTS_NS:
+            timestamps_ns = StreamingCameraSensor(stream, alignment_field=alignment_field).timestamps_ns
+        else:
+            video_index, _ = make_index_and_metadata(stream)
+            timestamps_ns = video_index.display_pts_ns
         if len(timestamps_ns) == 0:
             msg = f"{sensor_uri} has no displayable frames, so it has no container PTS to fall back to"
             raise ValueError(msg)

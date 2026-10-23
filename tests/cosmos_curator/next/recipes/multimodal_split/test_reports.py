@@ -84,6 +84,7 @@ def test_write_clip_manifest_records_where_and_how_fast_a_clip_was_cut(tmp_path:
         output_path=str(tmp_path),
         sampling_fps=30,
         storage_profile="default",
+        camera_alignment_fields={"front": "moe_ns", "left": "eof_ns"},
     )
 
     manifest_path = tmp_path / "sessions" / "session-000" / "clip-abc" / "clip.json"

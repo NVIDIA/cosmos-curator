@@ -29,6 +29,7 @@ from cosmos_curator.core.sensors.data.video import VideoProbe
 from cosmos_curator.core.sensors.mp4.box_primitives import VIDEO_FOURCC_CODEC_NAMES
 from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.mp4.moov_track import VideoTrack
+from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import AttrsAttribute, optional_int64_array
 
 _NS_PER_SECOND = 1_000_000_000
@@ -64,11 +65,11 @@ _ELST_NORMAL_RATE = (1, 0)
 
 
 class UnsupportedEditListError(UnindexableVideoError):
-    """An ``edts/elst`` box this reader doesn't know how to apply to ``pts_ns``.
+    """An ``edts/elst`` box this reader cannot map to ``edited_pts_ns``.
 
     Only the common shape is applied: a single entry, playing at normal (1x) rate, with a
     non-negative ``media_time`` (the lead-in the encoder buffered before presentation
-    starts, trimmed by shifting every ``pts_ns`` back by that amount). Multiple entries, an
+    starts, represented in ``edited_pts_ns`` by subtracting that amount). Multiple entries, an
     empty edit (``media_time == -1``, meaning "insert a gap here"), a non-1x rate, or bytes
     too short to even hold the shape being checked all describe an edit list this reader
     refuses to guess at rather than silently produce a wrong shift.
@@ -114,6 +115,24 @@ def _edit_list_media_time_ticks(elst_bytes: bytes | None) -> int:
         msg = f"elst's single entry plays at rate {rate_integer}.{rate_fraction} -- only normal (1x) rate is supported"
         raise UnsupportedEditListError(msg)
     return int(media_time)
+
+
+def _edited_pts_ns(
+    pts_ns: npt.NDArray[np.int64],
+    *,
+    time_base_num: int,
+    time_base_den: int,
+    elst_bytes: bytes | None,
+) -> npt.NDArray[np.int64]:
+    """Apply the supported edit shift, sharing unchanged PTS.
+
+    Raises:
+        UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+    """
+    media_time_ticks = _edit_list_media_time_ticks(elst_bytes)
+    shift_ns = int(media_time_ticks) * int(time_base_num) * _NS_PER_SECOND // int(time_base_den)
+    return pts_ns if shift_ns == 0 else pts_ns - shift_ns
 
 
 #: Bounds `avg_frame_rate`'s denominator (after `Fraction.limit_denominator`) so its
@@ -174,32 +193,30 @@ def _stream_rate_stats(
 
 @attrs.define(frozen=True)
 class Mp4FrameIndex:
-    """Struct-of-arrays frame index in decode order.
+    """Frame index stored in decode order, with int64 nanosecond timestamps.
 
-    Timestamps, presentation order, and keyframe indices are computed at construction.
-    The track's time base converts ticks to nanoseconds; a supported ``edts/elst`` edit
-    shifts ``pts_ns`` but leaves ``dts_ns`` unchanged.
+    ``pts_ns`` is ``dts_ns`` plus composition offset; ``edited_pts_ns`` also applies
+    the supported playback edit shift. ``pts_sort_order[rank]`` gives the decode-order
+    sample index for a presentation rank without reordering the arrays. DTS and both
+    PTS arrays expose read-only views and may share buffers.
 
-    Optional upstream-provided EOF/SOF/MOE arrays use int64 nanoseconds and share
-    the frame index's decode order. Container time-base conversion, edit-list shifts,
-    and presentation sorting never transform these values.
+    EOF/SOF/MOE are independently optional sensor timestamps, unaffected by container
+    time-base conversion or edit shifts. SOF is readout start; MOE is exposure midpoint,
+    may precede SOF, and is never inferred from SOF/EOF.
 
-    ``eof_ns``, ``sof_ns``, and ``moe_ns`` are independently optional; recipes decide
-    which timestamps are required. ``sof_ns`` records readout start; ``moe_ns`` records exposure midpoint
-    and may precede SOF. SOF/MOE are independently absent when the recorder did not
-    populate them. Partially missing SOF/MOE use masked int64 arrays, with ``True``
-    marking unavailable frames; entirely missing columns are ``None``. Fully populated
-    columns remain ordinary NumPy arrays. Exposure midpoint is not derived from SOF/EOF.
-
-    ``pts_sort_order[rank]`` maps a presentation-order rank to a decode-order sample
-    index, without reordering the frame arrays.
+    Entirely absent timing arrays are ``None``. Partial SOF/MOE use masked int64 arrays
+    (``True`` means unavailable); EOF must be complete when present.
     """
 
     dts_ticks: npt.NDArray[np.int64]
     composition_offset_ticks: npt.NDArray[np.int64] | None  # None iff every row's own value is null
-    dts_ns: npt.NDArray[np.int64]
+    dts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
+    pts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
+    edited_pts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
     composition_offset_ns: npt.NDArray[np.int64] | None  # None iff every row's own value is null
-    pts_ns: npt.NDArray[np.int64]  # dts_ns + (composition_offset_ns or 0) - edit_list_shift_ns, decode order
+    time_base_num: int
+    time_base_den: int
+    elst_bytes: bytes | None
     pts_sort_order: npt.NDArray[np.int64]  # argsort(pts_ns) -- a decode-order-index permutation
     keyframe_indices: npt.NDArray[np.int64]  # flatnonzero(is_keyframe), already sorted
     is_keyframe: npt.NDArray[np.bool_]
@@ -243,12 +260,11 @@ class Mp4FrameIndex:
         sof_ns: TimestampArray | None = None,
         moe_ns: TimestampArray | None = None,
     ) -> Self:
-        """Shared construction path for both real constructors below -- one place ticks become ns/pts/order.
+        """Mp4FrameIndex initializer.
 
         Raises:
-            UnsupportedEditListError: *elst_bytes* is present but not the one shape this
-                reader knows how to apply -- see that class's own docstring.
             InvalidTimeBaseError: *time_base_den* is 0.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
 
         """
         dts_ns = _ticks_to_ns(dts_ticks, time_base_num, time_base_den)
@@ -257,19 +273,24 @@ class Mp4FrameIndex:
             if composition_offset_ticks is None
             else _ticks_to_ns(composition_offset_ticks, time_base_num, time_base_den)
         )
-        pts_ns = dts_ns if composition_offset_ns is None else dts_ns + composition_offset_ns
-        edit_list_media_time_ticks = _edit_list_media_time_ticks(elst_bytes)
-        if edit_list_media_time_ticks:
-            edit_list_shift_ns = (
-                int(edit_list_media_time_ticks) * int(time_base_num) * _NS_PER_SECOND // int(time_base_den)
-            )
-            pts_ns = pts_ns - edit_list_shift_ns
+        pts_ns = (
+            dts_ns
+            if composition_offset_ns is None or not np.any(composition_offset_ns)
+            else dts_ns + composition_offset_ns
+        )
+        edited_pts_ns = _edited_pts_ns(
+            pts_ns, time_base_num=time_base_num, time_base_den=time_base_den, elst_bytes=elst_bytes
+        )
         return cls(
             dts_ticks=dts_ticks,
             composition_offset_ticks=composition_offset_ticks,
             dts_ns=dts_ns,
-            composition_offset_ns=composition_offset_ns,
             pts_ns=pts_ns,
+            edited_pts_ns=edited_pts_ns,
+            composition_offset_ns=composition_offset_ns,
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+            elst_bytes=elst_bytes,
             pts_sort_order=np.argsort(pts_ns, kind="stable"),
             keyframe_indices=np.flatnonzero(is_keyframe),
             is_keyframe=is_keyframe,
@@ -287,14 +308,14 @@ class Mp4FrameIndex:
         """Build from a ``FRAME_INDEX_SCHEMA`` table and the video's accompanying metadata.
 
         Pass ``time_base_num``, ``time_base_den``, and ``elst_bytes`` from ``Mp4Metadata``
-        to convert ticks and apply the presentation-time shift.
+        to compute media and edited PTS once.
 
         Raises:
             ValueError: Composition offsets or EOF contain a mix of null and non-null values;
                 those columns must be all-null or fully populated. Partially missing SOF/MOE
                 are represented as masked int64 arrays without rounding through float64.
-            UnsupportedEditListError: The edit list has an unsupported shape.
             InvalidTimeBaseError: ``time_base_den`` is zero.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
 
         """
         dts_ticks = table.column("dts_ticks").to_numpy()
@@ -341,13 +362,31 @@ class Mp4FrameIndex:
         )
 
     @classmethod
-    def from_video_track(cls, video_track: VideoTrack) -> Self:
-        """Build directly from a real, already-parsed ``VideoTrack`` -- no sidecar round-trip.
+    def from_video_probe(cls, probe: VideoProbe, *, elst_bytes: bytes | None = None) -> Self:
+        """Build a frame index from a PyAV probe.
 
         Raises:
-            UnsupportedEditListError: *video_track*'s own ``elst_bytes`` is present but not
-                the one shape this reader knows how to apply.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+        """
+        return cls._assemble(
+            dts_ticks=probe.dts,
+            composition_offset_ticks=probe.composition_offset,
+            is_keyframe=probe.is_keyframe,
+            offset=probe.offset,
+            size=probe.size,
+            time_base_num=probe.time_base.numerator,
+            time_base_den=probe.time_base.denominator,
+            elst_bytes=elst_bytes,
+        )
+
+    @classmethod
+    def from_video_track(cls, video_track: VideoTrack) -> Self:
+        """Build a frame index from a parsed video track.
+
+        Raises:
             InvalidTimeBaseError: *video_track*'s own ``timescale`` is 0.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
 
         """
         dts_ticks, composition_offset_ticks, is_keyframe = video_track_sample_arrays(video_track)

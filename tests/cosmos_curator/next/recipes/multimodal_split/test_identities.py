@@ -158,7 +158,7 @@ def test_episode_and_materialization_digest_fixtures(
     assert split_clip_id == "e2d8eef2b261db0f41f75affa52c7d7bb77b812057705a8209d63c306ceda282"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "9b19fe0edb21bfcdc561d5ec2b160b523475aee456c6d2e0314e3c0f0d7f323a"
+    assert split_digest == "f4ed4de65c93cccd0e5e5a87ab204fde21b0d6979ce20edeb6179dc134692229"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "38d340b327919269c2eac214785bcf955b144c0faa186638e9ee50f82ef2a600"
+        == "ab5b53deaa21b765b4e6728abc7f048c081919d7bccb9a07484a713770bd02a1"
     )
 
 
@@ -185,20 +185,17 @@ def test_split_contract_includes_rendering_but_excludes_execution(
     assert make_split_contract_digest(execution) == make_split_contract_digest(baseline)
 
 
-def test_allow_pts_fallback_changes_the_split_contract(
+def test_camera_alignment_preferences_and_their_order_change_the_split_contract(
     tmp_path: Path,
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A camera's fallback setting is result-defining, not execution tuning.
+    """Changing clock preferences must not reconcile against the previous policy's output."""
+    configs = [
+        make_config(tmp_path / "input", tmp_path / "output", camera_alignment_fields={"front": fields})
+        for fields in (["eof_ns"], ["eof_ns", "edited_pts_ns"], ["edited_pts_ns", "eof_ns"])
+    ]
 
-    It decides whether the camera can produce output at all and which clock its
-    timeline came from, so a rerun that flips it must not reconcile against
-    episodes planned under the old setting.
-    """
-    without_fallback = make_config(tmp_path / "input", tmp_path / "output")
-    with_fallback = make_config(tmp_path / "input", tmp_path / "output", pts_fallback_cameras=frozenset({"front"}))
-
-    assert make_split_contract_digest(with_fallback) != make_split_contract_digest(without_fallback)
+    assert len({make_split_contract_digest(config) for config in configs}) == 3
 
 
 def test_whole_session_changes_the_split_contract(

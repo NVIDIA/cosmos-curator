@@ -63,6 +63,7 @@ MultimodalSplitVideoEncoder = Literal["libopenh264"]
 # Widened as each kind lands. A config naming a kind the recipe cannot process
 # yet is refused at load, rather than discovering it after a listing pass.
 MultimodalSplitSensorType = Literal["camera", "egotrajectory", "gps", "imu"]
+CameraAlignmentField = Literal["eof_ns", "moe_ns", "sof_ns", "pts_ns", "edited_pts_ns"]
 
 #: How a sensor's samples are placed on the clip's grid.
 #:
@@ -135,6 +136,12 @@ class MultimodalSplitInputConfig(BaseModel):
         description="Optional newline-delimited UTF-8 file of session IDs to join to input_path_prefix.",
         examples=["s3://example-bucket/sessions.txt"],
     )
+    mp4_index_uri: str | None = Field(
+        default=None,
+        description="Optional manifest.lance URI produced by mp4-index. Require a current record for each camera; "
+        "use eof_ns or explicitly allowed container PTS, without external timestamp sidecars.",
+        examples=["s3://example-bucket/mp4-index/manifest.lance"],
+    )
     limit: int | None = Field(
         default=None,
         ge=1,
@@ -146,7 +153,7 @@ class MultimodalSplitInputConfig(BaseModel):
     def _validate_input_path_prefix(cls, prefix: str) -> str:
         return _validate_location(prefix, strip_trailing_slash=True)
 
-    @field_validator("session_id_list_path")
+    @field_validator("session_id_list_path", "mp4_index_uri")
     @classmethod
     def _validate_session_id_list_path(cls, path: str | None) -> str | None:
         if path is None:
@@ -378,13 +385,12 @@ class MultimodalSplitSensorConfig(BaseModel):
         default=True,
         description="Whether a session missing this sensor is refused, or produces episodes without it.",
     )
-    allow_pts_fallback: bool = Field(
-        default=False,
+    camera_alignment_fields: list[CameraAlignmentField] | None = Field(
+        default=None,
+        min_length=1,
         description=(
-            "Whether a camera missing its sensor timeline may fall back to the container's own "
-            "presentation timestamps instead of being refused as broken. Off by default: a "
-            "constant-frame-rate mux regenerates PTS on a fixed grid, so a timeline read from it "
-            "describes the encoder rather than the hardware."
+            "Camera-only timestamp preference order; use the first complete column for the entire video. "
+            "Defaults to [eof_ns] for cameras. Container PTS requires explicit inclusion; SOF/MOE require mp4-index."
         ),
     )
     sampling: MultimodalSplitSampling | None = Field(
@@ -485,14 +491,13 @@ class MultimodalSplitSensorConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_pts_fallback_applies(self) -> Self:
-        """Reject PTS fallback on a sensor that has no sensor timeline to fall back from.
-
-        Only a camera reads a sensor timeline in the first place, so only a
-        camera has anything to fall back from.
-        """
-        if self.allow_pts_fallback and self.sensor_type != SENSOR_TYPE_CAMERA:
-            msg = f"sensor_type {self.sensor_type!r} has no sensor timeline, so allow_pts_fallback cannot be set"
+    def _validate_camera_alignment_fields(self) -> Self:
+        """Resolve camera defaults and reject camera clocks on other modalities."""
+        if self.sensor_type == SENSOR_TYPE_CAMERA:
+            if self.camera_alignment_fields is None:
+                object.__setattr__(self, "camera_alignment_fields", ["eof_ns"])
+        elif self.camera_alignment_fields is not None:
+            msg = f"camera_alignment_fields applies only to cameras, not {self.sensor_type!r}"
             raise ValueError(msg)
         return self
 
@@ -753,6 +758,7 @@ _TEMPLATE_PREAMBLE = """\
 # Every setting with a non-null default is shown; unchanged settings may be removed.
 # These default to null, so they are omitted above and are named here instead:
 #   input.session_id_list_path  read session IDs from a file instead of listing the prefix
+#   input.mp4_index_uri         mp4-index manifest.lance supplying indexed camera timelines
 #   input.limit                 cap how many sessions are kept
 #   sensors.<key>.topic         which topic to cut from an MCAP carrying more than one
 #   sensors.<key>.sampling      nearest_neighbor or interpolate; required for a gps sensor

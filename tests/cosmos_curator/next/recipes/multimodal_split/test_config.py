@@ -765,33 +765,45 @@ def test_an_imu_sensor_is_copied_like_egotrajectory() -> None:
     assert list(config.mcap_sensors) == ["imu"]
 
 
-def test_allow_pts_fallback_defaults_to_false() -> None:
-    """A camera missing its sensor timeline is refused unless a config opts in."""
+def test_camera_alignment_fields_default_to_eof_only() -> None:
+    """Container-clock fallback requires an explicit entry in the camera's list."""
     config = _resolved(sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4"}})
 
-    assert config.sensors["front"].allow_pts_fallback is False
+    assert config.sensors["front"].camera_alignment_fields == ["eof_ns"]
 
 
-def test_allow_pts_fallback_on_a_camera_is_accepted() -> None:
-    """The one sensor type that carries a sensor timeline may opt into its fallback."""
+def test_camera_alignment_fields_preserve_the_requested_order() -> None:
+    """The first available complete column wins, so list order is meaningful."""
+    fields = ["moe_ns", "sof_ns", "eof_ns", "pts_ns", "edited_pts_ns"]
     config = _resolved(
-        sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4", "allow_pts_fallback": True}}
+        sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4", "camera_alignment_fields": fields}}
     )
 
-    assert config.sensors["front"].allow_pts_fallback is True
+    assert config.sensors["front"].camera_alignment_fields == fields
 
 
-def test_allow_pts_fallback_on_an_mcap_sensor_is_refused_rather_than_ignored() -> None:
-    """Only a camera reads a sensor timeline, so only a camera has one to fall back from."""
-    with pytest.raises(ValidationError, match="has no sensor timeline"):
+@pytest.mark.parametrize("fields", [[], ["dts_ns"], ["not_a_clock"], [42]])
+def test_camera_alignment_fields_reject_empty_or_unknown_selections(fields: list[object]) -> None:
+    """A clock preference must name at least one supported camera column."""
+    with pytest.raises(ValidationError):
+        _resolved(
+            sensors={"front": {"sensor_type": "camera", "uri_pattern": "front.mp4", "camera_alignment_fields": fields}}
+        )
+
+
+@pytest.mark.parametrize("sensor_type", ["egotrajectory", "imu", "gps"])
+def test_camera_alignment_fields_are_refused_on_other_sensors(sensor_type: str) -> None:
+    """Camera exposure and container clocks do not apply to other modalities."""
+    with pytest.raises(ValidationError, match="camera_alignment_fields"):
         _resolved(
             sensors={
                 "front": {"sensor_type": "camera", "uri_pattern": "front.mp4"},
                 "ego": {
-                    "sensor_type": "egotrajectory",
+                    "sensor_type": sensor_type,
                     "uri_pattern": "ego.mcap",
                     "topic": "/ego",
-                    "allow_pts_fallback": True,
+                    "camera_alignment_fields": ["eof_ns"],
+                    **({"sampling": "nearest_neighbor"} if sensor_type == "gps" else {}),
                 },
             }
         )

@@ -1,16 +1,15 @@
 schema_version: 1
 kind: multimodal-split
 input:
+  mp4_index_uri: s3://bucket_name/golden_v52_v1/test/mp4-index/manifest.lance
   input_path_prefix: s3://bucket_name/golden_v52_v1/test/clips
 sensors:
   front:
     sensor_type: camera
     uri_pattern: '*/camera_front.mp4'
     required: true
-    # A session missing its timestamps.npy capture sidecar falls back to the
-    # container's own presentation timestamps instead of being refused. Off by
-    # default; only turn this on for sources known to lack the sidecar.
-    allow_pts_fallback: true
+    # Use the first available complete column; container PTS must be explicit.
+    camera_alignment_fields: [eof_ns, edited_pts_ns]
 output:
   path: s3://bucket_name/golden_v52_v1/test/multimodal-split-output
 clip:

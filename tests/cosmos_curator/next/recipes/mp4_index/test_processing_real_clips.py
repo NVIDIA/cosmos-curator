@@ -158,7 +158,7 @@ def test_indexed_track_survives_lance_and_selects_the_decoded_video(
     assert record is not None
     index, metadata = record
     assert metadata.track_id == track_id
-    sensor = StreamingCameraSensor.from_index(index, metadata, source=data)
+    sensor = StreamingCameraSensor(data, frame_index=index, metadata=metadata)
     timestamps = sensor.timestamps_ns[:2]
     start_ns, end_ns = int(timestamps[0]), int(timestamps[-1]) + 1
     spec = SamplingSpec(
@@ -172,7 +172,7 @@ def test_indexed_track_survives_lance_and_selects_the_decoded_video(
     assert [frame.shape for frame in frames] == [expected_shape] * 2
 
     missing_track = attrs.evolve(metadata, track_id=track_id + 100)
-    sensor = StreamingCameraSensor.from_index(index, missing_track, source=data)
+    sensor = StreamingCameraSensor(data, frame_index=index, metadata=missing_track)
     window = next(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0)))
     with pytest.raises(ValueError, match=r"track.*not found"):
         list(window.frames())

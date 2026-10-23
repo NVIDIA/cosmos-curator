@@ -1,9 +1,11 @@
 schema_version: 1
 kind: multimodal-split
 input:
+  # Requires recorded EOF from a recorder-specific index extension; ordinary mp4-index leaves it null.
+  mp4_index_uri: /data/mp4-index/manifest.lance
   input_path_prefix: /data/recordings
 # Illustrative rig: enumerate EVERY camera in your rig, not only caption selections.
-# Expected layout: <source-id>/recorder-*/<media-file> and MP4 .timestamps.npy sidecars.
+# Expected layout: <source-id>/recorder-*/<media-file>; EOF values come from the index.
 sensors:
   front_wide:
     sensor_type: camera

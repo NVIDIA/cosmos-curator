@@ -35,9 +35,14 @@ import pyarrow.compute as pc
 
 from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sampling.sampler import find_closest_indices
-from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.core.sensors.types.types import TimestampSource, VideoFrameAlignmentField
 from cosmos_curator.next.media.spans import Span
-from cosmos_curator.next.recipes.multimodal_split.config import SENSOR_TYPE_CAMERA, ResolvedMultimodalSplitConfig
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
+from cosmos_curator.next.recipes.multimodal_split.config import (
+    SENSOR_TYPE_CAMERA,
+    MultimodalSplitSensorConfig,
+    ResolvedMultimodalSplitConfig,
+)
 from cosmos_curator.next.recipes.multimodal_split.grids import (
     clip_duration_ns,
     plan_clip_spans,
@@ -51,6 +56,7 @@ from cosmos_curator.next.recipes.multimodal_split.identities import (
     make_source_id,
     make_split_contract_digest,
 )
+from cosmos_curator.next.recipes.multimodal_split.index_input import indexed_timeline
 from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
 from cosmos_curator.next.recipes.multimodal_split.recovery import ReconciliationMap, reconcile_planned_episode
 from cosmos_curator.next.recipes.multimodal_split.reports import (
@@ -110,6 +116,7 @@ PLANNING_RESULT_SCHEMA = pa.schema(
         # stage that reads this row has to know which it was handed.
         pa.field("sensor_type", pa.large_string()),
         pa.field("timeline_ns", pa.large_list(pa.int64())),
+        pa.field("camera_alignment_field", pa.string()),
         pa.field(
             "spans",
             pa.large_list(pa.field("item", _PLANNED_SPAN_STRUCT, nullable=False)),
@@ -141,7 +148,7 @@ def open_cameras(
     *,
     config: ResolvedMultimodalSplitConfig,
     storage_profile: str,
-) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], set[str], list[dict[str, Any]]]:
+) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], dict[str, str | None], list[dict[str, Any]]]:
     """Resolve and read every camera in *session_uri*, and say which ones failed.
 
     Failures are per sensor, so one names the camera that failed. Attributing all
@@ -163,21 +170,24 @@ def open_cameras(
     immutable session could plan different episode sets, and the second would
     then fail reconciliation against the first.
 
-    A camera missing its sensor timeline is still a fault unless its config sets
-    ``allow_pts_fallback``, in which case its timeline is read from the
-    container's own presentation timestamps instead -- returned in the third
-    element, the keys whose timeline came from that fallback rather than from a
-    sensor-timestamp sidecar. "Missing" is decided the same way a camera's own
-    absence is: against the listing, not from whatever
-    ``load_sensor_timestamps_ns`` raises. A sidecar the listing does carry is read, and if that read fails -- a
-    truncated write, a wrong dtype, a non-ascending timeline -- it is a fault,
-    the same as a broken video would be, and never falls back: the fallback
-    exists for a sidecar that was never written, not for one that was written
-    badly.
+    ``camera_alignment_fields`` selects the first complete indexed column for
+    the entire video. An indexed camera must have a current, valid record;
+    deprecated ``.timestamps.npy`` inputs are ignored. The third return value
+    maps each camera to its selected clock for decoding and provenance.
+
+    Without a manifest, ``eof_ns`` accepts a listed legacy sidecar, recorded as
+    None because sidecars do not identify their clock. Explicit PTS choices read
+    the container; SOF/MOE require an index. A listed-but-broken sidecar is a
+    failure rather than permission to change clocks.
     """
+    index_lookup = (
+        Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=storage_profile)
+        if config.input.mp4_index_uri is not None
+        else None
+    )
     sensor_uris: dict[str, str] = {}
     timelines: dict[str, npt.NDArray[np.int64]] = {}
-    pts_fallback_keys: set[str] = set()
+    alignment_fields: dict[str, str | None] = {}
     failures: list[dict[str, Any]] = []
     for key, camera in config.cameras.items():
         # Resolving and reading are separate because only the first can say the
@@ -195,39 +205,62 @@ def open_cameras(
         except Exception as error:  # noqa: BLE001 -- an ambiguous pattern is one failed sensor
             failures.append(failure(session_id, key, None, "open_sensor", error))
             continue
-        # The listing, not an exception type, decides whether the sidecar is
-        # missing -- the same reason ``resolve_sensor_pattern`` above is given
-        # the listing rather than being let to raise and be sniffed. Relative to
-        # session_uri because session_paths is: resolve_sensor_uri's own join,
-        # reversed.
-        relative_match = uri.removeprefix(f"{session_uri.rstrip('/')}/")
-        if timestamps_sidecar_uri(relative_match) not in session_paths:
-            if not camera.allow_pts_fallback:
-                missing_timeline = FileNotFoundError(f"no sensor-timestamp sidecar for {uri}")
-                failures.append(failure(session_id, key, None, "open_sensor", missing_timeline))
-                continue
-            try:
-                timelines[key] = load_container_pts_ns(
-                    uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
-                )
-            except Exception as pts_error:  # noqa: BLE001 -- one unreadable sensor is one failed sensor
-                failures.append(failure(session_id, key, None, "open_sensor", pts_error))
-                continue
-            pts_fallback_keys.add(key)
-        else:
-            try:
-                timelines[key] = load_sensor_timestamps_ns(
-                    uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
-                )
-            except Exception as timeline_error:  # noqa: BLE001 -- a listed-but-broken sidecar is one failed sensor
-                failures.append(failure(session_id, key, None, "open_sensor", timeline_error))
-                continue
+        try:
+            timeline, alignment_field = _camera_timeline(
+                uri,
+                session_uri,
+                session_paths,
+                camera=camera,
+                config=config,
+                storage_profile=storage_profile,
+                index_lookup=index_lookup,
+            )
+        except Exception as error:  # noqa: BLE001 -- one unreadable timeline is one failed sensor
+            failures.append(failure(session_id, key, None, "open_sensor", error))
+            continue
+        timelines[key] = timeline
         sensor_uris[key] = uri
+        alignment_fields[key] = alignment_field
 
     if not sensor_uris and not failures:
         no_camera = ValueError("no configured camera could be opened")
         failures.append(failure(session_id, None, None, "open_sensor", no_camera))
-    return sensor_uris, timelines, pts_fallback_keys, failures
+    return sensor_uris, timelines, alignment_fields, failures
+
+
+def _camera_timeline(  # noqa: PLR0913 -- the source, available artifacts, and configured read contract
+    uri: str,
+    session_uri: str,
+    session_paths: list[str],
+    *,
+    camera: MultimodalSplitSensorConfig,
+    config: ResolvedMultimodalSplitConfig,
+    storage_profile: str,
+    index_lookup: Mp4IndexLookup | None,
+) -> tuple[npt.NDArray[np.int64], str | None]:
+    """Select one clock per camera; None identifies a legacy external sidecar."""
+    fields = camera.camera_alignment_fields
+    assert fields is not None
+    if index_lookup is not None:
+        index, metadata = index_lookup.require_index_for(uri, storage_profile=storage_profile)
+        return indexed_timeline(index, metadata, alignment_fields=fields)
+    relative_match = uri.removeprefix(f"{session_uri.rstrip('/')}/")
+    has_sidecar = timestamps_sidecar_uri(relative_match) in session_paths
+    # A listed-but-broken sidecar is a fault, not permission to change clocks.
+    for field in fields:
+        if field == "eof_ns" and has_sidecar:
+            return load_sensor_timestamps_ns(
+                uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
+            ), None
+        if field in ("pts_ns", "edited_pts_ns"):
+            return load_container_pts_ns(
+                uri,
+                storage_profile=storage_profile,
+                read_buffer_bytes=config.execution.read_buffer_bytes,
+                alignment_field=VideoFrameAlignmentField(field),
+            ), field
+    msg = f"no sensor-timestamp sidecar or requested camera timestamps for {uri}; SOF/MOE require input.mp4_index_uri"
+    raise FileNotFoundError(msg)
 
 
 def open_mcap_sensors(
@@ -308,7 +341,7 @@ def span_planner(
         )
         return []
 
-    sensor_uris, timelines, pts_fallback_keys, failures = open_cameras(
+    sensor_uris, timelines, alignment_fields, failures = open_cameras(
         session_id, session_uri, session_paths, config=config, storage_profile=storage_profile
     )
     mcap_uris, mcap_bounds, mcap_failures = open_mcap_sensors(
@@ -351,10 +384,14 @@ def span_planner(
     sensor_sources = {key: mcap_uris[key] for key in mcap_keys}
     split_contract_digest = make_split_contract_digest(config)
     # A clip is one moment across everything the rig promised, so one camera
-    # reading its timeline from container PTS instead of a sensor sidecar marks
+    # reading its timeline from container PTS instead of a sensor clock marks
     # the whole episode CONTAINER_PTS -- there is no per-camera timestamp_source
     # on the row for a mixed episode to carry.
-    timestamp_source = TimestampSource.CONTAINER_PTS if pts_fallback_keys & set(camera_keys) else TimestampSource.SENSOR
+    timestamp_source = (
+        TimestampSource.CONTAINER_PTS
+        if any(field in ("pts_ns", "edited_pts_ns") for field in alignment_fields.values())
+        else TimestampSource.SENSOR
+    )
     planned: list[dict[str, Any]] = []
     already_canonical: list[dict[str, Any]] = []
     existing_by_episode_id = (reconciliation or {}).get(source_id, {})
@@ -415,6 +452,7 @@ def span_planner(
             output_path=config.output.path,
             sampling_fps=config.clip.sampling_fps,
             storage_profile=storage_profile,
+            camera_alignment_fields=alignment_fields,
         )
 
     camera_plans = [
@@ -425,6 +463,7 @@ def span_planner(
             "sensor_uri": sensor_uris[key],
             "sensor_type": SENSOR_TYPE_CAMERA,
             "timeline_ns": timelines[key].tolist(),
+            "camera_alignment_field": alignment_fields[key],
             "spans": planned,
             "episode_id": None,
         }

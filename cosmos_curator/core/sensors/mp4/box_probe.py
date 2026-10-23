@@ -268,9 +268,14 @@ class BoxIndex:
     metadata: Mp4Metadata
 
 
-def _index_best_video_stream(container: InputContainer, file_size: int, moov_bytes: bytes) -> BoxIndex:
-    """Index and describe the video stream libav ranks best in *container*."""
-    stream = container.streams.best("video")
+def _index_video_stream(
+    container: InputContainer, file_size: int, moov_bytes: bytes, stream_idx: int | None
+) -> BoxIndex:
+    """Index the requested video stream, or libav's preferred stream when no index is given."""
+    if stream_idx is not None and not 0 <= stream_idx < len(container.streams.video):
+        msg = f"video stream index {stream_idx} is out of range"
+        raise BoxNotFoundError(msg)
+    stream = container.streams.best("video") if stream_idx is None else container.streams.video[stream_idx]
     if stream is None:
         msg = "libav lists no video stream in the extracted moov"
         raise BoxNotFoundError(msg)
@@ -304,8 +309,14 @@ def _index_best_video_stream(container: InputContainer, file_size: int, moov_byt
     return BoxIndex(probe=probe, metadata=metadata)
 
 
-def index_from_boxes(file_size: int, moov_bytes: bytes, moof_rows: Sequence[tuple[int, bytes]] = ()) -> BoxIndex:
-    """Index and describe one video's best video stream with PyAV from its extracted boxes.
+def index_from_boxes(
+    file_size: int,
+    moov_bytes: bytes,
+    moof_rows: Sequence[tuple[int, bytes]] = (),
+    *,
+    stream_idx: int | None = None,
+) -> BoxIndex:
+    """Index and describe one video stream with PyAV from its extracted boxes.
 
     Every sample field comes from a full demux of :func:`boxes_only_stream`, apart from
     ``is_keyframe``: libav also derives a demuxed packet's key flag from its payload, so
@@ -321,9 +332,13 @@ def index_from_boxes(file_size: int, moov_bytes: bytes, moof_rows: Sequence[tupl
     the edit list, so that decode times are the stored ones. When libav reports a width or height
     of 0, both come from the first sample entry of that ``trak``'s ``stsd``, if it has one.
 
+    ``stream_idx`` selects a stream by video-stream position. When omitted, libav's
+    preferred video stream is selected.
+
     Raises:
         BoxLayoutUnsupportedError: see :func:`boxes_only_stream`.
-        BoxNotFoundError: libav lists no video stream, or its ``trak`` has no ``mdhd``.
+        BoxNotFoundError: the video stream index is out of range, libav lists no video stream,
+            or its ``trak`` has no ``mdhd``.
         UnsupportedTimescaleError: the stream's ``mdhd`` timescale is 0 or 2**31 and above.
         EmptySampleTableError: libav reads no samples from the boxes.
         InvalidFrameByteRangeError: a sample's byte range lies outside the source.
@@ -337,7 +352,7 @@ def index_from_boxes(file_size: int, moov_bytes: bytes, moof_rows: Sequence[tupl
     boxes = boxes_only_stream(file_size, moov_bytes, moof_rows)
     try:
         with av.open(boxes, mode="r", options={"ignore_editlist": "1"}) as container:
-            return _index_best_video_stream(container, file_size, moov_bytes)
+            return _index_video_stream(container, file_size, moov_bytes, stream_idx)
     except (av.error.FFmpegError, IncompletePacketError) as exc:
         msg = f"libav cannot index the extracted boxes: {exc}"
         raise BoxProbeReadError(msg) from exc

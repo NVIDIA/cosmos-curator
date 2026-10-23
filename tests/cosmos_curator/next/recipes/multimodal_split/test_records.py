@@ -117,7 +117,7 @@ def test_record_builder_sorts_cameras_and_camera_resolution_is_exact() -> None:
 def test_record_builder_accepts_sensor_or_container_pts_clock() -> None:
     """Both clocks a camera can legally report reach canonical output.
 
-    ``CONTAINER_PTS`` is the ``allow_pts_fallback`` result, and is accepted on
+    ``CONTAINER_PTS`` identifies a selected container clock, and is accepted on
     the same terms as ``SENSOR``: canonical output just needs a well-formed
     grid, not a specific source for the timeline.
     """

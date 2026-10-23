@@ -20,8 +20,8 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 
-# One aligned row: the reference timestamp being served, the presentation
-# timestamp of the source frame chosen for it, and that frame's pixels.
+# One aligned row: the reference timestamp being served, the selected timestamp
+# of the source frame chosen for it, and that frame's pixels.
 type StreamingFrame = tuple[int, int, npt.NDArray[np.uint8]]
 
 
@@ -45,7 +45,7 @@ class StreamingCameraData:
     _consumed: bool = attrs.field(init=False, default=False)
 
     def frames(self) -> Generator[StreamingFrame]:
-        """Decode this window, yielding ``(align_timestamp_ns, pts_ns, frame)`` per reference.
+        """Decode this window, yielding ``(align_timestamp_ns, source_timestamp_ns, frame)`` per reference.
 
         The frame in each row is only valid until the generator advances, and
         the same array comes back when one source frame serves several

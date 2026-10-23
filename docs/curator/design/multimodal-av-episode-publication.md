@@ -148,6 +148,9 @@ contract. The per-clip `clip.json` and sparse files under `errors/` remain path-
 publication inputs or current canonical state. Sensor outcomes carried within one invocation are transient assembly
 inputs and are not another durable table.
 
+`clip.json` records each camera's selected clock in `camera_alignment_fields`;
+null identifies an unlabeled legacy timestamp sidecar.
+
 Each MP4 is written after its two timing sidecars and is the per-camera artifact commit point. The episode row becomes
 visible only after every planned camera and every planned non-camera sensor has produced a complete receipt.
 
@@ -168,7 +171,7 @@ The ordered producer-owned Arrow schema is:
 | `exclusive_end_ns` | `int64 not null` | Exclusive selected episode-clock end |
 | `sampling_fps` | `int32 not null` | Shared regular-grid rate |
 | `row_count` | `int64 not null` | Grid points and encoded frames per camera |
-| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; `sensor`, or `container_pts` when a camera's `allow_pts_fallback` fires |
+| `timestamp_source` | `string not null` | Sensor Library timestamp provenance; `sensor`, or `container_pts` when any camera selects `pts_ns` or `edited_pts_ns` |
 | `split_contract_digest` | `string not null` | Result-defining split configuration identity |
 | `materialization_digest` | `string not null` | Exact complete published artifact-set identity |
 | `camera_media` | `large_list<struct<...>> not null` | Complete camera descriptors, sorted by `camera_key` |
@@ -246,14 +249,16 @@ across rendering choices.
 ```text
 {
   "kind": "multimodal-av-split-contract",
-  "split_contract_digest_version": 4,
+  "split_contract_digest_version": 6,
   "media_contract_version": <media contract version>,
   "clip": {
     "duration_ns": <resolved integer duration>,
     "sampling_fps": <resolved sampling rate>
   },
+  # Present only when configured; changing the indexed timeline source is a contract change.
+  "index_manifest_uri": <input.mp4_index_uri>,
   "cameras": [
-    {"camera_key": <key>, "sensor_type": <type>, "allow_pts_fallback": <bool>},
+    {"camera_key": <key>, "sensor_type": <type>, "camera_alignment_fields": <ordered list>},
     ... sorted by camera_key
   ],
   "mcap_sensors": [
@@ -332,11 +337,16 @@ damaged already-canonical artifact. Repair requires an explicit verification-and
 ### Episode clock and grid
 
 Record schema version 2 publishes half-open intervals `[start_ns, exclusive_end_ns)` with
-`timestamp_source="sensor"` unless a camera's `allow_pts_fallback` config fired because its
-sensor-timestamp sidecar was missing. In that case the episode uses `"container_pts"`: one
-camera reading its timeline from the container sets the provenance for the whole episode,
-since a clip is one moment across every view the rig promised. Media contract version 3
-names the selected-source sidecar `<camera>.mp4.sensor_timestamps.npy`.
+`timestamp_source="sensor"` for recorded EOF/SOF/MOE. Each camera's ordered
+`camera_alignment_fields` chooses the first complete indexed column for the whole video,
+defaulting to `[eof_ns]`. Selecting `pts_ns` or `edited_pts_ns` on any camera marks the
+whole episode `"container_pts"`. The former uses container PTS before playback edits;
+the latter applies supported edit-list shifts. Media contract version 3 names the
+selected-source sidecar `<camera>.mp4.sensor_timestamps.npy`.
+
+Split contract version 6 includes the ordered preferences. It replaces the former
+`allow_pts_fallback` setting and rejects reconciliation with outputs from earlier
+split contracts; use a fresh output root.
 
 There is no in-place migration from the previous record or media contract. An existing
 `episodes.lance` table written under record schema version 1 and media contract version 2 fails
@@ -362,7 +372,7 @@ mapping used to transform them.
 The delivered `multimodal-caption` Ego contexts rely on the producer contract that required Ego MCAP `log_time` and
 the episode clock share a session-local domain; captioning does not independently verify that relationship. They
 require `timestamp_source: sensor`, which means the camera timelines came from recorded sensor timestamps rather than
-the configured `container_pts` fallback, but does not prove camera-to-Ego clock equivalence. Within the Ego MCAP,
+a selected container clock, but does not prove camera-to-Ego clock equivalence. Within the Ego MCAP,
 alignment uses `log_time`; the embedded
 `PoseInFrame.timestamp` is decoded as non-serialized source provenance. The `video_only` context does not consume the
 Ego clock and continues to support canonical `container_pts` episodes.
@@ -381,6 +391,7 @@ For each planned logical episode:
    touches no artifact path.
 3. An incompatible match fails before a manifest, sidecar, MP4, or sensor MCAP is rewritten.
 
+Reconciliation also assumes a configured `input.mp4_index_uri` refers to immutable indexed records.
 Reconciliation assumes resolved source artifacts—and each camera's input sensor-timestamp sidecar derived from its
 source URI—remain immutable in place. Canonical reuse does not rehash those inputs. Corrected inputs must use a new
 session location, and therefore a new source identity.

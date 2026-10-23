@@ -169,6 +169,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
     output_path: str,
     sampling_fps: int,
     storage_profile: str,
+    camera_alignment_fields: dict[str, str | None],
 ) -> None:
     """Write what a clip needs to place itself, for a reader holding only the directory.
 
@@ -176,6 +177,9 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
     directory says which session was cut, or which part of it. Written as an
     artifact rather than left to the row stream so that a consumer given a path
     does not also need the table that produced it.
+
+    ``camera_alignment_fields`` records each selected camera clock; None means
+    an unlabeled legacy timestamp sidecar.
 
     ``planned_sensors`` lists what else the clip was meant to hold -- a
     trajectory, and eventually the rest -- separately from the cameras, because
@@ -198,6 +202,7 @@ def write_clip_manifest(  # noqa: PLR0913 -- a clip is placed by exactly these f
         "sampling_fps": sampling_fps,
         "planned_cameras": sorted(cameras),
         "planned_sensors": sorted(sensors),
+        "camera_alignment_fields": camera_alignment_fields,
     }
     destination = f"{clip_dir_uri(output_path, session_id, clip_id)}/{_MANIFEST_NAME}"
     write_media(destination, json.dumps(manifest, indent=2).encode(), storage_profile=storage_profile)

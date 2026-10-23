@@ -224,7 +224,7 @@ def test_a_missing_optional_camera_leaves_the_session_planning(
     assert not Path(plan_error_uri(config.output.path, "session-000")).exists()
 
 
-def test_a_camera_missing_its_timeline_is_refused_without_the_fallback_flag(
+def test_a_camera_missing_its_timeline_is_refused_without_an_alternative_clock(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
@@ -246,10 +246,10 @@ def test_a_camera_missing_its_timeline_falls_back_to_container_pts_when_allowed(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """``allow_pts_fallback`` reads a camera's timeline from its own container instead of refusing it."""
+    """An explicit container clock can serve a camera with no timestamp sidecar."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000", write_timestamps=False)
-    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+    config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]})
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
 
@@ -259,23 +259,36 @@ def test_a_camera_missing_its_timeline_falls_back_to_container_pts_when_allowed(
     assert all(span["timestamp_source"] == "container_pts" for span in results[0]["spans"])
 
 
+@pytest.mark.parametrize("fields", [["pts_ns", "eof_ns"], ["sof_ns", "moe_ns", "pts_ns"]])
+def test_explicit_pts_precedes_a_legacy_sidecar(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    fields: list[str],
+) -> None:
+    """A legacy sidecar must not override an earlier available container clock."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000")
+    config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": fields})
+
+    results = span_planner({"source_session_id": session.name, "session_uri": str(session)}, config=config)
+
+    assert len(results) == 1
+    assert results[0]["camera_alignment_field"] == "pts_ns"
+    assert results[0]["timeline_ns"][0] == 0
+    assert all(span["timestamp_source"] == "container_pts" for span in results[0]["spans"])
+
+
 def test_a_camera_whose_container_pts_also_fails_is_an_open_sensor_failure(
     tmp_path: Path,
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """``allow_pts_fallback`` is a fallback, not a second guarantee: a camera that fails both stays failed.
-
-    The session's video is unreadable garbage rather than missing, so
-    ``load_sensor_timestamps_ns`` fails for the usual reason (no sidecar) and the
-    fallback then fails too, for a different one (no parseable container).
-    Both are camera-read faults, and the second must not escape as anything
-    other than the same per-camera ``open_sensor`` failure the first is.
-    """
+    """A camera with neither a sidecar nor a readable container reports an open_sensor failure."""
     root = tmp_path / "recordings"
     camera_path = root / "session-000" / "camera" / "front.mp4"
     camera_path.parent.mkdir(parents=True)
     camera_path.write_bytes(b"not a video container")
-    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+    config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]})
 
     results = span_planner(
         {"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config
@@ -292,17 +305,11 @@ def test_a_malformed_timeline_sidecar_never_falls_back(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A present-but-corrupt sidecar is a fault, not a missing one, even with the flag set.
-
-    ``allow_pts_fallback`` exists for a sidecar that was never written, not one
-    that was written badly: a truncated or malformed ``timestamps.npy`` in the
-    listing must fail the camera outright, the same as it would with the flag
-    off, rather than being quietly reinterpreted as container PTS.
-    """
+    """A corrupt preferred sidecar fails the camera even when container PTS is next in the list."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000")
     (session / "camera" / "front.mp4.timestamps.npy").write_bytes(b"not a valid npy timeline")
-    config = make_config(root, tmp_path / "media", pts_fallback_cameras=frozenset({"front"}))
+    config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]})
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
 
@@ -336,7 +343,7 @@ def test_a_mixed_session_marks_the_whole_episode_container_pts(
         root,
         tmp_path / "media",
         cameras={"front": "camera/front.mp4", "left": "camera/left.mp4"},
-        pts_fallback_cameras=frozenset({"front"}),
+        camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]},
     )
 
     def fake_load_container_pts_ns(*_args: object, **_kwargs: object) -> np.ndarray:

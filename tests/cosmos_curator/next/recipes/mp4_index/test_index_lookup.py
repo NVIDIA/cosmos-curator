@@ -16,13 +16,19 @@
 """Reading one video's frame index back out of a manifest row."""
 
 import pathlib
+import struct
 from typing import Any
+from unittest.mock import Mock
 
 import lance  # type: ignore[import-untyped]
 import pyarrow as pa
 import pytest
 from loguru import logger
 
+from cosmos_curator.core.sensors.data.mp4 import UnsupportedEditListError
+from cosmos_curator.core.utils.storage import s3_client, storage_utils
+from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
+from cosmos_curator.next.recipes.mp4_index import index_lookup
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     RECORD_SCHEMA_VERSION,
     VIDEO_MANIFEST_SCHEMA,
@@ -138,6 +144,103 @@ def test_lookup_returns_none_when_the_manifest_does_not_exist(tmp_path: pathlib.
     assert Mp4IndexLookup.open(str(tmp_path / "absent.lance")) is None
 
 
+def test_required_lookup_raises_when_the_manifest_does_not_exist(tmp_path: pathlib.Path) -> None:
+    """A required index cannot silently fall back to reading source media."""
+    with pytest.raises(FileNotFoundError, match="Configured mp4-index manifest"):
+        Mp4IndexLookup.open_required(str(tmp_path / "absent.lance"))
+
+
+def test_required_lookup_uses_the_manifest_writers_profile_endpoint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading a recipe's manifest must use the same profile options as writing it."""
+    profile = tmp_path / "profiles.ini"
+    profile.write_text(
+        "[manifest-profile]\n"
+        "aws_access_key_id = test-key\n"
+        "aws_secret_access_key = test-secret\n"
+        "region = us-east-1\n"
+        "endpoint_url = https://s3.example.invalid\n"
+    )
+    monkeypatch.setattr(s3_client, "S3_PROFILE_PATH", profile)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(profile))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "absent-config"))
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    opener = Mock(return_value=Mock(count_rows=Mock(return_value=0)))
+    monkeypatch.setattr(index_lookup, "open_dataset", opener)
+    uri = "s3://bucket/index/manifest.lance"
+
+    Mp4IndexLookup.open_required(uri, storage_profile="manifest-profile")
+
+    expected = storage_utils.get_lance_storage_options(uri, profile_name="manifest-profile")
+    assert expected is not None
+    assert expected["aws_endpoint"] == "https://s3.example.invalid"
+    opener.assert_called_once_with(uri, storage_options=expected)
+
+    opener.reset_mock()
+    Mp4IndexLookup.open(uri, s3_profile_name="manifest-profile", endpoint_url="https://cli.example.invalid")
+    opener.assert_called_once_with(uri, storage_options={**expected, "aws_endpoint": "https://cli.example.invalid"})
+
+
+def test_required_lookup_preserves_manifest_access_errors(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable manifest retains its original error."""
+    monkeypatch.setattr(index_lookup, "open_dataset", Mock(side_effect=PermissionError("access denied")))
+    with pytest.raises(PermissionError, match="access denied"):
+        Mp4IndexLookup.open_required(str(tmp_path / "manifest.lance"))
+
+
+def test_required_lookup_normalizes_local_uris_and_reads_the_source_size(
+    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Required reads handle file URIs and validate the current source without opening its media."""
+    video = tmp_path / "front camera.mp4"
+    video.write_bytes(bytes(INDEXED_SIZE_BYTES))
+    manifest_uri = _write_manifest(tmp_path, [_manifest_row(str(video))])
+    lookup = Mp4IndexLookup.open_required(pathlib.Path(manifest_uri).as_uri())
+    index, metadata = lookup.require_index_for(video.as_uri(), storage_profile="default")
+    assert metadata.frame_count == len(index) == 3
+    assert index.dts_ns.tolist() == [_expected_ns(position * FRAME_TICKS) for position in range(3)]
+    video.write_bytes(bytes(INDEXED_SIZE_BYTES + 1))
+    with pytest.raises(ValueError, match="stale"):
+        lookup.require_index_for(str(video), storage_profile="default")
+    assert "the index is stale" in capfd.readouterr().err
+
+
+def test_required_lookup_propagates_a_missing_source(tmp_path: pathlib.Path) -> None:
+    """A manifest record alone cannot establish that its source is still current."""
+    video = tmp_path / "front.mp4"
+    lookup = Mp4IndexLookup.open_required(_write_manifest(tmp_path, [_manifest_row(str(video))]))
+    with pytest.raises(FileNotFoundError):
+        lookup.require_index_for(str(video), storage_profile="default")
+
+
+@pytest.mark.parametrize("accessible", [False, True])
+def test_required_lookup_checks_s3_size_using_the_requested_profile(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, *, accessible: bool
+) -> None:
+    """S3 validation uses one HEAD request and propagates a source access failure."""
+    video = "s3://bucket/session/front.mp4"
+    lookup = Mp4IndexLookup.open_required(_write_manifest(tmp_path, [_manifest_row(video)]))
+    client = Mock(spec=S3Client)
+    client.stat.return_value.size_bytes = INDEXED_SIZE_BYTES
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(index_lookup, "get_storage_client", factory)
+    if accessible:
+        index, metadata = lookup.require_index_for(video, storage_profile="video-profile")
+        assert metadata.frame_count == len(index) == 3
+    else:
+        client.stat.side_effect = PermissionError("source access denied")
+        with pytest.raises(PermissionError, match="source access denied"):
+            lookup.require_index_for(video, storage_profile="video-profile")
+    factory.assert_called_once_with(video, profile_name="video-profile")
+    client.stat.assert_called_once_with(S3Prefix(video))
+
+
 def test_lookup_serves_the_frame_index_for_an_indexed_video(tmp_path: pathlib.Path) -> None:
     """The ordinary hit: a row for this media_location unpacks into the sensor library's types."""
     video = tmp_path / "front.mp4"
@@ -161,6 +264,15 @@ def test_lookup_returns_none_for_a_video_the_manifest_does_not_hold(tmp_path: pa
     assert lookup is not None
 
     assert lookup.index_for(str(tmp_path / "rear.mp4"), media_size_bytes=INDEXED_SIZE_BYTES) is None
+
+
+def test_lookup_returns_none_for_duplicate_manifest_rows(tmp_path: pathlib.Path) -> None:
+    """Ambiguous optional indexes fall back to reading media instead of choosing a row."""
+    video = str(tmp_path / "front.mp4")
+    row = _manifest_row(video)
+    lookup = Mp4IndexLookup.open_required(_write_manifest(tmp_path, [row, row]))
+
+    assert lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES) is None
 
 
 def test_lookup_matches_a_differently_spelled_path_for_the_same_file(tmp_path: pathlib.Path) -> None:
@@ -201,7 +313,7 @@ def test_lookup_serves_a_row_holding_no_frames_and_leaves_the_refusal_to_the_sen
     """Emptiness is the sensor's judgement to make; the reader only reports what the row holds.
 
     The recipe turns this into a fallback by catching ``IndexRecordUnusableError`` from
-    ``StreamingCameraSensor.from_index``, which is covered in ``test_sources``.
+    the ``StreamingCameraSensor`` constructor, which is covered in ``test_sources``.
     """
     video = tmp_path / "front.mp4"
     uri = _write_manifest(
@@ -258,3 +370,55 @@ def test_lookup_refuses_a_row_it_cannot_check_and_says_so_once(tmp_path: pathlib
         logger.remove(sink_id)
 
     assert sum("cannot read the size of" in warning for warning in warnings) == 1
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "size", "count"])
+def test_required_index_raises_instead_of_falling_back(tmp_path: pathlib.Path, fault: str) -> None:
+    """Consumers requiring the manifest cannot silently open a different source of timestamps."""
+    video = str(tmp_path / "front.mp4")
+    row = _manifest_row(video)
+    rows = [row]
+    if fault == "missing":
+        row["media_location"] = str(tmp_path / "other.mp4")
+    elif fault == "duplicate":
+        rows.append(row)
+    elif fault == "count":
+        row["metadata"] = _metadata(frame_count=99)
+    lookup = Mp4IndexLookup.open(_write_manifest(tmp_path, rows))
+    assert lookup is not None
+    with pytest.raises(ValueError, match=r"exactly one|stale|Frame count"):
+        lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES + (fault == "size"), required=True)
+
+
+def test_lookup_preserves_edit_list_and_constructs_both_pts_timelines(tmp_path: pathlib.Path) -> None:
+    """Lookup retains playback metadata and obtains interpreted timelines from the sensor library."""
+    video = str(tmp_path / "front.mp4")
+    elst = struct.pack(">I4sIIIihh", 28, b"elst", 0, 1, 1000, FRAME_TICKS, 1, 0)
+    row = _manifest_row(video, metadata=_metadata(elst_bytes=elst))
+    lookup = Mp4IndexLookup.open(_write_manifest(tmp_path, [row]))
+    assert lookup is not None
+    record = lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES, required=True)
+    assert record is not None
+    index, metadata = record
+    assert metadata.elst_bytes == elst
+    assert index.elst_bytes == metadata.elst_bytes
+    assert index.dts_ns[0] == 0
+    assert index.pts_ns[0] == 0
+    assert index.edited_pts_ns[0] == -_expected_ns(FRAME_TICKS)
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_lookup_handles_unsupported_edits_at_the_caller_boundary(
+    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str], *, required: bool
+) -> None:
+    """Required inputs propagate the original error; optional inputs log and fall back."""
+    video = str(tmp_path / "front.mp4")
+    row = _manifest_row(video, metadata=_metadata(elst_bytes=b"bad"))
+    lookup = Mp4IndexLookup.open(_write_manifest(tmp_path, [row]))
+    assert lookup is not None
+    if required:
+        with pytest.raises(UnsupportedEditListError, match="truncated"):
+            lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES, required=True)
+    else:
+        assert lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES) is None
+        assert "unusable; opening the video" in capfd.readouterr().err

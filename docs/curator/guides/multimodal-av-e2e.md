@@ -22,16 +22,73 @@ recordings/
   source-001/
     recorder-01/
       front.mp4
-      front.mp4.timestamps.npy
       side.mp4
-      side.mp4.timestamps.npy
       rear.mp4
-      rear.mp4.timestamps.npy
       egotrajectory.mcap
 ```
 
-Camera sidecars contain monotonic signed 64-bit nanosecond capture timestamps. Ego captioning requires sensor
-timestamps, a `foxglove.PoseInFrame` MCAP topic, and episodes no longer than 10 seconds. Range overlap does not prove
+For Ego captioning, produce the index with a recorder-specific
+[`Mp4IndexExtension`](../../../cosmos_curator/next/recipes/mp4_index/processing.py)
+that decodes recorded camera timestamps into the shared EOF/SOF/MOE columns. The ordinary
+`mp4-index` recipe leaves those columns null; it does not recover recorded timestamps or
+synthesize them from container PTS. See the [indexing contract](../design/curator-next-mp4-index.md#frame-indexing).
+Point `input.mp4_index_uri` at the resulting manifest:
+
+```yaml
+input:
+  input_path_prefix: s3://example-bucket/recordings
+  mp4_index_uri: s3://example-bucket/mp4-index/manifest.lance
+```
+
+Sessions and configured sensor patterns are still discovered from `input_path_prefix`.
+Every resolved camera must have exactly one current manifest record at its normalized
+media location. The splitter checks the source size before using that record. Missing,
+ambiguous, malformed, or stale records fail planning for that sensor; an unreadable,
+missing, or incompatible manifest fails the run. Size equality does not detect a
+replacement with the same byte length. Keep the source media and the supplied manifest
+immutable during the run and across retries into the same output dataset.
+
+Each camera accepts an ordered `camera_alignment_fields` list, defaulting to `[eof_ns]`:
+
+```yaml
+sensors:
+  front:
+    sensor_type: camera
+    uri_pattern: '*/camera_front.mp4'
+    camera_alignment_fields: [eof_ns, moe_ns, sof_ns]
+```
+
+The first complete indexed column serves the entire video; missing or masked
+columns fall through without mixing clocks per frame. Invalid available timelines
+remain failures, as do malformed indexes (including partially populated EOF).
+The selected timeline must increase and contain one value per indexed frame.
+`pts_ns` means container PTS before playback edits; `edited_pts_ns` applies supported
+edit-list shifts. Recorded EOF/SOF/MOE retain `timestamp_source: sensor`; selecting
+either PTS field marks the episode `container_pts`. `clip.json` records the chosen
+field per camera. These settings do not map container PTS into a shared sensor clock.
+
+For video-only captioning or embeddings, an ordinary `mp4-index` manifest can be used with
+`camera_alignment_fields: [pts_ns]` (or `[edited_pts_ns]`) on each camera. These episodes
+have `timestamp_source: container_pts` and cannot be used for the rear Ego-caption example below.
+
+With a manifest, deprecated `.timestamps.npy` input files are ignored. Without
+one, the `eof_ns` entry accepts a legacy timestamp sidecar, whose unidentified clock
+is recorded as null in `clip.json`; explicit PTS choices read the container.
+SOF/MOE require an index. A broken preferred sidecar remains a failure.
+If your recorder exports camera timestamps as `.mp4.timestamps.npy` files instead of an
+index, omit `input.mp4_index_uri` and keep those files next to the source MP4s. For Ego
+captioning, verify that these timestamps use the same clock as the Ego MCAP's `log_time`.
+
+The manifest does not record packet discard flags; only use indexed inputs whose
+samples correspond one-to-one with decoded frames. The forward-only decoder still
+reads the source media once to produce clips; it does not repeat index extraction.
+Adding or changing the manifest input changes the recovery contract, so use a new
+output dataset when switching an existing run to a different index input.
+The ordered list replaces `allow_pts_fallback`; existing boolean configs must be
+updated, and outputs from the previous split contract require a fresh output dataset.
+
+Ego captioning requires recorded sensor timestamps, a `foxglove.PoseInFrame` MCAP topic, and episodes no longer than
+10 seconds. Range overlap does not prove
 physical camera-to-Ego clock equivalence or pose quality. Verify source clocks and coordinate meaning separately.
 The example uses topic `/egotrajectory` and frame label `clip_local_enu`; adapt these to your source. The frame label
 does not transform coordinates or verify a vehicle convention.

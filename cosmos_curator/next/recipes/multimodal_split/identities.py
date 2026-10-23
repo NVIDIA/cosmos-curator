@@ -57,7 +57,8 @@ EPISODE_IDENTITY_VERSION = 1
 # identity matches but whose contract does not is a conflict, and
 # ``reconcile_planned_episode`` raises. So adding a sensor to a config that has
 # already published needs a new output path, not a rerun into the old one.
-SPLIT_CONTRACT_DIGEST_VERSION = 5
+# 6: ordered camera timestamp preferences replace the PTS fallback switch.
+SPLIT_CONTRACT_DIGEST_VERSION = 6
 # 2: non-camera sensor artifacts joined the digest. An episode published under
 # version 1 was its cameras and nothing else, so it cannot be compared byte for
 # byte against one that also carries a trajectory.
@@ -153,11 +154,14 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
                 "sampling_fps": config.clip.sampling_fps,
                 "whole_session": config.clip.whole_session,
             },
+            # Index input can change the camera timeline and therefore frame selection.
+            # Keep the digest key stable across the config field rename.
+            **({"index_manifest_uri": config.input.mp4_index_uri} if config.input.mp4_index_uri else {}),
             "cameras": [
                 {
                     "camera_key": key,
                     "sensor_type": camera.sensor_type,
-                    "allow_pts_fallback": camera.allow_pts_fallback,
+                    "camera_alignment_fields": camera.camera_alignment_fields,
                 }
                 for key, camera in sorted(config.cameras.items())
             ],

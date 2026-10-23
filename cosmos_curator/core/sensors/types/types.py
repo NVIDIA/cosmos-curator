@@ -43,6 +43,17 @@ from pathlib import Path
 type DataSource = Path | bytes | io.BufferedIOBase
 
 
+class VideoFrameAlignmentField(enum.Enum):
+    """Frame-index timestamps used for alignment."""
+
+    PTS_NS = "pts_ns"
+    EDITED_PTS_NS = "edited_pts_ns"
+    DTS_NS = "dts_ns"
+    EOF_NS = "eof_ns"
+    SOF_NS = "sof_ns"
+    MOE_NS = "moe_ns"
+
+
 class TimestampSource(enum.Enum):
     """Which clock a sensor's reported timeline came from.
 

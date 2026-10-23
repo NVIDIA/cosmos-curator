@@ -89,6 +89,13 @@ frame column's declared type and rejects mismatches without casting. `Mp4Metadat
 `Mp4FrameIndex.from_frame_index_table` remain independent of Lance. Arrow unwrapping does not
 eliminate allocations for subsequent NumPy conversion or derived timestamp calculations.
 
+`Mp4IndexLookup` owns manifest opening, source-location normalization, source-size checks, and
+record decoding. Consumers requiring indexed input use `open_required()` and
+`require_index_for()`; missing, ambiguous, stale, or invalid records raise. Optional consumers
+use `open()` and `index_for()` to retain their fallback behavior. Timestamp selection belongs
+to the consumer: multimodal splitting selects EOF/SOF/MOE or explicit `pts_ns`/`edited_pts_ns`
+through `camera_alignment_fields`, while data-integrity checks select DTS for stored indexes.
+
 The ordinary `mp4-index` recipe leaves EOF/SOF/MOE fields null. Extensions can supply timing
 columns within the fixed shared frame schema; recorder-specific requirements and sentinel
 normalization belong in the extension. The shared reader preserves partially missing timing as

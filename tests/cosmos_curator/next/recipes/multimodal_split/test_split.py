@@ -19,9 +19,10 @@ import hashlib
 import io
 import itertools
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import av
 import numpy as np
@@ -199,6 +200,27 @@ def test_a_session_yields_one_playable_clip_per_full_span(
     for clip in clips:
         assert len(_sensor_timestamps(clip)) == 30
         assert len(_decoded_means(Path(clip["clip_location"]))) == 30
+
+
+def test_whole_session_encodes_the_full_recording_despite_a_short_clip_duration(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """A three-second whole-session clip must receive all 90 frames, even with duration_s=1."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", frames=90)
+    config = make_config(root, tmp_path / "media", duration_s=1.0, whole_session=True)
+
+    clips = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)
+
+    assert not _errors(config)
+    assert len(clips) == 1
+    clip = clips[0]
+    assert clip["start_ns"] == DEVICE_ORIGIN_NS
+    assert clip["exclusive_end_ns"] == DEVICE_ORIGIN_NS + 3 * _S
+    assert len(_sensor_timestamps(clip)) == 90
+    assert len(_decoded_means(Path(clip["clip_location"]))) == 90
 
 
 def test_one_source_frame_may_serve_several_grid_timestamps(
@@ -1007,14 +1029,7 @@ def test_a_failed_clip_does_not_shift_the_frames_of_the_clips_after_it(
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The streaming pass is shared across spans and cannot seek back.
-
-    A clip that fails partway leaves the cursor inside its own span: the encoder
-    stopped reading, but the frames it read are gone. Without realigning, the
-    next span starts mid-clip and every clip after it holds frames from the
-    wrong moment -- written with no error, because nothing compares a clip's
-    frames against the span it claims.
-    """
+    """An encoder failure cannot move later windows or their source-frame associations."""
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
@@ -1051,17 +1066,7 @@ def test_a_failure_that_ends_the_pass_early_reports_the_spans_after_it(
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The other way the pass ends, with spans still to come.
-
-    A clip can fail partway and leave too few frames to catch up on, so
-    realigning ends the pass rather than the feed running dry inside a clip.
-    Both paths strand every span after them, but only this one leaves the failed
-    span already recorded -- so it must report the ones after it and not itself
-    again.
-
-    The last-span test reaches this branch too, and cannot show it works: there
-    is nothing after the last span, so the list it builds is empty either way.
-    """
+    """Failure to reach the next window reports it and every later planned clip."""
     root = tmp_path / "recordings"
     # Five spans planned from the timeline, seventy frames of media: the third
     # span is where the container runs out, and two spans follow it.
@@ -1116,13 +1121,7 @@ def test_a_failure_on_the_last_span_is_still_reported(
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Realigning must not swallow the outcome it was realigning after.
-
-    A clip that fails near the tail leaves the cursor short of the boundary, and
-    there may be no frames left to catch up on. Realigning then ends the pass --
-    which is correct -- but the failure that caused it still happened and still
-    has to be reported.
-    """
+    """A failed final clip is reported even when no later window advances the decoder."""
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
@@ -1150,25 +1149,65 @@ def test_a_failure_on_the_last_span_is_still_reported(
     assert [entry["stage"] for entry in recorded] == ["sample_and_encode"]
 
 
-def test_realigning_past_the_end_of_the_stream_is_refused() -> None:
-    """A span the stream cannot finish leaves too few frames to catch up on.
+def test_non_contiguous_clips_share_one_decode_pass(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipping a recovered middle clip preserves the next window's frames and timestamps."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000", frames=90)
+    item = {"source_session_id": "session-000", "session_uri": str(session)}
+    reference = split_all(item, config=make_config(root, tmp_path / "clean"))
+    config = make_config(root, tmp_path / "sparse")
+    plan = span_planner(item, config=config)[0]
+    plan["spans"] = [plan["spans"][0], plan["spans"][2]]
+    decoder = Mock(wraps=split_module.iter_video_frames)
+    monkeypatch.setattr(split_module, "iter_video_frames", decoder)
 
-    This is the case that makes the ordering matter: realigning has to be able
-    to fail, so the outcome it was realigning after must already be recorded.
-    """
-    frames = ((index, index, np.zeros((2, 2, 3), dtype=np.uint8)) for index in range(15))
-    feed = split_module._FrameFeed(frames)
-    sensor_timestamps_ns: list[int] = []
+    outcomes = split_module.split_session(plan, config=config)
 
-    taking = feed.take(30, sensor_timestamps_ns)
-    for index, _frame in enumerate(taking):
-        if index == 9:
-            break
-    taking.close()
+    assert [outcome["status"] for outcome in outcomes] == ["success", "success"]
+    for outcome, expected in zip(outcomes, [reference[0], reference[2]], strict=True):
+        assert np.load(outcome["sensor_timestamps_location"]).tolist() == _sensor_timestamps(expected)
+        assert _decoded_means(Path(outcome["media_location"])) == _decoded_means(Path(expected["clip_location"]))
+    decoder.assert_called_once()
 
-    assert feed.taken == 10
-    with pytest.raises(split_module._StreamEndedError):
-        feed.realign(30)
+
+def test_decoder_failure_stops_the_camera_and_reports_remaining_clips(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed decoder cannot be reused for later windows or erase earlier successes."""
+    root = tmp_path / "recordings"
+    session = make_session(root, "session-000", frames=90)
+    config = make_config(root, tmp_path / "media")
+    plan = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)[0]
+    real_decode = split_module.iter_video_frames
+
+    def fail_partway(source: io.BufferedIOBase) -> Iterator[tuple[int, np.ndarray]]:
+        for index, row in enumerate(real_decode(source)):
+            if index == 40:
+                msg = "decoder failed"
+                raise ValueError(msg)
+            yield row
+
+    decoder = Mock(side_effect=fail_partway)
+    encoder = Mock(wraps=split_module.encode_frames_to_path)
+    monkeypatch.setattr(split_module, "iter_video_frames", decoder)
+    monkeypatch.setattr(split_module, "encode_frames_to_path", encoder)
+
+    outcomes = split_module.split_session(plan, config=config)
+
+    assert [outcome["status"] for outcome in outcomes] == ["success", "failure", "failure"]
+    recorded = _errors(config)
+    assert [error["clip_id"] for error in recorded] == [entry["clip_id"] for entry in plan["spans"][1:]]
+    assert all(error["stage"] == "stream_ended" and "decoder failed" in error["message"] for error in recorded)
+    decoder.assert_called_once()
+    assert encoder.call_count == 2
 
 
 def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
@@ -1177,13 +1216,7 @@ def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Realigning has to hold across consecutive failures, not just one.
-
-    Each failure leaves the cursor at its own offset inside its own span, so the
-    catch-up is cumulative: a second failure realigns from wherever the first
-    one left it. Get that wrong and the survivor after them holds frames from
-    somewhere between the two.
-    """
+    """Two partial encoder failures cannot move the third window."""
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
@@ -1191,8 +1224,7 @@ def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
 
     real_encode = split_module.encode_frames_to_path
     calls = {"n": 0}
-    # Different offsets, so the two catch-ups differ and a fixed-size drop would
-    # not save it.
+    # Fail at different positions inside the two windows.
     give_up_at = {1: 5, 2: 22}
 
     def fail_the_first_two(frames: object, path: Path, **kwargs: object) -> int:
