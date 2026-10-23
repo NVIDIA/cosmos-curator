@@ -92,9 +92,10 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
         store root.
 
     Raises:
-        ValueError: if the input expands to no sessions, or if nothing at all was
-            measured. Both mean the run has no answer to record, which is a mistake in
-            the config rather than a passing run. The second is only knowable once
+        ValueError: if a configured ``input.mp4_index_uri`` cannot be opened, if the
+            input expands to no sessions, or if nothing at all was measured. The first
+            two are mistakes in the config, caught before anything is measured. The
+            third means the run has no answer to record, and is only knowable once
             every session has been listed, so it is raised after the appends and
             before the commit -- leaving rows that no reader believes, which is the
             same outcome as any other run that does not reach its commit.
@@ -103,6 +104,11 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
             the measurements survive the nonzero exit.
 
     """
+    # Opened here only to fail early; the lookup is discarded because each worker opens
+    # its own. Without this, the first worker to hit an unusable index raises mid-run,
+    # and past the first batch that discards every session already measured.
+    processing.open_mp4_index(config)
+
     sessions = expand_sessions(config.input, execution=config.execution)
     logger.info("data-integrity: {} session(s) to check", len(sessions))
 

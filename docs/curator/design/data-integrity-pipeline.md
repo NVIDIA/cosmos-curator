@@ -210,6 +210,7 @@ input:
   session_depth: 1          # prefix levels below each root that name a session
   limit: null               # max streams per session; null maps to discover_streams limit=0
   stream_globs: []          # keep only streams matching these globs, relative to the session
+  mp4_index_uri: null       # mp4-index manifest.lance; one named here and unreadable fails the run
 
 checks:
   expected_hz: null         # null = per-stream header rate, or unavailable (see below)
@@ -926,6 +927,19 @@ stale path cheap to find. Rejected as the primary answer: proving a path listabl
 it listable *now*, so it is one more round trip per session against the same failure modes,
 and a token that expires mid-run is untouched by it. It is additive later as a fast-fail
 convenience, not as the contract.
+
+One narrow case does validate up front: `input.mp4_index_uri`. `run_config` opens the
+`mp4-index` manifest once, before it lists a session and before Ray starts, and a configured
+manifest it cannot open fails the run. That is not the rejected alternative above — it is one
+read rather than one per session, and it proves a config setting rather than a path's
+liveness. It fails rather than falling back because the index decides which *clock* the run
+measures on: scanning the videos instead would put part of the run on media PTS where the
+rest is on indexed DTS, a difference no stored row explains. A manifest that is readable but
+does not cover a video, or whose row no longer matches its bytes, still falls back to reading
+that one video — that is a miss, not a misconfiguration. The single-session `di-check` and
+`di-session` keep `--index-manifest`'s softer reading, where an absent manifest means "not
+built yet"; an operator watching one session can afford to scan, a thousand-session run
+cannot afford to do it silently.
 
 **A bespoke argparse entry point reusing `di-session`'s exit codes.** Rejected: that returns
 1 on a data-quality FAIL. `pipeline.py` keeps an argparse `main()` for local iteration, but

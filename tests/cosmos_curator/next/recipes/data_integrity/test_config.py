@@ -170,32 +170,40 @@ def test_an_s3_store_root_is_left_verbatim() -> None:
     assert resolved.output.store_root == "s3://bucket/di-store/"
 
 
-def test_no_index_manifest_is_the_default() -> None:
+def test_no_mp4_index_is_the_default() -> None:
     """Reading from an index is opt-in, so a config that says nothing gets the old behaviour."""
-    assert config.resolve_config_data(_config_data()).input.index_manifest_uri is None
+    assert config.resolve_config_data(_config_data()).input.mp4_index_uri is None
 
 
-def test_an_index_manifest_is_normalized_the_way_mp4_index_normalizes_its_output() -> None:
+def test_an_mp4_index_is_normalized_the_way_mp4_index_normalizes_its_output() -> None:
     """The two recipes have to arrive at one spelling or the lookup silently misses."""
     resolved = config.resolve_config_data(_config_data(input={"sessions": ["/data/clips/one"]}))
-    assert resolved.input.index_manifest_uri is None
+    assert resolved.input.mp4_index_uri is None
 
     named = config.resolve_config_data(
-        _config_data(input={"sessions": ["/data/clips/one"], "index_manifest_uri": "~/di_index/smoke/manifest.lance"})
+        _config_data(input={"sessions": ["/data/clips/one"], "mp4_index_uri": "~/di_index/smoke/manifest.lance"})
     )
 
-    assert named.input.index_manifest_uri == normalize_location("~/di_index/smoke/manifest.lance")
+    assert named.input.mp4_index_uri == normalize_location("~/di_index/smoke/manifest.lance")
 
 
-def test_an_s3_index_manifest_survives_resolution() -> None:
+def test_an_s3_mp4_index_survives_resolution() -> None:
     """The shared case: an index built once and read by every machine checking the corpus."""
     resolved = config.resolve_config_data(
-        _config_data(
-            input={"sessions": ["/data/clips/one"], "index_manifest_uri": "s3://bucket/mp4-index/manifest.lance"}
-        )
+        _config_data(input={"sessions": ["/data/clips/one"], "mp4_index_uri": "s3://bucket/mp4-index/manifest.lance"})
     )
 
-    assert resolved.input.index_manifest_uri == "s3://bucket/mp4-index/manifest.lance"
+    assert resolved.input.mp4_index_uri == "s3://bucket/mp4-index/manifest.lance"
+
+
+def test_the_old_index_manifest_uri_name_is_rejected_rather_than_ignored() -> None:
+    """The rename must not read as "no index configured", which would quietly scan every video."""
+    with pytest.raises(ValidationError, match="index_manifest_uri"):
+        config.resolve_config_data(
+            _config_data(
+                input={"sessions": ["/data/clips/one"], "index_manifest_uri": "s3://bucket/mp4-index/manifest.lance"}
+            )
+        )
 
 
 def test_stream_globs_reach_the_resolved_input_as_a_tuple() -> None:

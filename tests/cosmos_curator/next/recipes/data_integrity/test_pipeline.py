@@ -475,6 +475,32 @@ def test_a_run_that_measured_nothing_names_every_reason_it_did_not(tmp_path: pat
     assert _nothing_readable(store_root)
 
 
+def test_a_configured_mp4_index_that_holds_nothing_fails_before_anything_is_listed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The driver opens the manifest before it lists any session and before Ray starts.
+
+    Every worker would raise on the same index, and one raising past the first batch
+    costs the run every session it had already measured.
+    """
+    store_root = tmp_path / "di-store"
+    manifest = tmp_path / "mp4-index" / "manifest.lance"
+    config_data = _config_data(tmp_path / "clips", store_root)
+    config_data["input"]["mp4_index_uri"] = str(manifest)
+    monkeypatch.setattr(
+        pipeline, "expand_sessions", lambda *_args, **_kwargs: pytest.fail("listed sessions before checking the index")
+    )
+    monkeypatch.setattr(
+        pipeline, "ensure_ray_initialized", lambda: pytest.fail("started Ray for a run that cannot be honoured")
+    )
+
+    with pytest.raises(ValueError, match="holds no mp4-index manifest") as raised:
+        pipeline.run_config(resolve_config_data(config_data))
+
+    assert str(manifest) in str(raised.value)
+    assert _nothing_readable(store_root)
+
+
 #: The three clauses a zero-row run can carry, one per cause.
 _UNLISTED_CLAUSE = "session(s) could not be listed"
 _UNREACHED_CLAUSE = "stream(s) could not be reached"

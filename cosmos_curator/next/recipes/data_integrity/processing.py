@@ -24,8 +24,8 @@ one stream on its own, but the session-grain ones -- how far apart the rig's sen
 started, how much of the session they were all recording for -- have no per-stream task
 to run in, and a whole session in one worker is what they need.
 
-Nothing here raises. Every failure is classified by what it says, and the split is
-between the two things a failure can be evidence *of*:
+Nothing here raises over the data. Every failure is classified by what it says, and the
+split is between the two things a failure can be evidence *of*:
 
 * **The data is bad.** An unreadable or undecodable stream becomes that stream's
   ``error`` row, which is what keeps one corrupt video from failing a run over
@@ -40,6 +40,12 @@ between the two things a failure can be evidence *of*:
 
 Transient transport failures are retried inside
 :func:`~.session_runner.run_one_stream` before either verdict is reached.
+
+The one failure that does raise is a configured ``input.mp4_index_uri`` that cannot be
+opened (:func:`open_mp4_index`), because it says something about the run rather than
+about any session. :func:`~.pipeline.run_config` opens the manifest on the driver before
+any session is listed, so a run that names an unusable one fails before it measures
+anything.
 """
 
 import datetime
@@ -283,25 +289,51 @@ def _mp4_lookup_index_open(
     return Mp4IndexLookup.open(manifest_uri, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
 
 
-def _session_index_lookup(config: ResolvedDataIntegrityConfig) -> Mp4IndexLookup | None:
+def open_mp4_index(config: ResolvedDataIntegrityConfig) -> Mp4IndexLookup | None:
     """Open the configured mp4-index manifest, or return ``None`` if there is none.
 
-    Warns and returns ``None`` when the manifest cannot be opened; the run then opens
-    the videos instead.
+    The one place the driver and the workers both open it, so the two cannot disagree
+    about which manifests are usable.
+
+    Args:
+        config: the resolved config, for the manifest URI and credentials.
+
+    Returns:
+        The opened manifest, or ``None`` when ``input.mp4_index_uri`` is unset, which is
+        the only case in which a run reads its videos rather than the index.
+
+    Raises:
+        ValueError: if a configured manifest holds no dataset or cannot be read. The
+            index is optional to *configure* and not optional to *honour*: falling back
+            would measure these streams the way an unindexed run does, leaving one run
+            holding streams timed two ways.
+
     """
-    uri = config.input.index_manifest_uri
+    uri = config.input.mp4_index_uri
     if uri is None:
         return None
     try:
-        return _mp4_lookup_index_open(
+        lookup = _mp4_lookup_index_open(
             uri,
             s3_profile_name=config.execution.s3_profile_name,
             endpoint_url=config.execution.endpoint_url,
         )
-    except Exception as exc:  # noqa: BLE001 - see above
-        logger.opt(exception=True).debug("data-integrity index manifest unusable at {}", uri)
-        logger.warning("index manifest {} could not be used, checking videos directly: {}", uri, exc)
-        return None
+    # Wide because a manifest fails to open in more ways than are worth enumerating: a
+    # stale path, a denied prefix, an expired token, rows from an older mp4-index.
+    # Re-raised rather than propagated so the message names the setting that caused it.
+    except Exception as exc:
+        logger.opt(exception=True).debug("data-integrity mp4 index unusable at {}", uri)
+        msg = f"input.mp4_index_uri {uri} could not be read: {exc}"
+        raise ValueError(msg) from exc
+    if lookup is None:
+        # Mp4IndexLookup.open returns None for a manifest that does not exist, which the
+        # single-session CLIs read as "not built yet". A run that names one reads it as a typo.
+        msg = (
+            f"input.mp4_index_uri {uri} holds no mp4-index manifest; build it with the "
+            f"mp4-index recipe, or unset input.mp4_index_uri to read the videos directly"
+        )
+        raise ValueError(msg)
+    return lookup
 
 
 def check_session(
@@ -313,15 +345,19 @@ def check_session(
 ) -> dict[str, object]:
     """List one session and measure every stream in it, in one task.
 
-    Never raises: a session always produces a record, whether it could not be listed
-    at all or held streams that could not be reached or read. What separates those
-    outcomes is which columns the record comes back with.
+    Nothing the session itself can do raises: it always produces a record, whether it
+    could not be listed at all or held streams that could not be reached or read. What
+    separates those outcomes is which columns the record comes back with.
 
     Args:
         record: ``{"session_path": ...}``, as the driver seeded it.
         config: the resolved config.
         run_id: the id every row of this invocation shares.
         created_at: the timestamp every row of this invocation shares.
+
+    Raises:
+        ValueError: if a configured ``input.mp4_index_uri`` cannot be opened -- the only
+            thing this function raises. See :func:`open_mp4_index`.
 
     Returns:
         The session's flat columns -- its path, how many streams it held, how many
@@ -336,6 +372,9 @@ def check_session(
 
     """
     session_path = record["session_path"]
+    # Opened before the listing, since an unusable index ends the run and a listing
+    # done first would be wasted.
+    index_lookup = open_mp4_index(config)
     try:
         sources = discover_session(session_path, config=config)
     # Wide on purpose. A listing fails as a stale path, a missing bucket, a denied
@@ -363,7 +402,6 @@ def check_session(
             ),
         )
 
-    index_lookup = _session_index_lookup(config)
     rows: dict[str, list[dict[str, object]]] = {}
     results: list[StreamResult] = []
     unreadable = 0

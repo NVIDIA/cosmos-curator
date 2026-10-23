@@ -18,7 +18,7 @@
 import datetime
 import pathlib
 import pickle
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import lance
@@ -30,6 +30,10 @@ from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, 
 from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
 from cosmos_curator.next.recipes.data_integrity import processing, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
+from cosmos_curator.next.recipes.mp4_index import processing as mp4_index_processing
+from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
+from cosmos_curator.next.recipes.mp4_index.contracts import CONTAINER_KIND_NONFRAGMENTED, make_video_id
+from cosmos_curator.next.utils.uris import normalize_location
 
 RUN_ID = "0" * 32
 CREATED_AT = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.UTC)
@@ -43,14 +47,18 @@ def _config(
     session: pathlib.Path,
     *,
     thresholds: dict[str, Any] | None = None,
+    mp4_index_uri: str | None = None,
     **execution: Any,  # noqa: ANN401
 ) -> ResolvedDataIntegrityConfig:
     """Resolve a config covering one local session."""
+    session_input: dict[str, Any] = {"sessions": [str(session)]}
+    if mp4_index_uri is not None:
+        session_input["mp4_index_uri"] = mp4_index_uri
     return ResolvedDataIntegrityConfig.model_validate(
         {
             "schema_version": 1,
             "kind": "data-integrity",
-            "input": {"sessions": [str(session)]},
+            "input": session_input,
             "output": {"store_root": str(session.parent / "di-store")},
             "checks": {"thresholds": thresholds or {}},
             "execution": execution,
@@ -72,12 +80,13 @@ def _check(
     session: pathlib.Path,
     *,
     thresholds: dict[str, Any] | None = None,
+    mp4_index_uri: str | None = None,
     **execution: Any,  # noqa: ANN401
 ) -> dict[str, object]:
     """Measure one session the way the Ray stage does."""
     return processing.check_session(
         {"session_path": str(session)},
-        config=_config(session, thresholds=thresholds, **execution),
+        config=_config(session, thresholds=thresholds, mp4_index_uri=mp4_index_uri, **execution),
         run_id=RUN_ID,
         created_at=CREATED_AT,
     )
@@ -86,6 +95,52 @@ def _check(
 def _rows(record: dict[str, object]) -> dict[str, list[dict[str, object]]]:
     """Unpack the opaque payload the driver appends."""
     return pickle.loads(record["rows"])  # type: ignore[arg-type]  # noqa: S301 -- written by check_session
+
+
+def _timestamp_sources(record: dict[str, object]) -> dict[str, object]:
+    """Which clock each measured stream was timed on, keyed by its source."""
+    return {str(row["source"]): row["timestamp_source"] for row in _rows(record)[store_schema.STREAM_DATASET]}
+
+
+def _manifest(session: pathlib.Path, *videos: pathlib.Path) -> str:
+    """Index *videos* with the mp4-index recipe and write the manifest a run would be pointed at.
+
+    A real manifest rather than hand-written rows: the key the indexer stores, the size
+    it records and its schema version all have to line up for a lookup to hit.
+    """
+    config = ResolvedMp4IndexConfig.model_validate(
+        {
+            "schema_version": 1,
+            "kind": "mp4-index",
+            "input": {
+                "path_prefix": str(session),
+                "globs": ["*.mp4"],
+                "container_kind": CONTAINER_KIND_NONFRAGMENTED,
+            },
+            "output": {"path": str(session.parent / "mp4-index")},
+        }
+    )
+    tables = []
+    for video in videos:
+        # Normalized the way discovery spells a source, since that is the key a lookup
+        # builds from one and the key this row has to match.
+        location = normalize_location(str(video))
+        result = mp4_index_processing.process_one_video(
+            {"video_id": make_video_id(location), "media_location": location}, config=config
+        )
+        assert result["status"] == "success", result["error_message"]
+        tables.append(mp4_index_processing.result_table(result))
+    uri = str(session.parent / "mp4-index" / "manifest.lance")
+    lance.write_dataset(pa.concat_tables(tables), uri)
+    return uri
+
+
+@pytest.fixture(autouse=True)
+def _forget_opened_manifests() -> Iterator[None]:
+    """Clear the per-process manifest cache, since several tests here open different manifests."""
+    processing._mp4_lookup_index_open.cache_clear()
+    yield
+    processing._mp4_lookup_index_open.cache_clear()
 
 
 def test_a_session_lists_its_streams_in_discovery_order(session: pathlib.Path) -> None:
@@ -128,31 +183,71 @@ def test_listing_honours_the_configured_stream_globs(session: pathlib.Path) -> N
 
 def test_no_configured_manifest_means_no_lookup(session: pathlib.Path) -> None:
     """The index is opt-in: an unconfigured run must not reach for a dataset at all."""
-    assert processing._session_index_lookup(_config(session)) is None
+    assert processing.open_mp4_index(_config(session)) is None
 
 
-def test_a_manifest_that_cannot_be_opened_falls_back_to_reading_the_videos(session: pathlib.Path) -> None:
-    """The index makes checks cheaper, so losing it must cost speed rather than the session."""
-    config = ResolvedDataIntegrityConfig.model_validate(
-        {
-            "schema_version": 1,
-            "kind": "data-integrity",
-            "input": {"sessions": [str(session)], "index_manifest_uri": str(session / "not-a-manifest.lance")},
-            "output": {"store_root": str(session.parent / "di-store")},
-        }
-    )
-    # A real dataset that is not a manifest, so opening it raises rather than returning
-    # None, which absence would and which is already a quiet fallback.
-    lance.write_dataset(pa.table({"unrelated": [1]}), session / "not-a-manifest.lance")
-    processing._mp4_lookup_index_open.cache_clear()
+def test_a_manifest_that_cannot_be_read_fails_rather_than_reading_the_videos(session: pathlib.Path) -> None:
+    """Falling back would measure these sessions differently from the rest of the run, silently."""
+    manifest = session / "not-a-manifest.lance"
+    # A real Lance dataset that is not a manifest, so opening it raises. A URI with no
+    # dataset at all returns None instead, and is the next test.
+    lance.write_dataset(pa.table({"unrelated": [1]}), manifest)
+
+    with pytest.raises(ValueError, match="could not be read") as failure:
+        processing.open_mp4_index(_config(session, mp4_index_uri=str(manifest)))
+
+    assert str(manifest) in str(failure.value)
+
+
+def test_a_manifest_that_does_not_exist_fails_rather_than_counting_as_unconfigured(session: pathlib.Path) -> None:
+    """``Mp4IndexLookup.open`` reads absence as "not built yet"; a configured run reads it as a typo."""
+    manifest = session / "absent.lance"
+
+    with pytest.raises(ValueError, match="holds no mp4-index manifest") as failure:
+        processing.open_mp4_index(_config(session, mp4_index_uri=str(manifest)))
+
+    assert str(manifest) in str(failure.value)
+
+
+def test_a_covered_stream_is_measured_from_the_index_and_an_uncovered_one_from_its_video(
+    session: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """A stream the manifest covers is measured from it; the rest are opened as usual.
+
+    The clock each row records is what makes the difference visible in the store.
+    """
+    (session / "side.mp4").write_bytes(h264_video())
+
+    record = _check(session, mp4_index_uri=_manifest(session, session / "front.mp4"))
+
+    assert _timestamp_sources(record) == {
+        str(session / "front.mp4"): "container_dts",
+        str(session / "side.mp4"): "container_pts",
+        str(session / "rear.mp4"): None,  # unreadable, so measured on no clock at all
+    }
+
+
+def test_a_stale_index_row_reads_the_video_it_describes_rather_than_trusting_it(
+    session: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """A partial or stale index is a miss, not a misconfiguration: this one video is opened."""
+    manifest_uri = _manifest(session, session / "front.mp4")
+    # Re-encoded longer, so the indexed size no longer matches the bytes there.
+    (session / "front.mp4").write_bytes(h264_video(frames=45))
     warnings: list[str] = []
     sink_id = logger.add(warnings.append, level="WARNING")
 
     try:
-        assert processing._session_index_lookup(config) is None
+        record = _check(session, mp4_index_uri=manifest_uri)
     finally:
         logger.remove(sink_id)
-    assert any("checking videos directly" in warning for warning in warnings)
+
+    assert _timestamp_sources(record)[str(session / "front.mp4")] == "container_pts"
+    # The clock above does not say why the video was read: any index miss reads it too.
+    # The warning is what pins that staleness was the reason.
+    assert any("the index is stale for this video" in warning for warning in warnings)
 
 
 def test_a_session_that_cannot_be_listed_is_reported_rather_than_raised(tmp_path: pathlib.Path) -> None:

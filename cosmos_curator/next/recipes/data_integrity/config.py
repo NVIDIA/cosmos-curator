@@ -107,13 +107,16 @@ class DataIntegrityInputConfig(BaseModel):
         ),
         examples=[["recorder-*/*"]],
     )
-    index_manifest_uri: str | None = Field(
+    mp4_index_uri: str | None = Field(
         default=None,
         min_length=1,
         description=(
             "An mp4-index manifest.lance. Read each covered stream's timeline from the "
             "manifest instead of opening the video; check the rest as usual. Sessions are "
-            "still discovered by listing, so a partly indexed dataset is fine."
+            "still discovered by listing, so a partly indexed dataset is fine. A manifest named "
+            "here that cannot be read fails the run rather than falling back to the videos: the "
+            "two paths report different timestamp_source values, so a run that fell back would "
+            "measure some of its streams one way and the rest another."
         ),
         examples=["s3://example-bucket/mp4-index/manifest.lance"],
     )
@@ -123,7 +126,7 @@ class DataIntegrityInputConfig(BaseModel):
     def _coerce_sequence(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
 
-    @field_validator("index_manifest_uri")
+    @field_validator("mp4_index_uri")
     @classmethod
     def _normalize_manifest_uri(cls, uri: str | None) -> str | None:
         return None if uri is None else normalize_location(uri)
