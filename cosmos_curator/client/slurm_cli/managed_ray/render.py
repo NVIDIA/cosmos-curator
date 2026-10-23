@@ -28,7 +28,6 @@ from cosmos_curator.client.slurm_cli.managed_ray.config import (
     SlurmRayConfig,
     SlurmRayConfigError,
     SlurmRayMount,
-    expand_host_path,
     resolve_container_image,
     startup_timeout_seconds,
     validate_state_dir,
@@ -62,12 +61,14 @@ from cosmos_curator.client.slurm_cli.slurm_common import (
     _build_container_srun_argv,
     _merge_mount_specs_by_destination,
     _resolve_forwarded_environment,
+    expand_host_path,
 )
 
 _CONTAINER_RUN_STATE_DIR = "/run/cosmos-curator/slurm-ray"
 _CONTAINER_MANIFEST = f"{_CONTAINER_RUN_STATE_DIR}/{MANIFEST_FILENAME}"
 _CONTAINER_BOOTSTRAP = f"{_CONTAINER_RUN_STATE_DIR}/{BOOTSTRAP_FILENAME}"
 _CONTAINER_RUNTIME_MODULE = f"{_CONTAINER_RUN_STATE_DIR}/{RUNTIME_MODULE_FILENAME}"
+HOST_CLEANUP_FILENAME = "host_cleanup.sh"
 
 
 def _configured_mount_spec(mount: SlurmRayMount, home: Path) -> MountSpec:
@@ -161,6 +162,12 @@ def resolve_runtime_paths(  # noqa: PLR0913
         "prepare_directories": list(dict.fromkeys(prepare_directories)),
         "forwarded_environment_keys": forwarded_environment_keys,
         "ray_temp_dir": ray_temp_dir,
+        "host_setup_script": (
+            str(expand_host_path(runtime.host_setup_script, home)) if runtime.host_setup_script else None
+        ),
+        "host_cleanup_script": (
+            str(expand_host_path(runtime.host_cleanup_script, home)) if runtime.host_cleanup_script else None
+        ),
     }
 
 
@@ -248,7 +255,18 @@ def _container_launch_command(
             extra=extra_environment_keys,
         ),
         command=command,
-        slurm_args=["--mpi=none", "--nodes=1", "--ntasks=1", "--ntasks-per-node=1", *extra_slurm_args],
+        slurm_args=[
+            "--mpi=none",
+            "--nodes=1",
+            "--ntasks=1",
+            "--ntasks-per-node=1",
+            *extra_slurm_args,
+            *(
+                [f"--task-epilog={run_dir(runtime_paths) / HOST_CLEANUP_FILENAME}"]
+                if runtime_paths.get("host_cleanup_script")
+                else []
+            ),
+        ],
     )
     return shlex.join(srun_command)
 
@@ -314,11 +332,52 @@ def _runtime_setup(
     runtime_paths: SlurmRayRuntimePaths,
 ) -> list[str]:
     """Render environment and node-local setup shared by head and workers."""
+    setup_script = runtime_paths.get("host_setup_script")
     return [
         *_render_environment_setup(config, runtime_paths),
         f"export CURATOR_RUN_ID={shlex.quote(run_id)}",
         *(f"mkdir -p -- {shlex.quote(source)}" for source in runtime_paths["prepare_directories"]),
+        *(
+            [
+                f"source {shlex.quote(setup_script)}",
+                "host_setup_status=$?",
+                'if [ "$host_setup_status" -ne 0 ]; then exit "$host_setup_status"; fi',
+            ]
+            if setup_script
+            else []
+        ),
     ]
+
+
+def _host_cleanup_lines(runtime_paths: SlurmRayRuntimePaths) -> list[str]:
+    script = runtime_paths.get("host_cleanup_script")
+    wrapper = run_dir(runtime_paths) / HOST_CLEANUP_FILENAME
+    return [f"bash {shlex.quote(str(wrapper))} || echo 'Host cleanup failed' >&2"] if script else []
+
+
+def render_host_cleanup_script(runtime_paths: SlurmRayRuntimePaths) -> str:
+    """Run a short host hook once per allocation attempt, from the task epilog or EXIT fallback.
+
+    Managed Ray has one task per node. The atomic claim prevents duplicate execution if the batch shell
+    exits while slurmstepd is running the epilog. Keep claims in the run directory, not uncollected /tmp.
+    """
+    script = runtime_paths["host_cleanup_script"]
+    assert script is not None
+    claim_prefix = shlex.quote(str(run_dir(runtime_paths) / ".host-cleanup-"))
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            "set -uo pipefail",
+            f'claim={claim_prefix}"${{SLURM_JOB_ID:?}}.${{SLURM_RESTART_COUNT:-0}}"',
+            'if ! mkdir -m 700 -- "$claim" 2>/dev/null; then',
+            '  if [ -d "$claim" ]; then exit 0; fi',
+            '  echo "Cannot claim host cleanup: $claim" >&2',
+            "  exit 1",
+            "fi",
+            f"bash {shlex.quote(script)} || echo 'Host cleanup failed' >&2",
+            "",
+        ]
+    )
 
 
 def render_head_script(
@@ -371,7 +430,8 @@ def render_head_script(
         # cancels every recorded lane, waits for Slurm to release them, and publishes the terminal run state.
         "finalize_run() {",
         "  trap - EXIT",
-        f"  {_cleanup_command(run_id, runtime_paths)} >&2",
+        f"  {_cleanup_command(run_id, runtime_paths)} >&2 || echo 'Managed Ray cleanup failed' >&2",
+        *(f"  {line}" for line in _host_cleanup_lines(runtime_paths)),
         '  exit "$1"',
         "}",
         "trap 'finalize_run \"$?\"' EXIT",
@@ -474,6 +534,21 @@ def render_worker_script(
         'case "$lane" in (*[!0-9]*|"") echo "Worker lane must be a nonnegative integer" >&2; exit 2;; esac',
         # Refuse to join a run whose head is already gone, before this allocation starts anything.
         f'{_host_runtime_command(runtime_paths, "probe-head", "--job-id")} "$head_job_id" || exit 1',
+        *(
+            [
+                "finalize_worker() {",
+                "  local status=$?",
+                "  trap - EXIT",
+                *(f"  {line}" for line in _host_cleanup_lines(runtime_paths)),
+                '  exit "$status"',
+                "}",
+                "trap finalize_worker EXIT",
+                "trap 'exit 143' TERM",
+                "trap 'exit 130' INT",
+            ]
+            if runtime_paths.get("host_cleanup_script")
+            else []
+        ),
         "",
         *_runtime_setup(config, run_id=run_id, runtime_paths=runtime_paths),
         f'export {WORKER_HEAD_JOB_ID_ENV}="$head_job_id"',

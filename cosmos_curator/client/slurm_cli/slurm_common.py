@@ -163,6 +163,16 @@ class MountSpec:
         return f"{self.source}:{self.dest}:{self.mode}"
 
 
+def expand_host_path(value: str, home: Path | None) -> Path:
+    """Resolve a home-relative host path against an explicitly supplied cluster home."""
+    if value.startswith("~/"):
+        if home is None:
+            msg = "Home-relative host paths require the cluster account's home directory"
+            raise ValueError(msg)
+        return home / value[2:]
+    return Path(value)
+
+
 def _get_username() -> str:
     """Retrieve the username of the current user."""
     uid = os.getuid()

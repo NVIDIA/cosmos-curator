@@ -58,6 +58,7 @@ from cosmos_curator.client.slurm_cli.slurm_common import (
     _resolve_container_image,
     _resolve_slurm_account,
     _validate_gpu_options,
+    expand_host_path,
 )
 from cosmos_curator.core.utils import environment as core_environment
 
@@ -271,6 +272,8 @@ class SlurmSubmitOptions:
     mail_user: str | None = None
     extra_remote_files: list[tuple[str, Path, int]] = attrs.field(factory=list)
     source_environment_file: Path | None = None
+    host_setup_script: Path | None = None
+    host_cleanup_script: Path | None = None
     extra_container_env_keys: list[str] = attrs.field(factory=list)
 
 
@@ -302,9 +305,20 @@ class SlurmJobSpec:
     mail_user: str | None = None
     extra_remote_files: list[tuple[str, Path, int]] = attrs.field(factory=list)
     source_environment_file: Path | None = None
+    host_setup_script: Path | None = None
+    host_cleanup_script: Path | None = None
     extra_container_env_keys: list[str] = attrs.field(factory=list)
     node_local_mount_sources: list[str] = attrs.field(factory=list)
     prepare_node_local_mounts: bool = False
+
+
+def _resolve_host_hook_paths(spec: SlurmJobSpec, home: Path | None) -> SlurmJobSpec:
+    """Resolve hook paths before rendering, using the connected cluster account's home."""
+    return attrs.evolve(
+        spec,
+        host_setup_script=expand_host_path(str(spec.host_setup_script), home) if spec.host_setup_script else None,
+        host_cleanup_script=expand_host_path(str(spec.host_cleanup_script), home) if spec.host_cleanup_script else None,
+    )
 
 
 def _render_sbatch_script(spec: SlurmJobSpec) -> str:
@@ -350,6 +364,8 @@ def _render_sbatch_script(spec: SlurmJobSpec) -> str:
         container_env_keys=container_env_keys,
         env_vars=env_vars,
         source_environment_file=str(spec.source_environment_file) if spec.source_environment_file else "",
+        host_setup_script=shlex.quote(str(spec.host_setup_script)) if spec.host_setup_script else "",
+        host_cleanup_script=shlex.quote(str(spec.host_cleanup_script)) if spec.host_cleanup_script else "",
         launcher_env_prefixes_to_unset=_LAUNCHER_ENV_PREFIXES,
         launcher_env_vars_to_unset=(*_PIXI_ACTIVATION_ENV_VARS, *_CONDA_ACTIVATION_ENV_VARS),
         time_limit_string=spec.time_limit,
@@ -418,6 +434,16 @@ def connect(remote_host: str, user: str) -> ConnectionProtocol:
     conn = fabric.Connection(remote_host, user=user)
     conn.run("ls", hide=True)
     return cast("ConnectionProtocol", conn)
+
+
+def remote_home(connection: ConnectionProtocol) -> Path:
+    """Resolve the absolute home directory of the connected cluster account."""
+    result = connection.run('printf "%s" "$HOME"', hide=True, timeout=300)
+    home = Path(result.stdout.strip())
+    if not home.is_absolute():
+        msg = f"Could not resolve an absolute home directory on {connection.host}: {result.stdout!r}"
+        raise ValueError(msg)
+    return home
 
 
 def upload_text(connection: ConnectionProtocol, files: list[tuple[str, Path, int]]) -> None:
@@ -600,6 +626,9 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
 
     """
     connection = connect(slurm_job_spec.login_node, slurm_job_spec.username)
+    hooks = (slurm_job_spec.host_setup_script, slurm_job_spec.host_cleanup_script)
+    home = remote_home(connection) if any(path is not None and str(path).startswith("~/") for path in hooks) else None
+    slurm_job_spec = _resolve_host_hook_paths(slurm_job_spec, home)
     create_remote_job_path(connection, slurm_job_spec)
     _create_extra_remote_file_dirs(connection, slurm_job_spec)
 
@@ -647,9 +676,10 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
     return _parse_job_id(out.stdout)
 
 
-def render_slurm_submit_script(slurm_job_spec: SlurmJobSpec) -> str:
-    """Render the sbatch script that would be uploaded by :func:`curator_submit`."""
-    return _render_sbatch_script(_with_remote_files_mount(slurm_job_spec))
+def render_slurm_submit_script(slurm_job_spec: SlurmJobSpec, *, home: Path | None = None) -> str:
+    """Render offline; home-relative hooks require the cluster account's explicit home."""
+    resolved = _resolve_host_hook_paths(slurm_job_spec, home)
+    return _render_sbatch_script(_with_remote_files_mount(resolved))
 
 
 def remote_find_job_log_file(connection: ConnectionProtocol, log_dir: Path, job_id: str) -> Path:
@@ -808,6 +838,8 @@ def build_slurm_submit_job_spec(command: list[str], options: SlurmSubmitOptions 
         mail_user=opts.mail_user,
         extra_remote_files=list(opts.extra_remote_files),
         source_environment_file=opts.source_environment_file,
+        host_setup_script=opts.host_setup_script,
+        host_cleanup_script=opts.host_cleanup_script,
         extra_container_env_keys=list(opts.extra_container_env_keys),
         node_local_mount_sources=[mount.source for mount in node_local_mount_specs],
         prepare_node_local_mounts=opts.prepare_node_local_mounts,
@@ -852,6 +884,27 @@ def submit_cli(  # noqa: PLR0913
             rich_help_panel="cluster",
         ),
     ] = _HOME_DIR / "curator_launch_files",
+    host_setup_script: Annotated[
+        Path | None,
+        Option(
+            help=(
+                "Host script sourced on the batch node and executed on other allocated nodes, once per node, "
+                "after node-local directory preparation and before container import. "
+                "Use an absolute path or ~/ relative to the cluster account's home."
+            ),
+            rich_help_panel="cluster",
+        ),
+    ] = None,
+    host_cleanup_script: Annotated[
+        Path | None,
+        Option(
+            help=(
+                "Host script executed on allocated nodes during exit cleanup. "
+                "Use an absolute path or ~/ relative to the cluster account's home."
+            ),
+            rich_help_panel="cluster",
+        ),
+    ] = None,
     container_image: Annotated[
         str,
         Option(help=("Canonical path to the .sqsh container image"), rich_help_panel="container"),
@@ -1100,7 +1153,10 @@ def submit_cli(  # noqa: PLR0913
         bool,
         Option(
             "--dry-run",
-            help="Render the sbatch script and exit without uploading files or submitting the job.",
+            help=(
+                "Render the sbatch script and exit without uploading files or submitting the job. "
+                "Home-relative host hooks require connecting to look up the cluster account's home."
+            ),
             rich_help_panel="misc",
         ),
     ] = False,
@@ -1114,6 +1170,8 @@ def submit_cli(  # noqa: PLR0913
             account=account,
             partition=partition,
             remote_files_path=remote_files_path,
+            host_setup_script=host_setup_script,
+            host_cleanup_script=host_cleanup_script,
             container_image=container_image,
             curator_path=_infer_curator_path(curator_path),
             workspace_path=workspace_path,
@@ -1147,7 +1205,13 @@ def submit_cli(  # noqa: PLR0913
     )
 
     if dry_run:
-        typer.echo(render_slurm_submit_script(slurm_job_spec))
+        hooks = (slurm_job_spec.host_setup_script, slurm_job_spec.host_cleanup_script)
+        home = (
+            remote_home(connect(slurm_job_spec.login_node, slurm_job_spec.username))
+            if any(path is not None and str(path).startswith("~/") for path in hooks)
+            else None
+        )
+        typer.echo(render_slurm_submit_script(slurm_job_spec, home=home))
         return
 
     job_id = curator_submit(slurm_job_spec)

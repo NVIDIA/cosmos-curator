@@ -24,13 +24,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from cosmos_curator.client.slurm_cli.slurm_common import (
     _DEFAULT_CACHE_PATH,
     _DEFAULT_CONTAINER_IMAGE,
     _SLURM_ACCOUNT_ENV_VAR,
     _is_valid_slurm_memory,
+    expand_host_path,
 )
 from cosmos_curator.core.utils import environment
 
@@ -64,17 +65,6 @@ def _default_host_path(path: Path) -> str:
     except ValueError:
         return str(expanded)
     return f"~/{relative}"
-
-
-def expand_host_path(value: str, home: Path) -> Path:
-    """Resolve a configured host path against the cluster account's home.
-
-    Every path in this config is absolute or ``~/``-relative by validation, so expansion is the same operation
-    wherever it happens.
-    """
-    if value.startswith("~/"):
-        return home / value[2:]
-    return Path(value)
 
 
 def resolve_container_image(value: str, home: Path) -> str:
@@ -342,6 +332,16 @@ class SlurmRayRuntimeConfig(BaseModel):
         default=None,
         description="Optional Pixi environment warmup override.",
     )
+    host_setup_script: str | None = Field(
+        default=None, description="Host shell script sourced before container import."
+    )
+    host_cleanup_script: str | None = Field(
+        default=None,
+        description=(
+            "Short host shell script run by the primary task epilog, with a batch EXIT fallback before task startup. "
+            "Attempted once per allocation/restart. Slurm limits task epilogs to a few seconds; cleanup is best-effort."
+        ),
+    )
 
     @field_validator("container_image")
     @classmethod
@@ -356,15 +356,15 @@ class SlurmRayRuntimeConfig(BaseModel):
 
     @field_validator("workspace_path", "cache_path")
     @classmethod
-    def _validate_required_paths(cls, value: str, info: Any) -> str:  # noqa: ANN401
+    def _validate_required_paths(cls, value: str, info: ValidationInfo) -> str:
         return _host_path(value, field_name=str(info.field_name))
 
-    @field_validator("curator_path")
+    @field_validator("curator_path", "host_setup_script", "host_cleanup_script")
     @classmethod
-    def _validate_optional_path(cls, value: str | None) -> str | None:
+    def _validate_optional_path(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is None:
             return None
-        return _host_path(value, field_name="curator_path")
+        return _host_path(value, field_name=str(info.field_name))
 
     @field_validator("environment")
     @classmethod

@@ -130,6 +130,8 @@ class SlurmRayRuntimePaths(TypedDict):
     prepare_directories: list[str]
     forwarded_environment_keys: list[str]
     ray_temp_dir: str | None
+    host_setup_script: str | None
+    host_cleanup_script: str | None
 
 
 class SlurmRayManifest(TypedDict):

@@ -30,7 +30,7 @@ from typing import cast
 
 from invoke.runners import Result as InvokeResult
 
-from cosmos_curator.client.slurm_cli.managed_ray.config import expand_host_path, validate_state_dir
+from cosmos_curator.client.slurm_cli.managed_ray.config import validate_state_dir
 from cosmos_curator.client.slurm_cli.managed_ray.onnode import slurm_ray_runtime, slurm_ray_state
 from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_runtime import RUNTIME_MODULE_FILENAME
 from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_state import (
@@ -42,11 +42,14 @@ from cosmos_curator.client.slurm_cli.managed_ray.onnode.slurm_ray_state import (
     SlurmRayManifest,
     validate_manifest,
 )
-from cosmos_curator.client.slurm_cli.slurm_common import _get_username
+from cosmos_curator.client.slurm_cli.slurm_common import _get_username, expand_host_path
 from cosmos_curator.client.slurm_cli.slurm_submit import (
     ConnectionProtocol,
     connect,
     upload_text,
+)
+from cosmos_curator.client.slurm_cli.slurm_submit import (
+    remote_home as _remote_home,
 )
 
 _RUN_ID_PATTERN = re.compile(r"^cc-ray-[0-9a-f]{8,32}$")
@@ -102,12 +105,10 @@ def _verify_manifest_cluster(connection: ConnectionProtocol, manifest: SlurmRayM
 
 def remote_home(connection: ConnectionProtocol) -> Path:
     """Resolve the absolute home directory of the connected cluster account."""
-    result = run_remote(connection, 'printf "%s" "$HOME"', hide=True)
-    home = Path(result.stdout.strip())
-    if not home.is_absolute():
-        msg = f"Could not resolve an absolute home directory on {connection.host}: {result.stdout!r}"
-        raise SlurmRayOperationError(msg)
-    return home
+    try:
+        return _remote_home(connection)
+    except ValueError as exc:
+        raise SlurmRayOperationError(str(exc)) from exc
 
 
 def verify_remote_python(connection: ConnectionProtocol) -> None:

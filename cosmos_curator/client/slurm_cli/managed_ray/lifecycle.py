@@ -60,10 +60,12 @@ from cosmos_curator.client.slurm_cli.managed_ray.remote import (
     verify_remote_python,
 )
 from cosmos_curator.client.slurm_cli.managed_ray.render import (
+    HOST_CLEANUP_FILENAME,
     capture_forwarded_environment,
     job_name,
     render_environment_file,
     render_head_script,
+    render_host_cleanup_script,
     render_worker_script,
     resolve_runtime_paths,
     run_dir,
@@ -323,6 +325,11 @@ def _create_run_directory(  # noqa: PLR0913
         connection,
         [
             (render_environment_file(forwarded_environment), directory / ENVIRONMENT_FILENAME, 0o600),
+            *(
+                [(render_host_cleanup_script(runtime_paths), directory / HOST_CLEANUP_FILENAME, 0o700)]
+                if runtime_paths.get("host_cleanup_script")
+                else []
+            ),
             (
                 render_head_script(config, run_id=run_id, runtime_paths=runtime_paths, command=command),
                 directory / HEAD_SCRIPT_FILENAME,

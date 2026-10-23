@@ -15,6 +15,7 @@
 """Tests for the managed Ray commands that submit, scale, stop, and list a run."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ import pytest
 
 from cosmos_curator.client.slurm_cli.managed_ray.lifecycle import (
     SlurmRayPartialOperationError,
+    _create_run_directory,
     list_slurm_ray_runs,
     scale_slurm_ray_run,
     stop_slurm_ray_run,
@@ -61,6 +63,86 @@ from tests.cosmos_curator.client.slurm_cli.managed_ray.launcher_stubs import (
 
 MODULE = "cosmos_curator.client.slurm_cli.managed_ray.lifecycle"
 REMOTE_MODULE = "cosmos_curator.client.slurm_cli.managed_ray.remote"
+
+
+@pytest.mark.parametrize("role", ["head", "worker"])
+@pytest.mark.parametrize("failure", ["none", "setup", "import", "payload", "batch-killed"])
+def test_staged_host_cleanup_runs_once_and_preserves_exit_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str, failure: str
+) -> None:
+    """Execute staged jobs; only the scheduler boundary stands in for Slurm/Pyxis."""
+    connection = LocalConnection("localhost", "user")
+    connection._context.config.run.in_stream = False
+    setup = tmp_path / "setup.sh"
+    cleanup = tmp_path / "cleanup.sh"
+    calls = tmp_path / "cleanup-calls"
+    setup.write_text('export HOOK_VALUE="from setup"\n' + ("return 7\n" if failure == "setup" else ""))
+    # Deliberately not executable: the public hook contract accepts bash scripts.
+    cleanup.write_text(f'printf "%s\\n" "${{HOOK_VALUE:-missing}}" >> "{calls}"\nexit 9\n')
+    config = make_config()
+    config = config.model_copy(
+        update={
+            "runtime": config.runtime.model_copy(
+                update={
+                    "host_setup_script": str(setup),
+                    "host_cleanup_script": str(cleanup),
+                }
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "cosmos_curator.client.slurm_cli.managed_ray.render._host_runtime_command",
+        lambda *_args: "/bin/true",
+    )
+    paths = _create_run_directory(
+        connection, config, ["true"], run_id="cc-ray-probe", state_dir=str(tmp_path), cluster_name="test"
+    )
+    directory = Path(paths["run_dir"])
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    srun = binaries / "srun"
+    srun.write_text(
+        "#!/bin/bash\n"
+        'if [ "$PROBE_FAILURE" = import ]; then exit 19; fi\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in --task-epilog=*) epilog=${arg#*=};; esac\n'
+        "done\n"
+        # This assertion makes a missing/miswired task epilog observable, even though the EXIT fallback works.
+        '[ -n "${epilog:-}" ] || exit 81\n'
+        '"$epilog"\n'
+        'if [ "$PROBE_FAILURE" = batch-killed ]; then kill -KILL "$PPID"; fi\n'
+        'if [ "$PROBE_FAILURE" = payload ]; then exit 23; fi\n'
+        "exit 0\n"
+    )
+    srun.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{binaries}:{os.environ['PATH']}",
+        "SLURM_JOB_ID": "100",
+        "SLURM_RESTART_COUNT": "0",
+        "PROBE_FAILURE": failure,
+    }
+    script = directory / f"{role}.sbatch"
+    args = ["bash", str(script), *(["cc-ray-probe", "99", "0"] if role == "worker" else [])]
+    result = subprocess.run(args, env=environment, capture_output=True, text=True, check=False)  # noqa: S603
+    assert (
+        result.returncode
+        == {
+            "none": 0,
+            "setup": 7,
+            "import": 19,
+            "payload": 23,
+            "batch-killed": -9,
+        }[failure]
+    ), result.stderr
+    assert calls.read_text().splitlines() == ["from setup"]
+    if role == "worker" and failure == "none":
+        # A requeued allocation must get a fresh cleanup attempt, even with the same job ID.
+        result = subprocess.run(  # noqa: S603
+            args, env={**environment, "SLURM_RESTART_COUNT": "1"}, capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, result.stderr
+        assert calls.read_text().splitlines() == ["from setup", "from setup"]
 
 
 @pytest.mark.parametrize("worker_lanes", [0, 2])

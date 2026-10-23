@@ -139,11 +139,16 @@ if [ "{{enable_metrics_scraping}}" == "yes" ]; then
 fi
 
 cleanup_on_exit() {
+  local exit_status=$?
   echo "Cleaning up any mess ..."
   if [ "{{enable_metrics_scraping}}" == "yes" ]; then
     rm -f $_SLURM_JOB_NODELIST_FILE
     rm -f "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json"
   fi
+{% if host_cleanup_script %}
+  srun --mpi=none --nodes={{num_nodes}} --ntasks={{num_nodes}} --ntasks-per-node=1 bash {{host_cleanup_script}} || echo "Host cleanup failed" >&2
+{% endif %}
+  return "$exit_status"
 }
 trap cleanup_on_exit EXIT
 trap 'exit 143' SIGTERM
@@ -161,6 +166,21 @@ if [ "${node_local_mount_status}" -ne 0 ]; then
   echo "Failed to prepare node-local mount paths (srun status ${node_local_mount_status})." >&2
   exit "${node_local_mount_status}"
 fi
+{% endif %}
+
+{% if host_setup_script %}
+source {{host_setup_script}}
+host_setup_status=$?
+if [ "${host_setup_status}" -ne 0 ]; then
+  exit "${host_setup_status}"
+fi
+{% if num_nodes > 1 %}
+srun --mpi=none --nodes={{num_nodes - 1}} --ntasks={{num_nodes - 1}} --ntasks-per-node=1 --exclude="$SLURMD_NODENAME" bash {{host_setup_script}}
+host_setup_status=$?
+if [ "${host_setup_status}" -ne 0 ]; then
+  exit "${host_setup_status}"
+fi
+{% endif %}
 {% endif %}
 
 # Actual run command
