@@ -77,8 +77,9 @@ Curator focuses on a few reusable areas:
 - **Validation and integration.** Define shared schemas and provenance, make results inspectable, and connect them to
   downstream tools.
 - **Checkpointing and recovery.** Reuse durable work after failures and verify canonical publication before cleanup.
-  The [shared recovery design](curator-next-checkpoint-recovery.md) starts with transcode and embedding and expands
-  across recipes by removing accidental differences in their recovery implementations.
+  The [shared recovery design](curator-next-checkpoint-recovery.md) covers enrichment, starting with transcode and
+  embedding, and append publication, starting with cutting. It expands across recipes by removing accidental
+  differences in their recovery implementations.
 
 Shared schemas give components a common vocabulary while allowing customer-specific extensions. Their exact
 representation can evolve as the toolkit gains implementation experience.

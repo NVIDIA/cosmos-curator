@@ -42,6 +42,7 @@ def caption_run_bindings(spec: CaptionModelSpec, digest: str) -> CaptionRunBindi
             media_size_column="clip_size_bytes",
             media_sha256_column=None,
             staged_binding_columns=("clip_id",),
+            skip_null_ids=True,
         ),
         result=CaptionResultBindings(
             caption_field_name=spec.caption_field_name,

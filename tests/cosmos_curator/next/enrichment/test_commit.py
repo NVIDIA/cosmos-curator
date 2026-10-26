@@ -154,7 +154,7 @@ def test_publication_leaves_unselected_fragments_pending(
     """One job can complete its selection while the rest of the table is unfinished."""
     candidates = prepare_items(dataset, spec, (0,))
     published = commit_items(lambda *_: candidates, dataset, spec, selected=(0,))
-    commit.verify_completed(original=dataset, current=published, spec=spec, selected=(0,))
+    commit.verify_inputs(original=dataset, current=published, spec=spec, selected=(0,))
     assert inputs.pending_fragment_ids(published, make_bindings(published.uri, spec)) == (1,)
     assert commit_items(lambda *_: candidates, dataset, spec, selected=(0,)).version == published.version
 
@@ -198,7 +198,8 @@ def test_publication_ignores_unselected_fragment_changes(
         == workspace
     )
     published = commit_items(lambda *_: candidates, dataset, spec, selected=(0,))
-    commit.verify_completed(original=dataset, current=published, spec=spec, selected=(0,))
+    commit.verify_inputs(original=dataset, current=published, spec=spec, selected=(0,))
+    assert inputs.fragment_complete(published.get_fragment(0), spec)
     if mutation == "delete":
         assert published.count_rows() == 1
     elif mutation == "input":
@@ -324,7 +325,7 @@ def test_duplicate_input_ids_are_rejected_before_join(tmp_path: Path, spec: cont
         data_storage_version="2.2",
     )
     dataset = inputs.register_fields(make_bindings(uri, spec))
-    with pytest.raises(ValueError, match="non-null and unique"):
+    with pytest.raises(ValueError, match="unique within fragment"):
         prepare_items(dataset, spec)
 
 

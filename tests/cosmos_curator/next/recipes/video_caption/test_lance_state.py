@@ -24,7 +24,6 @@ from cosmos_curator.next.recipes.video_caption.lance_state import (
     leaf_field_ids,
     validate_caption_input,
 )
-from cosmos_curator.next.recipes.video_transcode.contracts import completed_publication
 
 
 def _registered(
@@ -156,8 +155,8 @@ def test_pending_fragment_classification_reads_only_result_columns(
     def scan(*, columns: list[str]) -> SimpleNamespace:
         nonlocal scans
         scans += 1
-        assert columns == [caption_spec.caption_field_name, caption_spec.metadata_field_name]
-        return SimpleNamespace(to_batches=table.to_batches)
+        assert columns == [caption_spec.caption_field_name, caption_spec.metadata_field_name, "clip_id"]
+        return SimpleNamespace(to_batches=table.append_column("clip_id", pa.array(["clip-0"])).to_batches)
 
     def unexpected_projection(_batch: pa.Table) -> pa.Table:
         pytest.fail("pending fragment input must not be projected")
@@ -196,8 +195,8 @@ def test_complete_fragment_classification_reads_only_result_columns(
     def scan(*, columns: list[str]) -> SimpleNamespace:
         nonlocal scans
         scans += 1
-        assert columns == [caption_spec.caption_field_name, caption_spec.metadata_field_name]
-        return SimpleNamespace(to_batches=table.to_batches)
+        assert columns == [caption_spec.caption_field_name, caption_spec.metadata_field_name, "clip_id"]
+        return SimpleNamespace(to_batches=table.append_column("clip_id", pa.array(["clip-0"])).to_batches)
 
     def unexpected_projection(_batch: pa.Table) -> pa.Table:
         pytest.fail("complete clip fragment input must not be projected")
@@ -293,25 +292,36 @@ def test_input_validation_rejects_duplicate_clip_ids(
     """Publication keys must be globally unique before caption registration."""
     uri, dataset = clip_dataset_factory(clip_ids=["duplicate", "duplicate"])
 
-    with pytest.raises(ValueError, match="not globally unique"):
+    with pytest.raises(ValueError, match="globally unique"):
         validate_caption_input(dataset, uri=uri)
 
 
-@pytest.mark.parametrize("mutation", ["append", "delete"])
-def test_input_validation_rejects_stale_transcode_publication(
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("clip_size_bytes", 1, None),
+        ("clip_id", None, "non-null and globally unique clip_id"),
+        ("clip_uri", None, "non-null URIs"),
+        ("clip_size_bytes", None, "positive byte sizes"),
+        ("clip_size_bytes", 0, "positive byte sizes"),
+        ("clip_size_bytes", -1, "positive byte sizes"),
+    ],
+)
+def test_input_validation_checks_appended_clip_values(
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
     clip_row_factory: Callable[..., dict[str, object]],
-    mutation: str,
+    field: str,
+    value: int | None,
+    message: str | None,
 ) -> None:
-    """Later row changes invalidate a completion record even with valid clip fields."""
+    """New spans must have usable clips; their readiness depends on values, not publication history."""
     uri, dataset = clip_dataset_factory()
-    record = completed_publication(dataset)
-    if mutation == "append":
-        lance.write_dataset(pa.Table.from_pylist([clip_row_factory(2)], schema=dataset.schema), uri, mode="append")
-    else:
-        dataset.delete("clip_id = 'clip-0'")
+    row = clip_row_factory(2)
+    row[field] = value
+    lance.write_dataset(pa.Table.from_pylist([row], schema=dataset.schema), uri, mode="append")
     latest = lance.dataset(uri)
-    assert completed_publication(latest) == record
-
-    with pytest.raises(ValueError, match="changed after video-transcode publication"):
+    if message is None:
         validate_caption_input(latest, uri=uri)
+    else:
+        with pytest.raises(ValueError, match=message):
+            validate_caption_input(latest, uri=uri)

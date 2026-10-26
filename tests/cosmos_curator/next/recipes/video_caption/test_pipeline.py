@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import lance
+import pyarrow as pa
 import pyarrow.fs as pafs
 import pytest
 
@@ -58,17 +59,19 @@ def _common_mocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, attempt: Capt
     return events
 
 
-def test_registration_rejects_changed_transcode_input(
+def test_registration_rejects_unready_transcode_input(
     tmp_path: Path,
     clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    clip_row_factory: Callable[..., dict[str, object]],
 ) -> None:
-    """The shared caption engine keeps video-transcode's completion validation."""
+    """Caption startup rejects appended spans with incomplete clip metadata."""
     uri, dataset = clip_dataset_factory()
-    dataset.delete("clip_id = 'clip-0'")
+    row = clip_row_factory(2) | {"clip_uri": None}
+    lance.write_dataset(pa.Table.from_pylist([row], schema=dataset.schema), uri, mode="append")
     config = _config(tmp_path)
     config = config.model_copy(update={"input": config.input.model_copy(update={"clips_lance_uri": uri})})
 
-    with pytest.raises(ValueError, match="changed after video-transcode publication"):
+    with pytest.raises(ValueError, match="non-null URIs and positive byte sizes"):
         pipeline.run_config(config)
 
 

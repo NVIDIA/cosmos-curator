@@ -16,17 +16,15 @@ from typing import Any
 import attrs
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 
-from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options
 from cosmos_curator.next.core.lance_datasource import ROW_ADDRESS_FIELDS
+from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE, parquet_stable_schema
+from cosmos_curator.next.core.recovery_bindings import RecoveryBindings
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
-from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 from cosmos_curator.next.utils.identity import canonical_digest, json_snapshot
 
 OWNER_METADATA = b"cosmos_curator.owner"
 FIELD_SET_METADATA = b"cosmos_curator.field_set"
-VALIDATION_BATCH_SIZE = 1_024
 
 
 def owned_fields(fields: pa.Schema, *, owner: str, field_set: str) -> pa.Schema:
@@ -55,43 +53,6 @@ def _ownership(fields: pa.Schema) -> tuple[str, str]:
     raise ValueError(msg)
 
 
-def _parquet_stable(data_type: pa.DataType) -> pa.DataType:
-    """Stage list types as Parquet reads them back, including lists nested in structs.
-
-    Parquet names every list child ``element``. Arrow cannot read back a null
-    ``fixed_size_list``, so fixed-size lists stage as variable lists; publication
-    casts staged values to their canonical types and rejects rows that do not convert.
-    """
-    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
-        value = data_type.value_field
-        element = value.with_name("element").with_type(_parquet_stable(value.type))
-        return pa.large_list(element) if pa.types.is_large_list(data_type) else pa.list_(element)
-    if pa.types.is_struct(data_type):
-        return pa.struct([field.with_type(_parquet_stable(field.type)) for field in data_type])
-    return data_type
-
-
-def _staged_result_schema(id_field: pa.Field, output_fields: pa.Schema) -> pa.Schema:
-    """Return the checkpointed row schema: ``ROW_ADDRESS_FIELDS``, the ID, and Parquet-stable outputs.
-
-    Ray checkpoints a result's ID once its Parquet file is written, so a staged
-    schema that changed in that round trip would leave checkpointed results that
-    publication rejects. Reject any output type Parquet would not read back
-    unchanged, before processing begins.
-    """
-    schema = pa.schema(
-        [*ROW_ADDRESS_FIELDS, id_field, *(field.with_type(_parquet_stable(field.type)) for field in output_fields)]
-    )
-    sink = pa.BufferOutputStream()
-    pq.write_table(schema.empty_table(), sink)
-    restored = pq.read_schema(pa.BufferReader(sink.getvalue()))
-    for field, read_back in zip(schema, restored, strict=True):
-        if not field.equals(read_back, check_metadata=True):
-            msg = f"Staged field {field.name!r} of type {field.type} reads back from Parquet as {read_back.type}"
-            raise ValueError(msg)
-    return schema
-
-
 @attrs.frozen
 class EnrichmentSpec:
     """Recipe-owned input, output fields, result contract, and validation: the complete data contract.
@@ -112,9 +73,16 @@ class EnrichmentSpec:
     validator code, so a recipe that changes what either accepts must change its
     result contract so earlier evidence is not reused.
 
-    The derived ``staged_schema`` is the only definition of checkpointed Parquet
-    rows: ``ROW_ADDRESS_FIELDS``, the ID as declared in the input, and the output
-    fields as Parquet reads them back. Processing receives it from ``ProcessingScope``.
+    A null input ID marks a row outside the work set, such as an upstream
+    source outcome. Read tasks skip such rows while preserving physical offsets,
+    and publication requires exact coverage of non-null IDs in each selected
+    fragment. Fragment counts describe physical rows, including skipped rows;
+    result IDs are always non-null.
+
+    The derived ``result_schema`` holds canonical processing results:
+    ``ROW_ADDRESS_FIELDS``, the non-null ID, and the owned output
+    fields. The shared writer converts these to ``staged_schema`` for Parquet;
+    recipes use only the canonical schema exposed by ``ProcessingScope``.
     """
 
     id_column: str
@@ -123,6 +91,7 @@ class EnrichmentSpec:
     _result_contract_json: str = attrs.field(alias="result_contract", converter=json_snapshot)
     validate_batch: Callable[[pa.RecordBatch], None]
     validate_input: Callable[[lance.LanceDataset], None] | None = None
+    result_schema: pa.Schema = attrs.field(init=False, eq=False)
     staged_schema: pa.Schema = attrs.field(init=False, eq=False)
 
     def __attrs_post_init__(self) -> None:
@@ -145,8 +114,15 @@ class EnrichmentSpec:
             raise ValueError(msg)
         _ownership(self.output_fields)
         # Frozen attrs classes assign derived fields once, through object.__setattr__.
-        staged = _staged_result_schema(self.input_fields.field(self.id_column), self.output_fields)
-        object.__setattr__(self, "staged_schema", staged)
+        result = pa.schema(
+            [
+                *ROW_ADDRESS_FIELDS,
+                self.input_fields.field(self.id_column).with_nullable(nullable=False),
+                *self.output_fields,
+            ]
+        )
+        object.__setattr__(self, "result_schema", result)
+        object.__setattr__(self, "staged_schema", parquet_stable_schema(result))
 
     @property
     def owner(self) -> str:
@@ -197,7 +173,7 @@ def canonical_results(staged: pa.Table, spec: EnrichmentSpec) -> pa.Table:
         raise ValueError(msg)
     try:
         canonical = staged.select([spec.id_column, *spec.output_fields.names]).cast(
-            pa.schema([spec.input_fields.field(spec.id_column), *spec.output_fields])
+            pa.schema([spec.result_schema.field(spec.id_column), *spec.output_fields])
         )
     except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
         msg = "Staged results do not convert to the canonical output types"
@@ -209,7 +185,7 @@ def canonical_results(staged: pa.Table, spec: EnrichmentSpec) -> pa.Table:
 
 
 @attrs.frozen
-class EnrichmentBindings:
+class EnrichmentBindings(RecoveryBindings):
     """Bind a spec to one invocation's table, staging root, and execution settings.
 
     The spec says what is produced; the bindings say where and how. Only ``spec``
@@ -222,17 +198,3 @@ class EnrichmentBindings:
     spec: EnrichmentSpec
     staging_root: str
     execution: EnrichmentExecutionConfig
-
-    @property
-    def storage_options(self) -> dict[str, str] | None:
-        """Resolve the current runtime credentials without retaining them in bindings."""
-        return get_lance_storage_options(self.uri, profile_name=self.execution.storage_profile)
-
-    def storage_env_vars(self, *locations: str) -> dict[str, str]:
-        """Return the Ray worker storage environment for the table, staging root, and the recipe's locations.
-
-        Pass every other location the recipe's workers read or write, such as media roots.
-        """
-        return s3_compatibility_env_vars(
-            self.uri, self.staging_root, *locations, storage_profile=self.execution.storage_profile
-        )

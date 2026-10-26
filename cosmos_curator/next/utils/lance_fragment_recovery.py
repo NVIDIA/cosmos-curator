@@ -15,6 +15,10 @@
 
 """Generic canonical-table bootstrap, fragment staging, and idempotent appends.
 
+Deprecated: new append producers use shared append publication in
+``cosmos_curator.next.append``, which video-cut adopts. The producers still using
+this module migrate explicitly; see ``docs/curator/design/curator-next-checkpoint-recovery.md``.
+
 Shared by any Curator Next recipe that publishes one row per deterministically
 identified unit of work into an append-only Lance table and needs that table to
 double as a cross-run recovery checkpoint. Originated in ``video_split``'s

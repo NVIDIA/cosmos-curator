@@ -39,6 +39,7 @@ def _read_fragments(  # noqa: PLR0913 -- serializable worker inputs
     storage_profile: str,
     schema: pa.Schema,
     batch_size: int,
+    id_column: str,
 ) -> Iterator[pa.Table]:
     # Resolve credentials on the worker so long runs pick up refreshed profiles.
     storage_options = get_lance_storage_options(uri, profile_name=storage_profile)
@@ -57,7 +58,7 @@ def _read_fragments(  # noqa: PLR0913 -- serializable worker inputs
             limit=selected.num_rows,
         )
         for batch in scanner.to_batches():
-            table = pa.Table.from_batches([batch])
+            table = pa.Table.from_batches([batch]).filter(pc.is_valid(batch.column(id_column)))
             offsets = pc.bit_wise_and(table["_rowaddr"], pa.scalar((1 << _ROW_OFFSET_BITS) - 1, type=pa.uint64()))
             yield (
                 table.select(columns)
@@ -73,11 +74,13 @@ def _read_fragments(  # noqa: PLR0913 -- serializable worker inputs
 class LanceFragmentDatasource(Datasource):
     """Capture serializable metadata, retaining live Lance handles on the driver.
 
-    ``schema`` lists the projected input columns plus ``ROW_ADDRESS_FIELDS``.
-    Workers reopen the pinned version under ``storage_profile``.
+    ``schema`` lists the projected input columns, including ``id_column``, plus
+    ``ROW_ADDRESS_FIELDS``. Workers reopen the pinned version under
+    ``storage_profile``. Rows with a null ``id_column`` are outside the work set;
+    reads skip them without renumbering addresses.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- input projection, selection, and worker storage settings
         self,
         dataset: lance.LanceDataset,
         *,
@@ -85,9 +88,13 @@ class LanceFragmentDatasource(Datasource):
         schema: pa.Schema,
         storage_profile: str,
         batch_size: int,
+        id_column: str,
     ) -> None:
         """Pin the input version and selected physical fragments before execution."""
         super().__init__()  # type: ignore[no-untyped-call]
+        if id_column not in schema.names:
+            msg = f"The read schema requires the ID column {id_column!r}"
+            raise ValueError(msg)
         if any(
             field.name not in schema.names or not field.equals(schema.field(field.name), check_metadata=True)
             for field in ROW_ADDRESS_FIELDS
@@ -108,6 +115,7 @@ class LanceFragmentDatasource(Datasource):
         self._schema = schema
         self._storage_profile = storage_profile
         self._batch_size = batch_size
+        self._id_column = id_column
 
     def estimate_inmemory_data_size(self) -> int | None:
         """Let Ray estimate Arrow memory independently of compressed Lance sizes."""
@@ -153,8 +161,10 @@ class LanceFragmentDatasource(Datasource):
                                 storage_profile=self._storage_profile,
                                 schema=self._schema,
                                 batch_size=self._batch_size,
+                                id_column=self._id_column,
                             ),
-                            BlockMetadata(num_rows=task_rows, size_bytes=None, input_files=None, exec_stats=None),
+                            # Skipped null-ID rows leave a task's row count unknown until it reads.
+                            BlockMetadata(num_rows=None, size_bytes=None, input_files=None, exec_stats=None),
                             schema=self._schema,
                             per_task_row_limit=per_task_row_limit,
                         )

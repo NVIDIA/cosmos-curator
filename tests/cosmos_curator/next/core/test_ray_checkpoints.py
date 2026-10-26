@@ -11,6 +11,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import suppress
 
+import pyarrow as pa
 import pyarrow.fs as pafs
 import pytest
 import ray
@@ -283,3 +284,22 @@ def test_ray_checkpoints_imports_without_recipe_or_engine_dependencies(repo_root
     )
 
     assert completed.stdout.strip() == ""
+
+
+def test_staged_schemas_read_back_from_parquet_unchanged() -> None:
+    """Lists stage with Parquet's child names; field metadata survives and schema metadata does not."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string(), nullable=False, metadata={b"owner": b"recipe"}),
+            pa.field("vector", pa.list_(pa.float32(), 4)),
+            pa.field("spans", pa.large_list(pa.struct([("start", pa.int64())]))),
+        ],
+        metadata={b"table": b"binding"},
+    )
+    staged = ray_checkpoints.parquet_stable_schema(schema)
+    assert staged.metadata is None
+    assert staged.field("id").equals(schema.field("id"), check_metadata=True)
+    assert staged.field("vector").type == pa.list_(pa.field("element", pa.float32()))
+    assert staged.field("spans").type == pa.large_list(pa.field("element", pa.struct([("start", pa.int64())])))
+    with pytest.raises(ValueError, match=r"'day' of type date64.* reads back from Parquet as date32"):
+        ray_checkpoints.parquet_stable_schema(pa.schema([("day", pa.date64())]))

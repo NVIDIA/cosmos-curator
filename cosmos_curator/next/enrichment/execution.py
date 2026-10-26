@@ -26,18 +26,15 @@ import ray
 from ray.data.expressions import col
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
-from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
+from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.recovery_workspace import CheckpointWriter, RecoveryWorkspace, checkpoint_writer
 from cosmos_curator.next.enrichment import commit, contracts, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt, reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.commit import PreparedFragment
-from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem
 
-# Free-form provenance under the keys other Curator Next enrichment commits use:
-# the publishing recipe, the field set it fills, and its result contract digest.
-KIND_KEY = "kind"
+# Free-form provenance under the key other Curator Next enrichment commits use: the field set filled.
 FIELD_KEY = "field"
-CONTRACT_DIGEST_KEY = "contract_digest"
 
 
 def selection_datasource(attempt: EnrichmentAttempt, *, columns: Sequence[str]) -> LanceFragmentDatasource:
@@ -50,32 +47,25 @@ def selection_datasource(attempt: EnrichmentAttempt, *, columns: Sequence[str]) 
         schema=bindings.spec.read_schema(columns),
         storage_profile=bindings.execution.storage_profile,
         batch_size=bindings.execution.lance_read_batch_size,
+        id_column=bindings.spec.id_column,
     )
-
-
-def _require_publishable(block: pa.Table, *, spec: contracts.EnrichmentSpec) -> pa.Table:
-    """Pass staged rows through to the sink only if publication will accept them."""
-    if block.num_rows:
-        contracts.canonical_results(block, spec)
-    return block
 
 
 @attrs.frozen
 class ProcessingScope:
     """Both ends of one checkpointed read-to-Parquet plan over an attempt's selection.
 
-    Recipes use ``read``, ``write``, and ``staged_schema``; ``checkpointed_processing``
-    owns the attempt, workspace, and filesystem behind them.
+    Recipes use ``read``, ``write``, and ``result_schema``; ``checkpointed_processing``
+    owns the attempt and the checkpoint writer behind them.
     """
 
     _attempt: EnrichmentAttempt
-    _workspace: RecoveryWorkspace
-    _filesystem: pafs.FileSystem
+    _writer: CheckpointWriter
 
     @property
-    def staged_schema(self) -> pa.Schema:
+    def result_schema(self) -> pa.Schema:
         """Return the schema of rows the plan passes to ``write``; build results in it on workers."""
-        return self._attempt.input.bindings.spec.staged_schema
+        return self._writer.result_schema
 
     def read(self, columns: Sequence[str], *, override_num_blocks: int | None = None) -> ray.data.Dataset:
         """Read the IDs, named input columns, and row addresses, with checkpoint filtering before expensive work.
@@ -91,53 +81,39 @@ class ProcessingScope:
         )
 
     def write(self, results: ray.data.Dataset) -> None:
-        """Validate staged results, write them in strict checkpoint groups, then record that processing completed.
+        """Validate and encode canonical results, checkpoint them, then record processing completion.
 
-        Rows must match the spec's staged schema. Ray checkpoints a result's ID once
-        its Parquet file is written, so every row is validated first: a checkpointed
-        result can always be published.
+        Rows must match ``result_schema``; a checkpointed result can always be published.
         """
-        bindings = self._attempt.input.bindings
-        rows_per_file = bindings.execution.parquet_rows_per_file
-        publishable = results.map_batches(
-            partial(_require_publishable, spec=bindings.spec),
-            batch_format="pyarrow",
-            batch_size=None,
-            zero_copy_batch=True,
-            num_cpus=0.25,
-        )
-        groups = publishable.repartition(target_num_rows_per_block=rows_per_file, strict=True)
-        groups.write_parquet(
-            self._workspace.results,
-            filesystem=self._filesystem,
-            min_rows_per_file=rows_per_file,
-            max_rows_per_file=rows_per_file,
-        )
-        self._workspace.record_completion(storage_profile=bindings.execution.storage_profile)
+        self._writer.write(results)
 
 
 @contextmanager
 def checkpointed_processing(attempt: EnrichmentAttempt) -> Iterator[ProcessingScope]:
     """Construct and execute one plan from ``scope.read`` to ``scope.write`` inside a Ray checkpoint.
 
-    The checkpoint keys on the spec's ID column and shares the result sink's
-    filesystem. It is retained until the attempt's publication is verified.
+    The checkpoint keys on the spec's ID column and is retained until the
+    attempt's publication is verified.
     """
     workspace = attempt.workspace
     if workspace is None or not attempt.selected:
         msg = "Processing requires an attempt with selected fragments and a recovery workspace"
         raise ValueError(msg)
     bindings = attempt.input.bindings
-    filesystem = arrow_filesystem(workspace.root, storage_profile=bindings.execution.storage_profile)
-    with installed_checkpoint(
-        id_column=bindings.spec.id_column, checkpoint_path=workspace.checkpoints, filesystem=filesystem
-    ):
-        yield ProcessingScope(attempt, workspace, filesystem)
+    spec = bindings.spec
+    with checkpoint_writer(
+        workspace,
+        id_column=spec.id_column,
+        result_schema=spec.result_schema,
+        validate=partial(contracts.canonical_results, spec=spec),
+        execution=bindings.execution,
+    ) as writer:
+        yield ProcessingScope(attempt, writer)
 
 
 @attrs.frozen
 class EnrichmentOutcome:
-    """The table after an attempt and whether every eligible recovery workspace was removed."""
+    """The table after an attempt and whether its recovery workspace was removed."""
 
     attempt: EnrichmentAttempt
     dataset: lance.LanceDataset = attrs.field(eq=False)
@@ -177,17 +153,14 @@ def _bound_workspace(attempt: EnrichmentAttempt) -> RecoveryWorkspace:
     return workspace
 
 
-def publish_enrichment(
-    attempt: EnrichmentAttempt, *, transaction_properties: Mapping[str, str] | None = None
-) -> EnrichmentOutcome:
+def publish_enrichment(attempt: EnrichmentAttempt) -> EnrichmentOutcome:
     """Publish the attempt's selection with proof of its validated input, then remove its workspace.
 
     The shared publisher records the spec's owner as ``kind``, its field set as
     ``field``, and the result contract's ``contract_digest``. It also owns the
     recovery receipt and validation evidence, including during descriptor refresh.
-    Optional recipe properties add records that other recipes read. An attempt
-    without selected fragments has nothing to publish. Cleanup is best effort and
-    runs only after canonical verification.
+    An attempt without selected fragments has nothing to publish. Cleanup is
+    best effort and runs only after canonical verification.
     """
     enrichment_input = attempt.input
     bindings = enrichment_input.bindings
@@ -197,12 +170,8 @@ def publish_enrichment(
         CONTRACT_DIGEST_KEY: bindings.spec.contract_digest,
         inputs.VALIDATED_INPUT_KEY: enrichment_input.fingerprint,
     }
-    recipe_properties = dict(transaction_properties or {})
-    if {*shared, inputs.PUBLICATION_RECEIPT_KEY} & recipe_properties.keys():
-        msg = "Recipe properties cannot replace the shared provenance, recovery receipt, or validation evidence"
-        raise ValueError(msg)
     if not attempt.selected:
-        return EnrichmentOutcome(attempt, enrichment_input.dataset, attempt.cleanup_complete)
+        return EnrichmentOutcome(attempt, enrichment_input.dataset, cleanup_complete=True)
     workspace = _bound_workspace(attempt)
     execution = bindings.execution
 
@@ -221,10 +190,10 @@ def publish_enrichment(
         bindings=bindings,
         selected=attempt.selected,
         receipt=workspace.manifest_digest,
-        transaction_properties={**recipe_properties, **shared},
+        transaction_properties=shared,
     )
     cleaned = workspace.cleanup(storage_profile=execution.storage_profile)
-    return EnrichmentOutcome(attempt, published, attempt.cleanup_complete and cleaned)
+    return EnrichmentOutcome(attempt, published, cleaned)
 
 
 def run_enrichment(
@@ -232,8 +201,6 @@ def run_enrichment(
     *,
     start_ray: Callable[[contracts.EnrichmentBindings], None],
     process: Callable[[ProcessingScope], None],
-    transaction_properties: Callable[[EnrichmentAttempt], Mapping[str, str]] | None = None,
-    max_fragments: int | None = None,
 ) -> EnrichmentOutcome:
     """Open validated input, resume saved work or select pending fragments, process what is missing, and publish once.
 
@@ -244,18 +211,16 @@ def run_enrichment(
     prepares column files with Ray Data. It receives the bindings, whose
     ``storage_env_vars`` cover the table and staging root. ``process`` builds and
     executes the recipe's plan from ``scope.read`` to ``scope.write``. An attempt
-    without selected fragments starts no Ray. ``transaction_properties``
-    optionally adds recipe records that other recipes read; the shared provenance
-    needs none. ``max_fragments`` bounds only a new selection.
+    without selected fragments starts no Ray. ``execution.max_fragments`` bounds
+    only a new selection.
     """
-    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(bindings), max_fragments=max_fragments)
+    attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(bindings))
     if attempt.selected:
         start_ray(bindings)
         if not attempt.processing_complete():
             with checkpointed_processing(attempt) as processing:
                 process(processing)
-    properties = None if transaction_properties is None else transaction_properties(attempt)
-    return publish_enrichment(attempt, transaction_properties=properties)
+    return publish_enrichment(attempt)
 
 
 def prepare_enrichment_fragments(

@@ -11,6 +11,7 @@ import lance
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.core import recovery_bindings
 from cosmos_curator.next.enrichment import contracts, inputs
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 from tests.cosmos_curator.next.enrichment.helpers import commit_items, make_bindings, prepare_items
@@ -24,7 +25,7 @@ def test_workspace_tracks_input_file_layout_only(
     workspace = inputs.resolve_workspace(
         dataset, make_bindings(dataset.uri, spec, staging_root=root, result_contract={"version": 1}), selected=(0, 1)
     )
-    assert workspace.manifest["workspace_version"] == 3
+    assert workspace.manifest["workspace_version"] == 5
     assert [fragment["fragment_id"] for fragment in workspace.manifest["input_fragments"]] == [0, 1]
     current = lance.dataset(dataset.uri)
     current.add_columns(pa.schema([("unrelated", pa.string())]))
@@ -84,9 +85,12 @@ def test_workspace_tracks_input_file_layout_only(
         )
         != workspace
     )
-    assert inputs.workspace_prefix(
-        appended, make_bindings(appended.uri, spec, staging_root=root, result_contract={"version": 1})
-    ) == str(Path(workspace.root).parent)
+    assert (
+        inputs.workspace_root(
+            appended, make_bindings(appended.uri, spec, staging_root=root, result_contract={"version": 1})
+        )
+        == workspace.root
+    )
     published.delete("item_id = 'a'")
     with pytest.raises(ValueError, match="deleted rows"):
         inputs.resolve_workspace(
@@ -111,7 +115,7 @@ def test_recovery_identity_ignores_caller_mutations_and_runtime_settings(
     def unexpected_credentials(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Recovery identity must not resolve runtime credentials")
 
-    monkeypatch.setattr(contracts, "get_lance_storage_options", unexpected_credentials)
+    monkeypatch.setattr(recovery_bindings, "get_lance_storage_options", unexpected_credentials)
     tuned = attrs.evolve(
         bindings, execution=EnrichmentExecutionConfig(storage_profile="another-profile", commit_attempts=9)
     )
@@ -228,6 +232,24 @@ def test_mixed_pending_and_terminal_rows_are_rejected(
     )
     with pytest.raises(ValueError, match="mixes pending and terminal"):
         inputs.fragment_complete(mixed.get_fragments()[-1], spec)
+
+
+def test_null_ids_are_not_work_items(tmp_path: Path, spec: contracts.EnrichmentSpec) -> None:
+    """Rows without an ID, such as upstream outcomes, need no results and never conflict as duplicates."""
+    spec = attrs.evolve(spec, input_fields=pa.schema([pa.field("item_id", pa.string()), ("uri", pa.string())]))
+    uri = str(tmp_path / "outcomes.lance")
+    lance.write_dataset(
+        pa.Table.from_pylist(
+            [{"item_id": None, "uri": None}, {"item_id": None, "uri": None}, {"item_id": "a", "uri": "a.mp4"}],
+            schema=spec.input_fields,
+        ),
+        uri,
+        max_rows_per_file=2,
+        data_storage_version="2.2",
+    )
+    bindings = make_bindings(uri, spec)
+    enrichment_input = inputs.open_enrichment_input(bindings)
+    assert inputs.pending_fragment_ids(enrichment_input.dataset, bindings) == (1,)
 
 
 @pytest.mark.parametrize("fault", [None, "append", "other_fields", "repeated_fragment", "no_fragments"])

@@ -1,15 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Resolve source selection before Ray execution or output creation."""
+"""Discover identified source work items before Ray execution or output creation."""
+
+import pyarrow as pa
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
-from cosmos_curator.next.recipes.video_cut.config import InputConfig
-from cosmos_curator.next.recipes.video_cut.storage import s3_client
+from cosmos_curator.next.recipes.video_cut.config import InputConfig, ResolvedVideoCutConfig
+from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id
+from cosmos_curator.next.recipes.video_cut.sources import s3_client
 from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 
-def resolve_input_uris(config: InputConfig, *, storage_profile: str) -> tuple[str, ...]:
+def discover_items(config: ResolvedVideoCutConfig) -> pa.Table:
+    """Discover normalized source URIs and identify them in the append contract's input schema."""
+    uris = _resolve_input_uris(config.input, storage_profile=config.execution.storage_profile)
+    return pa.Table.from_pylist(
+        [{"source_id": make_source_id(uri), "source_uri": uri} for uri in uris], schema=INPUT_SCHEMA
+    )
+
+
+def _resolve_input_uris(config: InputConfig, *, storage_profile: str) -> tuple[str, ...]:
     """Select explicit objects or all MP4 descendants of a directory-like S3 root."""
     if config.uris is not None:
         return config.uris
@@ -30,7 +41,4 @@ def resolve_input_uris(config: InputConfig, *, storage_profile: str) -> tuple[st
             msg = f"S3 discovery returned an object outside {listing_root.path}: {source.path}"
             raise ValueError(msg)
         uris.add(normalize_s3_uri(source.path))
-    if not uris:
-        msg = f"No MP4 source videos found under {listing_root.path}"
-        raise ValueError(msg)
     return tuple(sorted(uris))

@@ -155,8 +155,8 @@ def test_reference_video_inference(variant: str, tmp_path: Path, monkeypatch: py
             "model": {"variant": variant},
         }
     )
-    staged_schema = resolve_bindings(config).spec.staged_schema
-    embedder = VideoEmbedder(spec=spec, model_dir=str(directory), staged_schema=staged_schema)
+    result_schema = resolve_bindings(config).spec.result_schema
+    embedder = VideoEmbedder(spec=spec, model_dir=str(directory), result_schema=result_schema)
     model_inference = embedder._model.get_video_embeddings
     projections: list[npt.NDArray[np.float32]] = []
 

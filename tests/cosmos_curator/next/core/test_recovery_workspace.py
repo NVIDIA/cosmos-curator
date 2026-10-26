@@ -10,8 +10,9 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
-from cosmos_curator.next.enrichment import workspace as recovery_workspace
-from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
+from cosmos_curator.next.core import recovery_workspace
+from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
+from cosmos_curator.next.utils.identity import canonical_digest
 
 
 @pytest.mark.parametrize("marker", [None, b"not-json", b"[]", b'{"manifest_digest":"different"}'])
@@ -52,29 +53,32 @@ def test_manifest_tuples_round_trip_on_resume(tmp_path: Path) -> None:
 
 def test_workspace_keeps_an_immutable_manifest_snapshot(tmp_path: Path) -> None:
     """Caller mutations cannot rebind a chosen workspace or its completion marker."""
-    manifest = {"contract": {"shape": [2, 3]}}
+    manifest = {"contract": {"shape": [2, 3], "name": "café"}}
     workspace = RecoveryWorkspace(str(tmp_path / "workspace"), manifest)
     digest = workspace.manifest_digest
+    assert digest == canonical_digest(manifest)
     workspace.ensure(storage_profile="default")
     workspace.record_completion(storage_profile="default")
     manifest["contract"]["shape"].append(4)
     workspace.manifest["contract"]["shape"].append(5)
     assert workspace.manifest_digest == digest
-    assert workspace.manifest == {"contract": {"shape": [2, 3]}}
+    assert workspace.manifest == {"contract": {"shape": [2, 3], "name": "café"}}
     workspace.ensure(storage_profile="default")
     assert workspace.processing_complete(storage_profile="default")
 
 
-def test_discovery_reads_only_direct_workspace_manifests(tmp_path: Path) -> None:
-    """Unmanaged paths and nested result files are never treated as recovery workspaces."""
-    workspace = RecoveryWorkspace(str(tmp_path / "selection"), {"contract": "test"})
+def test_load_reads_only_the_fixed_manifest(tmp_path: Path) -> None:
+    """A fixed workspace can be reopened without discovering nested or sibling directories."""
+    workspace = RecoveryWorkspace(str(tmp_path / "active"), {"selected_items": ["a"]})
+    assert RecoveryWorkspace.load(workspace.root, storage_profile="default") is None
     workspace.ensure(storage_profile="default")
-    nested = Path(workspace.results, "nested")
-    nested.mkdir(parents=True)
-    (nested / "workspace.json").write_text("not a manifest", encoding="utf-8")
-    (tmp_path / "unmanaged").mkdir()
-    assert RecoveryWorkspace.discover(str(tmp_path), storage_profile="default") == (workspace,)
-    assert RecoveryWorkspace.discover(str(tmp_path / "missing"), storage_profile="default") == ()
+    nested = Path(workspace.results)
+    nested.mkdir()
+    (nested / "workspace.json").write_text("invalid nested manifest", encoding="utf-8")
+    assert RecoveryWorkspace.load(workspace.root, storage_profile="default") == workspace
+    Path(workspace.root, "workspace.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest is not an object"):
+        RecoveryWorkspace.load(workspace.root, storage_profile="default")
 
 
 def test_marker_write_failure_keeps_durable_results(

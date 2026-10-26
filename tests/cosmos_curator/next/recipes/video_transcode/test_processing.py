@@ -32,7 +32,7 @@ def test_download_once_and_stream_bounded_clips(
     config: ResolvedVideoTranscodeConfig,
     enrichment_input: inputs.EnrichmentInput,
     source_path: Path,
-    staged_schema: pa.Schema,
+    result_schema: pa.Schema,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A downloaded source crosses the stage boundary without relying on its original path."""
@@ -66,26 +66,26 @@ def test_download_once_and_stream_bounded_clips(
     rows = [first, *iterator]
     assert calls == ["download", "encode-2", "encode-2"]
     assert len(rows) == 4
-    terminal = processing.upload_clips(pa.Table.from_pylist(rows), config=config, staged_schema=staged_schema)
-    assert terminal.schema.equals(staged_schema, check_metadata=True)
+    terminal = processing.upload_clips(pa.Table.from_pylist(rows), config=config, result_schema=result_schema)
+    assert terminal.schema.equals(result_schema, check_metadata=True)
     for uri in terminal["clip_uri"].to_pylist():
         assert Path(uri).read_bytes() == b"encoded-clip"
 
 
 @pytest.mark.parametrize("num_clips", [0, 1, 4])
 def test_upload_batch_preserves_result_schema(
-    config: ResolvedVideoTranscodeConfig, results: pa.Table, staged_schema: pa.Schema, num_clips: int
+    config: ResolvedVideoTranscodeConfig, results: pa.Table, result_schema: pa.Schema, num_clips: int
 ) -> None:
     """Empty and inferred batches normalize field types, metadata, and span addresses."""
     expected = results.slice(0, num_clips)
-    field = staged_schema.field("clip_frame_count")
+    field = result_schema.field("clip_frame_count")
     expected = expected.set_column(expected.schema.get_field_index(field.name), field, pa.nulls(num_clips, field.type))
     payloads = [bytes([index]) * 50 for index in range(num_clips)]
     batch = expected.append_column(_CLIP_BYTES, pa.array(payloads, type=pa.large_binary()))
     if num_clips:
         batch = pa.Table.from_pylist(batch.to_pylist())
-    uploaded = processing.upload_clips(batch, config=config, staged_schema=staged_schema)
-    assert uploaded.schema.equals(staged_schema, check_metadata=True)
+    uploaded = processing.upload_clips(batch, config=config, result_schema=result_schema)
+    assert uploaded.schema.equals(result_schema, check_metadata=True)
     assert uploaded.equals(expected)
     for uri, payload in zip(uploaded["clip_uri"].to_pylist(), payloads, strict=True):
         assert Path(uri).read_bytes() == payload
@@ -132,7 +132,7 @@ def test_upload_failure_produces_no_result(
 
     monkeypatch.setattr(processing, "upload_bytes", fail)
     with pytest.raises(OSError, match="upload unavailable"):
-        processing.upload_clips(batch, config=config, staged_schema=results.schema)
+        processing.upload_clips(batch, config=config, result_schema=results.schema)
     assert Path(uris[0]).read_bytes() == b"x" * 50
     assert all(not Path(uri).exists() for uri in uris[1:])
 

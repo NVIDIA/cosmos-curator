@@ -7,6 +7,11 @@ from collections.abc import Iterator
 
 import lance
 
+# Free-form provenance every shared Curator Next publication records: the
+# publishing recipe and the digest of its result contract.
+KIND_KEY = "kind"
+CONTRACT_DIGEST_KEY = "contract_digest"
+
 
 def iter_transactions(
     dataset: lance.LanceDataset,

@@ -26,17 +26,16 @@ from lance.fragment import FragmentMetadata
 from loguru import logger
 
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
+from cosmos_curator.next.core.lance_transactions import find_transaction
 from cosmos_curator.next.enrichment.contracts import EnrichmentBindings, EnrichmentSpec, canonical_results
 from cosmos_curator.next.enrichment.inputs import (
     PUBLICATION_RECEIPT_KEY,
     field_ids,
     file_layout_digest,
-    fragment_complete,
     result_files_match,
     selected_fragments,
     validate_fields,
 )
-from cosmos_curator.next.enrichment.transactions import find_transaction
 
 PREPARED_SCHEMA = pa.schema(
     [
@@ -91,13 +90,17 @@ def prepare_fragment(
         raise ValueError(msg)
     ordered = batch.take(pc.sort_indices(batch, sort_keys=[("row_offset", "ascending")]))
     expected = fragment.to_table(columns=[spec.id_column])
+    # Rows with null IDs are not work items; their offsets stay out of the expected coverage.
+    eligible = pc.is_valid(expected[spec.id_column]).combine_chunks()
+    offsets = pc.filter(pa.array(range(expected.num_rows), type=pa.int64()), eligible)
+    expected = expected.filter(eligible)
     expected_ids = expected[spec.id_column]
-    if expected_ids.null_count or pc.count_distinct(expected_ids).as_py() != expected.num_rows:
-        msg = f"Input {spec.id_column} values must be non-null and unique within fragment {fragment_id}"
+    if pc.count_distinct(expected_ids).as_py() != expected.num_rows:
+        msg = f"Input {spec.id_column} values must be unique within fragment {fragment_id}"
         raise ValueError(msg)
     if (
         ordered.num_rows != expected.num_rows
-        or not ordered["row_offset"].combine_chunks().equals(pa.array(range(expected.num_rows), type=pa.int64()))
+        or not ordered["row_offset"].combine_chunks().equals(offsets)
         or not ordered[spec.id_column].equals(expected_ids)
     ):
         msg = f"Missing, duplicate, or misaligned {spec.id_column} results for fragment {fragment_id}"
@@ -137,18 +140,6 @@ def verify_inputs(
         before_layout = file_layout_digest(before.metadata, input_ids)
         if after is None or file_layout_digest(after.metadata, input_ids) != before_layout:
             msg = f"Input rows or file layout changed for fragment {before.fragment_id}"
-            raise ValueError(msg)
-
-
-def verify_completed(
-    *, original: lance.LanceDataset, current: lance.LanceDataset, spec: EnrichmentSpec, selected: Sequence[int]
-) -> None:
-    """Verify the finite selection, leaving concurrent appends for the next invocation."""
-    verify_inputs(original=original, current=current, spec=spec, selected=selected)
-    for fragment_id in selected:
-        fragment = current.get_fragment(fragment_id)
-        if fragment is None or not fragment_complete(fragment, spec):
-            msg = f"Selected result fragment {fragment_id} remains pending"
             raise ValueError(msg)
 
 

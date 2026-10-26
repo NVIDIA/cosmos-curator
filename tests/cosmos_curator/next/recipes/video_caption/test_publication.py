@@ -15,7 +15,7 @@ import pytest
 from cosmos_curator.next.recipes.video_caption import publication
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
-from cosmos_curator.next.recipes.video_caption.inference import result_schema
+from cosmos_curator.next.recipes.video_caption.inference import caption_lance_datasource, result_schema
 from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
 from cosmos_curator.next.recipes.video_caption.publication import (
     PreparedFragmentPublication,
@@ -50,8 +50,9 @@ def _setup_attempt(  # integration fixture inputs stay explicit
     *,
     count: int = 2,
     rows_per_fragment: int = 2,
+    clip_rows: list[dict[str, object]] | None = None,
 ) -> tuple[str, CaptionAttempt, CaptionWorkspace, pa.Table]:
-    uri, _ = factory(count=count, rows_per_fragment=rows_per_fragment)
+    uri, _ = factory(count=count, rows_per_fragment=rows_per_fragment, rows=clip_rows)
     dataset = ensure_caption_fields(uri, storage_options=None, bindings=bindings, attempts=3)
     attempt = capture_attempt(dataset, bindings=bindings)
     rows = []
@@ -60,6 +61,8 @@ def _setup_attempt(  # integration fixture inputs stay explicit
         assert fragment is not None
         clip_ids = fragment.to_table(columns=["clip_id"])["clip_id"].to_pylist()
         for row_offset, clip_id in enumerate(clip_ids):
+            if clip_id is None:
+                continue
             rows.append(
                 {
                     "fragment_id": fragment_id,
@@ -664,3 +667,59 @@ def test_caption_fingerprint_keeps_default_arrow_hash(
         schema=schema,
     )
     assert publication._caption_table_fingerprint(table, caption_bindings) == publication.arrow_table_fingerprint(table)
+
+
+def test_caption_skips_outcomes_and_preserves_sparse_row_offsets(
+    tmp_path: Path,
+    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
+    clip_row_factory: Callable[..., dict[str, object]],
+    caption_spec: CaptionModelSpec,
+    caption_digest: str,
+    caption_bindings: CaptionRunBindings,
+) -> None:
+    """Whole-fragment publication only expects the clip rows, and leaves source outcomes untouched."""
+    empty = {"source_id": "empty", "source_uri": "s3://input/empty.mp4", "stream_index": 0}
+    rows = [
+        empty,
+        clip_row_factory(0),
+        empty | {"source_id": "error", "error_stage": "source-read", "error_message": "missing"},
+        clip_row_factory(1),
+        empty,
+    ]
+    uri, attempt, workspace, staged = _setup_attempt(
+        tmp_path,
+        clip_dataset_factory,
+        caption_spec,
+        caption_digest,
+        caption_bindings,
+        clip_rows=rows,
+        rows_per_fragment=4,
+    )
+    assert (attempt.pending_fragment_ids, attempt.complete_fragment_ids) == ((0,), (1,))
+    dataset = lance.dataset(uri)
+    source = caption_lance_datasource(
+        dataset,
+        attempt,
+        storage_options=None,
+        batch_size=1,
+        source_columns=caption_bindings.input.source_columns,
+        source_schema=caption_bindings.input.source_schema,
+        skip_null_column="clip_id",
+    )
+    read = pa.concat_tables([batch for task in source.get_read_tasks(1) for batch in task()])
+    assert read["_rowaddr"].to_pylist() == [1, 3]
+    assert read["clip_id"].to_pylist() == ["clip-0", "clip-1"]
+    summary = publish_staged_results(uri, attempt, workspace, caption_bindings, storage_options=None, commit_attempts=1)
+    assert summary.published_fragments == 1
+    current = lance.dataset(uri)
+    assert capture_attempt(current, bindings=caption_bindings).pending_fragment_ids == ()
+    assert current.to_table(columns=CLIP_SCHEMA.names).equals(dataset.to_table(columns=CLIP_SCHEMA.names))
+    assert (
+        current.to_table(filter="span_id IS NULL", columns=[caption_spec.caption_field_name])[
+            caption_spec.caption_field_name
+        ].null_count
+        == 3
+    )
+    assert staged["row_offset"].to_pylist() == [1, 3]
+    replay = publish_staged_results(uri, attempt, workspace, caption_bindings, storage_options=None, commit_attempts=1)
+    assert (replay.published_fragments, replay.already_committed_fragments) == (0, 1)

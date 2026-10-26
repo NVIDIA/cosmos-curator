@@ -3,7 +3,6 @@
 
 """Small canonical clip tables and typed visual results, without a Ray runtime."""
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +19,6 @@ from cosmos_curator.next.recipes.video_embed.config import ResolvedVideoEmbedCon
 from cosmos_curator.next.recipes.video_embed.contracts import READ_COLUMNS, ModelSpec, resolve_model_spec, terminal_row
 from cosmos_curator.next.recipes.video_transcode.contracts import (
     CLIP_SCHEMA,
-    PUBLICATION_KEY,
-    PUBLICATION_VERSION,
     make_clip_id,
 )
 from tests.cosmos_curator.next.enrichment.conformance import RecipeUnderTest
@@ -53,7 +50,7 @@ def spec(config: ResolvedVideoEmbedConfig) -> ModelSpec:
 
 
 def write_clips(config: ResolvedVideoEmbedConfig, *, payload: bytes = b"mp4") -> lance.LanceDataset:
-    """Write four immutable clip rows across two fragments with transcode provenance."""
+    """Write four immutable clip rows across two fragments."""
     root = Path(config.input.media_root)
     (root / "clips").mkdir(parents=True, exist_ok=True)
     source_uri = str(root / "source.mp4")
@@ -67,8 +64,6 @@ def write_clips(config: ResolvedVideoEmbedConfig, *, payload: bytes = b"mp4") ->
         clip_path.write_bytes(payload)
         rows.append(
             {
-                "record_schema_version": 1,
-                "cut_contract_id": "cut-contract",
                 "source_id": source_id,
                 "source_uri": source_uri,
                 "source_size_bytes": 100,
@@ -99,9 +94,6 @@ def write_clips(config: ResolvedVideoEmbedConfig, *, payload: bytes = b"mp4") ->
         config.input.clips_lance_uri,
         max_rows_per_file=2,
         data_storage_version="2.2",
-        transaction_properties={
-            PUBLICATION_KEY: json.dumps({"publication_version": PUBLICATION_VERSION, "spans": len(rows)})
-        },
     )
 
 
@@ -132,7 +124,7 @@ def results(enrichment_input: inputs.EnrichmentInput, work_rows: list[dict[str, 
     rows.append(
         terminal_row(work_rows[-1] | {"error_type": "MediaObjectError", "error_message": "missing"}, spec, None)
     )
-    return pa.Table.from_pylist(rows, schema=enrichment_input.bindings.spec.staged_schema)
+    return pa.Table.from_pylist(rows, schema=enrichment_input.bindings.spec.result_schema)
 
 
 def _retune(config: ResolvedVideoEmbedConfig) -> ResolvedVideoEmbedConfig:

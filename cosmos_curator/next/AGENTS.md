@@ -36,12 +36,12 @@ or measured performance, rather than every historical implementation choice.
 Scope extractions and adoptions to the task. Document shared assumptions and guarantees; extend the contract explicitly
 when semantics change, with tests for new and existing consumers.
 
-For checkpointing and recovery, `video_transcode`, `video_embed`, and their shared components are the canonical reference.
-Migrate other recipes and older recovery helpers toward that pattern, but check the
-[extensions it lacks](../../docs/curator/design/curator-next-checkpoint-recovery.md#expansion-across-curator-next)
+For checkpointing and recovery, `video_transcode` and `video_embed` (enrichment), `video_cut` (append), and their shared
+components are the canonical reference. Migrate other recipes and older recovery helpers toward that pattern, but check
+the [extensions it lacks](../../docs/curator/design/curator-next-checkpoint-recovery.md#expansion-across-curator-next)
 first: row-level selection (embeddings, robot-action-caption) and several field sets in one commit
-(multimodal-embedding) each need an explicit extension, not a force-fit. `lance_fragment_recovery` is deprecated for new
-workflows; producers need an explicit append-publication extension to shared recovery before migration.
+(multimodal-embedding) each need an explicit extension, not a force-fit. `lance_fragment_recovery` is deprecated; its
+producers (mp4-index, multimodal-split, robot-action-split) migrate to shared append publication explicitly.
 
 ## Recipe Contracts
 
@@ -58,16 +58,31 @@ Before scaling or declaring a recipe complete, record its contract in module doc
 - recovery boundary and compatibility inputs, when supported;
 - failure and quarantine behavior.
 
-Use the recipe's current design notes when changing publication or recovery. When adopting shared recovery, follow the
-[shared contract](../../docs/curator/design/curator-next-checkpoint-recovery.md#assumptions-and-guarantees).
-Document how the recipe and deployment meet its assumptions, and test its guarantees.
-Start from the
-[adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-the-reference-pattern): the
-recipe's `run_config` calls `run_enrichment`, its tests subclass the shared
-[conformance suite](../../tests/cosmos_curator/next/enrichment/conformance.py), and an integration test runs the shared
-[fresh-cluster scenario](../../tests/cosmos_curator/next/enrichment/fresh_cluster.py). The
-[`enrichment` package docstring](enrichment/__init__.py) lists the rest of the recipe-facing API. Keep processing graphs,
-payload durability, and terminal-error policy recipe-owned.
+Use the recipe's current design notes when changing publication or recovery. To adopt shared recovery:
+
+1. Read the [shared model](../../docs/curator/design/curator-next-checkpoint-recovery.md#the-shared-model), then your kind's
+   section: [enrichment](../../docs/curator/design/curator-next-checkpoint-recovery.md#enrichment-publication) or
+   [append](../../docs/curator/design/curator-next-checkpoint-recovery.md#append-publication). For append migrations, record the
+   [migration decisions](../../docs/curator/design/curator-next-checkpoint-recovery.md#append-migration-decisions) before copying video-cut.
+2. Document how the recipe and deployment meet the
+   [shared assumptions](../../docs/curator/design/curator-next-checkpoint-recovery.md#assumptions-and-guarantees).
+3. Start from the adoption example for
+   [enrichment](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-enrichment-publication) or
+   [append](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-append-publication): `bindings.py` defines
+   `resolve_bindings(config)`, and `run_config` calls `run_enrichment` or `run_append`. Pass append discovery as a callback
+   so saved selections resume without listing source storage. The
+   [`enrichment`](enrichment/__init__.py) and [`append`](append/__init__.py) package docstrings list the recipe-facing
+   API.
+4. Emit canonical results in `ProcessingScope.result_schema`; the shared writer owns Parquet conversion. Keep model
+   prerequisites inside `process`. Append recipes declare terminal errors with `AppendSpec.error_column`, and shared
+   publication counts them. Expansion must preserve every item's completion and error details in Lance rows,
+   including an outcome row when an item has no derived records.
+5. Subclass the matching conformance suite ([enrichment](../../tests/cosmos_curator/next/enrichment/conformance.py),
+   [append](../../tests/cosmos_curator/next/append/conformance.py)), and run the matching fresh-cluster scenario
+   ([enrichment](../../tests/cosmos_curator/next/enrichment/fresh_cluster.py),
+   [append](../../tests/cosmos_curator/next/append/fresh_cluster.py)) from an integration test for each processing plan.
+
+Keep discovery, processing graphs, payload durability, and terminal-error policy recipe-owned.
 
 ## Configuration and CLI
 

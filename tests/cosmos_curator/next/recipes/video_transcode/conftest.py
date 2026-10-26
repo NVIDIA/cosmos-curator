@@ -11,8 +11,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.next.enrichment.inputs import EnrichmentInput, open_enrichment_input
-from cosmos_curator.next.recipes.video_cut.config import FixedStrideConfig
-from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id, span_schema
+from cosmos_curator.next.recipes.video_cut.contracts import SPAN_SCHEMA, make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_transcode import pipeline
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig, resolve_config_data
@@ -57,8 +56,6 @@ def span_rows(source_path: Path) -> list[dict[str, Any]]:
     source_id = make_source_id(str(source_path))
     return [
         {
-            "record_schema_version": 1,
-            "cut_contract_id": FixedStrideConfig().contract_id,
             "source_id": source_id,
             "source_uri": str(source_path),
             "stream_index": 0,
@@ -80,7 +77,7 @@ def span_rows(source_path: Path) -> list[dict[str, Any]]:
 @pytest.fixture
 def enrichment_input(config: ResolvedVideoTranscodeConfig, span_rows: list[dict[str, Any]]) -> EnrichmentInput:
     """Create canonical span fragments; transcode does not require cut receipts."""
-    schema = span_schema(FixedStrideConfig())
+    schema = SPAN_SCHEMA
     lance.write_dataset(
         pa.Table.from_pylist(span_rows, schema=schema),
         config.input.spans_lance_uri,
@@ -97,13 +94,13 @@ def dataset(enrichment_input: EnrichmentInput) -> lance.LanceDataset:
 
 
 @pytest.fixture
-def staged_schema(config: ResolvedVideoTranscodeConfig) -> pa.Schema:
-    """Use the staged clip rows the recipe's enrichment spec defines, as processing receives them."""
-    return resolve_bindings(config).spec.staged_schema
+def result_schema(config: ResolvedVideoTranscodeConfig) -> pa.Schema:
+    """Use the canonical clip result schema that the processing scope supplies."""
+    return resolve_bindings(config).spec.result_schema
 
 
 @pytest.fixture
-def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, staged_schema: pa.Schema) -> pa.Table:
+def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, result_schema: pa.Schema) -> pa.Table:
     """Build completed results with exact original span addresses."""
     rows = []
     for fragment in dataset.get_fragments():
@@ -126,7 +123,7 @@ def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, s
                     "clip_video_codec": "h264",
                 }
             )
-    return pa.Table.from_pylist(rows, schema=staged_schema)
+    return pa.Table.from_pylist(rows, schema=result_schema)
 
 
 def _retune(config: ResolvedVideoTranscodeConfig) -> ResolvedVideoTranscodeConfig:

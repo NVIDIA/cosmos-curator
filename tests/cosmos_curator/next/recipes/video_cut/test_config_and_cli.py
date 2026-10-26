@@ -29,12 +29,13 @@ def test_normalization_and_contract_scope(config: ResolvedVideoCutConfig) -> Non
     raw = config.model_dump(mode="json")
     raw["input"]["uris"] = list(reversed(raw["input"]["uris"])) * 2
     tuned = resolve_config_data(
-        raw, overrides=["execution.sources_per_checkpoint=10", "execution.spans_per_fragment=99"]
+        raw, overrides=["execution.parquet_rows_per_file=10", "execution.rows_per_fragment=99", "execution.max_items=2"]
     )
+    assert tuned.execution.max_items == 2
     assert tuned.input == config.input
-    assert tuned.split.contract_id == config.split.contract_id
+    assert tuned.split.cutting_contract == config.split.cutting_contract
     changed = resolve_config_data(raw, overrides=["split.stride_s=1.0"])
-    assert changed.split.contract_id != config.split.contract_id
+    assert changed.split.cutting_contract != config.split.cutting_contract
     literal = "s3://test-bucket/a%2Fb//c.mp4"
     raw["input"]["uris"] = [literal]
     assert resolve_config_data(raw).input.uris == (literal,)
@@ -81,7 +82,7 @@ def test_root_config_renders_without_discovery(tmp_path: Path, monkeypatch: pyte
     """CLI validation/rendering needs no S3 access and resolves defaults after overrides."""
     from cosmos_curator.client.cli import cosmos_curator  # noqa: PLC0415 - deployment CLI dependencies are dev-only
 
-    monkeypatch.setattr(pipeline, "resolve_input_uris", lambda *_args, **_kwargs: pytest.fail("unexpected discovery"))
+    monkeypatch.setattr(pipeline, "discover_items", lambda *_args, **_kwargs: pytest.fail("unexpected discovery"))
     raw = {
         "schema_version": 1,
         "kind": "video-cut",
@@ -102,7 +103,7 @@ def test_root_config_renders_without_discovery(tmp_path: Path, monkeypatch: pyte
     assert resolved["output"]["spans_lance_uri"] == "s3://test-bucket/other/lance"
     assert resolved["output"]["staging_root_uri"] == "s3://test-bucket/other/staging/video-cut"
     explicit = resolve_config_data(raw | {"input": {"uris": ["s3://test-bucket/raw/a.mp4"]}})
-    assert resolve_config_data(raw).split.contract_id == explicit.split.contract_id
+    assert resolve_config_data(raw).split.cutting_contract == explicit.split.cutting_contract
 
 
 @pytest.mark.parametrize(
@@ -117,7 +118,9 @@ def test_root_config_renders_without_discovery(tmp_path: Path, monkeypatch: pyte
         'input.uris=["s3://test-bucket/a\\nb.mp4"]',
         "split.duration_s=0.0000000001",
         "split.min_duration_s=100.0",
-        "execution.sources_per_checkpoint=0",
+        "execution.parquet_rows_per_file=0",
+        "execution.max_items=0",
+        "execution.fixed_stride.probe_mode=auto",
         "execution.typo=1",
         "kind=video_cut",
     ],
@@ -145,9 +148,11 @@ def test_cli_template_render_schema_and_dispatch(
     assert "replace `uris` with `root_uri:" in template.stdout
     assert "derived from `media_root`" in template.stdout
     assert "root_uri" not in config_template()["input"]
-    assert config_template()["execution"]["probe_cpus"] == 0.25
-    assert config_template()["execution"]["sources_per_checkpoint"] == 1024
-    assert config_template()["execution"]["spans_per_fragment"] == 100_000
+    assert config_template()["execution"]["fixed_stride"] == {"probe_cpus": 0.25}
+    assert config_template()["execution"]["parquet_rows_per_file"] == 1_000
+    assert config_template()["execution"]["rows_per_fragment"] == 100_000
+    assert "max_items" not in config_template()["execution"]
+    assert "Set execution.max_items" in template.stdout
     template_path = tmp_path / "template.yaml"
     template_path.write_text(template.stdout)
     rendered = runner.invoke(
@@ -166,19 +171,18 @@ def test_cli_template_render_schema_and_dispatch(
     kind = pipeline_runtime.BUILTIN_PIPELINE_KINDS.get("video-cut")
     assert kind.validate(path, ()) == {"ok": True}
     assert (
-        json.loads(kind.render(path, ("execution.sources_per_checkpoint=3",)))["execution"]["sources_per_checkpoint"]
-        == 3
+        json.loads(kind.render(path, ("execution.parquet_rows_per_file=3",)))["execution"]["parquet_rows_per_file"] == 3
     )
     seen = []
 
     def run(resolved: ResolvedVideoCutConfig) -> dict[str, int]:
         seen.append(resolved)
-        return {"spans": 3, "errors": 0}
+        return {"selected_items": 2, "appended_rows": 3, "remaining_items": 1, "errors": 1}
 
     monkeypatch.setattr(pipeline, "run_config", run)
     pipeline_runtime.main(path)
     captured = capsys.readouterr()
-    assert "video-cut:" in captured.out
+    assert "video-cut: published 2 item(s) as 3 row(s) with 1 terminal error(s); 1 item(s) pending" in captured.out
     assert captured.err == ""
     assert seen == [config]
 
@@ -191,8 +195,7 @@ def test_transnetv2_resolution_and_contract(config: ResolvedVideoCutConfig) -> N
     resolved = resolve_config_data(raw)
     assert isinstance(resolved.split, TransNetV2Config)
     assert resolved.split.decoder == "pyav"
-    assert resolved.execution.sources_per_checkpoint == 32
-    assert resolved.split.contract_id != config.split.contract_id
+    assert resolved.split.cutting_contract != config.split.cutting_contract
     model = resolve_registered_model("transnetv2")
     assert resolved.split.cutting_contract["model"] == {
         "model_id": model.model_id,
@@ -208,16 +211,19 @@ def test_transnetv2_resolution_and_contract(config: ResolvedVideoCutConfig) -> N
             "execution.transnetv2.inference_cpus=0.5",
             "execution.transnetv2.inference_memory_gib=3",
             "execution.transnetv2.window_batch_size=8",
-            "execution.sources_per_checkpoint=1",
+            "execution.parquet_rows_per_file=1",
         ],
     )
-    assert tuned.split.contract_id == resolved.split.contract_id
-    assert tuned.execution.sources_per_checkpoint == 1
+    assert tuned.split.cutting_contract == resolved.split.cutting_contract
+    assert tuned.execution.parquet_rows_per_file == 1
     assert tuned.execution.transnetv2.cpus == 4
     assert tuned.execution.transnetv2.memory_gib == 8
     assert tuned.execution.transnetv2.inference_cpus == 0.5
     assert tuned.execution.transnetv2.inference_memory_gib == 3
-    assert resolve_config_data(raw, overrides=["split.threshold=0.5"]).split.contract_id != resolved.split.contract_id
+    assert (
+        resolve_config_data(raw, overrides=["split.threshold=0.5"]).split.cutting_contract
+        != resolved.split.cutting_contract
+    )
     assert resolve_config_data(resolved.model_dump(mode="json")) == resolved
 
 
@@ -225,11 +231,11 @@ def test_nvdec_has_a_separate_cutting_contract() -> None:
     """GPU resizing can change predictions, so it must not reuse PyAV source checkpoints."""
     cpu = TransNetV2Config()
     assert cpu.decoder == "pyav"
-    assert cpu.contract_id == TransNetV2Config(decoder="pyav").contract_id
+    assert cpu.cutting_contract == TransNetV2Config(decoder="pyav").cutting_contract
     assert cpu.cutting_contract["decode"] == "pyav-rgb24-48x27-presentation-timestamps-v1"
     gpu = TransNetV2Config(decoder="nvdec")
     assert gpu.decoder == "nvdec"
-    assert gpu.contract_id != cpu.contract_id
+    assert gpu.cutting_contract != cpu.cutting_contract
     assert gpu.cutting_contract["model"] == cpu.cutting_contract["model"]
 
 

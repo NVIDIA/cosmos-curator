@@ -1,18 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Own the Ray Data checkpoint configuration for one complete processing plan."""
+"""Own the Ray Data checkpoint configuration for one complete processing plan, and the rows it stages."""
 
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+import pyarrow as pa
 import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 import ray
 from loguru import logger
 from ray.data.checkpoint import CheckpointConfig
 
 _CHECKPOINT_CONFIG_LOCK = threading.Lock()
+# Terminal-value validation reads staged or published results in Arrow batches of at most this many rows.
+VALIDATION_BATCH_SIZE = 1_024
 
 
 @contextmanager
@@ -114,3 +118,38 @@ def installed_checkpoint(
     finally:
         with _CHECKPOINT_CONFIG_LOCK:
             context.checkpoint_config = None
+
+
+def _parquet_stable(data_type: pa.DataType) -> pa.DataType:
+    """Stage list types as Parquet reads them back, including lists nested in structs.
+
+    Parquet names every list child ``element``. Arrow cannot read back a null
+    ``fixed_size_list``, so fixed-size lists stage as variable lists; publishers
+    cast staged values to their canonical types and reject rows that do not convert.
+    """
+    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
+        value = data_type.value_field
+        element = value.with_name("element").with_type(_parquet_stable(value.type))
+        return pa.large_list(element) if pa.types.is_large_list(data_type) else pa.list_(element)
+    if pa.types.is_struct(data_type):
+        return pa.struct([field.with_type(_parquet_stable(field.type)) for field in data_type])
+    return data_type
+
+
+def parquet_stable_schema(schema: pa.Schema) -> pa.Schema:
+    """Return the schema to stage checkpointed rows in: the fields as Parquet reads them back.
+
+    Ray checkpoints a row's ID once its Parquet file is written, so a staged
+    schema that changed in that round trip would leave checkpointed results that
+    publication rejects. Reject any type Parquet would not read back unchanged,
+    such as ``date64``, before processing begins. Schema-level metadata is dropped.
+    """
+    staged = pa.schema([field.with_type(_parquet_stable(field.type)) for field in schema])
+    sink = pa.BufferOutputStream()
+    pq.write_table(staged.empty_table(), sink)
+    restored = pq.read_schema(pa.BufferReader(sink.getvalue()))
+    for field, read_back in zip(staged, restored, strict=True):
+        if not field.equals(read_back, check_metadata=True):
+            msg = f"Staged field {field.name!r} of type {field.type} reads back from Parquet as {read_back.type}"
+            raise ValueError(msg)
+    return staged

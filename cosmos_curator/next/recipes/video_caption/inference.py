@@ -131,6 +131,7 @@ class _CaptionLanceDatasource(Datasource):
         storage_options: dict[str, str] | None,
         batch_size: int,
         source_columns: tuple[str, ...],
+        skip_null_column: str | None = None,
     ) -> None:
         super().__init__()  # type: ignore[no-untyped-call]  # Ray's public Datasource constructor lacks typing.
         self._uri = uri
@@ -139,6 +140,7 @@ class _CaptionLanceDatasource(Datasource):
         self._storage_options = dict(storage_options) if storage_options is not None else None
         self._batch_size = batch_size
         self._source_columns = source_columns
+        self._skip_null_column = skip_null_column
 
     @property
     def num_rows(self) -> int:
@@ -168,7 +170,7 @@ class _CaptionLanceDatasource(Datasource):
             fragments = self._fragments[start:stop]
             fragment_ids = tuple(fragment.fragment_id for fragment in fragments)
             metadata = BlockMetadata(
-                num_rows=sum(fragment.num_rows for fragment in fragments),
+                num_rows=None if self._skip_null_column else sum(fragment.num_rows for fragment in fragments),
                 size_bytes=None,
                 input_files=tuple(path for fragment in fragments for path in fragment.input_files),
                 exec_stats=None,
@@ -183,6 +185,7 @@ class _CaptionLanceDatasource(Datasource):
                         storage_options=self._storage_options,
                         batch_size=self._batch_size,
                         source_columns=self._source_columns,
+                        skip_null_column=self._skip_null_column,
                     ),
                     metadata,
                     schema=fragments[0].schema,
@@ -469,6 +472,7 @@ def caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema
     batch_size: int,
     source_columns: tuple[str, ...],
     source_schema: pa.Schema,
+    skip_null_column: str | None = None,
 ) -> _CaptionLanceDatasource:
     """Snapshot selected-fragment metadata while keeping live handles on the driver."""
     fragments = []
@@ -495,6 +499,7 @@ def caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema
         storage_options=storage_options,
         batch_size=batch_size,
         source_columns=source_columns,
+        skip_null_column=skip_null_column,
     )
 
 
@@ -506,6 +511,7 @@ def _read_caption_fragments(  # noqa: PLR0913 -- serialized read-task inputs are
     storage_options: dict[str, str] | None,
     batch_size: int,
     source_columns: tuple[str, ...],
+    skip_null_column: str | None = None,
 ) -> Iterator[pa.Table]:
     """Reopen a pinned Lance snapshot with credentials and stream selected fragments."""
     dataset = lance.dataset(uri, version=version, storage_options=storage_options)
@@ -523,7 +529,11 @@ def _read_caption_fragments(  # noqa: PLR0913 -- serialized read-task inputs are
         batch_size=batch_size,
     )
     for batch in scanner.to_reader():
-        yield pa.Table.from_batches([batch])
+        table = pa.Table.from_batches([batch])
+        if skip_null_column is not None:
+            table = table.filter(table[skip_null_column].is_valid())
+        if table.num_rows:
+            yield table
 
 
 def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are independently meaningful
@@ -546,6 +556,7 @@ def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are 
         batch_size=config.lance_read_batch_size,
         source_columns=bindings.input.source_columns,
         source_schema=bindings.input.source_schema,
+        skip_null_column=bindings.input.row_id_column if bindings.input.skip_null_ids else None,
     )
 
     with installed_checkpoint(

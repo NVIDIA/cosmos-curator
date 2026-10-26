@@ -3,6 +3,7 @@
 
 """Recipe-facing enrichment declarations: specs, owned fields, staged schemas, and bindings."""
 
+from functools import partial
 from pathlib import Path
 
 import attrs
@@ -11,6 +12,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cosmos_curator.next.core import recovery_bindings
+from cosmos_curator.next.core.recovery_workspace import _stage_results
 from cosmos_curator.next.enrichment import contracts
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.enrichment.helpers import make_bindings
@@ -102,7 +105,7 @@ def test_staged_lists_read_back_from_parquet_and_cast_to_canonical_types(tmp_pat
     assert spec.staged_schema.field("labels").type == pa.struct(
         [("tags", pa.list_(element(pa.string()))), ("boxes", pa.large_list(element(pa.list_(element(pa.int32())))))]
     )
-    staged = pa.Table.from_pylist(
+    results = pa.Table.from_pylist(
         [
             {
                 "fragment_id": 0,
@@ -113,7 +116,13 @@ def test_staged_lists_read_back_from_parquet_and_cast_to_canonical_types(tmp_pat
             },
             {"fragment_id": 0, "row_offset": 1, "item_id": "b", "vector": None, "labels": None},
         ],
-        schema=spec.staged_schema,
+        schema=spec.result_schema,
+    )
+    staged = _stage_results(
+        results,
+        result_schema=spec.result_schema,
+        staged_schema=spec.staged_schema,
+        validate=partial(contracts.canonical_results, spec=spec),
     )
     path = tmp_path / "staged.parquet"
     pq.write_table(staged, path)
@@ -151,7 +160,7 @@ def test_storage_environment_covers_the_table_staging_root_and_recipe_locations(
         calls.append((locations, storage_profile))
         return {"AWS_EXAMPLE": "value"}
 
-    monkeypatch.setattr(contracts, "s3_compatibility_env_vars", environment)
+    monkeypatch.setattr(recovery_bindings, "s3_compatibility_env_vars", environment)
     bindings = make_bindings(dataset.uri, spec, staging_root=str(tmp_path / "staging"))
     assert bindings.storage_env_vars("s3://media") == {"AWS_EXAMPLE": "value"}
     assert calls == [((dataset.uri, str(tmp_path / "staging"), "s3://media"), "default")]

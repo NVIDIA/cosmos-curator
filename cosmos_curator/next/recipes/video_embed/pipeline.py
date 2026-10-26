@@ -69,7 +69,7 @@ def embed_clips(processing: ProcessingScope, config: ResolvedVideoEmbedConfig, s
     )
     inferred = downloaded.map_batches(
         VideoEmbedder,
-        fn_constructor_kwargs={"spec": spec, "model_dir": model_dir, "staged_schema": processing.staged_schema},
+        fn_constructor_kwargs={"spec": spec, "model_dir": model_dir, "result_schema": processing.result_schema},
         batch_format="pyarrow",
         batch_size=execution.inference_batch_size,
         compute=_actor_pool(execution.inference_concurrency),

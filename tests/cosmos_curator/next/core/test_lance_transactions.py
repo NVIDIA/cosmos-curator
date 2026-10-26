@@ -11,7 +11,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment.transactions import find_transaction
+from cosmos_curator.next.core.lance_transactions import find_transaction
 
 
 @pytest.fixture

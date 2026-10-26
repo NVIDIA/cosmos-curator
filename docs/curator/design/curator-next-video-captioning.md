@@ -23,15 +23,24 @@ corresponding fragments are verified in Lance.
 `video-cut` owns span rows and fragment creation. `video-transcode` owns clip media and its metadata. Captioning owns
 only its selected caption and metadata fields. It does not discover sources, split videos, rewrite media, append rows, or change row order.
 
+Empty/error source outcomes from video-cut have null span and clip IDs. Captioning skips these rows during reading,
+completion checks, and publication coverage, preserving their physical offsets and leaving caption fields null.
+Fragments containing only source outcomes need no caption work. The clip invariants below apply to real spans.
+
 The design relies on these properties of the upstream table:
 
 - `clip_id` is globally unique and immutable.
-- `clip_uri` and `clip_size_bytes` are non-null and immutable for an existing row.
+- `clip_uri` and `clip_size_bytes` are non-null and immutable for an existing row; byte sizes are positive.
 - Each clip is a standalone H.264 MP4 that was probed after transcoding.
 - Transcoding publishes all clip metadata in one commit while preserving the cut fragment layout.
 - Nullable enrichment fields may be added without changing the upstream-owned fields.
 
-Captioning starts after transcode publication. One logical writer owns a given caption field set. Enrichment writers
+Captioning validates the current clip schema, globally unique non-null IDs, non-null media URIs, and positive byte sizes
+on every real span. It shares the readiness validator with embedding and includes uniqueness in the same aggregate query.
+It requires no transcode publication receipt, so history pruning and later empty/error source outcomes do not block
+ready clips. Newly appended spans without clip metadata must finish transcoding before captioning starts.
+
+One logical writer owns a given caption field set. Enrichment writers
 for disjoint field sets may run concurrently when they follow the fragment-reconciliation protocol described below.
 Multiple writers for the same field set are outside the consistency model.
 
@@ -75,8 +84,8 @@ latest table.
 Each invocation captures the latest table as `V_attempt` after registering or validating the selected caption fields.
 Every fragment in that snapshot is classified as one of two valid states:
 
-- **pending:** both caption-owned fields are null on every row;
-- **complete:** every row is terminal and matches the selected contract digest.
+- **pending:** both caption-owned fields are null on every clip row;
+- **complete:** every clip row is terminal and matches the selected contract digest.
 
 A fragment with mixed pending and terminal rows, a partial field set, stale contract metadata, or invalid terminal
 values fails before new work begins.
@@ -365,8 +374,8 @@ Driver
 Each Ray group is sorted by `row_offset` and checked against the current fragment. Validation proves that:
 
 - the fragment was pending in `V_attempt`;
-- offsets are exactly `0..row_count - 1`, without gaps or duplicates;
-- ordered `clip_id` values match the current fragment;
+- offsets cover every clip row exactly, allowing gaps only for source outcomes with null clip IDs;
+- ordered `clip_id` values match the eligible rows in the current fragment;
 - every row has the selected field set and contract digest;
 - every row is a valid terminal value; and
 - both fields cast exactly to their registered Arrow types.

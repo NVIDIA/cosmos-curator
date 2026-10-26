@@ -179,8 +179,8 @@ def _encode(source: Path, outputs: tuple[tuple[Span, Path], ...], config: Resolv
     )
 
 
-def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, staged_schema: pa.Schema) -> pa.Table:
-    """Upload each clip before returning its metadata as ``staged_schema`` rows for checkpointing."""
+def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, result_schema: pa.Schema) -> pa.Table:
+    """Upload each clip before returning its metadata as ``result_schema`` rows for checkpointing."""
     for index in range(batch.num_rows):
         payload = batch["clip_bytes"][index].as_py()
         if not payload or len(payload) != batch["clip_size_bytes"][index].as_py():
@@ -197,4 +197,4 @@ def upload_clips(batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, stage
             max_attempts=config.execution.storage_attempts,
             name="clip-upload",
         )
-    return batch.select(staged_schema.names).cast(staged_schema)
+    return batch.select(result_schema.names).cast(result_schema)

@@ -1,97 +1,98 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Method dispatch, source checkpoint scope, and independent download/GPU admission."""
+"""Video-cut runs: the span-table summary, method prerequisites inside processing, and earlier table formats.
 
+Shared publication and recovery behavior is covered by ``test_conformance.py``, and each cutting
+method's stages by its own test module.
+"""
+
+import json
+from functools import partial
 from unittest.mock import Mock
 
+import lance
+import pyarrow as pa
 import pytest
-from ray.data import ActorPoolStrategy
-from ray.data._internal.execution.execution_callback import ExecutionCallback
-from ray.data.context import DataContext
 
-from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
 from cosmos_curator.next.recipes.video_cut import pipeline, transnetv2
+from cosmos_curator.next.recipes.video_cut.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_cut.publication import resolve_workspace
+from cosmos_curator.next.recipes.video_cut.contracts import SPAN_SCHEMA, make_source_id, source_result
+from cosmos_curator.next.recipes.video_cut.discovery import discover_items
+from tests.cosmos_curator.next.append.helpers import replace_ray, select, stage_results
+from tests.cosmos_curator.next.recipes.video_cut.conftest import probed_source
 
 
-@pytest.mark.parametrize("fail_write", [False, True])
-def test_transnetv2_actor_resources_and_checkpoint_scope(
-    config: ResolvedVideoCutConfig, snapshot_id: str, monkeypatch: pytest.MonkeyPatch, *, fail_write: bool
+def test_summary_adds_the_span_table(
+    config: ResolvedVideoCutConfig, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CPU decode and GPU inference scale separately, without freezing startup resource capacity."""
-    raw = config.model_dump(mode="json")
-    raw["split"] = {"method": "transnetv2"}
-    config = resolve_config_data(raw)
-    context = DataContext.get_current()
-    monkeypatch.setattr(context, "custom_execution_callback_classes", [ExecutionCallback])
-    monkeypatch.setattr(context.autoscaling_config, "actor_pool_util_upscaling_threshold", 1.75)
-    plan = Mock()
-    for method in ("map", "map_batches", "repartition"):
-        getattr(plan, method).return_value = plan
-
-    def read(*_args: object, **_kwargs: object) -> Mock:
-        assert context.checkpoint_config.id_column == "source_id"
-        plan.context = context.copy()
-        return plan
-
-    monkeypatch.setattr(pipeline.ray.data, "read_datasource", read)
-    snapshot = Mock(side_effect=AssertionError("Actor pools must not freeze startup resource capacity"))
-    monkeypatch.setattr(pipeline.ray, "cluster_resources", snapshot)
-    workspace = resolve_workspace(config, snapshot_id)
-    if fail_write:
-        plan.write_parquet.side_effect = RuntimeError("injected write failure")
-        with pytest.raises(RuntimeError, match="injected write failure"):
-            pipeline.cut_sources(config, workspace, config.input.uris)
-    else:
-        pipeline.cut_sources(config, workspace, config.input.uris)
-    download_args, download = plan.map.call_args
-    assert download_args == (transnetv2.SourceDownloader,)
-    assert download["resources"] == {"curator_io": 1.0}
-    assert download["num_cpus"] == 0.25
-    assert plan.map_batches.call_count == 2
-    decode_args, decode = plan.map_batches.call_args_list[0]
-    assert decode_args == (transnetv2.decode_sources,)
-    assert (decode["num_cpus"], decode["num_gpus"], decode["memory"]) == (3, 0, 2 * 1024**3)
-    assert decode["batch_size"] == 1
-    assert decode["fn_kwargs"] == {"execution": config.execution}
-    assert "resources" not in decode
-    assert "compute" not in decode  # Stateless CPU tasks release their reservations after each task.
-    inference_args, inference = plan.map_batches.call_args_list[1]
-    assert inference_args == (transnetv2.TransNetV2Planner,)
-    assert (inference["num_cpus"], inference["num_gpus"]) == (1, 0.25)
-    assert inference["batch_size"] == 1
-    assert inference["memory"] == 2 * 1024**3
-    assert inference["runtime_env"]["env_vars"]["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "0"
-    assert "resources" not in inference
-    for stage in (download, inference):
-        assert isinstance(stage["compute"], ActorPoolStrategy)
-        assert stage["compute"].max_size == float("inf")
-        assert stage["compute"].max_tasks_in_flight_per_actor == 1
-    assert plan.context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.0
-    assert plan.context.custom_execution_callback_classes == [ExecutionCallback, ReleasePendingDownloadActors]
-    assert context.custom_execution_callback_classes == [ExecutionCallback]
-    assert context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.75
-    assert context.checkpoint_config is None
-    snapshot.assert_not_called()
-
-
-def test_nvdec_shares_one_gpu_actor_with_inference(config: ResolvedVideoCutConfig) -> None:
-    """GPU decode avoids a CPU decode stage and reserves memory for the combined work."""
-    raw = config.model_dump(mode="json")
-    raw["split"] = {"method": "transnetv2", "decoder": "nvdec"}
-    config = resolve_config_data(
-        raw,
-        overrides=["execution.transnetv2.memory_gib=3", "execution.transnetv2.inference_memory_gib=2"],
+    """The shared summary gains the span table's location and version without counting its rows."""
+    replace_ray(pipeline, monkeypatch, results=results)
+    monkeypatch.setattr(
+        lance.LanceDataset, "count_rows", Mock(side_effect=AssertionError("Summary must not scan rows"))
     )
-    sources = Mock()
-    sources.context = DataContext.get_current().copy()
-    sources.map.return_value = sources
-    pipeline._transnetv2_plan(sources, config)
-    sources.map_batches.assert_called_once()
-    args, settings = sources.map_batches.call_args
-    assert args == (transnetv2.TransNetV2Planner,)
-    assert settings["fn_constructor_kwargs"]["split"].decoder == "nvdec"
-    assert (settings["num_cpus"], settings["num_gpus"], settings["memory"]) == (1, 0.25, 5 * 1024**3)
-    assert settings["compute"].max_size == float("inf")
+    summary = pipeline.run_config(config)
+    dataset = lance.dataset(config.output.spans_lance_uri)
+    assert summary == {
+        "input_items": 4,
+        "selected_items": 4,
+        "remaining_items": 0,
+        "appended_rows": 8,
+        "errors": 1,
+        "cleanup_complete": True,
+        "contract_digest": resolve_bindings(config).spec.contract_digest,
+        "spans_lance_uri": config.output.spans_lance_uri,
+        "spans_lance_version": int(dataset.version),
+    }
+    (reported,) = dataset.to_table(
+        filter="error_stage IS NOT NULL", columns=["source_id", "source_uri", "error_stage", "error_message"]
+    ).to_pylist()
+    assert reported == {
+        "source_id": make_source_id("s3://test-bucket/error.mp4"),
+        "source_uri": "s3://test-bucket/error.mp4",
+        "error_stage": "source-read",
+        "error_message": "synthetic missing source",
+    }
+
+
+def test_completed_transnetv2_plans_publish_without_weights(
+    config: ResolvedVideoCutConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh driver publishes completed plans without inference prerequisites."""
+    settings = config.model_dump(mode="json")
+    settings["split"] = {"method": "transnetv2"}
+    config = resolve_config_data(settings)
+    bindings = resolve_bindings(config)
+    assert config.input.uris is not None
+    attempt = select(bindings, discover_items(config))
+    results = pa.Table.from_pylist(
+        [source_result(probed_source(uri, 100), []) for uri in config.input.uris], schema=bindings.spec.result_fields
+    )
+    stage_results(attempt, results)
+    weights = Mock(side_effect=FileNotFoundError("weights are not mounted on this driver"))
+    monkeypatch.setattr(transnetv2, "validate_weights", weights)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", Mock())
+    replace_ray(pipeline, monkeypatch, results=None, start_ray=partial(pipeline.start_ray, config=config))
+
+    summary = pipeline.run_config(config)
+
+    assert summary["selected_items"] == len(config.input.uris)
+    assert summary["cleanup_complete"] is True
+    weights.assert_not_called()
+
+
+def test_tables_from_earlier_formats_are_rejected_without_mutation(
+    config: ResolvedVideoCutConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tables without the shared contract binding need a new output location; no migration exists."""
+    legacy_schema = SPAN_SCHEMA.with_metadata({b"video_cut.contract": json.dumps(config.split.cutting_contract)})
+    legacy = lance.write_dataset(
+        legacy_schema.empty_table(), config.output.spans_lance_uri, schema=legacy_schema, data_storage_version="2.2"
+    )
+    replace_ray(pipeline, monkeypatch, results=None, start_ray=Mock(side_effect=AssertionError("Ray started")))
+    with pytest.raises(
+        ValueError, match="different producer, item ID column, or result contract; use a new output location"
+    ):
+        pipeline.run_config(config)
+    assert lance.dataset(config.output.spans_lance_uri).version == legacy.version

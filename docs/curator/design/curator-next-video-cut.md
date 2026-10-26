@@ -17,36 +17,47 @@ select new sources -> probe + plan each source -> checkpointed Parquet with span
 - **Separate cutting from transcoding.** Boundaries and source references can be reused across encoding choices.
 - **Recover by source.** Keeping a complete source plan together avoids reconciling separate source and span progress.
 - **Pack spans independently.** Checkpoint size bounds replay; Lance fragment size controls storage layout.
-- **Append one finite selection.** One atomic Lance commit publishes the new spans and run receipt together, allowing
-  staging to be deleted afterward while preserving earlier fragments.
+- **Append one finite selection.** One atomic Lance commit publishes the new spans and empty/error outcomes together,
+  allowing staging to be deleted afterward while preserving earlier fragments and every source's completion.
 
 The tradeoff is that interrupted publication rebuilds fragments from Parquet. This repeats tabular work while reusing
-checkpointed source plans, avoiding a separate publication ledger.
+checkpointed source plans, avoiding a separate publication ledger. Video-cut is the reference recipe for
+[shared append publication](curator-next-checkpoint-recovery.md#append-publication), which owns selection, checkpoint
+scopes, publication of all source outcomes, and recovery proof. Video-cut owns discovery, source probing and planning,
+its terminal-error policy, and span expansion.
 
 ## Input, identity, and output contract
 
-Inputs are explicit S3 MP4 URIs or a recursive S3 root. Discovery normalizes, sorts, and deduplicates selected URIs while
-preserving literal S3 keys. Empty selections and listing failures stop before output creation.
+Inputs are explicit S3 MP4 URIs or a recursive S3 root. `discovery.discover_items(config)` normalizes, sorts, and
+deduplicates selected URIs, preserves literal S3 keys, and returns identified work items in `INPUT_SCHEMA`. Production
+and the conformance suite use this same entry point. The invocation opens the target table and reconciles saved work
+before discovery. An unfinished selection resumes without listing. For new work, listing failures propagate before
+selection or Ray starts; an empty target table may already have been created. A successful empty listing selects no
+work and starts no Ray.
 
 Each URI must identify immutable content. Each output is bound to one cutting contract, but its source set can grow.
-Root inputs are listed on every invocation. Sources already published are skipped before probing, including recorded
+Root inputs are listed when selecting new work. Sources already published are skipped before probing, including recorded
 empty plans and terminal errors. Removing a source from a later input selection does not remove its existing spans.
 Explicit URIs and root discovery are interchangeable when they select identical sources.
 
 | Identity | Meaning |
 | --- | --- |
-| `source_id` | Hash of the normalized immutable source URI. |
+| `source_id` | Hash of the normalized immutable source URI; the append work item. |
 | `span_id` | Hash of source ID, first video stream (`stream_index: 0`), start, and end. |
-| Cutting contract | Method, result settings, stream selection, behavior version, and (for TransNetV2) pinned model identity. |
-| Input snapshot | Hash of one invocation's normalized, sorted source URI set; identifies its workspace and receipt. |
+| Cutting contract | Method, result settings, stream selection, behavior version, and (for TransNetV2) pinned model identity; the append result contract, which binds the span table. |
 
 Span identity is independent of cutting settings. Intervals are half-open `[start_ns, end_ns)` on a zero-relative video
 timeline. The source endpoint is FFprobe's stream duration, falling back to container duration.
 [`next.media.spans`](../../../cosmos_curator/next/media/spans.py) defines rounding and fixed-stride tail rules.
 
-Lance is the canonical span dataset. Rows contain source references, media metadata, cutting provenance, and span
-boundaries; the v1 schemas are defined in [`contracts.py`](../../../cosmos_curator/next/recipes/video_cut/contracts.py).
-Sources with empty plans or terminal errors contribute no spans, but remain included in the committed outcome counts.
+Lance stores flat span rows and durable source outcomes. Every row carries source references and media metadata.
+Span rows have a `span_id` and interval boundaries. A source without spans has one outcome row with null `span_id`,
+`start_ns`, and `end_ns`; a terminal failure's outcome row also has `error_stage` and `error_message`.
+[`contracts.py`](../../../cosmos_curator/next/recipes/video_cut/contracts.py) defines the schemas. Current source-ID
+presence records completion even after history is pruned.
+
+Transcode, embedding, and captioning skip outcome rows. Query `span_id IS NOT NULL` for spans or
+`error_stage IS NOT NULL` for diagnostics. No append receipts or JSONL error reports are required.
 
 One logical cutter owns source selection for each output. Transcode and other producers of nullable enrichment columns
 may run concurrently. Cut only appends fragments; existing rows, fragment boundaries, and span columns are immutable.
@@ -55,47 +66,53 @@ compatibility.
 
 ## Execution and recovery
 
-Phase A exposes source identities through a Ray Data datasource, allowing native checkpoint filtering to skip completed
-sources before media access. Fixed-stride planning tasks process sources sequentially within each read block, producing one Parquet
-row per source with its metadata, spans, and outcome. A task retry repeats the block's probes. `execution.probe_cpus`
-controls probe concurrency and defaults to `0.25` CPUs per task. Empty plans and terminal errors are checkpointed too.
+Selection, resumption, `execution.max_items`, history pruning, and cleanup follow
+[shared append publication](curator-next-checkpoint-recovery.md#append-publication). By default, each invocation
+selects and publishes every pending source; set `execution.max_items` to publish fewer per invocation, and rerun while
+`remaining_items` is nonzero or null. A resumed selection skips source discovery and reports null input and remaining
+counts; the following invocation discovers any new work. Each table and cutting contract reuses one fixed workspace.
+Cleanup must succeed before a new selection starts; a cleanup failure leaves already-published results valid.
+This section describes what video-cut adds.
 
-Native checkpoints use `source_id` and advance in groups controlled by `sources_per_checkpoint`. An unfinished group
-can replay; setting the group size to one gives single-source durability. Plans and checkpoints are retained until
-publication succeeds. The workspace path hashes the input snapshot, cutting contract, full source-result schema, output
-destination, and workspace version to isolate compatible recovery state.
+Both cutting methods read the selected sources through the shared processing scope, one source per read block, so
+native checkpoint filtering skips completed sources before media access, each probe or download task handles one
+source, and a task retry repeats only that source. Both emit one canonical `SOURCE_SCHEMA` row per source. Each method
+owns its execution graph and shares only the source failure policy in
+[`sources.py`](../../../cosmos_curator/next/recipes/video_cut/sources.py):
 
-On resume, checkpointed outcomes for sources already published by an intervening cut invocation are excluded.
-Phase B expands the remaining source plans with Arrow and packs spans across source boundaries into Lance fragments controlled
-by `spans_per_fragment`. Workers stage the fragments; the driver commits them with one atomic `Append` transaction.
-The transaction's `video_cut.publication` property uses publication format version 1 and records the input snapshot,
-processed source IDs, outcome counts, and error report. Even a zero-span run commits its receipt. Reruns recognize the
-receipt despite intervening enrichment commits, and later input selections skip its source IDs. Retain Lance transaction
-history for these run receipts, especially the identities of sources with no span rows.
+```text
+fixed-stride: one task per source: remote probe -> local download/probe if needed -> plan
+transnetv2:   download -> probe + decode (CPU, or NVDEC on the GPU actor) -> inference + plan
+```
 
-Every committed fragment is ready for transcode; there is no whole-table completion gate. An empty table can coexist
-with an active cut run. Append preserves enrichment columns, and newly appended narrow span rows read those nullable
-columns as null. Previous fragments are never repacked, including an earlier run's partially filled final fragment.
+Fixed-stride needs only metadata and normally finishes through remote probing. An inconclusive remote probe streams
+the source to a temporary file and probes it there within the same task. Source bytes never enter Ray, and the task's
+CPU reservation bounds concurrency, including rare fallback downloads. It needs no `curator_io` resources or actor
+pool. If many sources require fallback, increase `execution.fixed_stride.probe_cpus` to reduce concurrent disk and
+network use.
 
-This implementation assumes freshly created datasets and recovery workspaces. Source completion is determined from
-transaction receipts, including zero-span outcomes; earlier schema receipts have no migration path. Tables carrying
-schema receipts are rejected at open with a request to use a new output location.
+TransNetV2 needs every source's frames, so its download actors pass encoded bytes through Ray to decoding. Each actor
+reserves one `curator_io` slot and defaults to 0.25 CPU, following the
+[large-download guidance](ray-data.md#large-source-downloads-and-curator_io). The pool autoscales and accepts late
+workers without a startup-derived maximum.
 
-| Failure boundary | Recovery |
-| --- | --- |
-| Before a source group is checkpointed | Replay incomplete source work. |
-| After source checkpoints, before the Lance commit | Reuse source plans and rebuild publication fragments. |
-| Commit succeeds but its response is lost | Recognize completion in Lance; the active invocation can proceed to cleanup. |
-| Driver exits after commit, or cleanup fails or is interrupted | A later invocation recognizes completion and returns success without starting Ray or touching staging. |
+Native checkpoints use `source_id` and advance in groups controlled by `parquet_rows_per_file`. Both methods default
+to 1,000 source plans per file. Lower this setting to reduce replay at the cost of more checkpoint writes; setting it
+to one gives single-source durability. An unfinished group and other in-flight sources can replay. Completed plans
+contain no frames or encoded bytes.
 
-After confirming publication, an invocation attempts to delete only the configuration-derived workspace it used or
-resumed. Cleanup is best effort: success returns `cleanup_complete: true`; a failure logs a warning and returns
-`cleanup_complete: false` without invalidating the output. An invocation that finds publication already complete skips
-cleanup and returns `cleanup_complete: null`, even if its staging root or storage profile has changed. Publication
-metadata never supplies a deletion path. Crashes and cleanup failures may leave orphaned staging for explicit cleanup
-or a storage expiration policy. Uncommitted fragment files from failed attempts can be removed through Lance cleanup.
+Publication expands the source plans with Arrow and packs spans and source outcomes across source boundaries into Lance fragments
+controlled by `rows_per_fragment`. Previous fragments are never repacked, including an earlier run's partially filled
+final fragment. Every committed fragment is ready for transcode; there is no whole-table completion gate. An empty
+table can coexist with an active cut run. Append preserves enrichment columns, and newly appended narrow span rows read
+those nullable columns as null.
 
-The fixed-stride method has completed a managed Ray run on Slurm. Failure recovery is tested locally with synthetic probe metadata.
+This implementation assumes freshly created datasets and recovery workspaces. Tables from earlier video-cut formats
+lack the shared contract binding or the current span schema and are rejected at open with a request to use a new output
+location; they have no migration path.
+
+The fixed-stride method has completed a managed Ray run on Slurm. Failure recovery is tested locally with synthetic
+probe metadata, through the shared append conformance suite and the fresh-cluster scenario, which runs for both methods.
 
 ### TransNetV2 execution
 
@@ -103,17 +120,16 @@ The fixed-stride method has completed a managed Ray run on Slurm. Failure recove
 and GPU inference stages:
 
 ```text
-checkpoint-filtered source blocks -> download actors
-  -> encoded bytes through Ray -> CPU tasks: PyAV decode, resize
-  -> tiny RGB frames and timestamps through Ray -> GPU actors: TransNetV2 inference
-  -> one complete source plan -> checkpointed Parquet -> existing Lance append
+checkpoint-filtered source blocks -> download actors (curator_io)
+  -> encoded bytes through Ray -> CPU tasks: probe, PyAV decode, resize
+  -> tiny RGB frames, timestamps, and media fields through Ray -> GPU actors: TransNetV2 inference
+  -> one complete source plan -> checkpointed Parquet -> shared Lance append
 ```
 
-Downloads reserve 0.25 CPU and one `curator_io` slot per actor, with one in-flight call. PyAV decode tasks default to
-3 CPUs (`execution.transnetv2.cpus`) and 2 GiB of host memory (`memory_gib`). Inference actors use
-1 CPU (`inference_cpus`), 0.25 GPU (`gpus`), and 2 GiB of host memory (`inference_memory_gib`). The different resource
-requests keep Ray from fusing decoding back into inference, so CPU decode concurrency can grow independently of the
-model pool.
+PyAV decode tasks default to 3 CPUs (`execution.transnetv2.cpus`) and 2 GiB of host memory (`memory_gib`). Inference
+actors use 1 CPU (`inference_cpus`), 0.25 GPU (`gpus`), and 2 GiB of host memory (`inference_memory_gib`). The
+different resource requests keep Ray from fusing decoding back into inference, so CPU decode concurrency can grow
+independently of the model pool.
 
 Set `split.decoder: nvdec` to opt into GPU preprocessing. Encoded bytes flow directly from download actors to GPU
 actors, where NVDEC decoding and inference share the same actor and GPU reservation. The actor's host memory
@@ -124,7 +140,6 @@ decoding hardware. Unclassified decoder/CUDA failures propagate.
 
 Both backends use actor pools that can grow with available resources, including late workers; neither has a
 startup-derived maximum. The actor autoscaling threshold is 1.0 for the media plan.
-See the [large-download guidance](ray-data.md#large-source-downloads-and-curator_io).
 
 NVDEC uses native demuxer timestamps, including variable cadence, and drains delayed B-frames at end of input.
 Its color conversion and resizing differ from PyAV, so decoder selection belongs to the cutting contract.
@@ -132,15 +147,13 @@ Switching decoders requires a separate `output.media_root`; PyAV checkpoints and
 To resume existing NVDEC output, keep `split.decoder: nvdec` explicit. PyAV is the default based on the managed Slurm
 comparison below; NVDEC remains opt-in while throughput and output quality are evaluated further.
 
-The shared download-autoscaling utility is scoped to the TransNetV2 media plan. It cancels surplus pending IO actors
-that would otherwise prevent Ray 2.58 from scaling down an idle download pool, preserving normal cooldown and scale-up.
-
-Download tasks process sources sequentially within each read block. Ray streams encoded bytes downstream using its
-normal block-size targets; inference still plans one source per call. Task retries may repeat multiple sources from a block,
-while durable recovery remains source-level through the existing checkpoints.
+The shared download-autoscaling utility cancels surplus pending IO actors that would otherwise prevent Ray 2.58 from
+scaling down an idle download pool, preserving normal cooldown and scale-up.
 
 Each inference actor loads the pinned FP32 PyTorch TransNetV2 checkpoint once. The driver checks that the checkpoint
-file exists before starting Ray, and every new actor checks before loading it. Staging must supply the revision in
+file exists when constructing the processing plan, and every new actor checks before loading it. A valid processing
+completion marker skips this preflight and all inference setup, so publication can finish without mounted weights.
+Staging must supply the revision in
 `configs/all_models.json` and keep the weights immutable across runs; video-cut does not verify their checksum.
 The checkpoint comes from the registry's runtime model directory:
 `/config/models/Sn4kehead/TransNetV2/transnetv2-pytorch-weights.pth`. Local Docker and managed Slurm launches mount the
@@ -152,8 +165,8 @@ resource/batch settings are not.
 
 With PyAV, each CPU decode task writes a temporary source file, probes it, and decodes the first video stream at its native cadence.
 Resizing reuses one single-threaded scaler per source. Decoded 48x27 RGB uint8 frames travel in Arrow binary buffers,
-alongside integer timestamps and probe metadata; encoded source bytes stop at the decode stage. These transient buffers
-are reconstructed as NumPy views by inference actors and are never part of the durable source-result schema.
+alongside integer timestamps and probed media fields; encoded source bytes stop at the decode stage. These transient
+buffers are reconstructed as NumPy views by inference actors and are never part of the durable source-result schema.
 Presentation timestamps are normalized to the first decoded frame,
 so variable-frame-rate input does not rely on average-FPS arithmetic. Missing/non-increasing timestamps or timestamps
 outside the probed duration produce terminal media errors. Sources must fit in worker memory and temporary storage;
@@ -172,17 +185,15 @@ Long scenes are tiled into `max_duration_s` spans, and scenes/tails shorter than
 scene includes the last frame and ends at the probed source duration. There is no extra boundary crop or frame-count
 minimum. These semantics are versioned independently of the legacy splitter.
 
-TransNetV2 defaults to 32 sources per checkpoint when that setting is omitted (fixed-stride remains 1,024). Completed
-plans contain no frames or encoded bytes. Incomplete groups and other in-flight sources may replay after failure.
-Missing objects and recognized invalid or unsupported media become terminal errors; storage infrastructure, model setup,
-CUDA, and unclassified decoding failures propagate. If NVDEC selects a different video stream from the required first
-video stream, the source receives a terminal `source-decode` error. Rerun those sources with `split.decoder: pyav` and
-a fresh output location. Inference failures never become successful empty plans.
+Inference failures never become successful empty plans. If NVDEC selects a different video stream from the required
+first video stream, the source receives a terminal `source-decode` error. Rerun those sources with
+`split.decoder: pyav` and a fresh output location.
 
-A CPU Ray integration test exercises the separate decode and inference boundary with a deterministic CPU model,
-terminal missing/invalid-source outcomes, Lance publication, and reuse of source checkpoints. The combined predecessor
-also completed a local GPU smoke run using the pinned model checkpoint. Both backends completed the managed Slurm
-runs below; qualification for changes in worker membership and worker loss remains outstanding.
+A CPU Ray integration test exercises the separate decode and inference boundary with a deterministic CPU model and
+terminal missing/invalid-source outcomes; the shared fresh-cluster scenario covers source checkpoints across an
+interrupted run and Lance publication. The combined predecessor also completed a local GPU smoke run using the pinned
+model checkpoint. Both backends completed the managed Slurm runs below; qualification for changes in worker membership
+and worker loss remains outstanding.
 
 The NVDEC prototype was compared locally with three 720p H.264 videos totaling 22,254 frames. Native timestamps and
 thresholded transition decisions matched PyAV for these samples, while antialiased GPU preprocessing was 2.4–3.7 times
@@ -216,21 +227,35 @@ resized frames on the GPU are follow-up performance experiments; visual checks o
 
 ## Media access and failure policy
 
-For fixed-stride, `probe_mode: auto` lets FFprobe read a presigned S3 URL, using HTTP ranges where possible and falling back to a temporary
-download if probing fails. `probe_mode: download` always downloads first. Signed URLs are never persisted, and avoiding
-a full-object transfer is not guaranteed.
+Fixed-stride always starts by letting FFprobe read a presigned S3 URL, using HTTP ranges where possible. A source the
+remote probe cannot settle is downloaded in full and probed locally in the same task, which decides whether it is
+unusable. There is no probe-mode setting. The task reserves `execution.fixed_stride.probe_cpus` (0.25 by default)
+through probing, any fallback download, and planning. The selection read reserves the same CPUs and sets no other
+remote args, so Ray runs each source's read and probe as one task.
+`execution.probe_timeout_s` is shared by both cutters. Signed URLs are never persisted, and avoiding a full-object
+transfer is not guaranteed.
 
-- **Terminal errors:** missing objects, unsupported media after a successful download, or local FFprobe failures
-  explicitly reporting `AVERROR_INVALIDDATA`. These are checkpointed and skipped on recovery; retrying them requires a
-  fresh output. A nonzero probe exit alone does not establish a terminal media problem.
-- **Retryable failures:** storage access problems (including archived objects and credentials), missing tools, local
-  probe timeouts, process termination, unclassified probe failures, and unexpected errors. These propagate without
-  terminal checkpoints, leaving the source retryable. Inconclusive probes receive up to three Ray map retries; exhaustion
-  fails the attempt without publishing completion.
+Both methods classify storage failures with the same helper in
+[`sources.py`](../../../cosmos_curator/next/recipes/video_cut/sources.py). Input storage is stable, so a source that is
+unusable as stored stays unusable.
 
-Terminal error details survive cleanup at `<spans_lance_uri>/video-cut/<input_snapshot>/errors.jsonl`. Each report is
-complete only when referenced by its committed run receipt. Summary `source_results` and `errors` describe that run's
-new sources; `spans` counts all canonical spans accumulated in the table.
+- **Terminal errors:** missing or archived objects (`NoSuchKey`, `InvalidObjectState`, or a bare 404 whose bucket
+  exists), unsupported media after a successful download, local FFprobe failures explicitly reporting
+  `AVERROR_INVALIDDATA`, and for TransNetV2, recognized invalid decoded media. These are checkpointed and skipped on
+  later runs; retrying them requires a fresh output. A nonzero probe exit alone does not establish a terminal media
+  problem.
+- **Retryable failures:** other storage failures, which describe the environment or a transient condition: missing
+  buckets, credentials, permissions such as `AccessDenied`, endpoints, and throttling. Missing tools, local probe
+  timeouts, process termination, unclassified probe or decoding failures, model setup, CUDA, and unexpected errors are
+  retryable too. These propagate without terminal checkpoints, and the saved selection resumes once the cause is
+  fixed. Inconclusive probes receive up to three Ray map retries; exhaustion fails the attempt without publishing
+  completion.
+
+Terminal errors are published in the same Lance append as successful and empty outcomes, with their `source_id`,
+`source_uri`, `error_stage`, and `error_message`. The [shared summary](curator-next-checkpoint-recovery.md#run-summaries)
+counts newly published rows (including outcomes) and terminal errors. Video-cut also reports the table's
+`spans_lance_uri` and `spans_lance_version`. Summaries use the invocation's counters without scanning the accumulated
+table for a cumulative span count.
 
 ## Running
 
@@ -272,7 +297,6 @@ split:
   min_duration_s: 2.0
   max_duration_s: 60.0
 execution:
-  sources_per_checkpoint: 32
   transnetv2:
     cpus: 3
     memory_gib: 2.0

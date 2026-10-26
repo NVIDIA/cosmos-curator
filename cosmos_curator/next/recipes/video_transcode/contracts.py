@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Span-addressed result rows, the canonical transcoded clip schema, and the receipt video-caption reads."""
+"""Span-addressed result rows and the canonical transcoded clip schema."""
 
-import json
 import math
 from typing import Any
 
@@ -12,12 +11,9 @@ import pyarrow as pa
 
 from cosmos_curator.next.core.lance_datasource import ROW_ADDRESS_FIELDS
 from cosmos_curator.next.enrichment.contracts import owned_fields
-from cosmos_curator.next.enrichment.transactions import find_transaction
 from cosmos_curator.next.recipes.video_cut.contracts import SPAN_FIELDS, SPAN_SCHEMA
 from cosmos_curator.next.utils.identity import canonical_digest
 
-PUBLICATION_KEY = "video_transcode.publication"
-PUBLICATION_VERSION = 1
 # Enrichment fields remain nullable at the schema level, as required by
 # video-cut's producer validation. Publication requires complete values.
 CLIP_FIELDS = owned_fields(
@@ -57,36 +53,36 @@ def make_clip_id(span_id: str, contract_id: str) -> str:
     return canonical_digest({"span_id": span_id, "transcode_contract_id": contract_id})
 
 
-def completed_publication(dataset: lance.LanceDataset) -> dict[str, Any] | None:
-    """Read the latest finite-run receipt from Lance transaction properties.
-
-    This describes that run's input snapshot, not necessarily every row in the
-    current table. Transcode scheduling uses fragment values instead.
-    """
-    transaction = find_transaction(dataset, property_key=PUBLICATION_KEY)
-    if transaction is None:
-        return None
-    record = json.loads((transaction.transaction_properties or {})[PUBLICATION_KEY])
-    if not isinstance(record, dict) or record.get("publication_version") != PUBLICATION_VERSION:
-        msg = "Unsupported video-transcode publication record"
-        raise ValueError(msg)
-    return record
-
-
 def validate_clip_table(dataset: lance.LanceDataset, *, uri: str) -> None:
-    """Require completed video-transcode output while preserving enrichment fields."""
+    """Require the canonical clip schema; consumers validate readiness from current values."""
     for field in CLIP_SCHEMA:
         if field.name not in dataset.schema.names or not dataset.schema.field(field.name).equals(
             field, check_metadata=True
         ):
             msg = f"Lance table {uri} does not have the video-transcode schema: {field.name}"
             raise ValueError(msg)
-    record = completed_publication(dataset)
-    if record is None:
-        msg = f"Lance table {uri} has no completed video-transcode publication"
+
+
+def validate_clip_readiness(dataset: lance.LanceDataset, *, check_unique_ids: bool = True) -> None:
+    """Require usable clip metadata for every real span in one aggregate query.
+
+    Source outcomes with null span IDs need no clips, and an empty table is ready.
+    The caller validates the schema first. Disable the distinct-ID aggregate only
+    when the caller already checks uniqueness, as shared enrichment does.
+    """
+    id_count = "COUNT(DISTINCT clip_id)" if check_unique_ids else "COUNT(clip_id)"
+    query = (
+        f"SELECT COUNT(*) AS n, {id_count} AS ids, "  # noqa: S608 -- fixed optional aggregate
+        "COUNT(clip_uri) AS uris, COUNT(clip_size_bytes) AS sizes, "
+        "MIN(clip_size_bytes) AS smallest FROM dataset WHERE span_id IS NOT NULL"
+    )
+    stats = next(iter(dataset.sql(query).build().to_batch_records())).to_pylist()[0]
+    if stats["ids"] != stats["n"]:
+        requirement = "non-null and globally unique" if check_unique_ids else "non-null"
+        msg = f"Every span requires a {requirement} clip_id"
         raise ValueError(msg)
-    if record.get("spans") != dataset.count_rows():
-        msg = f"Lance table {uri} changed after video-transcode publication"
+    if any(stats[name] != stats["n"] for name in ("uris", "sizes")) or (stats["n"] and stats["smallest"] <= 0):
+        msg = "Clips require non-null URIs and positive byte sizes"
         raise ValueError(msg)
 
 

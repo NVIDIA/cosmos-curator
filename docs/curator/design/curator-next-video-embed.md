@@ -97,28 +97,30 @@ be reused, even if their fields were also named version 1.
 ## Checkpoints and publication
 
 An attempt validates the canonical clip schema, registers its fields, and checks clip values in the pinned Lance
-snapshot. New work selects all pending embedding fragments; the recipe exposes no public selection-size limit.
-Saved selections follow the [shared recovery rules](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace).
+snapshot. New work selects all pending embedding fragments unless `execution.max_fragments` bounds it.
+Saved selections follow the [shared recovery rules](curator-next-checkpoint-recovery.md#recovery-workspaces-and-receipts).
 Ray filters checkpointed string `clip_id` values before media reads or GPU work.
 Fragment counts follow the [shared run summary definitions](curator-next-checkpoint-recovery.md#run-summaries).
 
-Input readiness comes from data: the table must have the canonical clip schema, globally unique non-null `clip_id`
-values, non-null `clip_uri` values, and positive non-null `clip_size_bytes`. No transcode publication receipt is required;
+Input readiness comes from data: the table must have the canonical clip schema, and every real span must have a globally
+unique non-null `clip_id`, a non-null `clip_uri`, and positive non-null `clip_size_bytes`. Source outcomes with null span
+and clip IDs remain in the table but are excluded from embedding work. No transcode publication receipt is required;
 valid clip tables remain usable after upstream history is pruned. Empty tables are valid. These checks cover the entire
 pinned snapshot; selecting individually ready fragments from a growing table remains follow-up work. Payload reads
 and decoding still validate the media during processing.
 
 Parquet stores `fragment_id`, `row_offset`, `clip_id`, the vector, and metadata. Encoded media and prepared tensors
-never enter durable result files. The shared staged schema stores vectors as variable-length lists because Arrow 25
-cannot read back null fixed-size lists from Parquet. Publication validates dimensions and casts to the fixed-size
-canonical fields.
+never enter durable result files. Processing emits canonical fixed-size vectors, including null vectors for terminal
+media errors. The shared writer converts them to variable-length lists because Arrow 25 cannot read back null
+fixed-size lists from Parquet. It validates the decoded values before checkpointing; publication repeats this check
+and restores the fixed-size canonical fields.
 `execution.parquet_rows_per_file` sets the strict repartition and checkpoint shard boundary, defaulting to 1,000 rows.
 Shared non-null `int64` fields define the fragment and row addresses; the logical `clip_id` retains its canonical field
 definition. These staged schema definitions isolate incompatible earlier development workspaces.
 
-The workspace is `<output.staging_root_uri>/<contract-namespace>/<selection-digest>/`. Embedding contributes its
+The workspace is `<output.staging_root_uri>/<contract-namespace>/`. Embedding contributes its
 pinned model and result contract to the
-[shared compatibility manifest](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace), so each variant
+[shared compatibility manifest](curator-next-checkpoint-recovery.md#enrichment-recovery-identity), so each variant
 uses its own contract namespace.
 A valid processing-completion marker allows publication retries to skip model setup.
 

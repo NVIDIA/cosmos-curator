@@ -3,7 +3,7 @@
 
 """Exercise shared publication with real Arrow/Lance data and no Ray execution."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 from unittest.mock import patch
@@ -13,6 +13,7 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
 from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
@@ -101,11 +102,16 @@ def prepare_results(
     prepare_fragment: Callable[[pa.Table], pa.Table],
     **_kwargs: object,
 ) -> list[commit.PreparedFragment]:
-    """Replace Ray's grouping and collection while retaining the production worker callable."""
+    """Encode canonical results for storage, then replace Ray's grouping and collection.
+
+    Derive storage types from the supplied schema so fault tests can still pass
+    malformed staged results to the production worker callable.
+    """
+    staged = results.cast(parquet_stable_schema(results.schema))
     candidates = []
-    for fragment_id in pc.unique(results["fragment_id"]).to_pylist():
+    for fragment_id in pc.unique(staged["fragment_id"]).to_pylist():
         if fragment_id in selected:
-            group = results.filter(pc.equal(results["fragment_id"], fragment_id))
+            group = staged.filter(pc.equal(staged["fragment_id"], fragment_id))
             candidates.extend(commit.PreparedFragment.from_row(row) for row in prepare_fragment(group).to_pylist())
     return candidates
 
@@ -115,27 +121,21 @@ def attempt_all(enrichment_input: inputs.EnrichmentInput) -> EnrichmentAttempt:
     dataset, bindings = enrichment_input.dataset, enrichment_input.bindings
     pending = inputs.pending_fragment_ids(dataset, bindings)
     workspace = inputs.resolve_workspace(dataset, bindings, selected=pending) if pending else None
-    return EnrichmentAttempt(enrichment_input, pending, pending, workspace, cleanup_complete=True)
+    return EnrichmentAttempt(enrichment_input, pending, pending, workspace)
 
 
 def publish_attempt(
     results: pa.Table,
     attempt: EnrichmentAttempt,
-    *,
-    properties: Callable[[EnrichmentAttempt], Mapping[str, str]] | None = None,
 ) -> execution.EnrichmentOutcome:
-    """Publish staged results through the recipes' adapter, preparing fragments locally instead of with Ray."""
+    """Publish canonical results through the recipes' adapter, preparing fragments locally instead of with Ray."""
     with patch.object(execution, "prepare_enrichment_fragments", partial(prepare_results, results)):
-        return execution.publish_enrichment(
-            attempt, transaction_properties=None if properties is None else properties(attempt)
-        )
+        return execution.publish_enrichment(attempt)
 
 
 def publish_results(
     results: pa.Table,
     enrichment_input: inputs.EnrichmentInput,
-    *,
-    properties: Callable[[EnrichmentAttempt], Mapping[str, str]] | None = None,
 ) -> lance.LanceDataset:
     """Publish every pending fragment of a validated input and return the published table."""
-    return publish_attempt(results, attempt_all(enrichment_input), properties=properties).dataset
+    return publish_attempt(results, attempt_all(enrichment_input)).dataset

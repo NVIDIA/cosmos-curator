@@ -153,6 +153,10 @@ concurrency. Reserve one `curator_io` slot per concurrent source download (defau
 and keep CPU/GPU processing in a separate stage. Ray's backpressure regulates queued payloads; bounded downstream
 uploads normally rely on production rate and backpressure without reserving download slots.
 
+[Video-cut's fixed-stride plan](curator-next-video-cut.md#execution-and-recovery) normally needs only a remote probe.
+Its rare fallback downloads stream to a temporary file inside the same task, with concurrency bounded by the task's
+CPU reservation. Source bytes never enter Ray, so this path does not need a separate download pool or `curator_io`.
+
 Custom resources bound execution in Ray Core, but Ray 2.58's Data task-pool admission accounting only tracks built-in
 resources. An uncapped task pool can therefore consume its CPU/memory budget with submitted downloads waiting for IO
 slots. For this workload, [video-transcode](curator-next-video-transcode.md) uses an autoscaling actor pool: each actor

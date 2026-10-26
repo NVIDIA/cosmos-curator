@@ -8,8 +8,7 @@ table, and validates it or reuses evidence an earlier publication recorded.
 Recovery identity binds the selected physical fragments and the result contract,
 never the Lance version or execution tuning. Publication receipts let startup
 skip value scans for fragments whose owned-column files were already validated;
-``receipt_fragments`` and ``result_files_match`` define what a receipt proves,
-for pending selection and workspace recovery alike.
+``receipt_fragments`` and ``result_files_match`` define what a receipt proves.
 """
 
 from collections.abc import Sequence
@@ -22,9 +21,10 @@ import pyarrow.compute as pc
 from lance.fragment import FragmentMetadata, LanceFragment
 
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
-from cosmos_curator.next.enrichment.contracts import VALIDATION_BATCH_SIZE, EnrichmentBindings, EnrichmentSpec
-from cosmos_curator.next.enrichment.transactions import find_transaction, iter_transactions
-from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
+from cosmos_curator.next.core.lance_transactions import find_transaction, iter_transactions
+from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE
+from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
+from cosmos_curator.next.enrichment.contracts import EnrichmentBindings, EnrichmentSpec
 from cosmos_curator.next.utils.identity import canonical_digest
 
 PUBLICATION_RECEIPT_KEY = "cosmos_curator.enrichment.publication"
@@ -79,10 +79,10 @@ class EnrichmentInput:
 def open_enrichment_input(bindings: EnrichmentBindings) -> EnrichmentInput:
     """Register fields, pin input, and validate it or reuse matching durable proof.
 
-    Validation requires globally unique, non-null IDs across the complete
-    snapshot, then runs the spec's optional ``validate_input`` for domain
-    readiness. Only successful validation or existing proof produces evidence
-    that publication can record.
+    Validation requires work IDs to be globally unique across the complete
+    snapshot; rows with null IDs are not work items. It then runs the spec's
+    optional ``validate_input`` for domain readiness. Only successful validation
+    or existing proof produces evidence that publication can record.
     """
     dataset = register_fields(bindings)
     fingerprint = input_fingerprint(dataset, bindings)
@@ -96,10 +96,10 @@ def open_enrichment_input(bindings: EnrichmentBindings) -> EnrichmentInput:
 def _require_unique_ids(dataset: lance.LanceDataset, id_column: str) -> None:
     """Checkpoints key on IDs, so an ID shared by two rows would silently skip one."""
     column = id_column.replace('"', '""')
-    query = f'SELECT COUNT(*) AS n, COUNT(DISTINCT "{column}") AS ids FROM dataset'  # noqa: S608 -- recipe column
+    query = f'SELECT COUNT("{column}") AS n, COUNT(DISTINCT "{column}") AS ids FROM dataset'  # noqa: S608 -- recipe column
     stats = next(iter(dataset.sql(query).build().to_batch_records())).to_pylist()[0]
     if stats["n"] != stats["ids"]:
-        msg = f"Input {id_column} values must be non-null and globally unique"
+        msg = f"Input {id_column} values must be globally unique"
         raise ValueError(msg)
 
 
@@ -174,7 +174,7 @@ def selected_fragments(dataset: lance.LanceDataset, selected: Sequence[int]) -> 
 def _namespace_manifest(dataset: lance.LanceDataset, spec: EnrichmentSpec) -> dict[str, Any]:
     # Persisted manifest keys: renaming one changes every namespace and orphans saved work.
     return {
-        "workspace_version": 3,
+        "workspace_version": 5,
         "input_uri": dataset.uri,
         "input_fields": field_ids(dataset, spec.input_fields.names),
         "result_contract": spec.result_contract,
@@ -182,8 +182,8 @@ def _namespace_manifest(dataset: lance.LanceDataset, spec: EnrichmentSpec) -> di
     }
 
 
-def workspace_prefix(dataset: lance.LanceDataset, bindings: EnrichmentBindings) -> str:
-    """Locate this dataset and result contract's selection workspaces."""
+def workspace_root(dataset: lance.LanceDataset, bindings: EnrichmentBindings) -> str:
+    """Locate the single workspace for this dataset and result contract."""
     namespace = canonical_digest(_namespace_manifest(dataset, bindings.spec))
     return f"{bindings.staging_root.rstrip('/')}/{namespace}"
 
@@ -194,12 +194,12 @@ def resolve_workspace(
     *,
     selected: Sequence[int],
 ) -> RecoveryWorkspace:
-    """Bind recovery to selected inputs, excluding unrelated fragments and tuning.
+    """Record the selected inputs in the dataset and contract's fixed workspace.
 
-    Appends and changes outside the selection retain its workspace. The selected
-    input file layout is immutable; a changed selection or layout resolves to
-    another workspace.
-    The input version is pinned per attempt and is never a recovery key.
+    The manifest binds each selected fragment's input file layout, which is
+    immutable; appends and changes outside the selection keep it unchanged. Each
+    selection reuses the same path after verified publication and cleanup. The
+    input version is pinned per attempt and is never a recovery key.
     """
     manifest = _namespace_manifest(dataset, bindings.spec)
     input_ids = set(field_ids(dataset, bindings.spec.input_fields.names).values())
@@ -208,15 +208,14 @@ def resolve_workspace(
         for fragment in selected_fragments(dataset, selected)
     ]
     manifest["input_fragments"] = fragments
-    prefix = workspace_prefix(dataset, bindings)
-    return RecoveryWorkspace(f"{prefix}/{canonical_digest(fragments)}", manifest)
+    return RecoveryWorkspace(workspace_root(dataset, bindings), manifest)
 
 
 def receipt_fragments(transaction: lance.Transaction, owned: set[int]) -> dict[int, FragmentMetadata] | None:
     """Decode a receipt's column update of exactly the owned fields over distinct fragments.
 
-    Startup selection and workspace recovery share this reading of a receipt. Any
-    other operation, field group, or fragment list proves nothing.
+    Startup selection reads receipts this way. Any other operation, field group,
+    or fragment list proves nothing.
     """
     operation = transaction.operation
     if not isinstance(operation, lance.LanceOperation.Update) or set(operation.fields_modified) != owned:
@@ -257,11 +256,12 @@ def _published_fragment_ids(dataset: lance.LanceDataset, bindings: EnrichmentBin
 
 
 def fragment_complete(fragment: LanceFragment, spec: EnrichmentSpec) -> bool:
-    """Require an entirely pending or entirely valid terminal physical fragment."""
+    """Require every eligible row in a fragment to be pending or every one terminal."""
     has_complete = has_pending = False
-    for batch in fragment.scanner(
+    for input_batch in fragment.scanner(
         columns=[spec.id_column, *spec.output_fields.names], batch_size=VALIDATION_BATCH_SIZE
     ).to_batches():
+        batch = input_batch.filter(pc.is_valid(input_batch.column(spec.id_column)))
         complete = pc.is_valid(batch.column(spec.output_fields.names[0]))
         for name in spec.output_fields.names[1:]:
             complete = pc.or_(complete, pc.is_valid(batch.column(name)))

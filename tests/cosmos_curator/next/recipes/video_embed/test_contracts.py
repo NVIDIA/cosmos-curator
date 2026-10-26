@@ -6,6 +6,7 @@
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_batch
 
 
@@ -13,8 +14,8 @@ from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validat
 def test_terminal_batch_preserves_slices_and_error_rows(results: pa.Table, spec: ModelSpec, *, canonical: bool) -> None:
     """Offsets and a null error vector do not shift or invalidate neighboring vectors."""
     table = results.select(spec.fields.names)
-    if canonical:
-        table = table.cast(spec.fields)
+    if not canonical:
+        table = table.cast(parquet_stable_schema(table.schema))
     batch = table.combine_chunks().to_batches()[0]
     for offset, count in ((0, len(batch)), (1, 2), (2, 2), (3, 1), (2, 0)):
         validate_terminal_batch(batch.slice(offset, count), spec)
@@ -64,7 +65,8 @@ def test_terminal_batch_rejects_invalid_results(results: pa.Table, spec: ModelSp
     else:
         row[spec.vector_field] = None
         metadata.update(status="error", error_type="MediaError", error_message="")
-    table = pa.Table.from_pylist([*results.slice(0, 1).to_pylist(), row], schema=results.schema)
+    # Storage uses variable lists, so malformed dimensions reach the validator.
+    table = pa.Table.from_pylist([*results.slice(0, 1).to_pylist(), row], schema=parquet_stable_schema(results.schema))
     batch = table.to_batches()[0].slice(1)
     with pytest.raises(ValueError, match=r"embedding provenance|embeddings require"):
         validate_terminal_batch(batch, spec)

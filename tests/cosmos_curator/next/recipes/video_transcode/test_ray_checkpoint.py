@@ -26,16 +26,37 @@ from cosmos_curator.next.recipes.video_transcode import pipeline, processing
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
-from tests.cosmos_curator.next.enrichment.fresh_cluster import assert_fresh_cluster_resume, run_in_fresh_driver
+from tests.cosmos_curator.next.enrichment.fresh_cluster import assert_fresh_cluster_resume
+from tests.cosmos_curator.next.fresh_driver import run_in_fresh_driver
 from tests.cosmos_curator.next.recipes.video_transcode.conftest import RECIPE
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("include_outcomes", [False, True])
 def test_native_span_resume_across_source_and_fragment_boundaries(
-    config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset
+    config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, *, include_outcomes: bool
 ) -> None:
     """A fresh cluster filters durable spans without replacing another test's cluster."""
-    del dataset
+    if include_outcomes:
+        spans = dataset.to_table().to_pylist()
+        empty = {
+            "source_id": "empty",
+            "source_uri": "s3://input/empty.mp4",
+            "stream_index": 0,
+        }
+        error = empty | {
+            "source_id": "error",
+            "error_stage": "source-read",
+            "error_message": "missing",
+        }
+        rows = [empty, *spans[:2], error, *spans[2:], empty | {"source_id": "another-empty"}]
+        lance.write_dataset(
+            pa.Table.from_pylist(rows, schema=dataset.schema),
+            dataset.uri,
+            mode="overwrite",
+            max_rows_per_file=3,
+            data_storage_version="2.2",
+        )
     run_in_fresh_driver(
         "tests.cosmos_curator.next.recipes.video_transcode.test_ray_checkpoint:assert_span_resume",
         config.model_dump_json(),
@@ -87,14 +108,14 @@ class _StreamingDownloader(_RecordingDownloader):
 
 
 def _upload_without_io_slot(
-    batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, staged_schema: pa.Schema
+    batch: pa.Table, *, config: ResolvedVideoTranscodeConfig, result_schema: pa.Schema
 ) -> pa.Table:
     """Exercise real uploads while checking that only downloads reserve IO slots."""
     resources = ray.get_runtime_context().get_assigned_resources()
     assert resources["CPU"] == 0.25
     assert environment.CURATOR_IO_RESOURCE_NAME not in resources
-    results = processing.upload_clips(batch, config=config, staged_schema=staged_schema)
-    assert results.schema.equals(staged_schema, check_metadata=True)
+    results = processing.upload_clips(batch, config=config, result_schema=result_schema)
+    assert results.schema.equals(result_schema, check_metadata=True)
     return results
 
 
@@ -172,7 +193,7 @@ def assert_span_resume(config_json: str) -> None:
     assert set(work[0]).isdisjoint(work[1])
     assert [download["span_ids"] for download in _log(media_root, "downloaded.jsonl")] == work
     published = lance.dataset(config.input.spans_lance_uri)
-    for row in published.to_table(columns=["clip_uri", "clip_size_bytes"]).to_pylist():
+    for row in published.to_table(columns=["clip_uri", "clip_size_bytes"], filter="span_id IS NOT NULL").to_pylist():
         assert Path(row["clip_uri"]).read_bytes() == b"clip"
         assert row["clip_size_bytes"] == 4
 

@@ -27,7 +27,7 @@ from cosmos_curator.core.utils import environment
 from cosmos_curator.next.recipes.video_cut.contracts import make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_transcode import pipeline, processing
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
-from cosmos_curator.next.recipes.video_transcode.contracts import completed_publication, make_clip_id
+from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
 from tests.cosmos_curator.next.recipes.video_transcode.test_ray_checkpoint import (
     _synthetic_transcode,
     _upload_without_io_slot,
@@ -233,7 +233,6 @@ def test_download_submission_tracks_live_io_capacity_and_recovers(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     published = lance.dataset(dataset.uri)
-    assert completed_publication(published) is not None
     output = published.to_table()
     assert output.num_rows == len(rows)
     assert output["span_id"].to_pylist() == [row["span_id"] for row in rows]

@@ -15,9 +15,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.models.registry import resolve_registered_model
+from cosmos_curator.next.append.config import AppendExecutionConfig
 from cosmos_curator.next.core.config import apply_dotted_overrides
 from cosmos_curator.next.media.spans import seconds_to_nanoseconds
-from cosmos_curator.next.utils.identity import canonical_digest
 from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 
@@ -95,11 +95,6 @@ class FixedStrideConfig(_Config):
             "min_duration_ns": seconds_to_nanoseconds(self.min_duration_s),
         }
 
-    @property
-    def contract_id(self) -> str:
-        """Identify compatible cutting work."""
-        return canonical_digest(self.cutting_contract)
-
 
 @lru_cache(maxsize=1)
 def transnetv2_model_contract() -> dict[str, str]:
@@ -151,11 +146,6 @@ class TransNetV2Config(_Config):
             "window_stride": 50,
             "scene_policy": "exclude-transitions-tile-long-drop-short-v1",
         }
-
-    @property
-    def contract_id(self) -> str:
-        """Identify compatible source plans independently of worker placement."""
-        return canonical_digest(self.cutting_contract)
 
 
 type SplitConfig = Annotated[FixedStrideConfig | TransNetV2Config, Field(discriminator="method")]
@@ -216,18 +206,27 @@ class OutputConfig(_Config):
         return self
 
 
-class ExecutionConfig(_Config):
-    """Tuning excluded from cutting identity and workspace compatibility."""
+class FixedStrideExecutionConfig(_Config):
+    """CPU reservation for fixed-stride probing, local fallback, and planning."""
 
-    storage_profile: str = Field(default="default", min_length=1)
-    probe_mode: Literal["auto", "download"] = "auto"
+    probe_cpus: float = Field(
+        default=0.25,
+        gt=0,
+        allow_inf_nan=False,
+        description="CPUs per source task, including remote probing, any local download/probe, and planning.",
+    )
+
+
+class ExecutionConfig(AppendExecutionConfig):
+    """Tuning excluded from cutting identity and workspace compatibility.
+
+    ``parquet_rows_per_file`` counts source plans per checkpoint group, and
+    ``rows_per_fragment`` counts spans per appended Lance fragment.
+    """
+
     probe_timeout_s: int = Field(default=120, ge=1)
-    probe_cpus: float = Field(default=0.25, gt=0, allow_inf_nan=False)
-    sources_per_checkpoint: int = Field(default=1024, ge=1)
-    spans_per_fragment: int = Field(default=100_000, ge=1)
-    commit_attempts: int = Field(default=3, ge=1)
+    fixed_stride: FixedStrideExecutionConfig = Field(default_factory=FixedStrideExecutionConfig)
     transnetv2: TransNetV2ExecutionConfig = Field(default_factory=TransNetV2ExecutionConfig)
-    progress: bool = False
 
 
 class ResolvedVideoCutConfig(_Config):
@@ -242,18 +241,13 @@ class ResolvedVideoCutConfig(_Config):
 
     @model_validator(mode="before")
     @classmethod
-    def _method_defaults(cls, value: object) -> object:
+    def _split_defaults(cls, value: object) -> object:
         if not isinstance(value, Mapping):
             return value
         resolved = dict(value)
         split = resolved.get("split", {})
         if isinstance(split, Mapping):
-            split = {"method": "fixed-stride", **split}
-            resolved["split"] = split
-            if split["method"] == "transnetv2":
-                execution = resolved.get("execution", {})
-                if isinstance(execution, Mapping):
-                    resolved["execution"] = {"sources_per_checkpoint": 32, **execution}
+            resolved["split"] = {"method": "fixed-stride", **split}
         return resolved
 
 
@@ -284,7 +278,7 @@ def config_schema_json() -> str:
 
 
 def config_template() -> dict[str, Any]:
-    """Show defaults while leaving derived output locations editable through their root."""
+    """Show defaults while leaving output locations to be derived from their root."""
     return resolve_config_data(
         {
             "schema_version": 1,
@@ -295,9 +289,7 @@ def config_template() -> dict[str, Any]:
     ).model_dump(
         mode="json",
         exclude_none=True,
-        exclude={
-            "output": {"spans_lance_uri", "staging_root_uri"},
-        },
+        exclude={"output": {"spans_lance_uri", "staging_root_uri"}},
     )
 
 
@@ -313,7 +305,8 @@ def config_template_yaml() -> str:
         "#   min_duration_s: 2.0, max_duration_s: 60.0}. Stage the registered checkpoint under\n"
         "# /config/models/Sn4kehead/TransNetV2 in the runtime container, using a host mount as needed.\n"
         "# Opt into GPU decoding with split.decoder: nvdec; use separate output roots when comparing decoders.\n"
-        "# Use sources_per_checkpoint: 32 for this heavier work.\n"
+        "# execution.fixed_stride settings apply only to fixed-stride; execution.transnetv2 only to scene cuts.\n"
+        "# Set execution.max_items to cap each new publication. Rerun while remaining_items is nonzero or null.\n"
     )
     return preamble + yaml.safe_dump(config_template(), sort_keys=False)
 

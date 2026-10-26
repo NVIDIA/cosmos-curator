@@ -38,7 +38,11 @@ class ContextStage(Protocol):
 
 @dataclass(frozen=True)
 class CaptionInputBindings:
-    """One recipe's physical read, projected media, and staged identity columns."""
+    """One recipe's physical read, projected media, and staged identity columns.
+
+    ``skip_null_ids`` excludes upstream source outcomes from media processing
+    and terminal validation while retaining their physical row offsets.
+    """
 
     source_columns: tuple[str, ...]
     source_schema: pa.Schema
@@ -49,6 +53,7 @@ class CaptionInputBindings:
     media_size_column: str
     media_sha256_column: str | None
     staged_binding_columns: tuple[str, ...]
+    skip_null_ids: bool = False
 
 
 @dataclass(frozen=True)

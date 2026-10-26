@@ -6,34 +6,27 @@
 Explicit URIs or a recursively listed S3 root select immutable MP4 objects. A
 source ID hashes its normalized URI; a span ID hashes that source, the first
 video stream, and its zero-relative half-open nanosecond interval. Cutting
-settings have a separate versioned hash. Default Lance/workspace locations are
-``<media_root>/lance`` and ``<media_root>/staging/video-cut``.
+settings have a separate versioned hash, which is the result contract. Default
+Lance/workspace locations are ``<media_root>/lance`` and
+``<media_root>/staging/video-cut``.
 
-Native Ray checkpoints retain one v1 Parquet outcome per source, including empty
-plans and terminal media errors. Durability advances in bounded source groups;
-in-flight groups can replay. Operational failures propagate instead of becoming
-terminal outcomes. No media payload is published.
+Video-cut is the reference recipe for shared append publication
+(``cosmos_curator.next.append``), which owns selection, checkpoints, atomic
+publication of all outcomes, and recovery from current rows. Each source is one work item whose result
+is its complete span plan or a terminal error. Spans remain flat rows; empty and
+error outcomes each retain one row with a null span ID.
+Input storage is stable, so missing or archived objects and recognized bad
+media are terminal; failures of the environment or transient conditions
+propagate.
 
-One logical cutter owns an output bound to a cutting contract. Changing the
-contract requires a new output location; later selections may append new sources.
-Workers expand
-and pack spans across source shards into 100,000-row Lance 2.2 fragments, then
-the driver atomically appends one finite selection. Completion and outcome
-counts commit with the table. Incomplete publication rebuilds from Parquet
-without repeating media work. After a confirmed commit the invocation attempts
-to delete the workspace it used or resumed. Completed reruns recognize Lance
-alone without starting Ray or touching staging. Cleanup is best effort; orphaned
-staging requires explicit cleanup or a storage expiration policy. Terminal error
-details survive in an output report. Use a fresh output to retry terminal errors;
-archived-object failures remain retryable in the same run. Execution tuning
-remains reusable.
+The cutting methods are peer modules that each export ``plan(sources, config)``
+and build results with ``contracts``. ``fixed_stride`` probes durations remotely
+on task workers, falling back to a temporary local download when needed; source
+bytes never enter Ray. ``transnetv2`` admits downloads through actors holding
+one ``curator_io`` slot each, then passes the bytes to frame decoding and scene
+inference on GPU actors, with pre-staged weights matching the pinned registry
+revision; the opt-in NVDEC backend decodes on the inference actor.
 
-TransNetV2 uses separate IO actors, PyAV CPU decode tasks, and GPU inference
-actors with pre-staged weights matching the pinned registry revision. Resized frame arrays pass
-through Ray to inference actors. The opt-in NVDEC backend combines GPU decoding
-and inference in one actor. Both backends share source-result checkpoints and
-Lance publication with fixed-stride cutting.
-
-See ``docs/curator/design/curator-next-video-cut.md`` for configuration, metadata
-probing, recovery tests, and the limits of current deployment qualification.
+See ``docs/curator/design/curator-next-video-cut.md`` for configuration, media
+access, recovery tests, and the limits of current deployment qualification.
 """

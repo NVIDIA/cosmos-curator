@@ -529,7 +529,9 @@ def _fragment_guard(
     base_ids: set[int],
     pending_ids: set[int],
 ) -> AttemptFragmentGuard:
-    row_id_schema = pa.schema([bindings.input.mapped_schema.field(bindings.input.row_id_column)])
+    row_id_schema = pa.schema(
+        [bindings.input.mapped_schema.field(bindings.input.row_id_column).with_nullable(bindings.input.skip_null_ids)]
+    )
     row_ids = fragment.to_table(columns=[bindings.input.row_id_column]).cast(row_id_schema)
     return AttemptFragmentGuard(
         fragment_id=int(fragment.fragment_id),
@@ -636,7 +638,7 @@ def iter_prepared_publications(dataset: ray.data.Dataset) -> Iterator[PreparedFr
         raise
 
 
-def _validate_staged_group(
+def _validate_staged_group(  # noqa: C901 -- coverage, physical identity, and terminal-value checks stay together
     table: pa.Table,
     fragment: LanceFragment,
     guard: AttemptFragmentGuard,
@@ -648,28 +650,32 @@ def _validate_staged_group(
     except (pa.ArrowException, ValueError) as exc:
         msg = f"Staged rows for fragment {guard.fragment_id} do not cast to the canonical result schema"
         raise PublicationError(msg) from exc
-    if table.num_rows > guard.row_count and bindings.result.reconcile_staged_rows is not None:
+    row_id = bindings.input.row_id_column
+    current_ids = fragment.to_table(columns=[row_id])
+    expected_offsets = pa.array(range(current_ids.num_rows), type=pa.int64())
+    if bindings.input.skip_null_ids:
+        expected_offsets = pc.filter(expected_offsets, current_ids[row_id].is_valid().combine_chunks())
+    expected_rows = len(expected_offsets)
+    if table.num_rows > expected_rows and bindings.result.reconcile_staged_rows is not None:
         table = bindings.result.reconcile_staged_rows(
-            table, _current_staged_bindings(fragment, bindings), guard.fragment_id, guard.row_count
+            table, _current_staged_bindings(fragment, bindings), guard.fragment_id, expected_rows
         )
-    if table.num_rows != guard.row_count:
+    if table.num_rows != expected_rows:
         msg = (
-            f"Staged fragment {guard.fragment_id} has {table.num_rows} row(s), expected exactly {guard.row_count}; "
+            f"Staged fragment {guard.fragment_id} has {table.num_rows} row(s), expected exactly {expected_rows}; "
             "missing or duplicate recovery rows are not publishable"
         )
         raise PublicationError(msg)
     indices = pc.sort_indices(table, sort_keys=[("row_offset", "ascending")])
     table = table.take(indices)
-    offsets = [int(value) for value in table["row_offset"].to_pylist()]
-    if offsets != list(range(guard.row_count)):
-        msg = f"Staged fragment {guard.fragment_id} offsets are not exactly 0..{guard.row_count - 1}"
+    if not table["row_offset"].combine_chunks().equals(expected_offsets):
+        msg = f"Staged fragment {guard.fragment_id} offsets do not exactly cover eligible rows"
         raise PublicationError(msg)
-    row_id = bindings.input.row_id_column
-    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id)])
+    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id).with_nullable(bindings.input.skip_null_ids)])
     staged_row_ids = table.select([row_id]).cast(row_id_schema)
-    current_row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
+    current_row_ids = current_ids.cast(row_id_schema)
     if (
-        arrow_table_fingerprint(staged_row_ids) != guard.ordered_row_ids_fingerprint
+        not staged_row_ids.equals(current_row_ids.take(expected_offsets))
         or arrow_table_fingerprint(current_row_ids) != guard.ordered_row_ids_fingerprint
     ):
         msg = f"Staged fragment {guard.fragment_id} row-ID order does not match the attempt and current fragment"
@@ -694,6 +700,8 @@ def _validate_staged_group(
 
 def _current_staged_bindings(fragment: LanceFragment, bindings: CaptionRunBindings) -> pa.Table:
     source = fragment.scanner(columns=list(bindings.input.source_columns), with_row_address=True).to_table()
+    if bindings.input.skip_null_ids:
+        source = source.filter(source[bindings.input.row_id_column].is_valid())
     projected = bindings.input.project_batch(source)
     return projected.select(list(bindings.input.staged_binding_columns))
 
@@ -975,6 +983,8 @@ def result_values_fingerprint(fragment: LanceFragment, bindings: CaptionRunBindi
     """Hash canonical result values for one fragment using its recipe bindings."""
     result = bindings.result
     table = fragment.to_table(columns=[bindings.input.row_id_column, *result.fields.names])
+    if bindings.input.skip_null_ids:
+        table = table.filter(table[bindings.input.row_id_column].is_valid())
     return _caption_table_fingerprint(table, bindings)
 
 
@@ -1069,7 +1079,7 @@ def assert_base_identity(
 ) -> None:
     """Require the captured row identities and protected input files to remain unchanged."""
     row_id = bindings.input.row_id_column
-    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id)])
+    row_id_schema = pa.schema([bindings.input.mapped_schema.field(row_id).with_nullable(bindings.input.skip_null_ids)])
     row_ids = fragment.to_table(columns=[row_id]).cast(row_id_schema)
     if row_ids.num_rows != guard.row_count or arrow_table_fingerprint(row_ids) != guard.ordered_row_ids_fingerprint:
         msg = f"Fragment {guard.fragment_id} changed row layout or canonical row identity after attempt capture"

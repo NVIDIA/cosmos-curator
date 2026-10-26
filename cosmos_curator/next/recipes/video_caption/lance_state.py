@@ -13,7 +13,7 @@ import pyarrow as pa
 from lance.fragment import FragmentMetadata, LanceFragment
 
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_table
+from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_readiness, validate_clip_table
 from cosmos_curator.next.utils.identity import canonical_digest
 
 
@@ -81,29 +81,9 @@ def ensure_caption_fields(
 
 
 def validate_caption_input(dataset: lance.LanceDataset, *, uri: str) -> None:
-    """Validate video-caption's clip-owned input contract and global ``clip_id`` uniqueness."""
+    """Require the canonical clip schema and ready media with globally unique IDs."""
     validate_clip_table(dataset, uri=uri)
-    query = (
-        "SELECT COUNT(*) AS rows, COUNT(DISTINCT clip_id) AS clip_ids, "
-        "SUM(CASE WHEN clip_id IS NULL THEN 1 ELSE 0 END) AS null_clip_ids, "
-        "SUM(CASE WHEN clip_uri IS NULL THEN 1 ELSE 0 END) AS null_clip_uris, "
-        "SUM(CASE WHEN clip_size_bytes IS NULL THEN 1 ELSE 0 END) AS null_clip_sizes FROM dataset"
-    )
-    batches = dataset.sql(query).build().to_batch_records()
-    rows = [row for batch in batches for row in batch.to_pylist()]
-    if len(rows) != 1:
-        msg = f"Could not validate canonical clip identities in {uri}"
-        raise RuntimeError(msg)
-    stats = rows[0]
-    row_count = int(stats["rows"])
-    distinct = int(stats["clip_ids"])
-    null_counts = [int(stats[name] or 0) for name in ("null_clip_ids", "null_clip_uris", "null_clip_sizes")]
-    if distinct != row_count:
-        msg = f"Canonical clip_id values in {uri} are not globally unique ({distinct} distinct for {row_count} rows)"
-        raise ValueError(msg)
-    if any(null_counts):
-        msg = f"Canonical clip_id, clip_uri, and clip_size_bytes values in {uri} must all be non-null"
-        raise ValueError(msg)
+    validate_clip_readiness(dataset)
 
 
 def capture_attempt(
@@ -137,8 +117,12 @@ def classify_fragment(  # noqa: C901, PLR0912 -- shared per-row and batch valida
     saw_pending = False
     saw_complete = False
     result_columns = [result.caption_field_name, result.metadata_field_name]
+    if bindings.input.skip_null_ids:
+        result_columns.append(bindings.input.row_id_column)
     for raw_batch in fragment.scanner(columns=result_columns).to_batches():
         batch = pa.Table.from_batches([raw_batch])
+        if bindings.input.skip_null_ids:
+            batch = batch.filter(batch[bindings.input.row_id_column].is_valid())
         if result.validate_terminal_batch is None:
             for row in batch.to_pylist():
                 caption = row[result.caption_field_name]

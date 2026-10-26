@@ -1,34 +1,46 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Source-local TransNetV2 decoding, inference, and scene planning.
+"""TransNetV2 cutting: admitted downloads, source-local decoding, inference, and scene planning.
 
-Download actors transfer encoded bytes to CPU decode tasks. Small RGB frames and
-timestamps then flow through Ray to model actors that emit the common source-result
-schema. With the NVDEC backend, decoding and inference share a GPU actor instead.
-All persistent progress belongs to video-cut's existing source checkpoint and Lance
-publication protocol.
+Download actors, each holding a ``curator_io`` slot, transfer encoded bytes to
+CPU decode tasks. Small RGB frames, timestamps, and probed media fields then
+flow through Ray to model actors that emit the common source-result schema.
+With the NVDEC backend, decoding and inference share a GPU actor instead. All
+persistent progress belongs to the shared source checkpoints and append
+publication.
 """
 
-from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 
 import av
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import ray
 from av.video.reformatter import VideoReformatter
 from botocore.exceptions import ClientError
 
+from cosmos_curator.core.utils import environment
+from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.models.transnetv2 import predict_transitions
-from cosmos_curator.next.media.ffmpeg import InvalidMediaError, MediaError, VideoMetadata, probe_video_path
+from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
+from cosmos_curator.next.media.ffmpeg import InvalidMediaError, MediaError, probe_video_path
 from cosmos_curator.next.media.spans import Span, fixed_stride_spans, seconds_to_nanoseconds
-from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, TransNetV2Config
-from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, SOURCE_SCHEMA, make_source_id
-from cosmos_curator.next.recipes.video_cut.processing import result_from_spans, source_envelope
+from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, ResolvedVideoCutConfig, TransNetV2Config
+from cosmos_curator.next.recipes.video_cut.contracts import (
+    INPUT_SCHEMA,
+    MEDIA_FIELDS,
+    SOURCE_SCHEMA,
+    error_details,
+    error_result,
+    media_fields,
+    source_result,
+)
+from cosmos_curator.next.recipes.video_cut.sources import unreadable_source_error
 from cosmos_curator.next.utils.storage import download_bytes
 
 _HEIGHT = 27
@@ -39,24 +51,11 @@ _WIDTH = 48
 _DECODED_SOURCE_SCHEMA = pa.schema(
     [
         *INPUT_SCHEMA,
-        pa.field("source_size_bytes", pa.int64()),
-        pa.field(
-            "metadata",
-            pa.struct(
-                [
-                    pa.field("duration_ns", pa.int64()),
-                    pa.field("width", pa.int32()),
-                    pa.field("height", pa.int32()),
-                    pa.field("frame_rate", pa.float64()),
-                    pa.field("frame_count", pa.int64()),
-                    pa.field("video_codec", pa.string()),
-                ]
-            ),
-        ),
+        *MEDIA_FIELDS,
         pa.field("frame_bytes", pa.large_binary(), nullable=False),
         pa.field("timestamps_ns", pa.large_list(pa.int64()), nullable=False),
-        pa.field("error_stage", pa.string()),
-        pa.field("error_message", pa.string()),
+        SOURCE_SCHEMA.field("error_stage"),
+        SOURCE_SCHEMA.field("error_message"),
     ]
 )
 
@@ -71,7 +70,7 @@ def validate_weights() -> Path:
 
 
 class SourceDownloader:
-    """One sequential source download per actor, admitted by a curator_io slot."""
+    """One sequential source download per actor, passing the encoded bytes on for decoding."""
 
     def __init__(self, *, storage_profile: str) -> None:
         """Retain credentials configuration without retaining downloaded sources."""
@@ -79,18 +78,14 @@ class SourceDownloader:
 
     def __call__(self, row: dict[str, Any]) -> dict[str, Any]:
         """Carry missing-object outcomes to the same source checkpoint as successes."""
-        uri = str(row["source_uri"])
-        if row["source_id"] != make_source_id(uri):
-            msg = "Source identity does not match its immutable URI"
-            raise ValueError(msg)
         try:
-            payload = download_bytes(uri, storage_profile=self._storage_profile)
+            payload = download_bytes(row["source_uri"], storage_profile=self._storage_profile)
         except ClientError as exc:
-            code = str(exc.response.get("Error", {}).get("Code"))
-            if code not in {"404", "NoSuchKey", "NotFound"}:
+            error = unreadable_source_error(exc, row["source_uri"], storage_profile=self._storage_profile)
+            if error is None:
                 raise
-            return {**row, "video_bytes": b"", "download_error": f"S3 source unavailable: {code}"}
-        return {**row, "video_bytes": payload, "download_error": ""}
+            return {**row, "video_bytes": b"", **error}
+        return {**row, "video_bytes": payload, "error_stage": None, "error_message": None}
 
 
 def normalize_frame_timestamps(timestamps_ns: list[int]) -> npt.NDArray[np.int64]:
@@ -136,29 +131,22 @@ def decode_frames(path: Path, *, cpus: int) -> tuple[npt.NDArray[np.uint8], npt.
 
 
 def _decode_source(row: dict[str, Any], execution: ExecutionConfig, *, nvdec: bool = False) -> dict[str, Any]:
-    uri = str(row["source_uri"])
-    if row["source_id"] != make_source_id(uri):
-        msg = "Source identity does not match its immutable URI"
-        raise ValueError(msg)
     result = {
         "source_id": row["source_id"],
-        "source_uri": uri,
-        "source_size_bytes": None,
-        "metadata": None,
+        "source_uri": row["source_uri"],
         "frame_bytes": b"",
         "timestamps_ns": [],
         "error_stage": None,
         "error_message": None,
     }
-    if row["download_error"]:
-        return result | {"error_stage": "source-read", "error_message": row["download_error"]}
+    if row["error_stage"] is not None:
+        return result | error_details(row["error_stage"], row["error_message"])
     error_stage = "source-probe"
     try:
         with TemporaryDirectory(prefix="curator_transnetv2_") as directory:
             path = Path(directory) / "source.mp4"
             path.write_bytes(row.pop("video_bytes"))
-            size_bytes = path.stat().st_size
-            metadata = probe_video_path(path, timeout_s=execution.probe_timeout_s)
+            media = media_fields(probe_video_path(path, timeout_s=execution.probe_timeout_s), path.stat().st_size)
             error_stage = "source-decode"
             if nvdec:
                 from cosmos_curator.next.recipes.video_cut.transnetv2_nvdec import decode_frames_nvdec  # noqa: PLC0415
@@ -167,13 +155,8 @@ def _decode_source(row: dict[str, Any], execution: ExecutionConfig, *, nvdec: bo
             else:
                 frames, timestamps = decode_frames(path, cpus=execution.transnetv2.cpus)
     except MediaError as exc:
-        return result | {"error_stage": error_stage, "error_message": str(exc)[:8192]}
-    return result | {
-        "source_size_bytes": size_bytes,
-        "metadata": asdict(metadata),
-        "frame_bytes": frames.tobytes(),
-        "timestamps_ns": timestamps.tolist(),
-    }
+        return result | error_details(error_stage, str(exc))
+    return result | media | {"frame_bytes": frames.tobytes(), "timestamps_ns": timestamps.tolist()}
 
 
 def decode_sources(batch: pa.Table, *, execution: ExecutionConfig) -> pa.Table:
@@ -238,18 +221,8 @@ class TransNetV2Planner:
     def _plan(self, row: dict[str, Any]) -> dict[str, Any]:
         if self._split.decoder == "nvdec":
             row = _decode_source(row, self._execution, nvdec=True)
-        uri = str(row["source_uri"])
-        if row["source_id"] != make_source_id(uri):
-            msg = "Source identity does not match its immutable URI"
-            raise ValueError(msg)
-        result = source_envelope(uri, self._split)
         if row["error_stage"] is not None:
-            return result | {
-                "status": "error",
-                "error_stage": row["error_stage"],
-                "error_message": row["error_message"],
-            }
-        metadata = VideoMetadata(**row["metadata"])
+            return error_result(row, error_stage=row["error_stage"], error_message=row["error_message"])
         frames = np.frombuffer(row.pop("frame_bytes"), dtype=np.uint8).reshape(-1, _HEIGHT, _WIDTH, 3)
         timestamps = np.asarray(row["timestamps_ns"], dtype=np.int64)
         try:
@@ -259,7 +232,56 @@ class TransNetV2Planner:
                 threshold=self._split.threshold,
                 window_batch_size=self._execution.transnetv2.window_batch_size,
             )
-            spans = scene_spans(transitions, timestamps, duration_ns=metadata.duration_ns, split=self._split)
+            spans = scene_spans(transitions, timestamps, duration_ns=row["source_duration_ns"], split=self._split)
         except MediaError as exc:
-            return result | {"status": "error", "error_stage": "source-decode", "error_message": str(exc)[:8192]}
-        return result_from_spans(uri, metadata, row["source_size_bytes"], self._split, spans)
+            return error_result(row, error_stage="source-decode", error_message=str(exc))
+        return source_result(row, spans)
+
+
+def plan(sources: ray.data.Dataset, config: ResolvedVideoCutConfig) -> ray.data.Dataset:
+    """Download sources, decode them on CPUs unless NVDEC shares the GPU actor, and plan scenes on GPUs."""
+    split = config.split
+    assert isinstance(split, TransNetV2Config)
+    validate_weights()
+    configure_download_actor_autoscaling(sources.context)
+    downloaded = sources.map(
+        cast("Any", SourceDownloader),
+        fn_constructor_kwargs={"storage_profile": config.execution.storage_profile},
+        compute=ray.data.ActorPoolStrategy(min_size=1, max_tasks_in_flight_per_actor=1),
+        num_cpus=0.25,
+        resources={environment.CURATOR_IO_RESOURCE_NAME: 1.0},
+        max_concurrency=1,
+        max_restarts=-1,
+        max_task_retries=3,
+    )
+    execution = config.execution.transnetv2
+    decoded = downloaded
+    inference_memory_gib = execution.inference_memory_gib
+    if split.decoder == "pyav":
+        decoded = downloaded.map_batches(
+            cast("Any", decode_sources),
+            fn_kwargs={"execution": config.execution},
+            batch_size=1,
+            batch_format="pyarrow",
+            num_cpus=execution.cpus,
+            num_gpus=0,
+            memory=int(execution.memory_gib * 1024**3),
+            max_retries=3,
+        )
+    else:
+        # NVDEC and inference share a GPU actor; account for both host-memory needs.
+        inference_memory_gib += execution.memory_gib
+    return decoded.map_batches(
+        TransNetV2Planner,
+        fn_constructor_kwargs={"split": split, "execution": config.execution},
+        batch_size=1,
+        batch_format="pyarrow",
+        compute=ray.data.ActorPoolStrategy(min_size=1, max_tasks_in_flight_per_actor=1),
+        num_cpus=execution.inference_cpus,
+        num_gpus=execution.gpus,
+        memory=int(inference_memory_gib * 1024**3),
+        max_concurrency=1,
+        max_restarts=-1,
+        max_task_retries=3,
+        runtime_env=ray_data_gpu_runtime_env("default"),
+    )

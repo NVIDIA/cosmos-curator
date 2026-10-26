@@ -10,7 +10,7 @@ Recipes use this API, imported from its defining modules:
   ``EnrichmentBindings`` binds the spec to one invocation's table, staging root, and
   execution settings
 - ``execution``: ``run_enrichment``, whose ``process`` callback receives a ``ProcessingScope``
-  that reads the selection and writes rows in its ``staged_schema``, and ``summary_message``
+  that reads the selection and writes canonical rows in its ``result_schema``, and ``summary_message``
 - ``config``: ``EnrichmentExecutionConfig``, the base of a recipe's ``execution`` settings
 - ``cosmos_curator.next.core.lance_datasource``: ``ROW_ADDRESS_FIELDS``, for recipe work schemas
   that carry row addresses
@@ -18,8 +18,11 @@ Recipes use this API, imported from its defining modules:
 Everything else is internal to ``run_enrichment``, which runs these steps in order:
 ``inputs`` opens and validates the pinned input and selects pending work, ``attempts``
 resumes or selects an attempt, ``execution`` processes it inside a checkpoint scope and
-publishes it, and ``commit`` implements the Lance publication protocol. ``transactions``
-and ``workspace`` hold publication evidence lookup and durable recovery state.
+publishes it, and ``commit`` implements the Lance publication protocol. Publication
+evidence lookup and durable recovery state come from ``cosmos_curator.next.core``
+(``lance_transactions`` and ``recovery_workspace``), which append publication shares.
+Each table and result contract reuses one fixed workspace; verified publication
+and cleanup must finish before another selection starts.
 
 Adopting recipes subclass the conformance suite in
 ``tests/cosmos_curator/next/enrichment/conformance.py`` and run the fresh-cluster scenario in

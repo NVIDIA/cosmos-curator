@@ -8,14 +8,15 @@ A recipe adopts the suite by subclassing ``EnrichmentConformance`` as
 ``config``, ``enrichment_input``, ``dataset``, and ``results`` fixtures and a ``recipe``
 fixture returning the recipe's module-level ``RecipeUnderTest``, which the fresh-cluster
 scenario in ``fresh_cluster.py`` reuses. ``config`` is the recipe's resolved config,
-whose ``kind`` the owned fields must name. ``results`` must hold one valid staged row
-for every input row, spread across at least two fragments with at least two rows each.
+whose ``kind`` the owned fields must name. ``results`` must hold one valid canonical row
+in the spec's ``result_schema`` for every input row, spread across at least two fragments
+with at least two rows each.
 Fragment IDs and recipe-specific summary keys are unrestricted. The recipe's
 ``run_config`` must run through its pipeline module's ``run_enrichment``; the suite
-replaces the ``start_ray`` and ``process`` callbacks passed there, checks the recipe's
-own ``transaction_properties``, and prepares fragments locally instead of starting Ray.
-It uses real Lance files. Recipe test modules keep only the checks specific to their
-own contract.
+replaces the ``start_ray`` and ``process`` callbacks passed there and prepares
+fragments locally instead of starting Ray.
+The shared helper converts results to storage types. It uses real Lance files. Recipe
+test modules keep only the checks specific to their own contract.
 """
 
 import json
@@ -33,10 +34,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
+from cosmos_curator.next.core import recovery_workspace
+from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.recovery_workspace import RecoveryStateError
 from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
-from cosmos_curator.next.enrichment import workspace as recovery_workspace
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
-from cosmos_curator.next.enrichment.workspace import RecoveryStateError
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.enrichment.helpers import attempt_all, prepare_results, publish_results
 
@@ -102,7 +104,7 @@ def _skip_processing(
     *,
     process: Callable[[execution.ProcessingScope], None] = lambda _processing: None,
 ) -> _Runs:
-    """Treat ``results`` as already staged: no Ray setup, processing, or Ray preparation."""
+    """Publish canonical ``results`` through the helper: no Ray setup, processing, or Ray preparation."""
     monkeypatch.setattr(execution, "prepare_enrichment_fragments", partial(prepare_results, results))
     return _replace_ray(recipe, monkeypatch, start_ray=lambda _bindings: None, process=process)
 
@@ -160,12 +162,13 @@ class EnrichmentConformance:
         results: pa.Table,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Rows, fragment IDs, and base files survive; provenance and recipe records share the receipt's commit."""
+        """Rows, fragment IDs, and base files survive; provenance shares the receipt's commit."""
         dataset = enrichment_input.dataset
         bindings = enrichment_input.bindings
+        assert results.schema.equals(bindings.spec.result_schema, check_metadata=True)
         runs = _skip_processing(recipe, results, monkeypatch)
         summary = recipe.pipeline.run_config(config)
-        ((recipe_arguments, outcome),) = runs
+        ((_, outcome),) = runs
         published = outcome.dataset
         assert summary["field_set"] == bindings.spec.field_set
         assert summary["contract_digest"] == canonical_digest(bindings.spec.result_contract)
@@ -177,12 +180,9 @@ class EnrichmentConformance:
             assert original_files == after.metadata.to_json()["files"][: len(original_files)]
             assert after.metadata.num_deletions == 0
         properties = published.read_transaction(published.version).transaction_properties
-        recipe_properties = recipe_arguments.get("transaction_properties")
-        if recipe_properties is not None:
-            assert recipe_properties(outcome.attempt).items() <= properties.items()
-        assert properties[execution.KIND_KEY] == bindings.spec.owner
+        assert properties[KIND_KEY] == bindings.spec.owner
         assert properties[execution.FIELD_KEY] == bindings.spec.field_set
-        assert properties[execution.CONTRACT_DIGEST_KEY] == canonical_digest(bindings.spec.result_contract)
+        assert properties[CONTRACT_DIGEST_KEY] == canonical_digest(bindings.spec.result_contract)
         assert properties[inputs.VALIDATED_INPUT_KEY] == enrichment_input.fingerprint
         assert published.to_table(columns=bindings.spec.input_fields.names).equals(
             dataset.to_table(columns=bindings.spec.input_fields.names)
@@ -395,7 +395,7 @@ class EnrichmentConformance:
         published = publish_results(results, enrichment_input)
         assert inputs.input_is_validated(published, fingerprint=enrichment_input.fingerprint)
         _append_copy(published, enrichment_input.bindings.spec, new_id=False)
-        with pytest.raises(ValueError, match="non-null and globally unique"):
+        with pytest.raises(ValueError, match="globally unique"):
             inputs.open_enrichment_input(enrichment_input.bindings)
 
     def test_execution_tuning_keeps_the_workspace(
@@ -436,13 +436,10 @@ class EnrichmentConformance:
         monkeypatch.setattr(
             lance.fragment.LanceFragment, "scanner", Mock(side_effect=AssertionError("Results must not be scanned"))
         )
-        verify = Mock(wraps=commit.verify_completed)
-        monkeypatch.setattr(commit, "verify_completed", verify)
         summary = recipe.pipeline.run_config(config)
         assert summary["selected_fragments"] == summary["remaining_fragments"] == summary["selected_rows"] == 0
         assert summary["cleanup_complete"] is True
         assert not Path(attempt.workspace.root).exists()
-        verify.assert_not_called()
 
     @pytest.mark.parametrize("incomplete", [False, True])
     def test_processing_marker_skips_processing_but_not_validation(
@@ -535,23 +532,25 @@ class EnrichmentConformance:
         monkeypatch: pytest.MonkeyPatch,
         capfd: pytest.CaptureFixture[str],
     ) -> None:
-        """Cleanup is best effort after publication and never a reason to process again."""
+        """Publication survives cleanup failure, but another invocation waits for the workspace to clear."""
         _skip_processing(recipe, results, monkeypatch)
 
-        def fail_cleanup(*_args: object, **_kwargs: object) -> None:
-            message = "cleanup unavailable"
-            raise OSError(message)
+        def fail_cleanup(uri: str, **_kwargs: object) -> None:
+            # Removing a workspace fails; a new selection's absent workspace has nothing to remove.
+            if Path(uri).exists():
+                message = "cleanup unavailable"
+                raise OSError(message)
 
         monkeypatch.setattr(recovery_workspace, "remove_prefix", fail_cleanup)
         sink = recovery_workspace.logger.add(sys.stderr, level="WARNING")
         try:
             first = recipe.pipeline.run_config(config)
-            second = recipe.pipeline.run_config(config)
+            with pytest.raises(OSError, match="until workspace cleanup succeeds"):
+                recipe.pipeline.run_config(config)
         finally:
             recovery_workspace.logger.remove(sink)
         assert (first["selected_fragments"], first["cleanup_complete"]) == (
             len(enrichment_input.dataset.get_fragments()),
             False,
         )
-        assert (second["selected_fragments"], second["cleanup_complete"]) == (0, False)
         assert "workspace cleanup failed" in capfd.readouterr().err

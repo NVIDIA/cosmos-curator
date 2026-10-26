@@ -6,7 +6,6 @@
 Shared recovery behavior is covered by ``test_conformance.py``.
 """
 
-import json
 from dataclasses import replace
 
 import lance
@@ -22,8 +21,6 @@ from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec
 from cosmos_curator.next.recipes.video_transcode.contracts import (
     CLIP_FIELDS,
     CLIP_SCHEMA,
-    PUBLICATION_KEY,
-    PUBLICATION_VERSION,
 )
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.enrichment.helpers import publish_results
@@ -130,8 +127,11 @@ def test_invalid_vectors_leave_all_fragments_pending(
         rows[0][spec.vector_field] = [1.0]
     else:
         rows[0][spec.vector_field][0] = float("nan")
+    # Corrupt the stored representation: canonical fixed-size vectors cannot
+    # even be constructed with the wrong dimension.
+    staged = pa.Table.from_pylist(rows, schema=enrichment_input.bindings.spec.staged_schema)
     with pytest.raises(ValueError, match=r"canonical output types|finite unit"):
-        publish_results(pa.Table.from_pylist(rows, schema=results.schema), enrichment_input)
+        publish_results(staged, enrichment_input)
     assert lance.dataset(dataset.uri).version == dataset.version
     assert inputs.pending_fragment_ids(lance.dataset(dataset.uri), enrichment_input.bindings) == (0, 1)
 
@@ -182,22 +182,22 @@ def test_ready_clips_do_not_require_a_retained_receipt(
 @pytest.mark.parametrize(
     ("fault", "message"),
     [
-        ("pending", "clip_id values must be non-null and globally unique"),
-        ("null_id", "clip_id values must be non-null and globally unique"),
-        ("duplicate_id", "clip_id values must be non-null and globally unique"),
+        ("pending", "Every span requires a non-null clip_id"),
+        ("null_id", "Every span requires a non-null clip_id"),
+        ("duplicate_id", "clip_id values must be globally unique"),
         ("null_uri", "Clips require non-null URIs"),
         ("null_size", "Clips require non-null URIs and positive byte sizes"),
         ("zero_size", "Clips require non-null URIs and positive byte sizes"),
         ("negative_size", "Clips require non-null URIs and positive byte sizes"),
     ],
 )
-def test_publication_receipt_does_not_make_invalid_clip_inputs_ready(
+def test_invalid_clip_inputs_are_not_ready(
     config: ResolvedVideoEmbedConfig,
     dataset: lance.LanceDataset,
     fault: str,
     message: str,
 ) -> None:
-    """A matching receipt count cannot hide missing or malformed inputs consumed by embedding."""
+    """Missing or malformed clip inputs are rejected before embedding."""
     rows = dataset.to_table(columns=CLIP_SCHEMA.names).to_pylist()
     if fault == "pending":
         rows[0].update(dict.fromkeys(CLIP_FIELDS.names))
@@ -217,9 +217,6 @@ def test_publication_receipt_does_not_make_invalid_clip_inputs_ready(
         dataset.uri,
         mode="overwrite",
         data_storage_version="2.2",
-        transaction_properties={
-            PUBLICATION_KEY: json.dumps({"publication_version": PUBLICATION_VERSION, "spans": len(rows)})
-        },
     )
     with pytest.raises(ValueError, match=message):
         inputs.open_enrichment_input(resolve_bindings(config))
@@ -236,3 +233,31 @@ def test_empty_clip_table_is_ready_without_a_receipt(config: ResolvedVideoEmbedC
 
     assert opened.count_rows() == 0
     assert inputs.pending_fragment_ids(opened, bindings) == ()
+
+
+@pytest.mark.parametrize("outcomes_only", [False, True])
+def test_cut_outcomes_do_not_require_clip_media(
+    config: ResolvedVideoEmbedConfig,
+    dataset: lance.LanceDataset,
+    *,
+    outcomes_only: bool,
+) -> None:
+    """Source outcomes are outside the embedding work set; real spans still require completed clips."""
+    rows = [] if outcomes_only else dataset.to_table(columns=CLIP_SCHEMA.names).to_pylist()
+    rows.extend(
+        [
+            {"source_id": status, "source_uri": f"s3://input/{status}.mp4", "stream_index": 0}
+            for status in ("empty", "error")
+        ]
+    )
+    lance.write_dataset(
+        pa.Table.from_pylist(rows, schema=CLIP_SCHEMA),
+        dataset.uri,
+        mode="overwrite",
+        max_rows_per_file=2,
+        data_storage_version="2.2",
+    )
+    bindings = resolve_bindings(config)
+    current = inputs.open_enrichment_input(bindings).dataset
+    expected = () if outcomes_only else tuple(fragment.fragment_id for fragment in current.get_fragments()[:2])
+    assert inputs.pending_fragment_ids(current, bindings) == expected

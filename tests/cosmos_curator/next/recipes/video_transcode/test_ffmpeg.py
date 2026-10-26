@@ -18,7 +18,6 @@ from cosmos_curator.next.recipes.video_transcode import processing
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import READ_COLUMNS
-from cosmos_curator.next.recipes.video_transcode.pipeline import publication_properties
 from tests.cosmos_curator.next.enrichment.helpers import attempt_all, publish_attempt
 
 
@@ -58,14 +57,14 @@ def test_real_ffmpeg_clips_publish_and_probe(
         spans, dataset.uri, mode="overwrite", data_storage_version="2.2", max_rows_per_file=2
     )
     attempt = attempt_all(open_enrichment_input(resolve_bindings(config)))
-    staged_schema = attempt.input.bindings.spec.staged_schema
+    result_schema = attempt.input.bindings.spec.result_schema
     datasource = selection_datasource(attempt, columns=READ_COLUMNS)
     inputs = pa.concat_tables([batch for task in datasource.get_read_tasks(2) for batch in task()])
     downloaded = processing.download_source(processing.group_source_spans(inputs).to_pylist()[0], config=config)
     encoded = pa.Table.from_pylist(list(processing.transcode_source(downloaded, config=config)))
-    results = processing.upload_clips(encoded, config=config, staged_schema=staged_schema)
-    assert results.schema.equals(staged_schema, check_metadata=True)
-    completed = publish_attempt(results, attempt, properties=publication_properties).dataset
+    results = processing.upload_clips(encoded, config=config, result_schema=result_schema)
+    assert results.schema.equals(result_schema, check_metadata=True)
+    completed = publish_attempt(results, attempt).dataset
     assert completed.version == original.version + 1
     assert completed.count_rows() == 4
     for row in completed.to_table(columns=["clip_uri", "clip_size_bytes", "clip_duration_ns"]).to_pylist():

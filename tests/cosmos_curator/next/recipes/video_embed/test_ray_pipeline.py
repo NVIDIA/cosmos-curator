@@ -23,7 +23,8 @@ from cosmos_curator.next.recipes.video_embed.contracts import (
     terminal_row,
 )
 from cosmos_curator.next.recipes.video_embed.processing import download_clip
-from tests.cosmos_curator.next.enrichment.fresh_cluster import assert_fresh_cluster_resume, run_in_fresh_driver
+from tests.cosmos_curator.next.enrichment.fresh_cluster import assert_fresh_cluster_resume
+from tests.cosmos_curator.next.fresh_driver import run_in_fresh_driver
 from tests.cosmos_curator.next.recipes.video_embed.conftest import RECIPE, write_clips
 from tests.cosmos_curator.next.recipes.video_embed.test_processing import video_bytes
 
@@ -40,10 +41,10 @@ def recording_download(row: dict[str, Any], **kwargs: Any) -> dict[str, Any]:  #
 class CpuEmbedder:
     """Stand in for GPU inference while retaining terminal schemas and row identities."""
 
-    def __init__(self, *, spec: ModelSpec, model_dir: str, staged_schema: pa.Schema) -> None:
+    def __init__(self, *, spec: ModelSpec, model_dir: str, result_schema: pa.Schema) -> None:
         """Use the test media directory for an expensive-work log."""
         self._spec = spec
-        self._staged_schema = staged_schema
+        self._result_schema = result_schema
         self._root = Path(model_dir)
 
     def __call__(self, batch: pa.Table) -> pa.Table:
@@ -58,7 +59,7 @@ class CpuEmbedder:
             rows.append(terminal_row(row, self._spec, vector))
             with (self._root / "inference.jsonl").open("a") as log:
                 log.write(json.dumps(row["clip_id"]) + "\n")
-        return pa.Table.from_pylist(rows, schema=self._staged_schema)
+        return pa.Table.from_pylist(rows, schema=self._result_schema)
 
 
 def assert_resume(config_json: str) -> None:

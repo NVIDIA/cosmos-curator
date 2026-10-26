@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
 from cosmos_curator.next.recipes.video_embed import processing
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_batch
 from cosmos_curator.next.recipes.video_embed.processing import download_clip, sample_indices, sample_video
@@ -113,10 +114,11 @@ def test_shared_faults_propagate(
 def test_nullable_vectors_survive_checkpoint_parquet(tmp_path: Path, results: pa.Table, spec: ModelSpec) -> None:
     """Staging supports null vectors while the canonical schema enforces fixed dimension."""
     path = tmp_path / "results.parquet"
-    pq.write_table(results, path)
+    staged = results.cast(parquet_stable_schema(results.schema))
+    pq.write_table(staged, path)
     restored = pq.read_table(path)
-    assert restored.schema.equals(results.schema, check_metadata=True)
-    assert restored.equals(results)
+    assert restored.equals(staged, check_metadata=True)
+    assert restored.cast(results.schema).equals(results, check_metadata=True)
     canonical = restored.select(spec.fields.names).cast(spec.fields)
     assert canonical[spec.vector_field].null_count == 1
     for batch in canonical.to_batches():

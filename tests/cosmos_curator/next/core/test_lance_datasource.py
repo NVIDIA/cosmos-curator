@@ -19,7 +19,7 @@ from ray.data.context import ShuffleStrategy
 from cosmos_curator.next.core import lance_datasource
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
 from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
-from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
+from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem
 
 _SCHEMA = pa.schema(
@@ -49,6 +49,7 @@ def _source(dataset: lance.LanceDataset, fragment_ids: list[int] | None = None) 
         schema=_SCHEMA,
         storage_profile="default",
         batch_size=7,
+        id_column="item_id",
     )
 
 
@@ -60,7 +61,6 @@ def test_balanced_tasks_cover_rows_and_addresses_once(dataset: lance.LanceDatase
     tables = [pa.concat_tables(list(task())) for task in tasks]
     counts = [table.num_rows for table in tables]
     assert max(counts) - min(counts) <= 1
-    assert counts == [task.metadata.num_rows for task in tasks]
     combined = pa.concat_tables(tables)
     assert combined.schema.equals(_SCHEMA, check_metadata=True)
     assert combined.to_pylist() == [
@@ -71,15 +71,14 @@ def test_balanced_tasks_cover_rows_and_addresses_once(dataset: lance.LanceDatase
 def test_selected_fragments_keep_physical_offsets_after_deletions(dataset: lance.LanceDataset) -> None:
     """Offsets come from Lance row addresses, never the new task's local row numbering."""
     dataset.delete("item_id IN (101, 104, 402, 499)")
-    tasks = _source(dataset, [4, 1]).get_read_tasks(7)
-    rows = [row for task in tasks for batch in task() for row in batch.to_pylist()]
+    tables = [pa.concat_tables(list(task())) for task in _source(dataset, [4, 1]).get_read_tasks(7)]
+    rows = [row for table in tables for row in table.to_pylist()]
     assert rows == [
         {"item_id": index, "fragment_id": index // 100, "row_offset": index % 100}
         for index in [*range(100, 200), *range(400, 500)]
         if index not in (101, 104, 402, 499)
     ]
-    counts = [task.metadata.num_rows for task in tasks]
-    assert counts == [28] * 7
+    assert [table.num_rows for table in tables] == [28] * 7
 
 
 def test_read_tasks_reopen_the_pinned_version(dataset: lance.LanceDataset) -> None:
@@ -90,6 +89,32 @@ def test_read_tasks_reopen_the_pinned_version(dataset: lance.LanceDataset) -> No
     rows = [row for task in tasks for batch in task() for row in batch.to_pylist()]
     assert [row["item_id"] for row in rows] == list(range(600))
     assert dataset.count_rows() == 450
+
+
+def test_null_id_filter_preserves_physical_offsets(tmp_path: Path) -> None:
+    """Sparse work rows keep their original addresses across read ranges and batches."""
+    dataset = lance.write_dataset(
+        pa.table({"item_id": [None, 10, None, 20, None, 30]}),
+        tmp_path / "outcomes.lance",
+        max_rows_per_file=3,
+        data_storage_version="2.2",
+    )
+    source = LanceFragmentDatasource(
+        dataset,
+        fragment_ids=[0, 1],
+        schema=_SCHEMA,
+        storage_profile="default",
+        batch_size=1,
+        id_column="item_id",
+    )
+    tasks = source.get_read_tasks(4)
+    assert all(task.metadata.num_rows is None for task in tasks)
+    rows = [row for task in tasks for batch in task() for row in batch.to_pylist()]
+    assert rows == [
+        {"item_id": 10, "fragment_id": 0, "row_offset": 1},
+        {"item_id": 20, "fragment_id": 1, "row_offset": 0},
+        {"item_id": 30, "fragment_id": 1, "row_offset": 2},
+    ]
 
 
 def test_row_limit_applies_across_fragment_ranges(dataset: lance.LanceDataset) -> None:
@@ -121,6 +146,15 @@ def test_read_schema_requires_row_addresses(dataset: lance.LanceDataset) -> None
             schema=pa.schema([_SCHEMA.field("item_id"), _SCHEMA.field("fragment_id")]),
             storage_profile="default",
             batch_size=7,
+            id_column="item_id",
+        )
+
+
+def test_read_schema_requires_the_id_column(dataset: lance.LanceDataset) -> None:
+    """Reads skip rows outside the work set by their ID, so the projection must carry it."""
+    with pytest.raises(ValueError, match="requires the ID column 'missing'"):
+        LanceFragmentDatasource(
+            dataset, fragment_ids=[0], schema=_SCHEMA, storage_profile="default", batch_size=7, id_column="missing"
         )
 
 
@@ -135,7 +169,7 @@ def test_workers_resolve_credentials_from_the_profile(
 
     monkeypatch.setattr(lance_datasource, "get_lance_storage_options", storage_options)
     source = LanceFragmentDatasource(
-        dataset, fragment_ids=[0], schema=_SCHEMA, storage_profile="worker-profile", batch_size=7
+        dataset, fragment_ids=[0], schema=_SCHEMA, storage_profile="worker-profile", batch_size=7, id_column="item_id"
     )
     (task,) = source.get_read_tasks(1)
     assert resolved == []

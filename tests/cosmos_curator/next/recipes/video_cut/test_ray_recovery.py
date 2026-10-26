@@ -4,139 +4,215 @@
 """Real local Ray execution with fresh processes and native checkpoint recovery."""
 
 import json
-import subprocess
-import sys
+import traceback
+from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
+from typing import NoReturn
+from unittest.mock import patch
 
 import lance
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import ray
+from botocore.exceptions import ClientError
+from lance.fragment import FragmentMetadata
 from ray.data.checkpoint import CheckpointConfig
 from ray.data.checkpoint.checkpoint_writer import CheckpointWriter
-
-from cosmos_curator.next.media.ffmpeg import VideoMetadata
-from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_cut.contracts import SOURCE_SCHEMA, make_source_id
-from cosmos_curator.next.recipes.video_cut.processing import source_result
-from cosmos_curator.next.recipes.video_cut.publication import completed_publication, resolve_workspace
-from cosmos_curator.next.utils.identity import canonical_digest
-
-# Each attempt has a new driver and Ray head. Only metadata probing is replaced;
-# datasource filtering, file-sink checkpoints, and Lance writes/commits are real.
-_ATTEMPT = """
-import json
-import sys
-from pathlib import Path
-
-import pyarrow as pa
-import ray
 from ray.data.context import DataContext
 
-from cosmos_curator.next.media.ffmpeg import ProbeError, VideoMetadata
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
-from cosmos_curator.next.recipes.video_cut import discovery, pipeline
-from cosmos_curator.next.recipes.video_cut.config import resolve_config
-from cosmos_curator.next.recipes.video_cut.contracts import SOURCE_SCHEMA, make_source_id
-from cosmos_curator.next.recipes.video_cut.processing import source_result
+from cosmos_curator.next.append import commit
+from cosmos_curator.next.append.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.media.ffmpeg import ProbeError, VideoMetadata
+from cosmos_curator.next.recipes.video_cut import discovery, fixed_stride, pipeline
+from cosmos_curator.next.recipes.video_cut.bindings import resolve_bindings
+from cosmos_curator.next.recipes.video_cut.config import (
+    ExecutionConfig,
+    FixedStrideConfig,
+    ResolvedVideoCutConfig,
+    resolve_config,
+    resolve_config_data,
+)
+from cosmos_curator.next.recipes.video_cut.contracts import make_source_id
+from cosmos_curator.next.recipes.video_cut.discovery import discover_items
+from cosmos_curator.next.recipes.video_cut.fixed_stride import plan_sources
+from tests.cosmos_curator.next.append.fresh_cluster import assert_fresh_cluster_resume
+from tests.cosmos_curator.next.fresh_driver import run_in_fresh_driver, start_local_cluster
+from tests.cosmos_curator.next.recipes.video_cut.conftest import RECIPE, plan_outcome
 
-config = resolve_config(Path(sys.argv[1]))
-allowed = set(json.loads(sys.argv[2]))
-log = Path(sys.argv[3])
-interrupt = sys.argv[4] == "interrupt"
-probe_failures = int(sys.argv[5])
+_MODULE = "tests.cosmos_curator.next.recipes.video_cut.test_ray_recovery"
 
-if config.input.root_uri is not None:
-    class ListedSources:
-        def list_recursive_with_suffixes(self, root: S3Prefix, suffixes: tuple[str, ...]) -> list[S3Prefix]:
-            assert root.path == "s3://test-bucket/"
-            assert suffixes == (".mp4",)
-            listed = Path(sys.argv[1]).parent / "listed-sources.json"
-            return [S3Prefix(uri) for uri in json.loads(listed.read_text())]
-    discovery.s3_client = lambda _: ListedSources()
 
-def plan(batch, *, split, execution):
-    rows = []
-    for source in batch.to_pylist():
-        uri = source["source_uri"]
-        assert uri in allowed, f"Checkpointed source reached probing: {uri}"
-        with log.open("a") as stream:
-            stream.write(uri + "\\n")
-        if probe_failures:
-            counter = log.with_name(make_source_id(uri) + ".attempts")
-            attempts = int(counter.read_text()) if counter.exists() else 0
-            counter.write_text(str(attempts + 1))
-            if attempts < probe_failures:
-                raise ProbeError("injected FFprobe failure")
-        duration = 100 if uri.endswith(("short.mp4", "error.mp4")) else 5_000_000_000
-        if "/large-" in uri:
-            duration = 120_000_000_000_000
-        row = source_result(uri, VideoMetadata(duration, 64, 48, 30.0, None, "h264"), 50, split)
-        if uri.endswith("error.mp4"):
-            row.update(status="error", error_stage="source-read", error_message="synthetic missing source")
-        rows.append(row)
-    return pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA)
+def _probe(uri: str, *, execution: object, allowed: set[str], log: Path, failures: int) -> tuple[VideoMetadata, int]:
+    """Stand in for remote FFprobe: record each source, fail its first ``failures`` probes, then settle it."""
+    del execution
+    assert uri in allowed, f"Checkpointed source reached probing: {uri}"
+    with log.open("a") as stream:
+        stream.write(uri + "\n")
+    if failures:
+        counter = log.with_name(make_source_id(uri) + ".attempts")
+        attempts = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(attempts + 1))
+        if attempts < failures:
+            msg = "injected FFprobe failure"
+            raise ProbeError(msg)
+    if uri.endswith("error.mp4"):
+        raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "synthetic missing source"}}, "HeadObject")
+    duration = 100 if uri.endswith("short.mp4") else 5_000_000_000
+    if "/large-" in uri:
+        duration = 120_000_000_000_000
+    return VideoMetadata(duration, 64, 48, 30.0, None, "h264"), 50
 
-pipeline.plan_sources = plan
-def interrupted_commit(candidates, **kwargs):
-    import lance
-    assert sorted(lance.FragmentMetadata.from_json(item).num_rows for item in candidates) == [1, 4, 4]
+
+def _plan_with_probe(
+    batch: pa.Table,
+    *,
+    split: FixedStrideConfig,
+    execution: ExecutionConfig,
+    probe: Callable[..., tuple[VideoMetadata, int]],
+) -> pa.Table:
+    """Replace only media access inside the worker; run the real source planning and failure policy."""
+    with patch.object(fixed_stride, "probe_source", probe):
+        return plan_sources(batch, split=split, execution=execution)
+
+
+class _ListedSources:
+    """Stand in for recursive S3 discovery with the URIs a test lists beside its config."""
+
+    def __init__(self, listing: Path) -> None:
+        self._listing = listing
+
+    def list_recursive_with_suffixes(self, root: S3Prefix, suffixes: tuple[str, ...]) -> list[S3Prefix]:
+        assert (root.path, suffixes) == ("s3://test-bucket/", (".mp4",))
+        return [S3Prefix(uri) for uri in json.loads(self._listing.read_text())]
+
+
+def _interrupted_commit(
+    fragments: Sequence[FragmentMetadata], *, config: ResolvedVideoCutConfig, root: Path, **_kwargs: object
+) -> NoReturn:
+    """Record the staged fragment sizes, prove nothing is visible yet, and lose the driver before committing."""
+    (root / "staged-fragments.json").write_text(json.dumps(sorted(fragment.num_rows for fragment in fragments)))
     assert lance.dataset(config.output.spans_lance_uri).count_rows() == 0
-    raise RuntimeError("injected driver loss before commit")
-if interrupt:
-    pipeline.commit_fragments = interrupted_commit
+    msg = "injected driver loss before commit"
+    raise RuntimeError(msg)
 
-ray.init(address="local", num_cpus=4,
-         include_dashboard=False, log_to_driver=False, object_store_memory=256 * 1024**2)
-try:
-    summary = pipeline.run_config(config)
-    assert DataContext.get_current().checkpoint_config is None
-    # A second successful attempt must be a no-op, including the empty plan.
-    allowed.clear()
-    def unexpected_stage(*args, **kwargs):
-        raise AssertionError("Completed publication reached fragment staging")
-    pipeline.stage_fragment = unexpected_stage
-    def unexpected_ray(**kwargs):
-        raise AssertionError("Completed publication reached Ray initialization")
-    pipeline.ensure_ray_initialized = unexpected_ray
-    def unexpected_cleanup(*args, **kwargs):
-        raise AssertionError("Completed publication reached workspace cleanup")
-    pipeline.cleanup_workspace = unexpected_cleanup
-    again = pipeline.run_config(config)
-    assert again == summary | {"cleanup_complete": None}
-    Path(sys.argv[1] + ".summary").write_text(json.dumps(summary))
-finally:
-    ray.shutdown()
-"""
+
+def _unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+    msg = "A completed publication reached Ray setup or fragment staging"
+    raise AssertionError(msg)
+
+
+def _assert_fails(run: Callable[[], object], message: str) -> None:
+    """Require ``run`` to raise ``message`` somewhere in its exception chain, which Ray may wrap."""
+    try:
+        run()
+    except Exception as exc:
+        if message not in "".join(traceback.format_exception(exc)):
+            raise
+        return
+    msg = f"The attempt did not fail with {message!r}"
+    raise AssertionError(msg)
+
+
+def run_attempt(config_path: str, allowed: str, faults: str) -> None:
+    """Run ``run_config`` in this fresh driver and Ray head, then require a rerun to find nothing to do.
+
+    Only media probing is replaced; datasource filtering, task planning,
+    file-sink checkpoints, and Lance writes/commits are real. The cluster has no
+    curator_io slots. ``faults`` can interrupt the commit and fail each
+    source's first probes; its ``fails_with`` names the error the run must then
+    raise, and the rerun is skipped. Probed URIs are logged to ``probes.txt``
+    and the summary is written beside the config.
+    """
+    path = Path(config_path)
+    config = resolve_config(path)
+    allowed_uris = set(json.loads(allowed))
+    injected = json.loads(faults)
+    if config.input.root_uri is not None:
+        discovery.s3_client = lambda _profile: _ListedSources(path.parent / "listed-sources.json")
+    fixed_stride.plan_sources = partial(
+        _plan_with_probe,
+        probe=partial(
+            _probe, allowed=allowed_uris, log=path.parent / "probes.txt", failures=injected["probe_failures"]
+        ),
+    )
+    if injected["interrupt"]:
+        commit.commit_append = partial(_interrupted_commit, config=config, root=path.parent)
+    start_local_cluster(4, io_slots=0)
+    try:
+        if injected["fails_with"] is not None:
+            _assert_fails(partial(pipeline.run_config, config), injected["fails_with"])
+            return
+        summary = pipeline.run_config(config)
+        assert DataContext.get_current().checkpoint_config is None
+        # A rerun finds nothing to do: no Ray setup, fragment staging, or commit.
+        allowed_uris.clear()
+        pipeline.ensure_ray_initialized = _unexpected
+        commit.stage_fragment = _unexpected
+        again = pipeline.run_config(config)
+        assert (again["selected_items"], again["appended_rows"]) == (0, 0)
+        assert again["spans_lance_version"] == summary["spans_lance_version"]
+        Path(f"{config_path}.summary").write_text(json.dumps(summary))
+    finally:
+        ray.shutdown()
 
 
 def _attempt(
     config: ResolvedVideoCutConfig,
     root: Path,
     name: str,
-    allowed: tuple[str, ...],
+    allowed: Sequence[str],
     *,
     interrupt: bool = False,
     probe_failures: int = 0,
-) -> subprocess.CompletedProcess[str]:
+    fails_with: str | None = None,
+) -> None:
+    """Run one attempt with a new driver and Ray head; it must fail with ``fails_with`` when given."""
     path = root / f"{name}.json"
     path.write_text(config.model_dump_json())
-    return subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "-c",
-            _ATTEMPT,
-            str(path),
-            json.dumps(allowed),
-            str(root / "probes.txt"),
-            "interrupt" if interrupt else "complete",
-            str(probe_failures),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=240,
+    faults = {"interrupt": interrupt, "probe_failures": probe_failures, "fails_with": fails_with}
+    run_in_fresh_driver(f"{_MODULE}:run_attempt", str(path), json.dumps(list(allowed)), json.dumps(faults))
+
+
+def _summary(root: Path, name: str) -> dict[str, object]:
+    return json.loads((root / f"{name}.json.summary").read_text())
+
+
+def _workspace_root(config: ResolvedVideoCutConfig) -> Path:
+    """Resolve the saved workspace of the config's sources without recording a new one."""
+    assert config.input.uris is not None
+    bindings = resolve_bindings(config)
+    attempt = reconcile_and_select_attempt(bindings, lambda: discover_items(config))
+    assert attempt.workspace is not None
+    return Path(attempt.workspace.root)
+
+
+def assert_source_resume(config_json: str, log_dir: str) -> None:
+    """Run the shared fresh-cluster scenario with a remote probe that records each source it settles."""
+    config = ResolvedVideoCutConfig.model_validate_json(config_json)
+    log = Path(log_dir, "probed.txt")
+
+    fixed_stride.plan_sources = partial(
+        _plan_with_probe, probe=partial(_probe, allowed=set(config.input.uris or ()), log=log, failures=0)
     )
+    summary = assert_fresh_cluster_resume(
+        RECIPE,
+        config,
+        process=pipeline.cut_sources,
+        work_logs=lambda: {
+            "probe": [make_source_id(uri) for uri in log.read_text().splitlines()] if log.exists() else []
+        },
+        num_cpus=4,
+    )
+    assert (summary["appended_rows"], summary["errors"]) == (8, 1)
+
+
+@pytest.mark.integration
+def test_fresh_cluster_resumes_source_checkpoints(config: ResolvedVideoCutConfig, tmp_path: Path) -> None:
+    """The real plan filters checkpointed sources on a fresh cluster and publishes through ``run_config``."""
+    run_in_fresh_driver(f"{_MODULE}:assert_source_resume", config.model_dump_json(), str(tmp_path))
 
 
 @pytest.mark.integration
@@ -145,163 +221,121 @@ def test_probe_retries_never_checkpoint_an_inconclusive_failure(
     config: ResolvedVideoCutConfig, tmp_path: Path, probe_failures: int
 ) -> None:
     """Probes retry within the attempt, or remain recoverable when retries are exhausted."""
+    uri = "s3://test-bucket/long.mp4"
     raw = config.model_dump(mode="json")
-    raw["input"]["uris"] = [config.input.uris[0]]
-    config = resolve_config_data(raw, overrides=["execution.sources_per_checkpoint=1"])
-    first = _attempt(config, tmp_path, "probe", config.input.uris, probe_failures=probe_failures)
-    if probe_failures == 4:
-        assert first.returncode != 0
-        assert "injected FFprobe failure" in first.stderr, first.stdout + first.stderr
+    raw["input"]["uris"] = [uri]
+    config = resolve_config_data(raw, overrides=["execution.parquet_rows_per_file=1"])
+    exhausted = probe_failures == 4
+    fails_with = "injected FFprobe failure" if exhausted else None
+    _attempt(config, tmp_path, "probe", (uri,), probe_failures=probe_failures, fails_with=fails_with)
+    if exhausted:
         dataset = lance.dataset(config.output.spans_lance_uri)
-        assert completed_publication(dataset) is None
         assert dataset.count_rows() == 0
-        workspace = resolve_workspace(config, canonical_digest(config.input.uris))
-        assert not list(Path(workspace.results).glob("*.parquet"))
-        resumed = _attempt(config, tmp_path, "probe", config.input.uris)
-        assert resumed.returncode == 0, resumed.stdout + resumed.stderr
-    else:
-        assert first.returncode == 0, first.stdout + first.stderr
-    summary = json.loads((tmp_path / "probe.json.summary").read_text())
-    assert summary["errors"] == 0
-    assert summary["source_results"] == 1
-    assert summary["spans"] == 3
+        assert not list(Path(_workspace_root(config), "results").glob("*.parquet"))
+        _attempt(config, tmp_path, "probe", (uri,))
+    summary = _summary(tmp_path, "probe")
+    assert (summary["errors"], summary["selected_items"], summary["appended_rows"]) == (0, 1, 3)
     probes = (tmp_path / "probes.txt").read_text().splitlines()
-    assert probes == [config.input.uris[0]] * (probe_failures + 1)
+    assert probes == [uri] * (probe_failures + 1)
 
 
 @pytest.mark.integration
-def test_fresh_driver_recovers_source_checkpoints_and_uncommitted_fragments(
+def test_interrupted_publication_resumes_without_media_work_and_matches_a_clean_run(
     config: ResolvedVideoCutConfig, tmp_path: Path
 ) -> None:
-    """Recovery skips durable sources in the frozen snapshot and matches a clean run."""
-    raw = config.model_dump(mode="json")
-    raw["input"]["uris"].extend(["s3://test-bucket/long-2.mp4", "s3://test-bucket/long-3.mp4"])
+    """Staged but uncommitted fragments are rebuilt from checkpoints; a root discovery resumes explicit URIs."""
     config = resolve_config_data(
-        raw, overrides=["execution.sources_per_checkpoint=1", "execution.spans_per_fragment=4"]
+        config.model_dump(mode="json"), overrides=["execution.parquet_rows_per_file=1", "execution.rows_per_fragment=4"]
     )
-    first = _attempt(config, tmp_path, "first", config.input.uris, interrupt=True)
-    assert first.returncode != 0
-    assert "injected driver loss before commit" in first.stderr, first.stdout + first.stderr
-    partial = lance.dataset(config.output.spans_lance_uri)
-    assert partial.count_rows() == 0
-    assert len(partial.get_fragments()) == 0
-    assert len(list((Path(config.output.spans_lance_uri) / "data").glob("*.lance"))) == 3
-    workspace = resolve_workspace(config, canonical_digest(config.input.uris))
-    initial_files = list(Path(workspace.results).glob("*.parquet"))
-    assert sum(pq.read_metadata(path).num_rows for path in initial_files) == 4
-    assert all(pq.read_metadata(path).num_rows == 1 for path in initial_files)
+    _attempt(
+        config,
+        tmp_path,
+        "first",
+        config.input.uris or (),
+        interrupt=True,
+        fails_with="injected driver loss before commit",
+    )
+    assert json.loads((tmp_path / "staged-fragments.json").read_text()) == [4, 4]
+    unpublished = lance.dataset(config.output.spans_lance_uri)
+    assert (unpublished.count_rows(), len(unpublished.get_fragments())) == (0, 0)
+    workspace = _workspace_root(config)
+    staged = list(Path(workspace, "results").glob("*.parquet"))
+    assert sorted(pq.read_metadata(path).num_rows for path in staged) == [1, 1, 1, 1]
 
+    expected_uris = config.input.uris or ()
+    (tmp_path / "listed-sources.json").write_text(json.dumps(list(expected_uris)))
     raw = config.model_dump(mode="json")
-    expected_uris = config.input.uris
-    (tmp_path / "listed-sources.json").write_text(json.dumps(expected_uris))
-    # A directory selection reuses the same source checkpoints as explicit URIs.
     raw["input"] = {"root_uri": "s3://test-bucket/"}
-    resumed = resolve_config_data(
-        raw, overrides=["execution.sources_per_checkpoint=2", "execution.spans_per_fragment=5"]
-    )
-    second = _attempt(resumed, tmp_path, "resumed", ())
-    assert second.returncode == 0, second.stdout + second.stderr
-    assert not Path(workspace.root).exists()
-    summary = json.loads((tmp_path / "resumed.json.summary").read_text())
-    assert summary["selected_sources"] == 4
-    assert summary["source_results"] == 4
-    assert summary["errors"] == 0
-    assert summary["spans"] == 9
+    resumed = resolve_config_data(raw, overrides=["execution.parquet_rows_per_file=2", "execution.rows_per_fragment=5"])
+    _attempt(resumed, tmp_path, "resumed", ())
+    assert not workspace.exists()
+    summary = _summary(tmp_path, "resumed")
+    assert (summary["selected_items"], summary["appended_rows"], summary["errors"]) == (4, 8, 1)
+    assert summary["input_items"] is summary["remaining_items"] is None
     assert summary["cleanup_complete"] is True
     recovered = lance.dataset(resumed.output.spans_lance_uri)
-    assert sorted(fragment.count_rows() for fragment in recovered.get_fragments()) == [4, 5]
-    assert recovered.version == 2
-    probes = (tmp_path / "probes.txt").read_text().splitlines()
-    assert sorted(probes) == list(expected_uris)
+    assert sorted(fragment.count_rows() for fragment in recovered.get_fragments()) == [3, 5]
+    assert sorted((tmp_path / "probes.txt").read_text().splitlines()) == sorted(expected_uris)
 
     reference = resolve_config_data(
         resumed.model_dump(mode="json"),
         overrides=[
             f"output.spans_lance_uri={tmp_path / 'reference.lance'}",
             f"output.staging_root_uri={tmp_path / 'reference-staging'}",
-            "execution.sources_per_checkpoint=3",
+            "execution.parquet_rows_per_file=3",
         ],
     )
-    clean = _attempt(reference, tmp_path, "clean", expected_uris)
-    assert clean.returncode == 0, clean.stdout + clean.stderr
-    actual = lance.dataset(resumed.output.spans_lance_uri).to_table().sort_by("span_id")
-    expected = lance.dataset(reference.output.spans_lance_uri).to_table().sort_by("span_id")
+    _attempt(reference, tmp_path, "clean", tuple(expected_uris))
+    actual = recovered.to_table().sort_by([("source_id", "ascending"), ("span_id", "ascending")])
+    expected = (
+        lance.dataset(reference.output.spans_lance_uri)
+        .to_table()
+        .sort_by([("source_id", "ascending"), ("span_id", "ascending")])
+    )
     assert actual.equals(expected, check_metadata=False)
-    assert len(set(actual["span_id"].to_pylist())) == len(actual) == 9
+    assert len(actual) == 8
+    span_ids = actual["span_id"].drop_null().to_pylist()
+    assert len(set(span_ids)) == len(span_ids) == 6
 
 
 @pytest.mark.integration
-def test_native_pending_write_is_replayed_within_frozen_snapshot(
+def test_native_pending_write_is_replayed_within_the_saved_selection(
     config: ResolvedVideoCutConfig, tmp_path: Path
 ) -> None:
     """An interrupted file write is discarded and its selected source is recomputed."""
-    workspace = resolve_workspace(config, canonical_digest(config.input.uris))
-    uri = config.input.uris[0]
+    workspace = _workspace_root(config)
+    uri = "s3://test-bucket/long.mp4"
     writer = CheckpointWriter.create(
         CheckpointConfig(
-            id_column="source_id", checkpoint_path=workspace.checkpoints, delete_checkpoint_on_success=False
+            id_column="source_id", checkpoint_path=str(workspace / "checkpoints"), delete_checkpoint_on_success=False
         )
     )
-    writer.write_pending_checkpoint(pa.array([make_source_id(uri)]), "interrupted")
-    Path(workspace.results).mkdir(parents=True)
-    unfinished = Path(workspace.results) / "interrupted_000000.parquet"
-    row = source_result(uri, VideoMetadata(5_000_000_000, 64, 48, 30.0, None, "h264"), 50, config.split)
-    pq.write_table(pa.Table.from_pylist([row], schema=SOURCE_SCHEMA), unfinished)
-    result = _attempt(config, tmp_path, "pending", config.input.uris)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert not Path(workspace.root).exists()
-    assert lance.dataset(config.output.spans_lance_uri).count_rows() == 3
-    assert sorted((tmp_path / "probes.txt").read_text().splitlines()) == list(config.input.uris)
-
-
-@pytest.mark.integration
-def test_resuming_after_an_overlapping_cut_run_filters_checkpointed_sources(
-    config: ResolvedVideoCutConfig, tmp_path: Path
-) -> None:
-    """A sequential cut run may publish some checkpointed sources before the original run resumes."""
-    raw = config.model_dump(mode="json")
-    raw["input"]["uris"].extend(["s3://test-bucket/long-2.mp4", "s3://test-bucket/long-3.mp4"])
-    config = resolve_config_data(
-        raw, overrides=["execution.sources_per_checkpoint=1", "execution.spans_per_fragment=4"]
+    row = plan_outcome(uri, config)
+    writer.write_pending_checkpoint(pa.array([row["source_id"]]), "interrupted")
+    Path(workspace, "results").mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([row], schema=resolve_bindings(config).spec.staged_schema),
+        workspace / "results" / "interrupted_000000.parquet",
     )
-    first = _attempt(config, tmp_path, "interrupted", config.input.uris, interrupt=True)
-    assert first.returncode != 0
-    assert "injected driver loss before commit" in first.stderr, first.stdout + first.stderr
-
-    raw = config.model_dump(mode="json")
-    raw["input"] = {"uris": [config.input.uris[0]]}
-    subset = resolve_config_data(raw)
-    second = _attempt(subset, tmp_path, "subset", subset.input.uris)
-    assert second.returncode == 0, second.stdout + second.stderr
-    existing = [
-        fragment.metadata.to_json() for fragment in lance.dataset(config.output.spans_lance_uri).get_fragments()
-    ]
-
-    third = _attempt(config, tmp_path, "resumed-overlap", ())
-    assert third.returncode == 0, third.stdout + third.stderr
-    dataset = lance.dataset(config.output.spans_lance_uri)
-    assert dataset.count_rows() == 9
-    assert len(set(dataset.to_table(columns=["span_id"])["span_id"].to_pylist())) == 9
-    assert [fragment.metadata.to_json() for fragment in dataset.get_fragments()[: len(existing)]] == existing
-    summary = json.loads((tmp_path / "resumed-overlap.json.summary").read_text())
-    assert summary["source_results"] == 3
-    assert summary["selected_sources"] == 4
+    _attempt(config, tmp_path, "pending", config.input.uris or ())
+    assert not workspace.exists()
+    assert lance.dataset(config.output.spans_lance_uri).count_rows() == 8
+    assert sorted((tmp_path / "probes.txt").read_text().splitlines()) == sorted(config.input.uris or ())
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("sources_per_checkpoint", [1, 2])
+@pytest.mark.parametrize("parquet_rows_per_file", [1, 2])
 def test_full_sized_fragments_pack_source_plans(
-    config: ResolvedVideoCutConfig, tmp_path: Path, sources_per_checkpoint: int
+    config: ResolvedVideoCutConfig, tmp_path: Path, parquet_rows_per_file: int
 ) -> None:
     """Two 60k-span plans pack into 100k/20k fragments within and across Parquet files."""
     raw = config.model_dump(mode="json")
     raw["input"] = {"uris": ["s3://test-bucket/large-1.mp4", "s3://test-bucket/large-2.mp4"]}
     config = resolve_config_data(
         raw,
-        overrides=[f"execution.sources_per_checkpoint={sources_per_checkpoint}", "execution.spans_per_fragment=100000"],
+        overrides=[f"execution.parquet_rows_per_file={parquet_rows_per_file}", "execution.rows_per_fragment=100000"],
     )
-    result = _attempt(config, tmp_path, "large", config.input.uris)
-    assert result.returncode == 0, result.stdout + result.stderr
+    _attempt(config, tmp_path, "large", config.input.uris or ())
     dataset = lance.dataset(config.output.spans_lance_uri)
     assert dataset.count_rows() == 120_000
     assert sorted(fragment.count_rows() for fragment in dataset.get_fragments()) == [20_000, 100_000]
@@ -313,23 +347,16 @@ def test_full_sized_fragments_pack_source_plans(
 
 @pytest.mark.integration
 def test_empty_and_error_only_sources_publish_and_resume(config: ResolvedVideoCutConfig, tmp_path: Path) -> None:
-    """An entirely empty expansion still publishes counts and skips all work on replay."""
+    """A selection without spans still publishes durable outcomes through Ray."""
     raw = config.model_dump(mode="json")
     raw["input"] = {"uris": ["s3://test-bucket/short.mp4", "s3://test-bucket/error.mp4"]}
     config = resolve_config_data(raw)
-    result = _attempt(config, tmp_path, "empty", config.input.uris)
-    assert result.returncode == 0, result.stdout + result.stderr
-    summary = json.loads((tmp_path / "empty.json.summary").read_text())
-    assert summary["source_results"] == 2
-    assert summary["errors"] == 1
-    assert summary["spans"] == 0
+    _attempt(config, tmp_path, "empty", config.input.uris or ())
+    summary = _summary(tmp_path, "empty")
+    assert (summary["selected_items"], summary["appended_rows"], summary["errors"]) == (2, 2, 1)
     assert summary["cleanup_complete"] is True
-    errors = [json.loads(line) for line in Path(summary["errors_uri"]).read_text().splitlines()]
-    assert len(errors) == 1
-    assert errors[0]["source_uri"] == "s3://test-bucket/error.mp4"
-    assert errors[0]["error_message"] == "synthetic missing source"
     dataset = lance.dataset(config.output.spans_lance_uri)
-    assert dataset.version == 2
-    assert dataset.get_fragments() == []
-    assert "workspace_root" not in completed_publication(dataset)
-    assert not Path(resolve_workspace(config, canonical_digest(config.input.uris)).root).exists()
+    assert (dataset.version, dataset.count_rows()) == (2, 2)
+    assert dataset.to_table(columns=["span_id"])["span_id"].null_count == 2
+    errors = dataset.to_table(filter="error_stage IS NOT NULL", columns=["source_uri"]).to_pylist()
+    assert errors == [{"source_uri": "s3://test-bucket/error.mp4"}]

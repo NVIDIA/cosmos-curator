@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared config resolution helpers for Curator Next recipes."""
+"""Shared config resolution helpers and execution settings for Curator Next recipes."""
 
 from collections.abc import Sequence
 from typing import Any
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def apply_dotted_overrides(data: dict[str, Any], overrides: Sequence[str]) -> None:
@@ -48,3 +49,23 @@ def apply_dotted_overrides(data: dict[str, Any], overrides: Sequence[str]) -> No
                 raise TypeError(msg)
             target = child
         target[path[-1]] = value
+
+
+class CheckpointedExecutionConfig(BaseModel):
+    """Storage, checkpoint, and publication tuning shared by checkpointed recipes, excluded from result identity.
+
+    ``EnrichmentExecutionConfig`` and ``AppendExecutionConfig`` add their
+    selection limits and publication settings; recipes subclass those for their
+    ``execution`` section. Override a default only for a recipe-specific reason.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    storage_profile: str = Field(default="default", min_length=1)
+    parquet_rows_per_file: int = Field(
+        default=1_000, ge=1, description="Staged results per Parquet file, which is also the checkpoint group size."
+    )
+    commit_attempts: int = Field(
+        default=5, ge=1, description="Attempts for preparing the output table and for publication."
+    )
+    progress: bool = False

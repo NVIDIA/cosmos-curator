@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.next.media.ffmpeg import probe_video_source
-from cosmos_curator.next.recipes.video_cut import processing
+from cosmos_curator.next.recipes.video_cut import fixed_stride
 from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig
 from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id
 
@@ -31,7 +31,7 @@ def test_remote_probe_reads_less_than_whole_mp4(
     *,
     faststart: bool,
 ) -> None:
-    """The recipe obtains real metadata without its whole-object download fallback."""
+    """The remote probe settles a source with real metadata, so it needs no whole-object download."""
     path = tmp_path / "source.mp4"
     subprocess.run(  # noqa: S603
         [  # noqa: S607 - FFmpeg comes from the selected runtime environment.
@@ -105,27 +105,23 @@ def test_remote_probe_reads_less_than_whole_mp4(
         thread.start()
         signed = f"http://127.0.0.1:{server.server_port}/source.mp4?signature=secret"
 
-        def unexpected_download(*_: object) -> None:
-            pytest.fail("Successful range probing must not download the source")
-
         client = SimpleNamespace(
             s3=SimpleNamespace(
                 head_object=lambda **_: {"ContentLength": size}, generate_presigned_url=lambda *_, **__: signed
-            ),
-            download_to_path=unexpected_download,
+            )
         )
-        monkeypatch.setattr(processing, "s3_client", lambda _: client)
+        monkeypatch.setattr(fixed_stride, "s3_client", lambda _: client)
         uri = config.input.uris[0]
         batch = pa.Table.from_pylist([{"source_id": make_source_id(uri), "source_uri": uri}], schema=INPUT_SCHEMA)
         try:
-            result = processing.plan_sources(batch, split=config.split, execution=config.execution).to_pylist()[0]
+            result = fixed_stride.plan_sources(batch, split=config.split, execution=config.execution).to_pylist()[0]
         finally:
             server.shutdown()
             thread.join(timeout=5)
     transferred = sum(count for _, count in transfers)
     record_property("source_bytes", size)
     record_property("probe_bytes_sent", transferred)
-    assert result["status"] == "success"
+    assert result["error_stage"] is None
     assert result["source_duration_ns"] == metadata.duration_ns == 20_000_000_000
     assert result["source_frame_count"] == metadata.frame_count == 600
     assert result["source_width"] == metadata.width

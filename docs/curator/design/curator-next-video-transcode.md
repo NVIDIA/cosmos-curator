@@ -33,13 +33,13 @@ commit: it creates no placeholder column files and rewrites no span data. The in
 version and passes it to workers. Reads within an attempt describe one consistent snapshot. Committed cut fragments
 are independently ready; a whole-table cut completion record is not required.
 
-Every fragment in the table must have either all clip fields null on every row (pending), or valid completed clip
-metadata on every row for the requested encoding contract and media destination. Mixed, partially filled, or incompatible
-fragments anywhere in the pinned snapshot are rejected. New work selects all pending fragments; the recipe has no
-public selection-size limit. Saved selections follow the
-[shared recovery rules](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace), and fragment counts follow
+Every fragment in the table must have either all clip fields null on every row with a span ID (pending), or valid
+completed clip metadata on every such row for the requested encoding contract and media destination. Mixed, partially
+filled, or incompatible fragments anywhere in the pinned snapshot are rejected. New work selects all pending fragments
+unless `execution.max_fragments` bounds it. Saved selections follow the
+[shared recovery rules](curator-next-checkpoint-recovery.md#recovery-workspaces-and-receipts), and fragment counts follow
 the [shared run summary definitions](curator-next-checkpoint-recovery.md#run-summaries).
-Input validation also requires globally unique, non-null span IDs.
+Input validation also requires globally unique span IDs; source outcomes have null span IDs and need no clips.
 
 Source grouping happens after checkpoint filtering. A source whose spans are all durable is never downloaded.
 A partially completed source is downloaded once for its remaining spans. Grouping shuffles only lightweight span
@@ -105,24 +105,22 @@ Video-transcode preserves the cut fields, row order, fragment IDs, and existing 
 codec. The exact schemas live in
 [contracts.py](../../../cosmos_curator/next/recipes/video_transcode/contracts.py). Arrow field metadata records owner
 `video-transcode` and field set `clip`. Added fields are nullable in the Arrow schema so the upstream producer can append
-narrow span rows; a completed fragment requires usable clip metadata on every span. Each completed fragment retains its
+narrow span rows; a completed fragment requires usable clip metadata on every non-null span ID. Empty/error
+source outcomes have null span IDs and remain untouched, including in mixed fragments. Each completed fragment retains its
 original span file and adds a file holding the transcode columns.
 Fragment IDs and row offsets stay unchanged; the column update creates no row deletions.
 
 All selected pending fragments are filled in one `Update` transaction under the
 [shared publication and concurrency rules](curator-next-checkpoint-recovery.md#canonical-publication-and-concurrent-writers).
-One logical transcode writer owns the clip columns. The transaction adds a `video_transcode.publication` receipt using
-publication format version 1, identifying the input version, selected fragments, encoding contract, media root, and
-completed span count, alongside the shared recovery receipt. Fragment values determine readiness and rerun selection;
-receipts do not declare later appended fragments complete. Completed rows and transaction receipts must match the
-requested encoding contract and destination. An empty table without a transcode receipt still records a zero-span
-run, without starting Ray, because video-caption requires a whole-table receipt. Transcode commits that receipt
-directly rather than through shared publication: recording it twice is harmless, so it needs no recovery workspace.
-This extension goes away once caption checks clip readiness from data.
+One logical transcode writer owns the clip columns. The transaction includes the shared recovery receipt and provenance.
+Fragment values determine readiness and rerun selection; completed clips must match the requested encoding contract
+and destination. A table with no spans, including one holding only empty/error source outcomes, requires no processing
+or completion commit once the clip fields are registered. Appending more source outcomes leaves existing clips ready.
 
 `video-caption` and `video-embed` have not yet been adapted to select only ready transcode fragments from a growing
-table. Caption requires a whole-table transcode receipt; embedding checks the clip schema, IDs, URIs, and byte sizes
-directly. Both reject tables with pending clip inputs; selecting ready fragments is separate work.
+table. Both check the clip schema, IDs, URIs, and byte sizes directly, without requiring transcode publication history.
+Both skip source outcomes and reject tables with pending clip inputs on real spans; selecting ready fragments is
+separate work.
 
 ## Checkpoints and recovery
 
@@ -137,16 +135,16 @@ The checkpoint ID is `span_id`. Result Parquet contains span IDs, original fragm
 metadata. It never contains media bytes. Upload must succeed before a result reaches the sink; an upload whose result
 was not checkpointed may repeat at the same deterministic clip destination.
 
-The workspace is `<output.staging_root_uri>/<contract-namespace>/<selection-digest>/`. Transcode contributes its
+The workspace is `<output.staging_root_uri>/<contract-namespace>/`. Transcode contributes its
 encoding contract and media destination to the
-[shared compatibility manifest](curator-next-checkpoint-recovery.md#recovery-identity-and-workspace). Span inputs and
+[shared compatibility manifest](curator-next-checkpoint-recovery.md#enrichment-recovery-identity). Span inputs and
 source media follow the [shared immutability requirements](curator-next-checkpoint-recovery.md#assumptions-and-guarantees).
 Earlier development receipt formats and workspace layouts have no migration path.
 
 Processing, publication, and cleanup follow the
 [shared failure and recovery boundaries](curator-next-checkpoint-recovery.md#failure-and-recovery-boundaries). A retry
 can rebuild publication from staged clip metadata without downloading sources or encoding checkpointed spans again.
-Retain transcode publication history for video-caption's receipt-based input validation.
+Retain publication history for commit reconciliation; cleanup and downstream input validation use current values.
 
 ## Failure policy and validation
 
@@ -159,8 +157,9 @@ Local tests run the shared fresh-cluster scenario: native checkpoint recovery ac
 disjoint schema commit, including a source spanning multiple Lance fragments, then publication through the recipe's
 `run_config`. Separate tests cover actual CPU FFmpeg encoding and publication. The shared conformance
 suite runs against transcode's span fixtures, covering incomplete result rejection despite a processing marker, an
-ambiguous commit response, concurrent writers, and cleanup failure; recipe tests cover the downstream receipt, empty
-input, and clip validation. See the [shared validation criteria](curator-next-checkpoint-recovery.md#validation-and-adoption-criteria).
+ambiguous commit response, concurrent writers, and cleanup failure; recipe tests cover downstream readiness after
+source-outcome appends and history pruning, empty input, and clip validation. See the
+[shared validation criteria](curator-next-checkpoint-recovery.md#validation-and-adoption-criteria).
 A CPU-only multi-node test checks submitted-task counts against live IO capacity, adds a late worker, removes every
 worker, and finishes publication on a replacement worker.
 The 22,000-source / 650,000-span managed benchmark and full Slurm worker-loss qualification have not been run for this

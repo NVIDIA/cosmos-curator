@@ -16,9 +16,12 @@ Coding agents and contributors starting a new recipe should first read the
 qualification criteria.
 
 For checkpointed enrichment, start with the
-[adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-the-reference-pattern).
+[adoption example](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-enrichment-publication).
 `video_embed` demonstrates independent row processing; `video_transcode` demonstrates source grouping and durable payload
-writes. The shared [`enrichment`](enrichment/__init__.py) package owns the run sequence, checkpoint scopes, publication,
-and recovery proof, while each recipe's Ray processing graph remains explicit.
+writes. For checkpointed appends to a producer-owned table, start with
+[append publication](../../docs/curator/design/curator-next-checkpoint-recovery.md#adopting-append-publication), which
+`video_cut` demonstrates. The shared [`enrichment`](enrichment/__init__.py) and [`append`](append/__init__.py) packages
+own the run sequence, checkpoint scopes, publication, and recovery proof, while each recipe's Ray processing graph
+remains explicit.
 
 See [Cosmos Curator Next](../../docs/curator/design/curator-next.md) for the design direction.

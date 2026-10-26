@@ -5,24 +5,28 @@ durable Parquet results; a Lance commit makes those results visible to readers. 
 index until publication is verified lets a fresh driver or Ray cluster finish the run without repeating checkpointed
 work.
 
-The shared implementation currently covers whole-fragment enrichment: a recipe fills its owned columns on existing
-Lance rows. Append publication, which `video-cut` and other producers need, is a planned extension; see
+The shared implementation covers two kinds of publication. **Enrichment** fills a recipe's owned columns on existing
+Lance rows, one whole fragment at a time; `video-transcode` and `video-embed` use it. **Append** adds a producer's rows
+to a Lance table it owns; `video-cut` uses it. [The shared model](#the-shared-model) describes what both kinds share:
+assumptions, run sequence, workspaces, failure handling, and summaries. [Enrichment
+publication](#enrichment-publication) and [append publication](#append-publication) each describe only what their kind
+adds, including an adoption example. Other recipes migrate explicitly; see
 [Expansion across Curator Next](#expansion-across-curator-next).
 
 ## Assumptions and guarantees
 
 These are the defaults for shared recovery. [Video-transcode](curator-next-video-transcode.md),
-[video-embed](curator-next-video-embed.md), and the shared components below define the canonical recovery pattern.
-Other recipes and older recovery helpers are migration candidates and retain their existing behavior until migrated.
-Migrations must meet these assumptions or explicitly extend the shared contract.
+[video-embed](curator-next-video-embed.md), [video-cut](curator-next-video-cut.md), and the shared components below
+define the canonical recovery pattern. Other recipes and older recovery helpers are migration candidates and retain
+their existing behavior until migrated. Migrations must meet these assumptions or explicitly extend the shared contract.
 
 - **Separate processing and publication.** Processing produces durable staged results. Publication consumes those
   results, so retrying a commit does not repeat downloads, encoding, or inference.
-- **One atomic result commit.** All selected results and their receipt become visible in one Lance transaction.
-  Registering nullable output fields is a separate schema commit; readers may see those fields before results are ready.
-- **One writer per output field group.** The caller ensures one active writer owns each field group and its compatible
-  contract namespace; its Ray workers may run in parallel. Recovery rejects multiple unfinished selections in that
-  namespace. The helpers provide no writer leases.
+- **One atomic result commit.** All selected results become visible in one Lance transaction.
+  Registering nullable output fields, or creating an appended table, is a separate schema commit; readers may see those
+  fields or the empty table before results are ready.
+- **One writer per output field group.** The caller ensures one active writer owns each field group, or each appended
+  table, and its contract's fixed workspace; its Ray workers may run in parallel. The helpers provide no writer leases.
 - **Serial plans within a driver.** Construct and execute plans serially when they share a Ray `DataContext`. Only one
   checkpointed plan may be active per driver; a second checkpoint scope is rejected. Separate driver processes have
   independent contexts; the field-group ownership rule still applies.
@@ -31,109 +35,242 @@ Migrations must meet these assumptions or explicitly extend the shared contract.
   later invocation. Dependencies must already be ready in the selected input.
 - **Recover the saved selection first.** Each invocation opens the latest Lance table and looks for an unfinished
   workspace for the same dataset and result contract before selecting new work. Recovery retains that workspace's
-  fragment selection, even when new fragments have arrived. Lance version, execution tuning, and runtime credentials
-  do not define compatibility.
+  selection of fragments or work items, even when new fragments have arrived or discovery finds other items. Lance
+  version, execution tuning, and runtime credentials do not define compatibility.
 - **Stable identities and immutable inputs.** Work IDs are globally unique, non-null, and stable across attempts.
-  Existing input values, physical row layouts, data files, and referenced media remain immutable. Compaction, row deletion,
-  and data-file rewrites are unsupported throughout the dataset's lifetime, including between attempts and after cleanup.
-  Producers may append complete fragments, and enrichments may add column files while preserving existing file layouts.
+  Existing input values, physical row layouts, data files, discovered sources, and referenced media remain immutable.
+  Source storage is stable too: objects do not appear, disappear, or change permissions or storage class between
+  attempts, so a source that is unreadable as stored stays unreadable.
+  Compaction, row deletion, and data-file rewrites are unsupported throughout the dataset's lifetime, including between
+  attempts and after cleanup. Producers may append complete fragments, and enrichments may add column files while
+  preserving existing file layouts.
 - **Replay is expected.** Execution is at least once. Payload writes and other external side effects must tolerate
   replay, and required payloads must be durable before their result IDs are checkpointed.
 - **Recovery state survives the cluster.** Results and checkpoint IDs stay together in intact shared storage.
-  Retain the Lance transaction history needed for strict ambiguous-commit reconciliation and receipt-based consumers
-  such as video-caption. Video-embed checks its input schema and values directly. Old driver memory and Ray lineage
-  are never required.
+  Enrichment retains the Lance transaction history needed for strict ambiguous-commit reconciliation. Recovery and
+  cleanup read current rows and values, so pruned history never blocks them. Video-caption and video-embed check their
+  input schema and values directly. Old driver memory and Ray lineage are never required.
 - **Verify before accepting or cleaning up.** Require exact staged coverage and valid terminal results. A processing
-  marker is only an optimization. Cleanup of a recovered workspace requires its publication receipt, an unchanged input
-  file layout, and the canonical owned-column files from that validated publication.
+  marker is only an optimization. Before cleanup, enrichment verifies that every selected fragment is terminal and its
+  input file layout unchanged; append verifies that every selected item is present in the current table.
 
-The current enrichment publisher additionally requires **whole, undeleted physical fragments** in one Lance table.
-Reference recipes require every fragment in the table to be wholly pending or wholly terminal for their owned fields;
-selection rejects mixed fragments anywhere in the pinned snapshot. The shared publisher accepts an explicit subset,
-and the reference recipes select all pending fragments when starting new work. Recovery resumes a saved selection as
-a unit; it does not repartition staged results among newly chosen selections.
+## The shared model
 
-## Shared components and recipe responsibilities
+### Shared components
 
-The shared code lives in [`cosmos_curator.next.enrichment`](../../../cosmos_curator/next/enrichment/__init__.py).
-
-Recipes use only these names:
+Both kinds build on these recipe-agnostic pieces in `cosmos_curator.next.core`:
 
 | Component | Responsibility |
 | --- | --- |
-| [`owned_fields`, `EnrichmentSpec`, `EnrichmentBindings`](../../../cosmos_curator/next/enrichment/contracts.py) | Declare the owned outputs; describe the required input, result contract, input readiness, and terminal validation, deriving Parquet-stable staged rows; bind the spec to one invocation's table, staging root, and execution settings. |
-| [`run_enrichment`, `ProcessingScope`, `summary_message`](../../../cosmos_curator/next/enrichment/execution.py) | The shared run sequence: open the recipe's validated input from its bindings, select an attempt, start the recipe's Ray runtime with its bindings when fragments are selected, run its plan unless processing already completed, and publish. The plan receives a `ProcessingScope` that reads the selection and writes staged rows. |
-| [`EnrichmentExecutionConfig`](../../../cosmos_curator/next/enrichment/config.py) | Base for a recipe's `execution` settings, which the bindings carry to every shared step: storage profile, read batches, checkpoint groups, publication memory, and commit attempts. |
-| [`ROW_ADDRESS_FIELDS`](../../../cosmos_curator/next/core/lance_datasource.py) | Original physical row addresses, for recipe work schemas that carry them to the staged rows. |
+| [`RecoveryWorkspace`, `RecoveryStateError`, `checkpoint_writer`](../../../cosmos_curator/next/core/recovery_workspace.py) | Durable recovery state: the manifest, staged results, native checkpoints, and processing marker of one selection; direct loading of the saved selection and `resume_or_clear`, which resumes it or clears it once fully published; best-effort cleanup. `checkpoint_writer` installs one plan's Ray checkpoint and yields the writer that validates, stages, and checkpoints its results, then records the marker. |
+| [`installed_checkpoint`, `parquet_stable_schema`, `VALIDATION_BATCH_SIZE`](../../../cosmos_curator/next/core/ray_checkpoints.py) | Own Ray Data's ambient checkpoint configuration for one plan, derive staged schemas that Parquet reads back unchanged, and bound terminal-validation batches. |
+| [`find_transaction`, `iter_transactions`, `KIND_KEY`, `CONTRACT_DIGEST_KEY`](../../../cosmos_curator/next/core/lance_transactions.py) | Find publication evidence in the retained history of a pinned Lance snapshot; name the provenance every shared publication records. |
+| [`RecoveryBindings`](../../../cosmos_curator/next/core/recovery_bindings.py) | Resolve a binding's storage credentials and Ray worker storage environment at runtime. |
+| [`CheckpointedExecutionConfig`](../../../cosmos_curator/next/core/config.py) | Execution settings both kinds share: storage profile, checkpoint group size (`parquet_rows_per_file`), commit attempts, and progress reporting. |
 
-`run_enrichment` runs the remaining steps; recipes do not call them directly, though tests may:
+Recipes use the API of their kind's package, [`enrichment`](../../../cosmos_curator/next/enrichment/__init__.py) or
+[`append`](../../../cosmos_curator/next/append/__init__.py), whose docstring lists it. Each package has the same
+shape: `contracts` (the spec and bindings), `config` (the execution base), `inputs` (opening the table, pending work,
+and recovery identity), `attempts` (reconciling workspaces and selecting work), `execution` (the run sequence,
+processing scope, and publisher), and `commit` (the Lance protocol).
+
+### Specs, bindings, and the run sequence
+
+A recipe describes what it produces in a spec, `EnrichmentSpec` or `AppendSpec`: the logical ID column, the result
+contract, and `validate_batch` for terminal results. The result contract holds only result-defining settings; the
+spec snapshots it as JSON, and it scopes recovery compatibility and publication provenance. Validators, and append's
+expansion, must depend only on the result contract: tables and workspaces are keyed by it, not by code, so a recipe
+that changes what they accept or produce must change its result contract.
+
+Bindings, `EnrichmentBindings` or `AppendBindings`, bind the spec to one invocation's table URI, staging root, and
+`execution` settings. Each reference recipe's `bindings.py` defines `resolve_bindings(config)`, which constructs one
+frozen bindings value per invocation; tests use the same factories as production. Storage credentials are resolved at
+runtime from `execution.storage_profile`, and execution tuning never enters recovery identity.
+
+`run_enrichment` and `run_append` run the same sequence:
+
+1. Open the table, reconcile saved workspaces, and resume or select an attempt. Append recipes call their discovery
+   callback only when selecting new work; a saved selection already contains its items.
+2. When work is selected, call the recipe's `start_ray(bindings)`. It runs even when a valid processing marker skips
+   processing, because publication prepares results with Ray Data and refuses to start a default Ray runtime itself.
+   `bindings.storage_env_vars(...)` covers the table and staging root; recipes pass their other locations.
+3. Unless the marker is valid, open `checkpointed_processing(attempt)` and call the recipe's `process(scope)`, which
+   builds and executes one plan from `scope.read` to `scope.write`. Put model preflight and other processing
+   prerequisites inside `process`.
+4. Publish atomically, verify, and remove the workspace. An attempt with nothing selected
+   starts no Ray and publishes nothing; its outcome still reports cleanup status.
+
+The `ProcessingScope` reads the frozen selection at Ray's native checkpoint-filter boundary, so checkpointed IDs are
+skipped before expensive work. Recipes keep the ID through the plan and emit canonical results in
+`scope.result_schema`. `scope.write` delegates to the core checkpoint writer, which repartitions results into strict
+groups of `execution.parquet_rows_per_file` rows, converts each group to the spec's `staged_schema` (the representation
+Parquet reads back), validates every row as publication would, writes the group through the checkpoint's filesystem,
+and records the processing marker. Validation runs after the repartition with default remote args, so Ray fuses it
+into each group's write task rather than adding a task per plan block. Parquet names list children `element`, and
+Arrow cannot read back a null `fixed_size_list`, so lists stage with `element` children and fixed-size lists stage as
+variable lists. Ray checkpoints a row's ID once its Parquet file is written, so specs reject any other result type
+that would not read back unchanged, such as `date64`. A row that publication would reject fails processing before Ray
+checkpoints its ID. The scope keys the checkpoint on the spec's ID column, retains checkpoints, and clears the ambient
+configuration on every exit. Publication runs outside this scope so it can read all staged results.
+
+`validate_batch` always receives the ID and result columns in their canonical types, in batches of at most
+`VALIDATION_BATCH_SIZE` (1,024) rows that claim to be terminal. Processing applies it to every staged row before Ray
+checkpoints the row's ID, and publication applies it again, so a checkpointed result is always publishable.
+
+Checkpoint groups control how soon processing becomes durable; publication fragments control storage layout. These
+are independent sizes, and a checkpoint group size does not bound all in-flight work that may replay after failure.
+Processing, resource scheduling, and configuration otherwise remain ordinary Ray Data recipe code.
+
+### Recovery workspaces and receipts
+
+A contract namespace binds the table identity, the spec's schemas and result contract, and the workspace format
+version; each kind adds its own input identity. Both kinds reuse one fixed workspace at
+`<staging-prefix>/<contract-namespace>/`. Persisted manifests retain unfinished selections after the table changes. The
+manifest digest identifies the selection in its processing marker and, for enrichment, the publication receipt. Both
+kinds record the owner as `kind` and result contract digest as `contract_digest`; append carries completion and errors
+in current rows.
+
+| Artifact | Meaning and lifetime |
+| --- | --- |
+| `workspace.json` | Contract and selection manifest, atomically created or compared as equivalent JSON. A mismatch fails without changing the workspace. |
+| `results/` | Parquet results needed for publication. |
+| `checkpoints/` | Ray's index of safely written result IDs. Retain it with the corresponding results. |
+| `processing-complete.json` | Optional marker naming the manifest digest, written after processing succeeds, allowing publication retries to skip processing setup. |
+
+`reconcile_and_select_attempt` reads the one saved manifest directly, validates it, and resumes an intact unfinished
+selection before admitting a new one. A published selection is verified against current rows or values, and its
+workspace must be cleaned before a new selection can reuse the path. A new selection first clears any files left by
+interrupted cleanup. A workspace is created only for a nonempty selection, and its manifest is
+durable before processing starts. A partly published selection, an invalid manifest, or changed selected input
+remains an error.
+
+Selection limits, `execution.max_fragments` for enrichment and `execution.max_items` for append, bound only a new
+selection, in ID order, and never change a saved selection's membership. Both default to `None`, which selects all
+pending work. Set a limit to make results visible sooner through smaller selections. For append, a limit also bounds
+the driver's per-item read tasks and manifest entries; a million video-cut items take about 1 GB of driver memory and
+a 170 MB manifest. With a limit, or after resuming a saved selection, rerun while the summary reports remaining or
+unknown work.
+
+These formats assume fresh datasets and workspaces; earlier development formats have no migration path. Future format
+changes must make compatibility explicit. Shared receipt values are digests whose payloads carry their format version,
+such as `workspace_version` in the manifest. Property keys are never versioned.
+
+### Failure and recovery boundaries
+
+| Interruption or invalid state | Recovery behavior |
+| --- | --- |
+| Processing or a Parquet write is interrupted | Ray reconciles pending/committed writes and replays uncheckpointed work. |
+| Results are checkpointed but Lance has not committed | Rebuild publication from staged Parquet; prepared or staged Lance files can be regenerated. |
+| Processing marker is missing, unreadable, malformed, or incompatible | Resume through native checkpoints. Marker write failure is only a warning. |
+| Staged results are missing, duplicated, or invalid | Processing rejects invalid values before checkpointing their IDs. Publication fails validation and retains recovery state, even if a completion marker exists. |
+| Lance committed but its response was lost | Verify the canonical files, plus the receipt for enrichment, before accepting success; results are not published twice. |
+| Driver exits after commit or cleanup fails | A fresh invocation verifies the saved selection against current rows (append) or terminal values and unchanged inputs (enrichment), then retries cleanup. |
+| Workspace cleanup still fails on the next invocation | Raise an error and defer new work until cleanup succeeds. Published results remain valid. |
+| History pruning removed a publication receipt | Current rows and values still prove completion; enrichment validates those fragments' values instead of skipping the scan. |
+| Saved inputs changed, or only part of a saved selection is published | Fail and retain recovery state; these mismatches are not cleanup warnings. |
+| New input arrives between attempts | Recover the prior unfinished selection; do not fold its staged results into a new selection. |
+
+Conflicting recovery state raises `RecoveryStateError`, a `ValueError` naming the workspace involved and how to resolve
+it. Cleanup after publication is best effort and reported as `cleanup_complete`; failure does not invalidate published
+results, but the next selection waits until cleanup succeeds. An incompatible workspace is retained. Other contract
+namespaces and uncommitted Lance files need separate cleanup.
+
+### Run summaries
+
+`run_enrichment` and `run_append` return an outcome whose `summary()` reports the shared vocabulary; `summary_message`
+in each kind's `execution` module renders the one-line CLI result. Recipes add their own fields, such as the published
+table as `<table>_lance_uri` and `<table>_lance_version`.
+
+| Field | Kind | Meaning |
+| --- | --- | --- |
+| `cleanup_complete` | Both | Whether this invocation cleaned its workspace. |
+| `contract_digest` | Both | Digest of the result contract, also recorded as the publication's `contract_digest`. |
+| `input_rows` | Enrichment | All rows in the invocation's pinned input. |
+| `selected_rows`, `selected_fragments` | Enrichment | Rows and fragments in the frozen selection this invocation published, including results recovered from checkpoints. |
+| `remaining_rows`, `remaining_fragments` | Enrichment | Rows and fragments still pending from the pinned input after publication. |
+| `field_set` | Enrichment | The output field set, also recorded as the publication's `field`. |
+| `input_items` | Append | The work items this invocation discovered, or null when resuming without discovery. |
+| `selected_items` | Append | Items in the frozen selection this invocation published, including recovered results, empty outcomes, and terminal errors. |
+| `remaining_items` | Append | Discovered items still pending, or null when resuming without discovery. Rerun to discover new work. |
+| `appended_rows` | Append | Rows the selection appended, including empty/error outcomes. |
+| `errors` | Append | Number of selected items with a terminal error; diagnostics remain in the table. |
+
+Enrichment counts describe physical rows in fragments, including any null-ID outcome rows skipped by processing.
+Counts exclude later appends. A completed rerun selects nothing. Selected counts include declared terminal errors
+where the recipe allows them; they do not claim fresh inference or successful media processing for every selected row
+or item. Logs include the complete structured summary.
+
+## Enrichment publication
+
+Enrichment fills a recipe's owned nullable columns on existing rows of one Lance table, one whole fragment at a time.
+Recipes use `owned_fields`, `EnrichmentSpec`, and `EnrichmentBindings` from
+[`contracts`](../../../cosmos_curator/next/enrichment/contracts.py); `run_enrichment`, `ProcessingScope`, and
+`summary_message` from [`execution`](../../../cosmos_curator/next/enrichment/execution.py);
+[`EnrichmentExecutionConfig`](../../../cosmos_curator/next/enrichment/config.py), which adds the selection limit
+(`max_fragments`), read batches (`lance_read_batch_size`), and publication memory to the shared settings; and
+[`ROW_ADDRESS_FIELDS`](../../../cosmos_curator/next/core/lance_datasource.py) for work schemas that carry row
+addresses. `run_enrichment` runs the remaining steps, which recipes do not call directly, though tests may:
 
 | Component | Responsibility |
 | --- | --- |
 | [`open_enrichment_input`](../../../cosmos_curator/next/enrichment/inputs.py) | Register fields, pin the input, and validate it or reuse earlier proof. The `inputs` module also defines recovery identity, what a publication receipt proves, and pending selection. |
-| [`reconcile_and_select_attempt`](../../../cosmos_curator/next/enrichment/attempts.py) | Verify and clean published workspaces, then resume saved work or select pending fragments. Returns an `EnrichmentAttempt` with a durable workspace and the run counts. |
-| [`checkpointed_processing`](../../../cosmos_curator/next/enrichment/execution.py) | Own the Ray checkpoint for one plan and create its `ProcessingScope`, which reads the attempt's selection with IDs and row addresses, then validates and writes staged results in checkpoint groups. |
+| [`reconcile_and_select_attempt`](../../../cosmos_curator/next/enrichment/attempts.py) | Resume saved work, or clean a published selection's workspace and select pending fragments. Returns an `EnrichmentAttempt` with a durable workspace and the run counts. |
+| [`checkpointed_processing`](../../../cosmos_curator/next/enrichment/execution.py) | Create the `ProcessingScope`, which reads the attempt's selection with IDs and row addresses and writes through the core checkpoint writer. |
 | [`publish_enrichment`](../../../cosmos_curator/next/enrichment/execution.py) | Prepare staged results with Ray Data, commit them atomically with shared provenance and recovery and validation evidence, verify, and remove the workspace. |
-| [`commit`](../../../cosmos_curator/next/enrichment/commit.py), [`workspace`](../../../cosmos_curator/next/enrichment/workspace.py), [`transactions`](../../../cosmos_curator/next/enrichment/transactions.py) | Validate coverage, reconcile concurrent writes, and commit; manage durable recovery state; find publication evidence in retained history. |
+| [`commit`](../../../cosmos_curator/next/enrichment/commit.py) | Validate coverage, reconcile concurrent writes, and commit. |
 | [`LanceFragmentDatasource`](../../../cosmos_curator/next/core/lance_datasource.py) | Read selected fragments at a pinned version with original row addresses. |
-| [`installed_checkpoint`](../../../cosmos_curator/next/core/ray_checkpoints.py) | Own Ray Data's ambient checkpoint configuration for one plan; every Curator Next recipe that checkpoints installs it here. |
 
-Each reference recipe's `bindings.py` defines `resolve_bindings(config)`, which constructs one frozen
-`EnrichmentBindings` value per invocation. The spec says what the recipe produces; the bindings add where and how: the
-table, the staging root, and the recipe's `execution` settings. The bindings resolve storage credentials at runtime,
-derive the Ray workers' storage environment, and keep execution tuning out of workspace identity. Tests use the same
-recipe binding factories as production. Transcode's `contracts.py` also defines the receipt video-caption reads.
+The current publisher requires **whole, undeleted physical fragments** in one Lance table. Reference recipes require
+every fragment in the table to be wholly pending or wholly terminal for their owned fields; selection rejects mixed
+fragments anywhere in the pinned snapshot. The shared publisher accepts an explicit subset, and the reference recipes
+select all pending fragments when starting new work unless `execution.max_fragments` bounds it. Recovery resumes a
+saved selection as a unit; it does not repartition staged results among newly chosen selections. Cleanup of a
+recovered workspace additionally requires an unchanged input file layout and terminal output in every selected
+fragment.
 
-`EnrichmentSpec` is the recipe's complete data contract. It names the logical `id_column`, the `input_fields` the recipe
-requires, the nullable `output_fields` it owns, the `result_contract`, `validate_batch` for terminal results, and an
-optional `validate_input` for domain readiness. The result contract holds only result-defining settings; the spec
-snapshots it as JSON, and it scopes recovery compatibility and publication provenance. Both validators must depend
-only on the result contract, so bind them to its values rather than to the whole config, as transcode's bindings do.
-`input_fields` is the upstream schema: registration validates it, recovery protects the file
-layout of every listed field, and processing reads a subset. Declare the output fields with
-`owned_fields(fields, owner=..., field_set=...)`. It makes them nullable while pending and stamps `cosmos_curator.owner`
-and `cosmos_curator.field_set` metadata, which registration compares exactly, so another recipe or field set cannot
-claim the same columns. The owner is the recipe kind; the field set names the column group, such as an embedding
-variant's vector field. The spec rejects a missing ID, duplicate names, non-nullable or overlapping output fields, names
-that collide with row addresses, and outputs without one owner and field set at construction.
+### Enrichment contract
 
-The spec derives `staged_schema`, the only definition of its checkpointed Parquet rows: the non-null `int64`
-`fragment_id` and `row_offset` fields in `ROW_ADDRESS_FIELDS`, the ID field as declared in the input, and the output
-fields in the shape Parquet reads back. Parquet names list children `element`, and Arrow cannot read back a null
-`fixed_size_list`, so lists stage with `element` children and fixed-size lists stage as variable lists. Ray checkpoints
-a row's ID once its Parquet file is written, so construction also rejects any other output type that would not read back
-unchanged, such as `date64`. Processing receives the schema as `ProcessingScope.staged_schema` and builds staged rows in
-it; recipes do not derive their own. Publication casts staged values to their canonical types and rejects rows that do
-not convert. `validate_batch` always receives the ID and output columns in their canonical types, in batches of at most
-1,024 rows that claim to be terminal, whether it is checking existing fragments or staged results. Processing applies it
-to every staged row before Ray checkpoints the row's ID, and publication applies it again, so a checkpointed result is
-always publishable. Transcode requires successful clips; embedding also accepts declared terminal media errors.
+`EnrichmentSpec` names the logical `id_column`, the `input_fields` the recipe requires, the nullable `output_fields` it
+owns, the `result_contract`, `validate_batch`, and an optional `validate_input` for domain readiness. Bind both
+validators to the result contract's values rather than to the whole config, as transcode's bindings do.
+`input_fields` is the upstream schema: registration validates it, recovery protects the file layout of every listed
+field, and processing reads a subset. Declare the output fields with `owned_fields(fields, owner=..., field_set=...)`.
+It makes them nullable while pending and stamps `cosmos_curator.owner` and `cosmos_curator.field_set` metadata, which
+registration compares exactly, so another recipe or field set cannot claim the same columns. The owner is the recipe
+kind; the field set names the column group, such as an embedding variant's vector field. The spec rejects a missing
+ID, duplicate names, non-nullable or overlapping output fields, names that collide with row addresses, and outputs
+without one owner and field set at construction.
+
+The spec derives `result_schema` for canonical processing results: the non-null `int64` `fragment_id` and
+`row_offset` fields in `ROW_ADDRESS_FIELDS`, the non-null ID field, and the owned output fields.
+`ProcessingScope.read(columns)` returns the selection's logical IDs, the named input columns, and the original row
+addresses; it reads only declared `input_fields`, so recovery protects every value the plan reads. The recipe keeps the
+ID and row addresses through to `write`. `validate_batch` receives the ID and output columns, whether it is checking
+existing fragments or staged results. Transcode requires successful clips; embedding also accepts declared terminal
+media errors.
 
 `run_enrichment` opens the input with `open_enrichment_input(bindings)`, which returns an `EnrichmentInput`: the pinned
-dataset, its bindings, and its validation fingerprint. Shared validation requires globally unique, non-null IDs across
-the whole pinned table, because checkpoints key on them and a fragment-local count cannot establish uniqueness. It then
-runs the spec's `validate_input`: embedding requires clip URIs and positive sizes, and transcode rejects a downstream
-receipt from another encoding contract or media destination.
+dataset, its bindings, and its validation fingerprint. Shared validation requires globally unique work IDs across
+the pinned table, because checkpoints key on them and a fragment-local count cannot establish uniqueness. A null ID
+marks a row outside the work set, such as a source outcome in video-cut's span table. Validation then runs the spec's
+optional `validate_input`: embedding requires clip URIs and positive sizes. Transcode's terminal-value validator checks
+the encoding contract and media destination of completed clips when classifying fragments.
 
-`publish_enrichment` records the provenance other Curator Next enrichment commits also carry: the spec's owner as
-`kind`, its field set as `field`, and the digest of the result contract as `contract_digest`. It also owns the recovery
-receipt and input-validation evidence, and rejects recipe properties that try to replace any of these. Recipes pass
-`run_enrichment` a `transaction_properties` callback only for records that another recipe reads, such as
-`video_transcode.publication`; each must be a namespaced JSON record carrying `publication_version`.
+`publish_enrichment` records the shared `kind` and `contract_digest` provenance plus the spec's field set as `field`.
+It also owns the recovery receipt, `cosmos_curator.enrichment.publication`, and input-validation evidence. Consumers
+determine upstream readiness from the current schema and values; recipes need no separate completion records.
 
-Processing, resource scheduling, and configuration remain ordinary Ray Data recipe code. The shared Lance reader splits
-or combines fragment row ranges into the requested number of balanced read tasks, capped by the number of selected rows.
-It preserves the pinned version and physical row addresses, and workers resolve credentials from the storage profile.
-Read parallelism is independent of publication fragments and checkpoint groups, and does not rely on Ray splitting
+The shared Lance reader splits or combines fragment row ranges into the requested number of balanced read tasks, capped
+by the number of selected rows. It preserves the pinned version and physical row addresses, and workers resolve
+credentials from the storage profile. `execution.lance_read_batch_size` sets the rows per scanner batch. Read
+parallelism is independent of publication fragments and checkpoint groups, and does not rely on Ray splitting
 whole-fragment tasks.
-
-## Processing and publication lifecycle
 
 ```mermaid
 flowchart TD
-    input["Open latest input and register fields"] --> recovery["Find saved selections for this contract"]
+    input["Open latest input and register fields"] --> recovery["Load the saved selection for this contract"]
     recovery --> workspace["Resume unfinished selection or select pending fragments"]
-    recovery -. "Published workspace" .-> verify
+    recovery -. "Published selection" .-> cleanup
     workspace --> processing["Process missing IDs into checkpointed Parquet"]
     processing --> prepare["Validate results and prepare column files"]
     workspace -. "Valid processing marker" .-> prepare
@@ -143,49 +280,18 @@ flowchart TD
     verify --> cleanup["Clean the recovery workspace"]
 ```
 
+### Enrichment recovery identity
+
+The contract namespace binds the dataset URI, declared input field IDs, result-defining settings, staged result schema,
+and workspace format version. Workspace format 5 isolates earlier layouts. The fixed workspace's manifest records the
+selection's explicit fragment IDs and the file layout of **those selected fragments**: their physical rows and the files
+and column positions holding input fields. File layouts do not hash external media. Unselected fragments and unrelated
+columns do not participate in selection compatibility.
+
 Before pinning the input, register the complete nullable output field set or validate existing fields against their
-types, nullability, and ownership. Validate existing workspace manifests and their saved selections before choosing new
-work. Enforce the table-wide pending-or-terminal invariant. A new selection contains only pending fragments; an
-unfinished selection retains its original membership on recovery.
-
-`run_enrichment` opens `checkpointed_processing(attempt)` and passes its `ProcessingScope` to the recipe's `process`
-callback, which constructs and executes the plan. `read(columns)` returns the selection's logical IDs, the named input
-columns, and original `fragment_id` and `row_offset`, so Ray filters checkpointed IDs before expensive work. It reads
-only declared `input_fields`, so recovery protects every value the processing plan reads. The recipe builds its plan
-from there, keeping the ID and row addresses through to `write` and emitting rows in `staged_schema`. `write` validates
-every staged row against the staged schema and `validate_batch`, repartitions results into strict checkpoint groups,
-writes them through the checkpoint's filesystem, and records the processing marker. A row that publication would reject
-fails processing before Ray checkpoints its ID. The processing scope keys the checkpoint on the spec's ID column,
-retains checkpoints, and clears the ambient configuration on every exit. Publication runs outside this scope so it can
-read all staged results.
-
-The processing scope reads `execution.lance_read_batch_size` rows per scanner batch and uses
-`execution.parquet_rows_per_file` for the strict repartition and Parquet/checkpoint group size. Checkpoint groups
-control how soon processing becomes durable; Lance fragments control publication alignment. These are independent sizes,
-and a checkpoint group size does not bound all in-flight work that may replay after failure.
-
-## Recovery identity and workspace
-
-A contract namespace binds the dataset URI, declared input field IDs, result-defining settings, staged result schema,
-and workspace format version. Each workspace within it records its explicit fragment IDs and the file layout of **those
-selected fragments**: their physical rows and the files and column positions holding input fields. File layouts do not
-hash external media. Unselected fragments and unrelated columns do not participate in selection compatibility.
-
-The workspace path is `<staging-prefix>/<contract-namespace>/<selection-digest>/`, where the selection digest covers the
-selected fragment IDs and their file layouts. The workspace's manifest digest, which also covers the namespace fields,
-identifies it in publication receipts and the processing marker. Persisted manifests make unfinished selections
-discoverable after appends. `reconcile_and_select_attempt` validates every discovered manifest before cleanup, rejects
-partially published selections or multiple unfinished selections, and resumes one intact unfinished selection before
-admitting a new one. Published selections are verified against their receipts before best-effort cleanup. A workspace
-exists only for a nonempty selection. If a selection is entirely terminal but its publication proof is missing, retain
-its workspace, warn, and report `cleanup_complete=false`; unrelated pending work can still proceed. A contradictory
-receipt or a changed file layout remains an error.
-
-The helper derives `pending`, every fragment whose output fields are pending, from the pinned input's values and
-retained receipts. Processing and publication use the frozen `selected` fragments. The optional `max_fragments`, which
-`run_enrichment` passes through, limits only a new selection, chosen in fragment-ID order; changing it never changes a
-saved selection's membership. Neither reference recipe exposes this limit in its public config yet. The selected
-workspace's manifest is durable before the helper returns.
+types, nullability, and ownership. Then enforce the table-wide pending-or-terminal invariant. The helper derives
+`pending`, every fragment whose output fields are pending, from the pinned input's values and retained receipts.
+Processing and publication use the frozen `selected` fragments.
 
 | Change | Current recovery behavior |
 | --- | --- |
@@ -194,21 +300,9 @@ workspace's manifest is durable before the helper returns.
 | Fragments appended before a new invocation | Resume an unfinished saved selection first. New fragments remain eligible for a later selection. |
 | Fragments appended during an attempt | Finish the pinned selection and leave new fragments for a later run. |
 | Existing rows compacted, replaced, deleted, or rebound | Unsupported by the immutable-dataset contract; a changed selected file layout fails recovery or publication and retains state. |
-| This selection has already published | Verify its receipt, the unchanged input file layout, and the owned-column files before cleanup. Terminal values alone do not authorize deleting its workspace. |
+| This selection has already published | Require the unchanged input file layout and terminal output in every selected fragment, from a matching receipt or validated values, then remove the workspace before selecting new work. |
 
-| Artifact | Meaning and lifetime |
-| --- | --- |
-| `workspace.json` | Contract and selected-fragment manifest, atomically created or compared as equivalent JSON. A mismatch fails without changing the workspace. |
-| `results/` | Parquet values and row addresses needed for publication. |
-| `checkpoints/` | Ray's index of safely written result IDs. Retain it with the corresponding results. |
-| `processing-complete.json` | Optional marker naming the manifest digest, written after processing succeeds, allowing publication retries to skip processing setup. |
-
-These formats assume fresh datasets and workspaces; earlier development formats have no migration path. Future format
-changes must make compatibility explicit. Shared receipt values are digests whose payloads carry their format version:
-`workspace_version` in the manifest, and the shared validation version in the input fingerprint. Recipe receipts are
-JSON records carrying `publication_version`. Property keys are never versioned.
-
-## Canonical publication and concurrent writers
+### Canonical publication and concurrent writers
 
 Workers group staged rows by original fragment and validate the schema, row count, every offset exactly once, ordered
 logical IDs, terminal values, and provenance. Terminal-value validation consumes Arrow record batches of at most 1,024
@@ -229,12 +323,11 @@ If a concurrent update to other columns makes descriptors stale, rebuild only th
 against the latest version and retry. The preparation callback receives that version and the stale fragment IDs.
 Unchanged descriptors remain reusable. Changed selected inputs or competing writes to the owned fields are rejected.
 
-The commit records the workspace's manifest digest in `cosmos_curator.enrichment.publication`. Fresh publication and
-recovery both prove success by checking unchanged inputs and the exact owned-column files validated during preparation.
-The driver does not rescan all result values after the commit. An ambiguous response additionally requires that receipt
-in a subsequent transaction. A fresh driver can recover the publication evidence from Lance transaction history; it need
-not retain the original in-memory descriptors. Neither terminal values alone nor a receipt followed by a competing
-overwrite proves success. Once the publication is verified, `publish_enrichment` removes the attempt's workspace.
+Publication proves success by checking unchanged inputs and the exact owned-column files validated during preparation.
+The driver does not rescan all result values after the commit. An ambiguous response additionally requires the receipt
+in a subsequent transaction; a receipt followed by a competing overwrite does not prove success. After a driver exits,
+the next invocation recognizes the publication from current output, as pending selection does, without the original
+in-memory descriptors.
 
 ### Reusing validation on later runs
 
@@ -266,50 +359,7 @@ Select fragment sizes that fit worker memory; this implementation does not estab
 billion-row-table qualification. Logical checkpoint IDs remain strings, and native Ray checkpoint loading still depends
 on the size of the entire selected run's checkpoint index.
 
-## Failure and recovery boundaries
-
-| Interruption or invalid state | Recovery behavior |
-| --- | --- |
-| Processing or a Parquet write is interrupted | Ray reconciles pending/committed writes and replays uncheckpointed work. |
-| Results are checkpointed but Lance has not committed | Rebuild publication from staged Parquet; prepared column files can be regenerated. |
-| Processing marker is missing, unreadable, malformed, or incompatible | Resume through native checkpoints. Marker write failure is only a warning. |
-| Staged rows are missing, duplicated, misaligned, or invalid | Processing rejects invalid values before checkpointing their IDs. Publication fails validation and retains recovery state, even if a completion marker exists. |
-| Lance committed but its response was lost | Reconcile the receipt and canonical results before accepting success. |
-| Driver exits after commit or cleanup fails | A fresh invocation discovers the saved selection and verifies its publication receipt, the unchanged input file layout, and the owned-column files before retrying cleanup. |
-| A saved selection is terminal but publication proof is missing | Retain the workspace, warn, report `cleanup_complete=false`, and allow unrelated work to proceed. |
-| Saved inputs, receipt coverage, or owned-column files contradict the workspace | Fail and retain recovery state; these mismatches are not cleanup warnings. |
-| New input fragments arrive between attempts | Recover the prior unfinished selection; do not fold its staged results into a new selection. |
-
-Conflicting recovery state raises `RecoveryStateError`, a `ValueError` naming each workspace involved and how to resolve
-it. Cleanup is best effort and reported as `cleanup_complete`; failure does not invalidate published results. An
-incompatible or unverifiable workspace is retained. Other contract namespaces and uncommitted column files need separate cleanup.
-Tolerating missing proof applies only to cleanup of already-terminal selections. It does not relax publication
-reconciliation or video-caption's transcode-provenance checks.
-
-## Run summaries
-
-`run_enrichment` returns the `EnrichmentOutcome` from `publish_enrichment`, whose `summary()` reports the shared
-vocabulary. Recipes add their own fields, such as the published table as `<table>_lance_uri` and
-`<table>_lance_version`, following other Curator Next recipes:
-
-| Field | Meaning |
-| --- | --- |
-| `input_rows` | All rows in the invocation's pinned input. |
-| `selected_rows` | Rows in the frozen selection published by this invocation, including results recovered from checkpoints. |
-| `remaining_rows` | Rows still pending from the pinned input after publication. |
-| `selected_fragments` | Fragments in the frozen selection. |
-| `remaining_fragments` | Fragments still pending from the pinned input after publication. |
-| `cleanup_complete` | Whether this invocation cleaned every eligible recovery workspace. |
-| `field_set` | The output field set, also recorded as the publication's `field`. |
-| `contract_digest` | Digest of the result contract, also recorded as the publication's `contract_digest`. |
-
-Counts exclude later appends. Already-terminal rows are included in `input_rows` but neither `selected_rows` nor
-`remaining_rows`. A completed rerun selects zero rows. Selected rows include declared terminal errors where the recipe
-allows them; the count does not claim fresh inference or successful media processing for every selected row.
-`summary_message` renders the CLI message from the selected row count and remaining fragments; logs include the
-complete structured summary.
-
-## Adopting the reference pattern
+### Adopting enrichment publication
 
 Use `video_embed` as the example for independent row processing and terminal media errors; use `video_transcode` for
 source grouping and payload writes that must finish before checkpointing. Both follow this sequence, sketched here for
@@ -352,7 +402,7 @@ def start_ray(bindings: EnrichmentBindings, config: ResolvedConfig) -> None:
 
 def process(processing: ProcessingScope, config: ResolvedConfig) -> None:
     rows = processing.read(READ_COLUMNS)
-    results = rows.map(...).map_batches(score_items, fn_kwargs={"staged_schema": processing.staged_schema})
+    results = rows.map(...).map_batches(score_items, fn_kwargs={"result_schema": processing.result_schema})
     processing.write(results)
 
 
@@ -369,17 +419,265 @@ def run_config(config: ResolvedConfig) -> dict[str, object]:
     }
 ```
 
-`run_enrichment` starts Ray whenever fragments are selected, even when a valid processing marker skips `process`,
-because publication prepares column files with Ray Data; preparation refuses to start a default Ray runtime itself.
-An attempt without selected fragments starts no Ray and publishes nothing, and its outcome still reports cleanup status.
 The shared publisher owns result grouping, preparation retries, receipts, proof verification, and workspace cleanup.
-
 Preserve deliberate differences: transcode's actors bound admission of large source downloads, while embed uses tasks
-for clips. Transcode requires successful payloads; embed permits declared terminal errors. Transcode passes
-`transaction_properties` for its receipt record and commits a zero-span receipt for an empty table itself
-(`record_empty_receipt`), because video-caption reads transcode's whole-table receipt. Recording that receipt twice is
-harmless, so it needs no recovery workspace. Remove both once caption checks clip readiness from data, as embedding
-does.
+for clips. Transcode requires successful payloads; embed permits declared terminal errors. Caption and embedding check
+clip readiness from the canonical schema and values. Empty tables and tables containing only source outcomes require
+no processing or completion commit once the clip fields are registered.
+
+## Append publication
+
+Append publication adds rows to a producer-owned Lance table. The producer discovers work items, checkpoints one
+complete result per item, and expands all selected results into one atomic append. Every item contributes at least
+one canonical row: derived records for a successful result, or a placeholder outcome for an empty result or terminal
+error. Current row presence is the completion record, so pruning history cannot make finished items pending again.
+[Video-cut](curator-next-video-cut.md) is the reference: successful sources produce flat span rows; empty and failed
+sources produce one row with a null `span_id`, and failed sources also record `error_stage` and `error_message`.
+
+Recipes use `AppendSpec` and `AppendBindings` from [`contracts`](../../../cosmos_curator/next/append/contracts.py),
+`run_append`, `ProcessingScope`, and `summary_message` from
+[`execution`](../../../cosmos_curator/next/append/execution.py), and
+[`AppendExecutionConfig`](../../../cosmos_curator/next/append/config.py). The shared code owns selection, checkpoint
+scope, expansion, packed fragment writes, atomic publication, and cleanup.
+
+### Append contract
+
+- `id_column` names one work item and is the same non-null string field in all three schemas.
+- `input_fields` describes discovered items. Their strings, integers, and booleans are saved in the workspace manifest.
+- `result_fields` holds one complete terminal result per item and is exposed as `ProcessingScope.result_schema`.
+- `output_fields` describes the producer's canonical rows, which lead the table. Enrichments may add nullable fields.
+- `owner` names the recipe. `result_contract` holds result-defining settings, excluding execution tuning.
+- `validate_batch` validates terminal results. `expand` sees all results, including errors, and must produce at least
+  one row per item. It may yield several Arrow tables to bound expansion memory.
+- Optional `error_column` is a nullable string field in both results and output. Publication counts non-null errors;
+  the recipe's expansion preserves the error and diagnostic fields in the canonical table.
+
+One staged result per item prevents a checkpoint from advancing after only part of its output is durable. Expansion
+happens during publication. Empty results and terminal errors must never disappear during expansion.
+
+`ProcessingScope.read()` produces one block per item, allowing workers that arrive later to contribute. If the first
+task stage sets only `num_cpus`, pass the same value to `read` so Ray can fuse the read and processing task. Packing
+remains independent of media processing and checkpoint groups.
+
+### Table binding and pending items
+
+`open_target` creates or validates the table before source discovery. Schema metadata under
+`cosmos_curator.append.contract` binds format version 2, owner, item ID column, and result contract. Producer fields
+must remain first and unchanged; extensions must be nullable. Earlier formats need a new output location.
+
+A new selection validates discovery, then looks up candidate IDs in current rows. The query projects only the ID,
+streams batches, and can use a Lance scalar index if present. It does not read payloads or transaction history.
+Without an index, this is an ID-column scan; `max_items` does not bound discovery or that scan. A single predicate
+avoids repeatedly scanning the table for chunks of candidate IDs.
+
+An unfinished selection resumes its saved items without discovery. Input and remaining counts are unknown until a
+later invocation discovers new work. A new selection contains every pending item unless `execution.max_items` caps
+it, in item-ID order. Rerun while `remaining_items` is nonzero or null.
+
+### Append selection and recovery identity
+
+The namespace binds table URI, owner, result contract, ID and error columns, and input, result, staged, and output
+schemas. Workspace format 4 isolates earlier layouts. One fixed workspace at
+`<staging-prefix>/<contract-namespace>/` records the selected items in its manifest. Subsequent selections reuse that
+path only after verified publication and successful cleanup. Changes to processing, validation, or expansion semantics
+require a result-contract change.
+
+Recovery reads and validates the fixed manifest directly, without listing selection directories:
+
+| Saved selection | Recovery behavior |
+| --- | --- |
+| No selected item is present in current rows | Resume its recorded items without discovery. |
+| Every selected item is present | The selection is complete; remove its workspace before discovering new work. If cleanup fails, raise an error and retry on a later invocation. |
+| Only some selected items are present | Reject overlapping writers or invalid state; a selection publishes atomically. |
+| An invalid manifest | Fail with `RecoveryStateError` and retain recovery state. |
+| No manifest | Discover pending items. Before saving a new selection, clear any files left by interrupted cleanup. |
+
+This proof depends on one producer, complete atomic selections, and immutable canonical rows. Source outcomes must
+not be deleted. Quiescent history pruning preserves completion, diagnostics, and workspace cleanup. Enrichment retains
+its own history requirements for commit reconciliation.
+
+Cleanup can remove the manifest before failing to delete results or checkpoints. A new selection therefore clears
+the fixed workspace even when no manifest remains, so old staged rows or checkpoint IDs cannot leak into new work.
+Cleanup failure after publication reports `cleanup_complete=false`; the successful append remains visible.
+
+### Append commits and concurrent writers
+
+The driver streams only staged IDs and the error column to require exactly one result per selected item and count
+errors, without retaining diagnostic messages. Workers validate and expand the full results, pack rows across items
+with strict `rows_per_fragment` repartitioning, and write uncommitted Lance fragments. Only descriptors reach the
+driver; media processing, expansion, and writes remain distributed.
+
+The driver appends all fragments in one transaction. The transaction carries `kind` and `contract_digest` provenance;
+completion and diagnostics are in the rows. Each attempt reopens the current table and validates the binding. After
+an ambiguous response, the exact staged file paths, field bindings, and physical row counts prove success. New
+fragments containing selected IDs but different files indicate an overlapping producer and reject the retry.
+Enrichments may add column files without changing producer files. Verification precedes best-effort workspace cleanup.
+
+### Terminal errors
+
+The recipe decides which failures are terminal. With immutable inputs, missing or archived objects and unusable
+content may be terminal. Environment failures, permissions, credentials, missing buckets, throttling, tools, and
+unclassified failures propagate without a result, leaving work recoverable. Retrying a published terminal error needs
+a contract extension or a fresh output.
+
+Diagnostics remain queryable after cleanup, reruns, and history pruning:
+
+```python
+import lance
+
+dataset = lance.dataset("/shared/curated/video-cut/lance")
+errors = dataset.scanner(
+    filter="error_stage IS NOT NULL",
+    columns=["source_id", "source_uri", "error_stage", "error_message"],
+)
+for batch in errors.to_batches():
+    print(batch)
+```
+
+Downstream recipes process only rows with a real derived ID. Enrichment excludes null IDs from processing and
+completion checks while retaining physical offsets and requiring exact coverage of eligible rows in each selected
+fragment. Fragments containing only outcome rows are already complete. `execution.max_fragments` still bounds each new
+processing/publication selection; pending discovery and whole-input validation remain table-wide.
+
+### Adopting append publication
+
+Follow video-cut's sequence. This word-index example shows the complete read/transform/write path: each item names a
+text file, checkpoints one list of words, then expands into one row per word. Empty text still checkpoints a complete
+result and produces one outcome row; a missing file is a terminal error. Configuration and discovery remain
+recipe-owned; base the resolved config's `execution` section on `AppendExecutionConfig` and have
+`discover_items(config)` return `ITEM_SCHEMA` rows.
+
+```python
+from collections.abc import Iterator
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from cosmos_curator.next.append.contracts import AppendBindings, AppendSpec
+from cosmos_curator.next.append.execution import ProcessingScope, run_append
+from cosmos_curator.next.core.ray_runtime import ensure_ray_initialized
+
+ITEM_ID = pa.field("item_id", pa.string(), nullable=False)
+ITEM_SCHEMA = pa.schema([ITEM_ID, pa.field("path", pa.string(), nullable=False)])
+RESULT_SCHEMA = pa.schema([
+    ITEM_ID,
+    pa.field("words", pa.list_(pa.string()), nullable=False),
+    pa.field("error", pa.string()),  # Non-null marks a terminal error.
+])
+ROW_SCHEMA = pa.schema([
+    ITEM_ID,
+    pa.field("word_index", pa.int64()),
+    pa.field("word", pa.string()),
+    pa.field("error", pa.string()),
+])
+
+
+def validate_results(batch: pa.RecordBatch) -> None:
+    words = batch.column("words")
+    failed_with_words = pc.and_(pc.is_valid(batch.column("error")), pc.greater(pc.list_value_length(words), 0))
+    if pc.list_flatten(words).null_count or pc.any(failed_with_words).as_py():
+        raise ValueError("A terminal result is a complete word list or an error without words")
+
+
+def expand_results(results: pa.Table) -> Iterator[pa.Table]:
+    for item in results.to_pylist():
+        rows = [
+            {"item_id": item["item_id"], "word_index": i, "word": word, "error": None}
+            for i, word in enumerate(item["words"])
+        ]
+        if not rows:
+            rows = [{"item_id": item["item_id"], "word_index": None, "word": None, "error": item["error"]}]
+        yield pa.Table.from_pylist(rows, schema=ROW_SCHEMA)
+
+
+def index_item(item: dict[str, str]) -> dict[str, object]:
+    try:
+        return {"item_id": item["item_id"], "words": Path(item["path"]).read_text().split(), "error": None}
+    except FileNotFoundError:
+        return {"item_id": item["item_id"], "words": [], "error": "missing text"}
+
+
+def process(scope: ProcessingScope) -> None:
+    items = scope.read()
+    results = items.map_batches(
+        lambda batch: pa.Table.from_pylist([index_item(item) for item in batch.to_pylist()], schema=RESULT_SCHEMA),
+        batch_format="pyarrow",
+        batch_size=None,
+    )
+    scope.write(results)  # Executes the plan and checkpoints one complete result per item.
+
+
+def start_ray(bindings: AppendBindings) -> None:
+    ensure_ray_initialized(runtime_env_vars=bindings.storage_env_vars())
+
+
+def resolve_bindings(config: ResolvedConfig) -> AppendBindings:
+    return AppendBindings(
+        uri=config.output.items_lance_uri,
+        spec=AppendSpec(
+            owner="word-index",
+            id_column="item_id",
+            input_fields=ITEM_SCHEMA,  # Discovered work items.
+            result_fields=RESULT_SCHEMA,  # One complete, terminal result per item.
+            output_fields=ROW_SCHEMA,  # Appended rows; each carries item_id.
+            result_contract={"tokenizer_version": 1},  # Bump if tokenization semantics change.
+            validate_batch=validate_results,
+            expand=expand_results,
+            error_column="error",
+        ),
+        staging_root=config.output.staging_root_uri,
+        execution=config.execution,
+    )
+
+
+def run_config(config: ResolvedConfig) -> dict[str, object]:
+    outcome = run_append(
+        resolve_bindings(config),
+        lambda: discover_items(config),  # Called only for new work; returns items in ITEM_SCHEMA without starting Ray.
+        start_ray=start_ray,
+        process=process,
+    )
+    return {**outcome.summary(), "items_lance_version": int(outcome.dataset.version)}
+```
+
+For a discovery of three items and `execution.max_items: 2`, the first invocation selects two and reports
+`remaining_items: 1`. The next invocation selects the remaining item. If the first invocation is interrupted, it
+resumes those same two items even if the limit is changed to one, skips discovery, and reports `input_items: null`
+and `remaining_items: null`. Rerun afterward to discover any pending items. `parquet_rows_per_file` and
+`rows_per_fragment` control checkpoint and output packing independently of that selection.
+
+### Append migration decisions
+
+Record these decisions in the recipe's contract before replacing its existing recovery path:
+
+| Decision | What the shared mechanism requires |
+| --- | --- |
+| Work item and identity | One stable ID exists at the read boundary and in its complete staged result. Output rows also carry it, but can have a separate row identity: a source produces many spans, or an item produces words distinguished by `word_index`. Do not checkpoint an item after emitting only some of its results. |
+| Durable result and payloads | Emit one complete canonical result per item in `scope.result_schema`; the shared writer converts it for Parquet. Large payloads belong in durable, replay-safe external storage before checkpointing; return their references. Discovery records must fit the shared scalar input schema and survive in the selection manifest. |
+| Publication and visibility | One frozen selection becomes visible atomically. By default it holds every pending item, so nothing is visible until the run publishes; set `execution.max_items` to publish in smaller selections, and arrange later invocations for `remaining_items`. Migrating incremental producers changes when downstream consumers can see results. |
+| Failure policy | Every item has a canonical row, including empty outcomes and terminal errors with diagnostic fields. Retryable failures must propagate without a terminal result. Retrying a published terminal failure needs a deliberate contract extension or a fresh output, not deletion of checkpoints. |
+| Compatibility and ownership | One producer and result contract own the table. Version changes to validation, expansion, or processing semantics; keep execution tuning outside the contract. Preserve immutable source content and table files, and retain required history. |
+
+By default, a migration adopts the shared policy: terminal errors become canonical rows, retryable failures raise,
+and each selection publishes atomically. The remaining producers' current failure handling and visibility are
+behaviors to evaluate on their merits, not requirements; some may be incidental. Extend the shared contract only where
+a recipe's data contract justifies it. Their current behaviors:
+
+- Mp4-index records classified failures in a queryable `errors.lance` table and skips them on later runs, except
+  `FileNotFoundError` or with `execution.skip_known_failures=false`.
+- Multimodal-split and robot-action-split record item failures, publish the rest, and retry failures on the next run.
+- Mp4-index and robot-action-split make rows visible as work completes, not once per selection.
+
+These structural differences need a decision before copying video-cut:
+
+- **Work item.** Multimodal-split discovers sessions but publishes and retries episodes, which exist only after
+  planning. With sessions as work items, episodes dropped while splitting a published session are not retried in that
+  output.
+- **Discovered fields.** Robot-action-split's discovered fields include floats and a list of floats, which the scalar
+  item schema rejects. It also groups clips by source chunk so each chunk downloads once.
+- **Result size.** Mp4-index rows can be very large, since the per-frame list grows with duration, while fragment and
+  validation sizes count rows, not bytes.
 
 ## Expansion across Curator Next
 
@@ -387,42 +685,62 @@ Migration should remove accidental differences, not turn them into recipe-specif
 scope, work selection, and publication granularity, then choose shared behavior deliberately. Keep differences justified
 by data contracts or measured performance, and document any changed guarantees for existing consumers.
 
-The current publisher supports selections of whole fragments and recovery of their unchanged inputs. `run_enrichment`
-accepts `max_fragments`, but public recipe selection-size limits and upstream readiness checks per fragment remain
-follow-up work. Video-embed validates clip readiness across the entire pinned table using schema and data checks,
-without an upstream publication receipt. Appending rows as a publication operation, updating selected rows within a
-fragment, publishing multiple datasets or several field sets in one commit, coordinating writers to the same fields, or
-regrouping unfinished work across selections require explicit extensions.
+The enrichment publisher supports selections of whole fragments and recovery of their unchanged inputs; the append
+publisher supports selections of discovered items appended to a table one producer owns. Both bound new selections
+through their execution settings. Upstream readiness checks per fragment remain follow-up work. Video-caption and
+video-embed validate clip readiness across the entire pinned table using schema and data checks, without an upstream
+publication receipt.
+Updating selected rows within a fragment, publishing multiple datasets or several field sets in one commit,
+coordinating writers to the same fields or table, or regrouping unfinished work across selections require explicit
+extensions.
 
 Check these before migrating a recipe. Embeddings and robot-action-caption select rows within fragments and checkpoint
 on row addresses, and multimodal-embedding publishes per-camera field sets in one commit; each needs an extension first.
-Video-caption's whole-fragment, `clip_id`-checkpointed enrichment is the closest fit. The append-oriented
-[`lance_fragment_recovery`](../../../cosmos_curator/next/utils/lance_fragment_recovery.py) is deprecated for new
-workflows. Extend shared publication to cover appends and migrate existing producers before retiring it. Shared APIs and
-package paths remain provisional during incubation.
+Video-caption's whole-fragment, `clip_id`-checkpointed enrichment is the closest fit. Mp4-index, multimodal-split, and
+robot-action-split still append through the deprecated
+[`lance_fragment_recovery`](../../../cosmos_curator/next/utils/lance_fragment_recovery.py), which retires once they
+migrate to append publication. They append rows in bounded fragments as work completes and treat row presence in the
+table as their progress record. Migrating means checkpointing one result per work item, representing empty outcomes and
+terminal errors as canonical rows, and publishing each selection atomically, with
+`execution.max_items` set where results should become visible sooner; see
+[append migration decisions](#append-migration-decisions). Shared APIs and package paths remain provisional during
+incubation.
 
 ## Validation and adoption criteria
 
 Shared tests cover [checkpoint isolation](../../../tests/cosmos_curator/next/core/test_ray_checkpoints.py),
-[workspaces](../../../tests/cosmos_curator/next/enrichment/test_workspace.py),
+[workspaces](../../../tests/cosmos_curator/next/core/test_recovery_workspace.py),
+[receipt lookup](../../../tests/cosmos_curator/next/core/test_lance_transactions.py), enrichment's
 [pending selection and publication evidence](../../../tests/cosmos_curator/next/enrichment/test_inputs.py),
 [attempt selection](../../../tests/cosmos_curator/next/enrichment/test_attempts.py), and
-[publication invariants](../../../tests/cosmos_curator/next/enrichment/test_commit.py).
+[publication invariants](../../../tests/cosmos_curator/next/enrichment/test_commit.py), and append's
+[table binding and published items](../../../tests/cosmos_curator/next/append/test_inputs.py),
+[attempt selection](../../../tests/cosmos_curator/next/append/test_attempts.py),
+[commits](../../../tests/cosmos_curator/next/append/test_commit.py), and
+[outcome publication](../../../tests/cosmos_curator/next/append/test_execution.py).
 
-Each adopting recipe runs the [conformance suite](../../../tests/cosmos_curator/next/enrichment/conformance.py) against
-its own data; the suite's module docstring lists the fixtures a recipe supplies. It drives the recipe's `run_config`
-without Ray and exercises publication, misaligned and missing results, concurrent writers, lost commit responses,
-appends, workspace identity, reruns, processing markers, incompatible workspaces, and cleanup failures. Recipe tests
-then cover only recipe-specific behavior.
+Each adopting recipe runs its kind's conformance suite against its own data,
+[enrichment](../../../tests/cosmos_curator/next/enrichment/conformance.py) or
+[append](../../../tests/cosmos_curator/next/append/conformance.py); each suite's module docstring lists the fixtures a
+recipe supplies. Result fixtures use the same canonical types as processing; shared test helpers own conversion to
+Parquet storage types. The suites drive the recipe's `run_config` without Ray and exercise publication, missing and invalid
+results, lost commit responses, workspace identity, reruns, processing markers, incompatible workspaces, and cleanup
+failures. The enrichment suite adds misaligned results, concurrent writers, and appended fragments; the append suite
+adds empty/error outcomes, newly discovered items, resumed selections, the table's contract
+binding, and recovery after history pruning. Recipe tests then cover only recipe-specific behavior.
 
-Each adopting recipe also runs the
-[fresh-cluster scenario](../../../tests/cosmos_curator/next/enrichment/fresh_cluster.py) from an integration test,
-supplying stand-ins for its expensive stages that record the IDs they process. On real Ray, the scenario interrupts
-processing after the first selected fragment, then resumes on a fresh cluster after a disjoint column write and
-execution retuning, and requires each expensive step to run exactly once per ID. Finally, it runs the recipe's own
-`run_config`, which must reprocess nothing, publish once, and remove the workspace. The
-[transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py) and
-[embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py) tests show the stand-ins.
+Each adopting recipe also runs the matching fresh-cluster scenario, for
+[enrichment](../../../tests/cosmos_curator/next/enrichment/fresh_cluster.py) or
+[append](../../../tests/cosmos_curator/next/append/fresh_cluster.py), from an integration test, supplying stand-ins for
+its expensive stages that record the IDs they process. A recipe with several processing plans, such as video-cut's two
+cutting methods, runs it for each. On real Ray, the scenario interrupts processing after the first selected fragment or
+item, then resumes on a fresh cluster after a disjoint column write and execution retuning, and requires each expensive
+step to run exactly once per ID. Finally, it runs the recipe's own `run_config`, which must reprocess nothing, publish
+once, and remove the workspace. The
+[transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py),
+[embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py), and cut
+([fixed-stride](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_recovery.py),
+[TransNetV2](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_transnetv2.py)) tests show the stand-ins.
 
 Each migration must document how it satisfies the [assumptions above](#assumptions-and-guarantees) and demonstrate that
 clean and resumed runs produce the same visible logical records and payload references. Exercise the failure boundaries,

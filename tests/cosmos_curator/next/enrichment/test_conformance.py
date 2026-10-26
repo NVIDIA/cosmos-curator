@@ -77,7 +77,7 @@ def results(enrichment_input: inputs.EnrichmentInput) -> pa.Table:
             for fragment in enrichment_input.dataset.get_fragments()
             for offset, item_id in enumerate(fragment.to_table(columns=["item_id"])["item_id"].to_pylist())
         ],
-        schema=enrichment_input.bindings.spec.staged_schema,
+        schema=enrichment_input.bindings.spec.result_schema,
     )
 
 
@@ -102,7 +102,6 @@ def recipe() -> RecipeUnderTest:
             config.bindings,
             start_ray=Mock(side_effect=AssertionError("Conformance must replace Ray setup")),
             process=Mock(side_effect=AssertionError("Conformance must replace processing")),
-            transaction_properties=lambda _attempt: {"item_recipe.note": "synthetic"},
         )
         return {**outcome.summary(), "items_lance_version": int(outcome.dataset.version)}
 

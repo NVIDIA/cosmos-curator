@@ -17,9 +17,10 @@ import pytest
 from ray.data.context import DataContext
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
+from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
 from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
-from cosmos_curator.next.enrichment.workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.enrichment.helpers import (
     attempt_all,
@@ -66,7 +67,7 @@ def results(enrichment_input: inputs.EnrichmentInput) -> pa.Table:
             {"fragment_id": 0, "row_offset": 0, "item_id": "a", "result": 1, "metadata": {"status": "success"}},
             {"fragment_id": 1, "row_offset": 0, "item_id": "b", "result": 2, "metadata": {"status": "success"}},
         ],
-        schema=enrichment_input.bindings.spec.staged_schema,
+        schema=enrichment_input.bindings.spec.result_schema,
     )
 
 
@@ -102,7 +103,7 @@ def test_shared_validation_rejects_duplicate_ids_before_recipe_checks(
     """Checkpoints key on IDs, so uniqueness is checked for every recipe across the whole snapshot."""
     _append(enrichment_input, "a", "duplicate.mp4")
     validator = Mock(wraps=_readiness)
-    with pytest.raises(ValueError, match="item_id values must be non-null and globally unique"):
+    with pytest.raises(ValueError, match="item_id values must be globally unique"):
         inputs.open_enrichment_input(_with_readiness(enrichment_input.bindings, validator))
     validator.assert_not_called()
 
@@ -168,29 +169,13 @@ def test_mismatched_attempts_fail_before_preparing_files(
     prepare.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        execution.KIND_KEY,
-        execution.FIELD_KEY,
-        execution.CONTRACT_DIGEST_KEY,
-        inputs.PUBLICATION_RECEIPT_KEY,
-        inputs.VALIDATED_INPUT_KEY,
-    ],
-)
-def test_recipe_properties_cannot_replace_shared_proof(enrichment_input: inputs.EnrichmentInput, key: str) -> None:
-    """Recipes add their own records; the adapter supplies provenance, the recovery receipt, and evidence."""
-    with pytest.raises(ValueError, match="cannot replace the shared provenance"):
-        execution.publish_enrichment(attempt_all(enrichment_input), transaction_properties={key: "recipe-value"})
-
-
 def test_publication_records_shared_provenance(enrichment_input: inputs.EnrichmentInput, results: pa.Table) -> None:
     """Every enrichment commit names its recipe, field set, and result contract without recipe properties."""
     published = publish_results(results, enrichment_input)
     properties = published.read_transaction(published.version).transaction_properties
-    assert properties[execution.KIND_KEY] == "item-recipe"
+    assert properties[KIND_KEY] == "item-recipe"
     assert properties[execution.FIELD_KEY] == "result"
-    assert properties[execution.CONTRACT_DIGEST_KEY] == canonical_digest({"version": 1})
+    assert properties[CONTRACT_DIGEST_KEY] == canonical_digest({"version": 1})
 
 
 @pytest.mark.parametrize("cleaned", [True, False])
@@ -269,7 +254,7 @@ def test_processing_scope_owns_checkpoint_and_sink(
         if fail_write:
             stack.enter_context(pytest.raises(RuntimeError, match="injected write failure"))
         with execution.checkpointed_processing(attempt) as processing:
-            assert processing.staged_schema is attempt.input.bindings.spec.staged_schema
+            assert processing.result_schema is attempt.input.bindings.spec.result_schema
             processing.write(processing.read(columns, override_num_blocks=3))
 
     ((datasource, kwargs, checkpoint),) = reads
@@ -304,15 +289,16 @@ def test_processing_validates_results_before_ray_checkpoints_them(
         processing.write(plan)
 
     ((validate,), options) = plan.map_batches.call_args
-    assert (options["batch_format"], options["batch_size"]) == ("pyarrow", None)
-    assert plan.method_calls[0][0] == "map_batches"
-    assert validate(results) is results
+    # Default remote args after the strict repartition let Ray fuse validation into each group's write task.
+    assert options == {"batch_format": "pyarrow", "batch_size": None, "zero_copy_batch": True}
+    assert [call[0] for call in plan.method_calls] == ["repartition", "map_batches", "write_parquet"]
+    assert validate(results).equals(results.cast(attempt.input.bindings.spec.staged_schema), check_metadata=True)
     assert validate(results.slice(0, 0)).num_rows == 0
     rows = results.to_pylist()
     rows[0]["result"] = None
     with pytest.raises(ValueError, match="Invalid test result"):
-        validate(pa.Table.from_pylist(rows, schema=results.schema))
-    with pytest.raises(ValueError, match="staged schema"):
+        validate(pa.Table.from_pylist(rows, schema=attempt.input.bindings.spec.result_schema))
+    with pytest.raises(ValueError, match="canonical result schema"):
         validate(results.drop_columns(["metadata"]))
 
 
@@ -360,9 +346,9 @@ def test_run_enrichment_limits_only_a_new_selection(
     """A fragment limit bounds new work and leaves the rest pending for a later run."""
     monkeypatch.setattr(execution, "prepare_enrichment_fragments", partial(prepare_results, results))
     monkeypatch.setattr(DataContext.get_current(), "checkpoint_config", None)
-    outcome = execution.run_enrichment(
-        enrichment_input.bindings, start_ray=lambda _bindings: None, process=lambda _processing: None, max_fragments=1
-    )
+    execution_config = enrichment_input.bindings.execution.model_copy(update={"max_fragments": 1})
+    bindings = attrs.evolve(enrichment_input.bindings, execution=execution_config)
+    outcome = execution.run_enrichment(bindings, start_ray=lambda _bindings: None, process=lambda _processing: None)
     assert (outcome.summary()["selected_fragments"], outcome.summary()["remaining_fragments"]) == (1, 1)
     assert inputs.pending_fragment_ids(outcome.dataset, enrichment_input.bindings) == (1,)
 

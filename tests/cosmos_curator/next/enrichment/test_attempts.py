@@ -1,19 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Selection recovery and receipt-authorized cleanup with real Lance metadata."""
+"""Saved selections resume first, and current values release published workspaces, with real Lance metadata."""
 
 import json
-import sys
 from pathlib import Path
 
+import attrs
 import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.enrichment import attempts, commit, contracts, inputs
+from cosmos_curator.next.core.recovery_workspace import RecoveryStateError, RecoveryWorkspace
+from cosmos_curator.next.enrichment import commit, contracts, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt, reconcile_and_select_attempt
-from cosmos_curator.next.enrichment.workspace import RecoveryStateError, RecoveryWorkspace
 from tests.cosmos_curator.next.enrichment.helpers import make_bindings
 
 
@@ -58,8 +58,9 @@ def _select(
     limit: int | None = None,
 ) -> EnrichmentAttempt:
     bindings = make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1})
+    bindings = attrs.evolve(bindings, execution=bindings.execution.model_copy(update={"max_fragments": limit}))
     enrichment_input = inputs.EnrichmentInput(dataset, bindings, inputs.input_fingerprint(dataset, bindings))
-    return reconcile_and_select_attempt(enrichment_input, max_fragments=limit)
+    return reconcile_and_select_attempt(enrichment_input)
 
 
 def _publish(
@@ -117,69 +118,33 @@ def test_retry_keeps_selection_after_appends_and_limit_changes(
     assert resumed.processing_complete()
 
 
-def test_published_workspace_is_verified_and_cleaned_before_selecting_new_work(
-    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
+@pytest.mark.parametrize("matching_receipt", [True, False])
+def test_published_workspace_is_cleaned_before_selecting_new_work(
+    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, *, matching_receipt: bool
 ) -> None:
-    """Publication receipts retain the cleanup path after a batch becomes complete."""
-    root = tmp_path / "staging"
-    attempt = _select(dataset, spec, root, limit=1)
-    assert attempt.workspace is not None
-    other = inputs.resolve_workspace(
-        dataset, make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 2}), selected=(1,)
-    )
-    other.ensure(storage_profile="default")
-    published = _publish(dataset, spec, attempt.workspace, attempt.selected)
-    next_attempt = _select(published, spec, root)
-    assert next_attempt.selected == (1,)
-    assert next_attempt.cleanup_complete
-    assert not Path(attempt.workspace.root).exists()
-    assert Path(other.root).exists()
-
-
-@pytest.mark.parametrize("resume", [False, True])
-def test_missing_receipt_preserves_completed_workspace_and_continues(
-    dataset: lance.LanceDataset,
-    spec: contracts.EnrichmentSpec,
-    tmp_path: Path,
-    capfd: pytest.CaptureFixture[str],
-    *,
-    resume: bool,
-) -> None:
-    """Missing proof prevents cleanup without treating terminal work as unfinished."""
+    """Current values prove publication, with or without a matching receipt; other contracts keep their workspace."""
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root, limit=1)
     assert attempt.workspace is not None
     attempt.workspace.record_completion(storage_profile="default")
-    published = _publish(dataset, spec, attempt.workspace, attempt.selected, matching_receipt=False)
-    next_workspace = inputs.resolve_workspace(
-        published,
-        make_bindings(published.uri, spec, staging_root=str(root), result_contract={"version": 1}),
-        selected=(1,),
+    other = inputs.resolve_workspace(
+        dataset, make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 2}), selected=(1,)
     )
-    if resume:
-        next_workspace.ensure(storage_profile="default")
-    sink = attempts.logger.add(sys.stderr, level="WARNING")
-    try:
-        next_attempt = _select(published, spec, root)
-    finally:
-        attempts.logger.remove(sink)
+    other.ensure(storage_profile="default")
+    published = _publish(dataset, spec, attempt.workspace, attempt.selected, matching_receipt=matching_receipt)
+    next_attempt = _select(published, spec, root)
     assert next_attempt.selected == (1,)
-    assert next_attempt.workspace == next_workspace
-    assert not next_attempt.cleanup_complete
-    assert Path(attempt.workspace.root, "workspace.json").exists()
-    assert attempt.workspace.processing_complete(storage_profile="default")
-    warning = capfd.readouterr().err
-    assert "no matching publication receipt" in warning
-    assert attempt.workspace.root in warning
+    assert next_attempt.workspace is not None
+    assert next_attempt.workspace.root == attempt.workspace.root
+    assert RecoveryWorkspace.load(attempt.workspace.root, storage_profile="default") == next_attempt.workspace
+    assert not next_attempt.processing_complete()
+    assert Path(other.root, "workspace.json").exists()
 
 
-def test_pruned_receipt_preserves_completed_workspace_without_blocking(
-    dataset: lance.LanceDataset,
-    spec: contracts.EnrichmentSpec,
-    tmp_path: Path,
-    capfd: pytest.CaptureFixture[str],
+def test_pruned_receipt_still_releases_the_completed_workspace(
+    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
 ) -> None:
-    """A real gap in retained Lance history is absent evidence, not a read failure."""
+    """A gap in retained Lance history leaves current values to prove publication."""
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root)
     assert attempt.workspace is not None
@@ -188,48 +153,36 @@ def test_pruned_receipt_preserves_completed_workspace_without_blocking(
     published.add_columns(pa.schema([("unrelated", pa.string())]))
     published.cleanup_old_versions(versions=[publication_version])
     assert publication_version not in {ref["version"] for ref in published.version_refs()}
-    sink = attempts.logger.add(sys.stderr, level="WARNING")
-    try:
-        next_attempt = _select(published, spec, root)
-    finally:
-        attempts.logger.remove(sink)
-    assert next_attempt.selected == ()
-    assert next_attempt.workspace is None
-    assert not next_attempt.cleanup_complete
-    assert Path(attempt.workspace.root, "workspace.json").exists()
-    warning = capfd.readouterr().err
-    assert "no matching publication receipt" in warning
-    assert attempt.workspace.root in warning
+    next_attempt = _select(published, spec, root)
+    assert (next_attempt.selected, next_attempt.workspace) == ((), None)
+    assert not Path(attempt.workspace.root).exists()
 
 
-@pytest.mark.parametrize("fault", ["replaced_results", "changed_inputs"])
-def test_unproven_publication_never_authorizes_cleanup(
-    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, fault: str
+def test_changed_selected_inputs_preserve_the_workspace(
+    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
 ) -> None:
-    """A manifest or valid terminal values alone cannot prove this selection was published."""
+    """Completion never releases a workspace whose selected input files changed."""
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root, limit=1)
     assert attempt.workspace is not None
     published = _publish(dataset, spec, attempt.workspace, attempt.selected)
-    fragment = published.get_fragment(0)
-    field = "result" if fault == "replaced_results" else "item_id"
-    values = {"item_id": ["a"], "result": [2]} if field == "result" else {"result": [1], "item_id": ["changed"]}
-    join = "item_id" if field == "result" else "result"
-    metadata, modified = fragment.update_columns(pa.table(values), left_on=join, right_on=join)
+    metadata, modified = published.get_fragment(0).update_columns(
+        pa.table({"result": [1], "item_id": ["changed"]}), left_on="result", right_on="result"
+    )
     published = lance.LanceDataset.commit(
         dataset.uri,
         lance.LanceOperation.Update(updated_fragments=[metadata], fields_modified=modified),
         read_version=published.version,
     )
-    with pytest.raises(ValueError, match=r"result files differ|current input file layout"):
+    with pytest.raises(RecoveryStateError, match="current input file layout"):
         _select(published, spec, root)
     assert Path(attempt.workspace.root, "workspace.json").exists()
 
 
-def test_receipted_cleanup_still_requires_compatible_schema(
+def test_cleanup_still_requires_compatible_schema(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
 ) -> None:
-    """A receipt does not authorize cleanup after schema changes that leave files intact."""
+    """Publication does not authorize cleanup after schema changes that leave files intact."""
     root = tmp_path / "staging"
     bindings = make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1})
     attempt = _select(dataset, spec, root)
@@ -242,45 +195,29 @@ def test_receipted_cleanup_still_requires_compatible_schema(
     assert Path(attempt.workspace.root, "workspace.json").exists()
 
 
-def test_receipt_read_failure_prevents_all_cleanup(
+def test_receipt_read_failure_prevents_cleanup(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unavailable evidence remains fatal even after another workspace was verified."""
+    """Unavailable publication evidence remains fatal rather than a reason to clean up."""
     root = tmp_path / "staging"
-    workspaces = [
-        inputs.resolve_workspace(
-            dataset,
-            make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1}),
-            selected=(fragment_id,),
-        )
-        for fragment_id in (0, 1)
-    ]
-    for fragment_id, workspace in enumerate(workspaces):
-        workspace.ensure(storage_profile="default")
-        dataset = _publish(dataset, spec, workspace, (fragment_id,))
-    find_transaction = attempts.find_transaction
+    attempt = _select(dataset, spec, root)
+    assert attempt.workspace is not None
+    published = _publish(dataset, spec, attempt.workspace, attempt.selected)
 
-    def unavailable_receipt(
-        dataset: lance.LanceDataset, *, property_key: str, property_value: str | None = None, after_version: int = 0
-    ) -> lance.Transaction | None:
-        if property_value == workspaces[1].manifest_digest:
-            msg = "Receipt storage unavailable"
-            raise OSError(msg)
-        return find_transaction(
-            dataset, property_key=property_key, property_value=property_value, after_version=after_version
-        )
+    def unavailable_history(*_args: object, **_kwargs: object) -> None:
+        msg = "Receipt storage unavailable"
+        raise OSError(msg)
 
-    monkeypatch.setattr(RecoveryWorkspace, "discover", lambda *_args, **_kwargs: workspaces)
-    monkeypatch.setattr(attempts, "find_transaction", unavailable_receipt)
+    monkeypatch.setattr(inputs, "iter_transactions", unavailable_history)
     with pytest.raises(OSError, match="Receipt storage unavailable"):
-        _select(dataset, spec, root)
-    assert all(Path(workspace.root, "workspace.json").exists() for workspace in workspaces)
+        _select(published, spec, root)
+    assert Path(attempt.workspace.root, "workspace.json").exists()
 
 
 def test_incompatible_manifest_is_preserved(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
 ) -> None:
-    """Discovery validates contracts before altering any workspace under its prefix."""
+    """Recovery validates the saved manifest before altering its workspace."""
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root)
     assert attempt.workspace is not None
@@ -293,25 +230,38 @@ def test_incompatible_manifest_is_preserved(
     assert json.loads(path.read_text())["result_contract"] == {"version": "wrong"}
 
 
-def test_multiple_unfinished_selections_require_explicit_resolution(
+@pytest.mark.parametrize(("fragments", "message"), [([], "Invalid fragment"), ([1, 0], "not sorted and unique")])
+def test_invalid_saved_selections_are_preserved(
+    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, fragments: list[int], message: str
+) -> None:
+    """A saved selection that is empty or out of order fails instead of resuming or being replaced."""
+    root = tmp_path / "staging"
+    attempt = _select(dataset, spec, root)
+    assert attempt.workspace is not None
+    manifest = attempt.workspace.manifest
+    by_id = {fragment["fragment_id"]: fragment for fragment in manifest["input_fragments"]}
+    manifest["input_fragments"] = [by_id[fragment_id] for fragment_id in fragments]
+    path = Path(attempt.workspace.root, "workspace.json")
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RecoveryStateError, match=message):
+        _select(dataset, spec, root)
+    assert json.loads(path.read_text())["input_fragments"] == manifest["input_fragments"]
+
+
+def test_another_selection_cannot_replace_the_active_manifest(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path
 ) -> None:
-    """The recovery selector does not silently merge independently owned checkpoints."""
+    """Every selection claims the same workspace, so a different manifest cannot create a second one."""
     root = tmp_path / "staging"
-    workspaces = [
-        inputs.resolve_workspace(
-            dataset,
-            make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1}),
-            selected=(fragment_id,),
-        )
-        for fragment_id in (0, 1)
-    ]
-    for workspace in workspaces:
-        workspace.ensure(storage_profile="default")
-    with pytest.raises(RecoveryStateError, match="Multiple unfinished") as error:
-        _select(dataset, spec, root)
-    assert all(workspace.root in str(error.value) for workspace in workspaces)
-    assert all(Path(workspace.root).exists() for workspace in workspaces)
+    first = _select(dataset, spec, root, limit=1)
+    assert first.workspace is not None
+    other = inputs.resolve_workspace(
+        dataset, make_bindings(dataset.uri, spec, staging_root=str(root), result_contract={"version": 1}), selected=(1,)
+    )
+    assert other.root == first.workspace.root
+    with pytest.raises(RecoveryStateError, match="workspace does not match"):
+        other.ensure(storage_profile="default")
+    assert _select(dataset, spec, root).workspace == first.workspace
 
 
 def test_partially_published_selection_is_preserved(
@@ -327,19 +277,43 @@ def test_partially_published_selection_is_preserved(
     assert Path(attempt.workspace.root).exists()
 
 
-def test_cleanup_failure_does_not_discard_new_pending_selection(
+def test_cleanup_failure_blocks_new_selections(
     dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Best-effort cleanup failures remain visible while new pending work is selected."""
+    """A published selection's workspace must be removed before the next selection can reuse it."""
     root = tmp_path / "staging"
     attempt = _select(dataset, spec, root, limit=1)
     assert attempt.workspace is not None
     published = _publish(dataset, spec, attempt.workspace, attempt.selected)
     monkeypatch.setattr(RecoveryWorkspace, "cleanup", lambda _self, **_kwargs: False)
-    next_attempt = _select(published, spec, root)
+    with pytest.raises(OSError, match="until workspace cleanup succeeds"):
+        _select(published, spec, root)
+    assert RecoveryWorkspace.load(attempt.workspace.root, storage_profile="default") == attempt.workspace
+    monkeypatch.undo()
+    assert _select(published, spec, root).selected == (1,)
+
+
+@pytest.mark.parametrize("manifest_removed", [False, True])
+def test_interrupted_cleanup_cannot_leak_state_into_the_next_selection(
+    dataset: lance.LanceDataset, spec: contracts.EnrichmentSpec, tmp_path: Path, *, manifest_removed: bool
+) -> None:
+    """A fixed workspace is reused only after earlier checkpoints and markers are removed."""
+    root = tmp_path / "staging"
+    attempt = _select(dataset, spec, root, limit=1)
+    workspace = attempt.workspace
+    assert workspace is not None
+    workspace.record_completion(storage_profile="default")
+    Path(workspace.checkpoints).mkdir()
+    Path(workspace.checkpoints, "old-checkpoint").write_text("a", encoding="utf-8")
+    published = _publish(dataset, spec, workspace, attempt.selected)
+    if manifest_removed:
+        Path(workspace.root, "workspace.json").unlink()
+    next_attempt = _select(published, spec, root, limit=1)
     assert next_attempt.selected == (1,)
-    assert not next_attempt.cleanup_complete
-    assert Path(attempt.workspace.root).exists()
+    assert next_attempt.workspace is not None
+    assert next_attempt.workspace.root == workspace.root
+    assert not Path(workspace.checkpoints).exists()
+    assert not next_attempt.processing_complete()
 
 
 def test_empty_input_selects_nothing_and_creates_no_workspace(spec: contracts.EnrichmentSpec, tmp_path: Path) -> None:

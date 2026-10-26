@@ -3,7 +3,6 @@
 
 """Shared fixtures for video-caption contract and Lance integration tests."""
 
-import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -17,15 +16,13 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
     caption_contract_digest,
     resolve_model_spec,
 )
-from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, PUBLICATION_KEY, PUBLICATION_VERSION
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
 from tests.cosmos_curator.next.recipes.video_caption.helpers import caption_run_bindings
 
 
 def clip_row(index: int, *, clip_id: str | None = None) -> dict[str, object]:
     """Return one valid canonical video-transcode row."""
     return {
-        "record_schema_version": 1,
-        "cut_contract_id": "cut-contract",
         "span_id": f"span-{index}",
         "stream_index": 0,
         "transcode_contract_id": "transcode-contract",
@@ -103,9 +100,6 @@ def clip_dataset_factory(
             uri,
             max_rows_per_file=rows_per_fragment,
             data_storage_version="2.2",
-            transaction_properties={
-                PUBLICATION_KEY: json.dumps({"publication_version": PUBLICATION_VERSION, "spans": len(values)})
-            },
         )
         return uri, dataset
 
