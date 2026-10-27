@@ -31,6 +31,7 @@ rows), so its minimum, median, maximum and mean are four different numbers and n
 assertion below can be satisfied by the wrong statistic.
 """
 
+import inspect
 import pathlib
 import shutil
 from collections.abc import Sequence
@@ -510,6 +511,19 @@ def _shape(
         max_fragment_rows=median_fragment_rows if max_fragment_rows is None else max_fragment_rows,
         num_fields=4,
     )
+
+
+@pytest.mark.parametrize(("row_count_offset", "small"), [(-1, True), (0, False), (1, False)])
+def test_small_fragment_note_matches_lances_default_boundary(
+    tmp_path: pathlib.Path, row_count_offset: int, *, small: bool
+) -> None:
+    """The note follows Lance's own default and small-file predicate across upgrades."""
+    default_rows = inspect.signature(lance.write_dataset).parameters["max_rows_per_group"].default
+    rows = default_rows + row_count_offset
+    dataset = _write_uneven_fragments(tmp_path / "boundary.lance", (rows, rows))
+
+    assert dataset.stats.dataset_stats()["num_small_files"] == (2 if small else 0)
+    assert (report_table_shape(dataset, "source").small_fragment_note is not None) is small
 
 
 def test_small_fragment_note_is_pinned_whole_for_a_table_below_lances_threshold() -> None:

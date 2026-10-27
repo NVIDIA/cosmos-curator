@@ -202,9 +202,9 @@ def count_rows(uri: str, *, storage_profile: str = "default") -> int:
     return int(dataset.count_rows())
 
 
-# Lance's own default for ``write_dataset(max_rows_per_group=...)``, measured 1024 at
-# pylance 13.0.0; the threshold tracks Lance's figure, not this literal, so
-# re-measure if that default ever moves.
+# Lance's default for ``write_dataset(max_rows_per_group=...)``. Regression tests
+# compare our note with Lance's small-file counts around this boundary, so a
+# dependency change cannot silently leave the threshold out of sync.
 #
 # Do NOT read it as a physical unit and do NOT retune it to whatever the writer's
 # current unit is. The Lance file format dropped row groups at data storage version

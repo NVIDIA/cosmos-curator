@@ -96,9 +96,9 @@ _CHECKPOINTS_SEGMENT: Final = "checkpoints"
 #     surviving fragment - an append opens a new fragment rather than extending
 #     one, and offsets freed by a delete are not handed to later rows. The second
 #     premise is the one other writers on this table could break, which is why it
-#     is stated rather than left to follow from the first. Both measured at
-#     pylance 13.0.0; re-measure on a pylance bump, and bump this
-#     constant if either stops holding;
+#     is stated rather than left to follow from the first. The datasource tests
+#     check both behaviours against real Lance writes; bump this constant if
+#     either stops holding;
 #   - the checkpoint surviving a successful Phase A
 #     (`delete_checkpoint_on_success=False`), without which a resume re-infers
 #     rows already staged and appends a second answer for each of them;

@@ -491,20 +491,23 @@ def test_registration_adds_every_caption_field(make_clips_table: ClipsTableFacto
 
 
 def test_registration_does_not_rewrite_data_files(make_clips_table: ClipsTableFactory) -> None:
-    """Widening is metadata-only: no fragment's row count or data-file count changes."""
+    """Widening preserves fragments, data-file counts, and every row's address."""
     uri = make_clips_table()
+    dataset = lance.dataset(uri)
     before = [
         (fragment.fragment_id, fragment.count_rows(), len(fragment.data_files()))
-        for fragment in lance.dataset(uri).get_fragments()
+        for fragment in dataset.get_fragments()
     ]
+    before_addresses = dataset.scanner(columns=[CLIP_ID_COLUMN], with_row_address=True).to_table()
 
-    register(uri)
+    widened = register(uri)
 
     after = [
         (fragment.fragment_id, fragment.count_rows(), len(fragment.data_files()))
-        for fragment in lance.dataset(uri).get_fragments()
+        for fragment in widened.get_fragments()
     ]
     assert after == before
+    assert widened.scanner(columns=[CLIP_ID_COLUMN], with_row_address=True).to_table().equals(before_addresses)
 
 
 def test_registration_is_idempotent_without_a_version_bump(make_clips_table: ClipsTableFactory) -> None:
@@ -595,19 +598,19 @@ def test_a_lost_schema_race_is_resolved_by_reopening(
 
     This is the whole reason the function takes a URI instead of a handle: the
     losing job cannot retry from the handle that lost, because the group it needs
-    exists only at a version that handle cannot see. The stub widens the table
-    for real before raising, so the reopened pass finds a genuinely present group
-    rather than a mock's say-so, and the returned handle must sit at THAT
-    version - the one the winner created.
+    exists only at a version that handle cannot see. A second handle commits
+    first, so Lance itself raises the conflict the retry must catch. Controlling
+    the commit order reproduces a stale snapshot without threads, and the
+    returned handle must sit at the version the competing writer created.
     """
     uri = make_clips_table()
     real_add_columns = lance.LanceDataset.add_columns
 
     def lose_once(self: lance.LanceDataset, *args: object, **kwargs: object) -> None:
         monkeypatch.setattr(lance.LanceDataset, "add_columns", real_add_columns)
+        real_add_columns(lance.dataset(uri), *args, **kwargs)  # type: ignore[arg-type]  # Untyped in Lance stubs.
         real_add_columns(self, *args, **kwargs)  # type: ignore[arg-type]  # Untyped in Lance stubs.
-        msg = "commit conflict"
-        raise OSError(msg)
+        pytest.fail("a stale schema-widening commit unexpectedly succeeded")
 
     monkeypatch.setattr(lance.LanceDataset, "add_columns", lose_once)
 

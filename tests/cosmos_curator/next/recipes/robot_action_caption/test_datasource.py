@@ -250,6 +250,67 @@ def test_checkpoint_ids_are_stable_across_two_reads(make_clips_table: ClipsTable
     assert len(first) == ROWS
 
 
+@pytest.mark.parametrize("delete_middle_row", [False, True])
+def test_append_preserves_checkpoint_ids_without_reusing_deleted_offsets(
+    make_clips_table: ClipsTableFactory, *, delete_middle_row: bool
+) -> None:
+    """New rows get a fresh fragment even when an existing fragment has a vacant offset."""
+    uri = make_clips_table(rows=3)
+    dataset = lance.dataset(uri)
+    before = ids_by_clip(read_all(uri))
+    fragment_ids = {fragment.fragment_id for fragment in dataset.get_fragments()}
+    appended_row = dataset.to_table().slice(0, 1).to_pylist()[0]
+    appended_row[CLIP_ID_COLUMN] = "appended"
+
+    if delete_middle_row:
+        dataset.delete("clip_id = 'c1'")
+    survivors = {clip_id: address for clip_id, address in before.items() if not delete_middle_row or clip_id != "c1"}
+    assert ids_by_clip(read_all(uri)) == survivors
+
+    lance.write_dataset(
+        pa.Table.from_pylist([appended_row], schema=dataset.schema),
+        uri,
+        mode="append",
+        data_storage_version=LANCE_DATA_STORAGE_VERSION,
+    )
+    after = ids_by_clip(read_all(uri))
+
+    assert after.keys() == survivors.keys() | {"appended"}
+    assert {clip_id: after[clip_id] for clip_id in survivors} == survivors
+    assert after["appended"] >> ROW_ADDRESS_FRAGMENT_SHIFT not in fragment_ids
+
+
+def test_updated_rows_get_checkpoint_ids_in_a_fresh_fragment(make_clips_table: ClipsTableFactory) -> None:
+    """A changed clip cannot inherit a checkpoint for its previous media contents."""
+    uri = make_clips_table()
+    dataset = lance.dataset(uri)
+    before = ids_by_clip(read_all(uri))
+    fragment_ids = {fragment.fragment_id for fragment in dataset.get_fragments()}
+
+    dataset.update({CLIP_URI_COLUMN: "'s3://b/replaced.mp4'"}, where="clip_id = 'c0'")
+    after = ids_by_clip(read_all(uri))
+
+    assert after.keys() == before.keys()
+    assert after["c0"] >> ROW_ADDRESS_FRAGMENT_SHIFT not in fragment_ids
+    assert {clip_id: address for clip_id, address in after.items() if clip_id != "c0"} == {
+        clip_id: address for clip_id, address in before.items() if clip_id != "c0"
+    }
+
+
+def test_compaction_does_not_reassign_checkpoint_ids(make_clips_table: ClipsTableFactory) -> None:
+    """Compaction cannot make a stale checkpoint address name a different live row."""
+    uri = make_clips_table()
+    dataset = lance.dataset(uri)
+    before = ids_by_clip(read_all(uri))
+    fragment_ids = {fragment.fragment_id for fragment in dataset.get_fragments()}
+
+    dataset.optimize.compact_files(target_rows_per_fragment=ROWS, num_threads=1)
+    after = ids_by_clip(read_all(uri))
+
+    assert after.keys() == before.keys()
+    assert {address >> ROW_ADDRESS_FRAGMENT_SHIFT for address in after.values()}.isdisjoint(fragment_ids)
+
+
 def test_the_fragment_id_is_the_high_half_of_the_checkpoint_id(make_clips_table: ClipsTableFactory) -> None:
     """Both identity columns come from one scanned value, so they cannot disagree.
 

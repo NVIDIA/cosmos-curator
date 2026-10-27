@@ -429,8 +429,8 @@ def ensure_caption_fields(
             # cheap on a large table, and why it cannot create a tombstone.
             dataset.add_columns(CAPTION_FIELDS)
         except OSError as e:
-            # At pylance 13.0.0, a lost widening race raises CommitConflictError,
-            # an OSError subtype. Re-measure on a pylance bump.
+            # Schema-widening conflicts are OSErrors; the retry test exercises a
+            # real competing commit to guard this dependency contract.
             #
             # Reopen to detect a concurrent success without parsing error messages.
             # Any persistent OSError surfaces as the cause of the RuntimeError below.
