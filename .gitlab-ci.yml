@@ -905,7 +905,7 @@ build_ci_builder_image_arch:
     - mkdir -p "${DOCKER_CONFIG}"
     - docker login -u gitlab-ci-token -p "${CI_JOB_TOKEN}" "${CI_REGISTRY}"
     - CI_BUILDER_ARCH_IMAGE="${CI_BUILDER_IMAGE_REPO}:${CI_COMMIT_SHORT_SHA}-${PLATFORM}"
-    - docker build -f Dockerfile.ci -t "${CI_BUILDER_ARCH_IMAGE}" .
+    - docker build -f Dockerfile.ci --build-arg VAULT_AGENT_DOWNLOAD_PATH -t "${CI_BUILDER_ARCH_IMAGE}" .
     - docker push "${CI_BUILDER_ARCH_IMAGE}"
     - echo "Pushed ${CI_BUILDER_ARCH_IMAGE}"
   retry:

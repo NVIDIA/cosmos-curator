@@ -31,11 +31,13 @@ RUN ARCH="$(uname -m)" \
 
 RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-RUN ARCH="$(uname -m)" \
+ARG VAULT_AGENT_DOWNLOAD_PATH
+RUN test -n "${VAULT_AGENT_DOWNLOAD_PATH}" || { echo "VAULT_AGENT_DOWNLOAD_PATH build arg is required" && exit 1; } \
+    && ARCH="$(uname -m)" \
     && if [ "${ARCH}" = "x86_64" ]; then VAULT_ARCH="amd64"; \
        elif [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "arm64" ]; then VAULT_ARCH="arm64"; \
        else echo "Unsupported architecture: ${ARCH}" && exit 1; fi \
-    && VAULT_AGENT_URL="https://urm.nvidia.com/artifactory/sw-kaizen-data-generic-local/com/nvidia/vault/vault-agent/2.4.4/nvault_agent_v2.4.4_linux_${VAULT_ARCH}.zip" \
+    && VAULT_AGENT_URL="${VAULT_AGENT_DOWNLOAD_PATH}/latest/nvault_agent_linux_${VAULT_ARCH}.zip" \
     && curl -fsSL "${VAULT_AGENT_URL}" -o /tmp/vault_agent.zip \
     && cd /tmp \
     && unzip -o vault_agent.zip \
