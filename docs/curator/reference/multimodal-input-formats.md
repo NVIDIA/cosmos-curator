@@ -76,10 +76,13 @@ exposed by the mapping or returned Data class.
   constructor reports container decode timestamps (DTS) when sensor timestamps are omitted.
   `ImageSensor` accepts per-image sensor timestamps; without them it uses sequential indices.
   Container timestamps and image indices do not establish sensor measurement time.
-- **Limitations:** prefer video without B-frames or frame reordering, which adds buffering
-  and frame dependencies. `CameraSensor` supports reordered video through presentation-order
-  indexing. A streaming reader needs video data through `source` to decode frames; building
-  it from an index without a source permits metadata-only use.
+- **Limitations:** prefer video without B-frames or frame reordering. Reordering introduces
+  buffering and decoding dependencies that complicate memory planning, compute scheduling,
+  and temporal alignment across cameras or modalities, making failures harder to diagnose.
+  `CameraSensor` supports reordered video through presentation-order indexing, but reader
+  support does not establish that the complete curation workflow has been validated with it.
+  A streaming reader needs video data through `source` to decode frames; building it from
+  an index without a source permits metadata-only use.
 
 ### IMU
 
