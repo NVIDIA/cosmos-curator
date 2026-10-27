@@ -19,9 +19,9 @@
 
 import io
 import pathlib
+from itertools import islice
 from typing import Any
 
-import attrs
 import av
 import lance
 import numpy as np
@@ -136,14 +136,14 @@ def test_process_one_video_indexes_a_real_clip_as_pyav_demuxes_the_source(
 def test_indexed_track_survives_lance_and_selects_the_decoded_video(
     tmp_path: pathlib.Path, *, with_extension: bool
 ) -> None:
-    """The stored native track ID selects the indexed pixels, even with audio and an earlier video track."""
+    """The stored index decodes the selected video track after a Lance round trip."""
     data = real_mp4.audio_then_two_video_tracks_clip()
     with av.open(io.BytesIO(data)) as container:
         selected = container.streams.video[1]
         assert container.streams.best("video") is selected
         assert selected.id != selected.index != 1
         track_id = selected.id
-        expected_shape = (selected.height, selected.width, 3)
+        expected_frames = [frame.to_ndarray(format="rgb24") for frame in islice(container.decode(selected), 2)]
     extension_factory = (lambda _media_location: _NoOpExtension()) if with_extension else None
     media_location = _write(tmp_path, data)
     result = _process(
@@ -169,13 +169,9 @@ def test_indexed_track_survives_lance_and_selects_the_decoded_video(
         for window in sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
         for _reference_ns, _timestamp_ns, frame in window.frames()
     ]
-    assert [frame.shape for frame in frames] == [expected_shape] * 2
-
-    missing_track = attrs.evolve(metadata, track_id=track_id + 100)
-    sensor = StreamingCameraSensor(data, frame_index=index, metadata=missing_track)
-    window = next(sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0)))
-    with pytest.raises(ValueError, match=r"track.*not found"):
-        list(window.frames())
+    assert len(frames) == 2
+    for frame, expected in zip(frames, expected_frames, strict=True):
+        np.testing.assert_array_equal(frame, expected)
 
 
 def test_process_one_video_indexes_a_real_fragment_layout_the_box_walker_refuses(tmp_path: pathlib.Path) -> None:

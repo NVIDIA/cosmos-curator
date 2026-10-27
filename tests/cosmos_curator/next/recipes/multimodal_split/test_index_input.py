@@ -244,8 +244,8 @@ def test_indexed_windows_continue_after_a_partial_encode_failure(
             return 0
         return real_encode(frames, path, **kwargs)  # type: ignore[arg-type]
 
-    decoder = Mock(wraps=streaming_camera_sensor.iter_video_frames)
-    monkeypatch.setattr(streaming_camera_sensor, "iter_video_frames", decoder)
+    decoder = Mock(wraps=streaming_camera_sensor.StreamingVideoDecoder)
+    monkeypatch.setattr(streaming_camera_sensor, "StreamingVideoDecoder", decoder)
     monkeypatch.setattr(streaming_camera_sensor, "index_video", _forbid_direct_index)
     monkeypatch.setattr(split, "encode_frames_to_path", fail_first_clip)
 

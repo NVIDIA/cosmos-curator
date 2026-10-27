@@ -34,7 +34,10 @@ from cosmos_curator.core.sensors.utils.validation import require_1d, require_str
 from cosmos_curator.core.sensors.utils.video import (
     DEFAULT_VIDEO_DECODE_CONFIG,
     CpuVideoDecodeConfig,
-    iter_video_frames,
+    StreamingDecodePlan,
+    StreamingVideoDecoder,
+    execute_streaming_decode_plan,
+    make_streaming_decode_plan,
 )
 
 _MIN_FOR_AN_INTERVAL = 2
@@ -58,17 +61,12 @@ class IndexRecordUnusableError(ValueError):
     """
 
 
-def _validate_timeline(timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-    """Reject a timeline whose shape cannot describe a recording.
+def _validate_timestamp_array(timestamps_ns: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+    """Validate and return a nonempty 1-D int64 timestamp array.
 
-    Rank, dtype, and emptiness only. ``start_ns`` and ``end_ns`` read the array's
-    ends, so every sensor needs at least one entry for its bounds to mean
-    anything. Ordering is checked in :meth:`StreamingCameraSensor.sample`
-    instead.
+    Raises:
+        ValueError: If the array is not 1-D, does not have dtype int64, or is empty.
 
-    Whether the timeline matches *this* video is the caller's guarantee: checking
-    means walking the file, which is the cost this sensor exists to avoid, and
-    the walk catches a mismatch at its own boundary for free.
     """
     require_1d("timestamps_ns", timestamps_ns, np.int64)
     if timestamps_ns.size == 0:
@@ -144,9 +142,9 @@ class StreamingCameraSensor:
 
     Metadata and the frame index may be supplied together or built lazily from the
     source. The selected alignment field supplies the frame timestamps.
-    Sampling serves frames in presentation order, keeping the current frame and one
-    lookahead frame independently of window length. Codec buffers, timestamps,
-    indexes, and caller-retained outputs contribute additional memory.
+    Frames are materialized on demand, retaining one selected RGB frame
+    independently of window length. Codec buffers, timestamps, indexes, and
+    caller-retained outputs contribute additional memory.
 
     Each reference timestamp in ``spec.grid`` selects its nearest source frame,
     even outside the window's bounds. With the same source timeline, reference
@@ -273,7 +271,7 @@ class StreamingCameraSensor:
             IndexRecordUnusableError: The selected field is absent or partially missing.
 
         """
-        return _validate_timeline(_indexed_timeline(self.frame_index, self._alignment_field))
+        return _validate_timestamp_array(_indexed_timeline(self.frame_index, self._alignment_field))
 
     @property
     def start_ns(self) -> int:
@@ -325,11 +323,10 @@ class StreamingCameraSensor:
         order they were yielded. Skipping a payload is fine; going back to one
         raises, because the walk cannot rewind to serve it.
 
-        A sparse grid rides that same walk. Asking for a low rate selects which
-        frames are served, not which are decoded, so it costs what a dense grid
-        over the same span costs. Two grids that share an alignment -- a clip
-        rate and a caption rate that divides it -- are one traversal serving both,
-        which is the shape this sensor was built for.
+        Sampling can start partway through a recording without decoding from the
+        beginning. Sparse sampling may still require decoding intermediate frames,
+        so a lower output frame rate does not guarantee proportionally less
+        decoding work.
 
         Decoding is where the timeline has to ascend, so that is where the order
         is checked. A disordered timeline is a bad argument to a forward-only
@@ -383,10 +380,91 @@ class StreamingCameraSensor:
         Split from :meth:`sample` so that method's checks run when it is called
         rather than when its first payload is pulled.
         """
-        frames: Iterator[tuple[int, npt.NDArray[np.uint8]]] = iter_video_frames(
-            source, self._stream_idx, self._decode_config, track_id=self.metadata.track_id
-        )
-        yield from stream_camera_windows(frames, timeline_ns, spec, policy=policy)
+        decoder = StreamingVideoDecoder(source, self.metadata, self.frame_index, self._decode_config)
+        yield from _stream_indexed_camera_windows(decoder, timeline_ns, spec, policy=policy)
+
+
+@attrs.define
+class _IndexedWindowState:
+    """Window ordering and lifetime, independent of the codec's target position."""
+
+    decoder: StreamingVideoDecoder
+    claimed_sequence: int = -1
+    last_sequence: int = -1
+    completed_sequence: int = -1
+    metadata_done: bool = False
+
+
+def _stream_indexed_camera_windows(
+    decoder: StreamingVideoDecoder,
+    timeline_ns: npt.NDArray[np.int64],
+    spec: SamplingSpec,
+    *,
+    policy: NearestTimestampPolicy,
+) -> Generator[StreamingCameraData]:
+    """Publish index-selected windows without opening or advancing the decoder."""
+    state = _IndexedWindowState(decoder)
+    validation = _WindowValidationState()
+    try:
+        for sequence, window in enumerate(spec.grid):
+            _validate_next_window(window, validation)
+            positions = (
+                find_closest_indices(timeline_ns, window.timestamps_ns)
+                if len(window.timestamps_ns)
+                else np.empty(0, dtype=np.int64)
+            )
+            plan = make_streaming_decode_plan(decoder.frame_index, positions)
+            source_ns = timeline_ns[positions]
+            state.last_sequence = sequence
+            yield StreamingCameraData(
+                align_timestamps_ns=window.timestamps_ns,
+                sensor_timestamps_ns=source_ns,
+                walk=_serve_indexed_window(state, plan, window, source_ns, sequence, policy.max_delta_ns),
+            )
+    except Exception:
+        decoder.close()
+        raise
+    finally:
+        # SensorGroup closes this iterator while retained payloads can still need it.
+        state.metadata_done = True
+        if state.completed_sequence == state.last_sequence:
+            decoder.close()
+
+
+def _serve_indexed_window(  # noqa: PLR0913 -- one window's plan, timestamps, ownership, and tolerance
+    state: _IndexedWindowState,
+    plan: StreamingDecodePlan,
+    window: SamplingWindow,
+    source_ns: npt.NDArray[np.int64],
+    sequence: int,
+    max_delta_ns: int | None,
+) -> Generator[StreamingFrame]:
+    """Execute a window only when consumed; abandoning it permits later windows."""
+    frames = execute_streaming_decode_plan(state.decoder, plan)
+    try:
+        for reference, timestamp in zip(window.timestamps_ns, source_ns, strict=True):
+            if sequence < state.claimed_sequence:
+                msg = "StreamingCameraData payloads must be consumed in the order they were yielded"
+                raise RuntimeError(msg)  # noqa: TRY301 -- errors must close the shared pass
+            state.claimed_sequence = sequence
+            reference_ns, timestamp_ns = int(reference), int(timestamp)
+            delta_ns = abs(timestamp_ns - reference_ns)
+            if max_delta_ns is not None and delta_ns > max_delta_ns:
+                msg = (
+                    f"max_delta_ns={max_delta_ns} exceeded: "
+                    f"delta was {delta_ns} ns for reference={reference_ns}, timestamp={timestamp_ns}"
+                )
+                raise ValueError(msg)  # noqa: TRY301 -- errors must close the shared pass
+            _position, pixels = next(frames)
+            yield reference_ns, timestamp_ns, pixels
+        state.completed_sequence = sequence
+        if state.metadata_done and sequence == state.last_sequence:
+            state.decoder.close()
+    except Exception:
+        state.decoder.close()
+        raise
+    finally:
+        frames.close()
 
 
 def stream_camera_windows(
@@ -397,7 +475,7 @@ def stream_camera_windows(
     policy: NearestTimestampPolicy,
 ) -> Generator[StreamingCameraData]:
     """Align a decoded frame iterator to reference windows using its supplied timeline."""
-    _validate_timeline(timeline_ns)
+    _validate_timestamp_array(timeline_ns)
     require_strictly_increasing("timestamps_ns", timeline_ns)
     cursor = _Cursor(frames, timeline_ns=timeline_ns)
     state = _WindowValidationState()

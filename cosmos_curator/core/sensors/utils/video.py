@@ -18,9 +18,11 @@ Given stream timestamps / keyframes / decoder state, these utilities decode
 frames at the requested timestamps.
 """
 
+import os
 import time
-from collections.abc import Generator
-from contextlib import contextmanager
+import weakref
+from collections.abc import Callable, Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from fractions import Fraction
 from typing import (
     Any,
@@ -36,12 +38,15 @@ import av
 import numpy as np
 import numpy.typing as npt
 from av.container import InputContainer
+from av.video.codeccontext import VideoCodecContext
 from loguru import logger
 
 from cosmos_curator.core.sensors.data.camera_data import MotionVectorData, MotionVectorFrameData
+from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.data.video import VideoIndex, VideoMetadata, VideoProbe
 from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.io import open_data_source
+from cosmos_curator.core.sensors.utils.validation import require_1d
 
 type DecodePlan = list[tuple[int, list[tuple[int, int]]]]
 type DecodeResult = tuple[npt.NDArray[np.uint8], MotionVectorData | None]
@@ -1334,3 +1339,236 @@ def iter_video_frames(
             if frame.pts is None:
                 continue
             yield pts_to_ns(frame.pts, time_base), cast("npt.NDArray[np.uint8]", frame.to_ndarray(format="rgb24"))
+
+
+@attrs.define(frozen=True)
+class StreamingDecodePlan:
+    """Which frames to return, how often to return each, and where decoding begins.
+
+    The caller has already selected the frames. Their positions follow
+    presentation order: the order frames are intended to be shown. Each selected
+    frame is stored once, with a count of how many times to return it.
+
+    For example, selecting presentation positions ``[101, 101, 103]`` produces
+    ``frame_indices=[101, 103]`` and ``counts=[2, 1]``: return frame 101
+    twice, then frame 103 once.
+
+    Attributes:
+        preceding_keyframe_idx: Decode-order row in ``Mp4FrameIndex`` of a
+            keyframe at or before the first selected frame. ``None`` for
+            an empty plan.
+        frame_indices: Strictly increasing frame positions in presentation order.
+        counts: Number of outputs for each entry in ``frame_indices``.
+
+    """
+
+    preceding_keyframe_idx: int | None
+    frame_indices: npt.NDArray[np.int64]
+    counts: npt.NDArray[np.int64]
+
+
+def _frame_pts_ticks(index: Mp4FrameIndex, frame_idx: int) -> int:
+    """Return PTS for a decode-order index row in stream time-base ticks."""
+    offset = 0 if index.composition_offset_ticks is None else int(index.composition_offset_ticks[frame_idx])
+    return int(index.dts_ticks[frame_idx]) + offset
+
+
+def make_streaming_decode_plan(index: Mp4FrameIndex, frame_indices: npt.NDArray[np.int64]) -> StreamingDecodePlan:
+    """Plan selected frames in presentation order without reading media or allocating pixels."""
+    require_1d("frame_indices", frame_indices, np.int64)
+    if np.any(frame_indices < 0) or np.any(frame_indices >= len(index)):
+        msg = "frame_indices must lie within the frame index"
+        raise ValueError(msg)
+    if np.any(frame_indices[1:] < frame_indices[:-1]):
+        msg = "frame_indices must be nondecreasing"
+        raise ValueError(msg)
+    positions, counts = np.unique(frame_indices, return_counts=True)
+    positions.flags.writeable = counts.flags.writeable = False
+    if not len(positions):
+        return StreamingDecodePlan(None, positions, counts)
+    first_frame_idx = int(index.pts_sort_order[positions[0]])
+    first_pts = _frame_pts_ticks(index, first_frame_idx)
+    candidates = index.keyframe_indices[: np.searchsorted(index.keyframe_indices, first_frame_idx, side="right")]
+    for keyframe_idx in reversed(candidates):
+        if _frame_pts_ticks(index, int(keyframe_idx)) <= first_pts:
+            return StreamingDecodePlan(int(keyframe_idx), positions, counts)
+    msg = f"no preceding keyframe can decode presentation position {positions[0]}"
+    raise ValueError(msg)
+
+
+def iter_indexed_video_packets(
+    stream: BinaryIO, index: Mp4FrameIndex, *, start_decode_index: int = 0
+) -> Generator[tuple[int, "av.Packet[Any]"]]:
+    """Yield ``(frame_idx, packet)`` pairs in decode order.
+
+    Start at ``start_decode_index``, a row in ``Mp4FrameIndex``.
+    Packets carry the indexed timestamps and keyframe flags.
+    The supplied stream must be seekable and remains open after iteration.
+    """
+    if not 0 <= start_decode_index < len(index):
+        msg = "start_decode_index must lie within the frame index"
+        raise ValueError(msg)
+    file_size = stream.seek(0, os.SEEK_END)
+    time_base = Fraction(index.time_base_num, index.time_base_den)
+    for frame_idx in range(start_decode_index, len(index)):
+        offset, size = int(index.offset[frame_idx]), int(index.size[frame_idx])
+        if offset < 0 or size <= 0 or size > file_size - offset:
+            msg = (
+                f"frame index {frame_idx} byte range [{offset}, {offset + size}) is invalid for media size {file_size}"
+            )
+            raise ValueError(msg)
+        if stream.tell() != offset:
+            stream.seek(offset)
+        packet_bytes = stream.read(size)
+        if len(packet_bytes) != size:
+            msg = f"short read for frame index {frame_idx}: expected {size} bytes at {offset}, got {len(packet_bytes)}"
+            raise ValueError(msg)
+        # PyAV 17's byte-input storage can expire during threaded decoding; allocate FFmpeg-owned storage.
+        packet = av.Packet(size)
+        packet.update(packet_bytes)
+        packet.dts = int(index.dts_ticks[frame_idx])
+        packet.pts = _frame_pts_ticks(index, frame_idx)
+        packet.time_base = time_base
+        packet.is_keyframe = bool(index.is_keyframe[frame_idx])
+        # Preserve the index row through frame reordering and duplicate PTS values.
+        packet.opaque = frame_idx
+        yield frame_idx, packet
+
+
+@attrs.define
+class StreamingVideoDecoder:
+    """Shared state for forward-only decoding across a sequence of plans.
+
+    Decoding starts when the first frame is requested. Finishing or abandoning
+    a plan preserves the decoding position for later plans, which must continue
+    in presentation order.
+
+    Call ``close()`` to release owned resources. Caller-supplied streams
+    remain open.
+    """
+
+    source: DataSource
+    metadata: Mp4Metadata
+    frame_index: Mp4FrameIndex
+    config: CpuVideoDecodeConfig = DEFAULT_VIDEO_DECODE_CONFIG
+    resources: ExitStack = attrs.field(factory=ExitStack, init=False, repr=False)
+    context: VideoCodecContext | None = attrs.field(default=None, init=False, repr=False)
+    packets: "Iterator[tuple[int, av.Packet[Any]]]" = attrs.field(factory=lambda: iter(()), init=False, repr=False)
+    pending: Iterator[av.VideoFrame] = attrs.field(factory=lambda: iter(()), init=False, repr=False)
+    flushed: bool = attrs.field(default=False, init=False)
+    closed: bool = attrs.field(default=False, init=False)
+    last_position: int = attrs.field(default=-1, init=False)
+    last_pixels: npt.NDArray[np.uint8] | None = attrs.field(default=None, init=False, repr=False)
+    _finalizer: Callable[[], object] = attrs.field(init=False, repr=False)
+
+    def __attrs_post_init__(self) -> None:
+        """Register cleanup of owned media when the decoder is released."""
+        self._finalizer = weakref.finalize(self, self.resources.close)
+
+    def close(self) -> None:
+        """Cancel the shared pass and release codec buffers and owned media."""
+        self.closed = True
+        self.pending = iter(())
+        self.packets = iter(())
+        self.context = None
+        self.last_pixels = None
+        self._finalizer()
+
+
+def _start_streaming_decode(state: StreamingVideoDecoder, plan: StreamingDecodePlan) -> None:
+    """Create a codec session at the first consumed plan's preceding keyframe."""
+    if plan.preceding_keyframe_idx is None:
+        msg = "a nonempty streaming plan requires a preceding keyframe index"
+        raise ValueError(msg)
+    metadata, index = state.metadata, state.frame_index
+    if metadata.frame_count != len(index) or Fraction(metadata.time_base_num, metadata.time_base_den) != Fraction(
+        index.time_base_num, index.time_base_den
+    ):
+        msg = "metadata and frame index disagree on frame count or time base"
+        raise ValueError(msg)
+    context = cast("VideoCodecContext", av.CodecContext.create(metadata.codec_name, "r"))
+    context.extradata = metadata.extradata
+    context.width, context.height = metadata.width, metadata.height
+    context.thread_type = av.codec.context.ThreadType[state.config.thread_type]
+    context.thread_count = state.config.thread_count
+    context.copy_opaque = True
+    if state.config.export_mvs:
+        context.flags2 |= av.codec.context.Flags2.export_mvs
+    stream = state.resources.enter_context(open_data_source(state.source))
+    state.packets = iter_indexed_video_packets(stream, index, start_decode_index=plan.preceding_keyframe_idx)
+    state.context = context
+
+
+def _next_streaming_frame(state: StreamingVideoDecoder) -> av.VideoFrame | None:
+    """Consume pending decoded frames before feeding more encoded packets, flushing once at EOF."""
+    context = state.context
+    if context is None:
+        msg = "streaming decoder has not started"
+        raise RuntimeError(msg)
+    while True:
+        frame = next(state.pending, None)
+        if frame is not None:
+            return frame
+        if state.flushed:
+            return None
+        row = next(state.packets, None)
+        if row is None:
+            state.flushed = True
+        state.pending = iter(context.decode(None if row is None else row[1]))
+
+
+def _decode_streaming_target(state: StreamingVideoDecoder, position: int) -> npt.NDArray[np.uint8]:
+    """Decode dependency frames and convert only the selected frame to an RGB array."""
+    frame_idx = int(state.frame_index.pts_sort_order[position])
+    while True:
+        frame = _next_streaming_frame(state)
+        if frame is None:
+            msg = f"indexed media ended before target frame index {frame_idx} (presentation position {position})"
+            raise ValueError(msg)
+        identity = frame.opaque
+        if not isinstance(identity, int) or not 0 <= identity < len(state.frame_index):
+            msg = "decoder output has no valid indexed frame identity"
+            raise ValueError(msg)
+        if identity == frame_idx:
+            return cast("npt.NDArray[np.uint8]", frame.to_ndarray(format=state.config.dest_format))
+
+
+def execute_streaming_decode_plan(
+    state: StreamingVideoDecoder, plan: StreamingDecodePlan
+) -> Generator[tuple[int, npt.NDArray[np.uint8]]]:
+    """Yield planned ``(position, pixels)`` pairs in presentation order.
+
+    Positions are presentation-order frame indices; pixels are RGB arrays.
+    Frames are materialized on demand. Repeated outputs for the same frame
+    share an array, including across plans.
+
+    Plans sharing ``state`` must be consumed in presentation order.
+    Closing this iterator abandons the plan without closing the decoder.
+    Errors close the decoder.
+    """
+    try:
+        for position_value, count in zip(plan.frame_indices, plan.counts, strict=True):
+            position = int(position_value)
+            if state.closed:
+                msg = "streaming decoder is closed"
+                raise RuntimeError(msg)  # noqa: TRY301 -- errors must close the shared pass
+            if position < state.last_position:
+                msg = "streaming decode plans must be consumed in presentation order"
+                raise RuntimeError(msg)  # noqa: TRY301 -- errors must close the shared pass
+            if state.context is None:
+                _start_streaming_decode(state, plan)
+            if position != state.last_position:
+                state.last_pixels = _decode_streaming_target(state, position)
+                state.last_position = position
+            pixels = state.last_pixels
+            if pixels is None:
+                msg = "streaming decoder has no selected frame"
+                raise RuntimeError(msg)  # noqa: TRY301 -- errors must close the shared pass
+            for _ in range(int(count)):
+                if state.closed or state.last_position != position:
+                    msg = "streaming decode plans must be consumed in order on an open decoder"
+                    raise RuntimeError(msg)  # noqa: TRY301 -- errors must close the shared pass
+                yield position, pixels
+    except Exception:
+        state.close()
+        raise

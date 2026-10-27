@@ -39,8 +39,14 @@ from cosmos_curator.core.sensors.sensors.group import SensorGroup
 from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
     IndexRecordUnusableError,
     StreamingCameraSensor,
+    stream_camera_windows,
 )
 from cosmos_curator.core.sensors.types.types import TimestampSource, VideoFrameAlignmentField
+from cosmos_curator.core.sensors.utils.video import (
+    StreamingDecodePlan,
+    StreamingVideoDecoder,
+    iter_video_frames,
+)
 from cosmos_curator.next.recipes.mp4_index.contracts import FRAME_INDEX_SCHEMA
 
 _DATA = pathlib.Path(__file__).resolve().parents[3] / "pipelines" / "video" / "data"
@@ -191,20 +197,23 @@ def test_window_count_does_not_change_selected_timestamps_or_pixels(clip: pathli
 
 
 @pytest.mark.parametrize("window_count", [1, 5])
-def test_window_payloads_decode_lazily_with_one_frame_of_lookahead(
+def test_window_payloads_materialize_only_the_requested_frames(
     monkeypatch: pytest.MonkeyPatch, window_count: int
 ) -> None:
     """Requesting windows decodes nothing; pulling a row advances only the shared cursor."""
     decoded_count = 0
     timestamps_ns = np.arange(30, dtype=np.int64) * 10
 
-    def decoded_frames(*_args: object, **_kwargs: object) -> Iterator[tuple[int, np.ndarray]]:
+    def decoded_frames(_decoder: StreamingVideoDecoder, plan: StreamingDecodePlan) -> Iterator[tuple[int, np.ndarray]]:
         nonlocal decoded_count
-        for index, timestamp_ns in enumerate(timestamps_ns):
+        for index, count in zip(plan.frame_indices, plan.counts, strict=True):
             decoded_count += 1
-            yield int(timestamp_ns), np.full((1, 1, 3), index, dtype=np.uint8)
+            for _ in range(int(count)):
+                yield int(index), np.full((1, 1, 3), index, dtype=np.uint8)
 
-    monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames", decoded_frames)
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.execute_streaming_decode_plan", decoded_frames
+    )
     sensor = _sensor_with_eof(_CLIP, timestamps_ns)
     width_ns = 300 // window_count
     spec = SamplingSpec(grid=SamplingGrid(0, 300, timestamps_ns, stride_ns=width_ns, duration_ns=width_ns))
@@ -215,7 +224,7 @@ def test_window_payloads_decode_lazily_with_one_frame_of_lookahead(
     rows = (row for payload in payloads for row in payload.frames())
     row_count = 0
     for index, (reference_ns, source_ns, frame) in enumerate(rows):
-        assert decoded_count == min(index + 2, len(timestamps_ns))
+        assert decoded_count == index + 1
         assert reference_ns == source_ns == timestamps_ns[index]
         assert frame[0, 0, 0] == index
         row_count += 1
@@ -538,10 +547,14 @@ def test_a_container_with_fewer_frames_than_the_timeline_raises() -> None:
     native = _timeline(_CLIP)
     longer = np.concatenate([native, [int(native[-1]) + 1]])
 
-    sensor = _sensor_with_eof(_CLIP, longer)
-
+    payloads = stream_camera_windows(
+        iter_video_frames(_CLIP),
+        longer,
+        _whole_clip(24.0, len(longer)),
+        policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS),
+    )
     with pytest.raises(ValueError, match="container ended"):
-        _walk(sensor, 24.0, _ONE_SECOND_NS)
+        [row for payload in payloads for row in payload.frames()]
 
 
 def test_a_container_with_more_frames_than_the_timeline_raises() -> None:
@@ -549,10 +562,14 @@ def test_a_container_with_more_frames_than_the_timeline_raises() -> None:
     native = _timeline(_CLIP)
     shorter = native[:-1]
 
-    sensor = _sensor_with_eof(_CLIP, shorter)
-
+    payloads = stream_camera_windows(
+        iter_video_frames(_CLIP),
+        shorter,
+        _whole_clip(24.0, len(shorter)),
+        policy=NearestTimestampPolicy(max_delta_ns=_ONE_SECOND_NS),
+    )
     with pytest.raises(ValueError, match="holds more frames"):
-        _walk(sensor, 24.0, _ONE_SECOND_NS)
+        [row for payload in payloads for row in payload.frames()]
 
 
 def test_a_missed_exposure_is_served_by_repeating_its_neighbour() -> None:
@@ -733,7 +750,7 @@ def test_an_explicitly_zero_composition_offset_also_means_no_reordering() -> Non
 
 
 def test_a_non_zero_composition_offset_signals_reordering() -> None:
-    """A populated ctts offset is the container saying decode order and display order come apart."""
+    """Composition offsets can make decode order and presentation order differ."""
     assert _sensor_from_rows(_frame_rows(composition_offset_ticks=_INDEX_FRAME_TICKS)).has_bframes is True
 
 
@@ -891,16 +908,22 @@ def test_indexed_alignment_uses_the_selected_field_for_the_matching_frames(
             **row,
             "dts_ticks": dts,
             "composition_offset_ticks": offset,
+            "is_keyframe": True,
             "eof_ns": eof,
             "sof_ns": eof - 30,
             "moe_ns": eof - 50,
         }
         for row, dts, offset, eof in zip(_frame_rows(), [0, 10, 20], [30, 0, -5], [300, 100, 200], strict=True)
     ]
-    decoded = [(pts, np.full((1, 1, 3), frame_id, dtype=np.uint8)) for pts, frame_id in [(5, 1), (10, 2), (25, 0)]]
+
+    def decoded_frames(decoder: StreamingVideoDecoder, plan: StreamingDecodePlan) -> Iterator[tuple[int, np.ndarray]]:
+        for position, count in zip(plan.frame_indices, plan.counts, strict=True):
+            sample = decoder.frame_index.pts_sort_order[position]
+            for _ in range(int(count)):
+                yield int(position), np.full((1, 1, 3), sample, dtype=np.uint8)
+
     monkeypatch.setattr(
-        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames",
-        lambda *_args, **_kwargs: iter(decoded),
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.execute_streaming_decode_plan", decoded_frames
     )
     sensor = StreamingCameraSensor(
         b"video", frame_index=_frame_index(rows, metadata), metadata=metadata, alignment_field=timestamp_field
@@ -937,7 +960,9 @@ def test_dts_sampling_rejects_reordered_frames_before_decoding(monkeypatch: pyte
     )
     np.testing.assert_array_equal(sensor.timestamps_ns, frame_index.dts_ns)
     decoder = Mock(side_effect=AssertionError("unexpected decode"))
-    monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames", decoder)
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.execute_streaming_decode_plan", decoder
+    )
     with pytest.raises(ValueError, match="matching decode and presentation order"):
         sensor.sample(_whole_clip(30.0, 3), policy=NearestTimestampPolicy(max_delta_ns=0))
     decoder.assert_not_called()
@@ -947,7 +972,7 @@ def test_dts_sampling_rejects_reordered_frames_before_decoding(monkeypatch: pyte
     "alignment_field",
     [VideoFrameAlignmentField.PTS_NS, VideoFrameAlignmentField.DTS_NS, VideoFrameAlignmentField.EOF_NS],
 )
-def test_sampling_pulls_only_one_frame_ahead(
+def test_sampling_materializes_one_target_at_a_time(
     monkeypatch: pytest.MonkeyPatch, alignment_field: VideoFrameAlignmentField
 ) -> None:
     """Frames retain presentation order and are pulled only as the consumer advances."""
@@ -960,17 +985,18 @@ def test_sampling_pulls_only_one_frame_ahead(
     for rank, sample in enumerate(presentation_order):
         rows[sample]["composition_offset_ticks"] = rank * 10 - rows[sample]["dts_ticks"]
         rows[sample]["eof_ns"] = 100 + rank * 10
+        rows[sample]["is_keyframe"] = True
     decoded_count = 0
 
-    def decoded_frames() -> Iterator[tuple[int, np.ndarray]]:
+    def decoded_frames(_decoder: StreamingVideoDecoder, plan: StreamingDecodePlan) -> Iterator[tuple[int, np.ndarray]]:
         nonlocal decoded_count
-        for rank, sample in enumerate(presentation_order):
+        for rank, count in zip(plan.frame_indices, plan.counts, strict=True):
             decoded_count += 1
-            yield rank * 10, np.full((1, 1, 3), sample, dtype=np.uint8)
+            for _ in range(int(count)):
+                yield int(rank), np.full((1, 1, 3), presentation_order[rank], dtype=np.uint8)
 
     monkeypatch.setattr(
-        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.iter_video_frames",
-        lambda *_args, **_kwargs: decoded_frames(),
+        "cosmos_curator.core.sensors.sensors.streaming_camera_sensor.execute_streaming_decode_plan", decoded_frames
     )
     sensor = StreamingCameraSensor(
         b"video", frame_index=_frame_index(rows, metadata), metadata=metadata, alignment_field=alignment_field
@@ -986,7 +1012,7 @@ def test_sampling_pulls_only_one_frame_ahead(
     for rank, (_align_ns, timestamp_ns, frame) in enumerate(payload.frames()):
         assert timestamp_ns == timestamps[rank]
         assert int(frame[0, 0, 0]) == presentation_order[rank]
-        assert decoded_count == min(rank + 2, count)
+        assert decoded_count == rank + 1
         served_count += 1
     assert served_count == count
 

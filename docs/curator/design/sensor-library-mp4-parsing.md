@@ -7,13 +7,18 @@ PyAV and the FFmpeg CLI do not provide a general interface for retrieving arbitr
 payloads.
 
 `box_probe.index_from_boxes` is an independent indexer: it indexes a video with PyAV from the
-extracted `moov` and `moof` boxes alone, laid out at their source offsets with zeros in place of
-media, and returns libav's `VideoProbe` with `Mp4Metadata` built from it. It indexes the stream
-libav ranks best, keeps libav's timestamps, reads fragment layouts this parser refuses, and leaves
-null the metadata fields libav does not report; it does not run UUID handlers. The
-underlying per-packet index is `video_probe` in `cosmos_curator.core.sensors.utils.video`, which
-opens a source with FFmpeg's `ignore_editlist` and reports each packet's decode time, unshifted by
-the edit list, with its composition offset, byte range, duration, and keyframe flag in decode order.
+extracted `moov` and `moof` boxes alone. Its synthetic stream places `moov` at offset zero, keeps
+each `moof` at its original source offset, and replaces media with zeros. It returns a `VideoProbe`
+with `Mp4Metadata` built from it. It indexes the requested video stream, defaulting to libav's
+preferred stream when `stream_idx` is omitted. It keeps libav's timestamps, reads fragment layouts
+this parser refuses, and leaves null the metadata fields libav does not report; it does not run
+UUID handlers.
+
+The box indexer calls `probe_open_video_stream` in `cosmos_curator.core.sensors.utils.video` on
+its already-open container. It reads keyframe flags from the header index and decode times,
+composition offsets, byte ranges, and durations from a full demux. The container is opened with
+FFmpeg's `ignore_editlist`, leaving timestamps unshifted by edit lists. `video_probe` is a separate
+wrapper that opens a source before probing it.
 
 The implementation lives in `cosmos_curator.core.sensors.mp4`; its typed metadata and frame-index
 views live in `cosmos_curator.core.sensors.data.mp4`. Callers supply the inputs and decide how to
@@ -78,8 +83,9 @@ share the `pts_ns` buffer. Nonzero transformations allocate separate arrays.
 `VideoFrameAlignmentField`: `PTS_NS` (the default), `EDITED_PTS_NS`, `DTS_NS`, `EOF_NS`, `SOF_NS`, or
 `MOE_NS`. Its `timestamps_ns` property reports the selected index timestamps. Absent or partially
 missing timestamps raise an error; selecting SOF or MOE does not substitute EOF or infer values.
-Decoded frames always stream in presentation order. Alignment retains the current frame and one
-lookahead frame; windows do not collect decoded pixels. DTS remains readable in decode order for
+Decoded frames stream in presentation order: the order frames are intended to be shown. Alignment
+selects frames from index timestamps before decoding and caches the last selected RGB array for repeats;
+windows do not collect decoded pixels. DTS remains readable in decode order for
 integrity checks. Sampling with DTS raises when decode and presentation order differ, since
 reordering decoded frames would require an additional pixel buffer.
 
@@ -109,9 +115,11 @@ These readers consume Arrow tables and metadata rows supplied by the caller. The
 datasets or depend on a storage client.
 
 `Mp4Metadata.track_id` is the selected track's native unsigned MP4 ID, preserved by both indexers.
-`StreamingCameraSensor(source, metadata=metadata, frame_index=frame_index)` decodes the track identified
-by `metadata.track_id`; a missing track is an error. Without a supplied pair, `stream_idx` selects the
-video stream for lazy indexing, and the resulting metadata identifies the track to decode.
+`StreamingCameraSensor(source, metadata=metadata, frame_index=frame_index)` reads the selected track's
+encoded samples directly from the index's byte ranges and configures its codec from the metadata.
+The caller must pair the index with the media it describes. Decoding validates byte ranges and output
+sample identities without reopening the container to look up `track_id`. Without a supplied pair,
+`stream_idx` selects the video stream for lazy indexing.
 
 ## Sampling windows and decoded-frame memory
 
@@ -126,12 +134,30 @@ same `NearestTimestampPolicy.max_delta_ns` tolerance.
 share one forward decode pass, so windows must be non-overlapping and their frames must be consumed
 in order. Creating payloads does not decode their pixels; decoding advances as `payload.frames()`
 is iterated. Callers can feed successive payloads into one clip output. The streaming recipe's current
-one-window-per-clip mapping does not limit this sensor-library behavior.
+one-window-per-clip mapping does not limit this sensor-library behavior. Collecting payloads before
+consuming their frames is supported. Skipping or abandoning a partially consumed window permits
+continuing with a later one; returning to an earlier window raises.
+
+The sensor selects frames using its configured index timestamp field and passes their
+presentation-order positions to `make_streaming_decode_plan`. The resulting `StreamingDecodePlan`
+records unique frame positions, repetition counts, and the preceding keyframe's decode-order index.
+A plan is independent of sampling windows and timestamp matching.
+
+On the first consumed target, `StreamingVideoDecoder` starts decoding at its latest usable
+preceding sync sample and discards dependency frames without converting them to RGB. Subsequent
+plans continue through the same codec context. Packet DTS/PTS in stream time-base ticks and opaque
+sample identities preserve frame associations through B-frame reordering, duplicate packet PTS,
+and sensor-clock alignment.
+Decoding performs no `av.open()`, demuxing, or container index scan; lazy index creation remains explicit.
+The existing `CameraSensor` and its `DecodePlan` are unchanged.
+
+Encoded MP4 samples enter the codec as `av.Packet` objects. The codec returns decoded `av.VideoFrame`
+objects; only selected decoded frames are converted to RGB NumPy arrays.
 
 | Sensor | Decoded-frame retention |
 | --- | --- |
 | `CameraSensor` | Materializes a window's selected frames as a batch. Smaller windows reduce that batch. |
-| `StreamingCameraSensor` | Yields frames lazily. Alignment retains the current frame and one lookahead frame, independently of window length. |
+| `StreamingCameraSensor` | Converts only planned targets and caches the last selected RGB array for repeats, independently of window length. Decoded `av.VideoFrame` objects awaiting consumption are retained across windows. |
 
 Increasing the number of windows is therefore not a decoded-pixel memory control for streaming
 consumption. This bound does not describe total actor memory: codec and I/O buffers, indexes,
