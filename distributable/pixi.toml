@@ -98,7 +98,6 @@ PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.13.0"
 torchvision = "==0.28.0"
-vllm = "==0.30.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/" }
 paddleocr = "==2.10.*"
 
@@ -130,11 +129,18 @@ nvidia-nvjitlink = "*"
 nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
+[feature.vllm.dependencies]
+transformers = ">=5.16.1,<5.20.0"
+
+[feature.vllm.pypi-dependencies]
+vllm = "==0.32.0"
+
 [feature.vllm-omni.dependencies]
-transformers = ">=5.13.0,<5.15"
+transformers = ">=5.16.1,<5.20.0"
 
 [feature.vllm-omni.pypi-dependencies]
-vllm-omni = "==0.30.0"
+vllm = "==0.32.0"
+vllm-omni = "==0.32.0"
 
 [feature.cuml]
 channels = ["nvidia"]
@@ -237,10 +243,10 @@ pypcd4 = "*"
 
 [environments]
 cuml = ["core", "cuml", "tracing"]
-default = ["core", "runtime", "media", "transformers", "tracing", "profiling", "sensors"]
+default = ["core", "runtime", "vllm", "media", "transformers", "tracing", "profiling", "sensors"]
 legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
-seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]
-sam3 = ["core", "runtime", "media", "sam3", "tracing", "profiling"]
+seedvr = ["core", "runtime", "vllm", "media", "transformers", "seedvr", "tracing", "profiling"]
+sam3 = ["core", "runtime", "vllm", "media", "sam3", "tracing", "profiling"]
 style-transfer = ["core", "runtime", "media", "transformers", "vllm-omni", "tracing", "profiling"]

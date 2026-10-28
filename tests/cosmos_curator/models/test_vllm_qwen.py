@@ -20,10 +20,19 @@ import pytest
 import torch
 
 from cosmos_curator.core.utils.model import pixi_utils
-from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
+from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig, WindowConfig
 
 if pixi_utils.is_running_in_env("default"):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast, Qwen2_5_VLProcessor, Qwen2VLImageProcessor, Qwen2VLVideoProcessor
+    from vllm.config import ModelConfig, MultiModalConfig
+    from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLMultiModalProcessor, Qwen2_5_VLProcessingInfo
+    from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
+    from vllm.multimodal.processing import InputProcessingContext
+
     from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError
+    from cosmos_curator.models.vllm_interface import make_metadata
     from cosmos_curator.models.vllm_qwen import (
         VllmQwen,
         VllmQwen3VL,
@@ -74,19 +83,56 @@ def test_make_llm_input_qwen() -> None:
     video_frames, video_metadata = result["multi_modal_data"]["video"][0]
     assert video_frames.shape == (2, 3, 32, 32)
     assert video_metadata == metadata
-    assert result["mm_processor_kwargs"] == {
-        "video_metadata": [
-            {
-                "total_num_frames": 2,
-                "fps": 2.0,
-                "width": 32,
-                "height": 32,
-                "duration": 1.0,
-                "video_backend": "opencv",
-                "frames_indices": [0, 1],
-            }
-        ]
-    }
+    assert "mm_processor_kwargs" not in result
+
+
+@pytest.mark.env("default")
+@pytest.mark.parametrize("sampling_fps", [2.0, 4.0])
+@pytest.mark.parametrize("refine", [False, True], ids=["initial", "refined"])
+def test_qwen_video_input_reaches_hf_processor(sampling_fps: float, *, refine: bool) -> None:
+    """Real vLLM/HF processing preserves sampled frames and timing without duplicate kwargs."""
+    frames = torch.zeros(4, 3, 56, 56, dtype=torch.uint8)
+    metadata = make_metadata([frames], WindowConfig(sampling_fps=sampling_fps))[0]
+    prompt_processor = MagicMock()
+    prompt_processor.apply_chat_template.return_value = torch.tensor([[1, 2, 3]])
+    config = VllmConfig(model_variant="qwen")
+    inputs = VllmQwen.make_llm_input("Describe the video", frames, metadata, prompt_processor, config)
+    if refine:
+        request = VllmCaptionRequest(request_id="r1", inputs=inputs, caption="A video caption")
+        inputs = VllmQwen.make_refined_llm_request(request, prompt_processor).inputs
+
+    # A tiny tokenizer avoids downloading weights; video preprocessing and vLLM's
+    # metadata extraction and processor invocation use the installed implementations.
+    unknown_token = "<unk>"  # noqa: S105 - tokenizer vocabulary marker
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({unknown_token: 0, "<|image_pad|>": 1, "<|video_pad|>": 2}, unk_token=unknown_token),
+        ),
+        unk_token=unknown_token,
+        additional_special_tokens=["<|image_pad|>", "<|video_pad|>"],
+    )
+    hf_processor = Qwen2_5_VLProcessor(
+        image_processor=Qwen2VLImageProcessor(),
+        video_processor=Qwen2VLVideoProcessor(cap_pixels_per_frame=True),
+        tokenizer=tokenizer,
+    )
+    model_config = MagicMock(spec=ModelConfig)
+    model_config.dtype = torch.float32
+    model_config.get_multimodal_config.return_value = MultiModalConfig(
+        mm_processor_kwargs={"do_resize": False, "do_sample_frames": False},
+    )
+    info = MagicMock(spec=Qwen2_5_VLProcessingInfo)
+    info.ctx = InputProcessingContext(model_config, tokenizer)
+    info.get_data_parser.return_value = Qwen2VLMultiModalDataParser(spatial_merge_size=2, video_needs_metadata=True)
+    info.get_hf_processor.return_value = hf_processor
+    vllm_processor = Qwen2_5_VLMultiModalProcessor(info, MagicMock())
+
+    mm_items = vllm_processor.data_parser.parse_mm_data(inputs["multi_modal_data"])
+    hf_inputs = vllm_processor._get_hf_mm_inputs(mm_items, inputs.get("mm_processor_kwargs", {}))
+    processed = vllm_processor._call_hf_processor(hf_inputs.hf_data, hf_inputs.hf_kwargs)
+
+    assert processed["video_grid_thw"].tolist() == [[2, 4, 4]]
+    assert processed["second_per_grid_ts"] == pytest.approx([2 / sampling_fps])
 
 
 @pytest.mark.env("default")
@@ -244,7 +290,7 @@ def test_make_llm_input_qwen3vl_video_emits_top_level_size() -> None:
 
 @pytest.mark.env("default")
 def test_make_llm_input_qwen_does_not_emit_size_when_cap_is_set() -> None:
-    """Qwen2.5 timing metadata is emitted without Qwen3 request-level size."""
+    """Qwen2.5 keeps timing in the video payload without Qwen3 request-level size."""
     mock_tensor = torch.tensor([[1, 2, 3, 4, 5]])
     mock_processor = MagicMock()
     mock_processor.apply_chat_template.return_value = mock_tensor
@@ -255,20 +301,8 @@ def test_make_llm_input_qwen_does_not_emit_size_when_cap_is_set() -> None:
 
     result = VllmQwen.make_llm_input("Describe the video", frames, metadata, mock_processor, config)
 
-    assert result["mm_processor_kwargs"] == {
-        "video_metadata": [
-            {
-                "total_num_frames": 2,
-                "fps": 2.0,
-                "width": 32,
-                "height": 32,
-                "duration": 1.0,
-                "video_backend": "opencv",
-                "frames_indices": [0, 1],
-            }
-        ]
-    }
-    assert "size" not in result["mm_processor_kwargs"]
+    assert result["multi_modal_data"]["video"][0][1] == metadata
+    assert "mm_processor_kwargs" not in result
 
 
 @pytest.mark.env("default")

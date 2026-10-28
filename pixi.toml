@@ -28,14 +28,14 @@ azure-identity = "*"
 azure-storage-blob = "*"
 cattrs = "*"
 easydict = "*"
-fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM 0.30 requires fastapi[standard]<0.137
+fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM requires fastapi[standard]<0.137
 huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
 mcap = ">=1.3.1,<2.0.0"
 numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 nvidia-ml-py = "*"
-nvtx = "==0.2.15" # vllm==0.30.0 depends on nvtx==0.2.15
+nvtx = "==0.2.15" # match vLLM's NVTX requirement
 openssl = ">=3.6.2,<4.0a0" # default env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
 pandas = "*"
 pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
@@ -161,7 +161,7 @@ platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 [feature.runtime.dependencies]
 cuda-libraries-dev = "==13.0.3"
 gpustat = "*"
-huggingface_hub = ">=1.31.0" # vllm==0.30.0 requires >=1.31.0; keep the conda solve compatible
+huggingface_hub = ">=1.31.0" # vLLM requires this floor; keep the conda solve compatible
 libgl = "*" # PaddleOCR/OpenCV image paths need libGL.so.1
 pycountry = "*"
 
@@ -177,7 +177,6 @@ PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmp
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.13.0"
 torchvision = "==0.28.0"
-vllm = "==0.30.0" # not available on conda-forge
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
@@ -213,14 +212,23 @@ nvidia-nvjitlink = "*"
 nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
+# Regular inference can upgrade vLLM independently of the Omni-compatible pair.
+[feature.vllm.dependencies]
+transformers = ">=5.16.1,<5.20.0" # keep the conda solve within vLLM's supported range
+
+[feature.vllm.pypi-dependencies]
+vllm = "==0.32.0" # not available on conda-forge
+
 # Cosmos3 Generator Transfer runs in-process through vLLM-Omni's offline `Omni`
 # API. Keep it out of the shared runtime feature: its large, transfer-specific
 # dependency tree (including openai-whisper) is needed only by StyleTransferStage.
+# Pin its matching vLLM here so regular inference upgrades do not change this pair.
 [feature.vllm-omni.dependencies]
-transformers = ">=5.13.0,<5.15" # vllm-omni==0.30.0 requires this Transformers range
+transformers = ">=5.16.1,<5.20.0" # keep the conda solve within Omni's supported range
 
 [feature.vllm-omni.pypi-dependencies]
-vllm-omni = "==0.30.0" # not available on conda-forge
+vllm = "==0.32.0" # keep paired with the Omni release
+vllm-omni = "==0.32.0" # not available on conda-forge
 
 [feature.cuml]
 channels = ["nvidia"]
@@ -250,7 +258,7 @@ pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as cor
 pylance = ">=14.0.0,<15.0.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
-transformers = ">=5.11.0,<6.0.0" # vLLM 0.30 + native Cosmos3 support require recent Transformers v5
+transformers = ">=5.11.0,<6.0.0" # native Cosmos3 support requires recent Transformers v5
 
 [feature.transformers.pypi-dependencies]
 # sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
@@ -354,11 +362,11 @@ pypcd4 = "*" # direct import in hesai_lidar_parser; declare, don't inherit
 tools = ["tools"]
 cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
-default = ["core", "runtime", "media", "transformers", "tracing", "profiling", "sensors"]
+default = ["core", "runtime", "vllm", "media", "transformers", "tracing", "profiling", "sensors"]
 dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev", "sensors"]
 legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
-seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]
-sam3 = ["core", "runtime", "media", "sam3", "tracing", "profiling"]
+seedvr = ["core", "runtime", "vllm", "media", "transformers", "seedvr", "tracing", "profiling"]
+sam3 = ["core", "runtime", "vllm", "media", "sam3", "tracing", "profiling"]
 style-transfer = ["core", "runtime", "media", "transformers", "vllm-omni", "tracing", "profiling"]

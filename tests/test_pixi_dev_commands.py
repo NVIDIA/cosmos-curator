@@ -212,9 +212,9 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert runtime_feature["channels"] == ["conda-forge", "nvidia"]
     assert runtime_feature["platforms"] == ["linux-64-cuda", "linux-aarch64-cuda"]
     assert "system-requirements" not in runtime_feature
-    for dependency_name in ("torch", "torchvision", "vllm", "cvcuda-cu13", "PyNvVideoCodec"):
+    for dependency_name in ("torch", "torchvision", "cvcuda-cu13", "PyNvVideoCodec"):
         assert dependency_name in runtime_pypi_dependencies
-    for dependency_name in ("transformers-cosmos3", "vllm-cosmos3"):
+    for dependency_name in ("vllm", "transformers-cosmos3", "vllm-cosmos3"):
         assert dependency_name not in runtime_pypi_dependencies
     for dependency_name in ("av", "opencv-python-headless", "opencv-python", "opencv-contrib-python"):
         assert dependency_name not in runtime_pypi_dependencies
@@ -234,6 +234,7 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert pixi_config["environments"]["default"] == [
         "core",
         "runtime",
+        "vllm",
         "media",
         "transformers",
         "tracing",
@@ -242,13 +243,22 @@ def test_runtime_features_are_separated_from_core() -> None:
     ]
 
 
-def test_vllm_omni_is_isolated_to_style_transfer_environment() -> None:
-    """Verify transfer-only dependencies do not leak into shared runtime environments."""
+def test_vllm_and_omni_have_independent_pins() -> None:
+    """Regular inference can change its vLLM pin without changing the style-transfer pair."""
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
     features = pixi_config["feature"]
 
+    assert "vllm" not in pixi_config.get("pypi-dependencies", {})
+    assert {name for name, feature in features.items() if "vllm" in feature.get("pypi-dependencies", {})} == {
+        "vllm",
+        "vllm-omni",
+    }
     assert "vllm-omni" not in features["runtime"]["pypi-dependencies"]
-    assert features["vllm-omni"]["pypi-dependencies"] == {"vllm-omni": "==0.30.0"}
+    assert set(features["vllm"]["pypi-dependencies"]) == {"vllm"}
+    assert set(features["vllm-omni"]["pypi-dependencies"]) == {"vllm", "vllm-omni"}
+    for feature_name in ("vllm", "vllm-omni"):
+        for constraint in features[feature_name]["pypi-dependencies"].values():
+            assert constraint.startswith("==")
     assert pixi_config["environments"]["style-transfer"] == [
         "core",
         "runtime",
@@ -259,6 +269,7 @@ def test_vllm_omni_is_isolated_to_style_transfer_environment() -> None:
         "profiling",
     ]
     for environment_name in ("default", "seedvr", "sam3"):
+        assert "vllm" in pixi_config["environments"][environment_name]
         assert "vllm-omni" not in pixi_config["environments"][environment_name]
 
 
