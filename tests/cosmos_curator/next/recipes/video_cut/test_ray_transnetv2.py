@@ -10,7 +10,6 @@ from unittest.mock import Mock, patch
 
 import attrs
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import ray
 import torch
@@ -28,6 +27,7 @@ from cosmos_curator.next.recipes.video_cut.config import (
 )
 from cosmos_curator.next.recipes.video_cut.discovery import discover_items
 from tests.cosmos_curator.next.append.fresh_cluster import assert_fresh_cluster_resume
+from tests.cosmos_curator.next.core.helpers import staged_results
 from tests.cosmos_curator.next.fresh_driver import run_in_fresh_driver
 from tests.cosmos_curator.next.recipes.video_cut.conftest import RECIPE
 
@@ -126,8 +126,8 @@ def test_separate_decode_transport_and_terminal_errors(
     with checkpointed_processing(attempt) as processing:
         pipeline.cut_sources(processing, config)
     assert DataContext.get_current().checkpoint_config is None
-    outcomes = pq.read_table(attempt.workspace.results)
-    assert outcomes.schema.equals(resolve_bindings(config).spec.staged_schema, check_metadata=True)
+    outcomes = staged_results(attempt.workspace.results)
+    assert outcomes.schema.equals(resolve_bindings(config).spec.result_fields, check_metadata=True)
     rows = {row["source_uri"]: row for row in outcomes.to_pylist()}
     assert len(rows) == len(uris)
     assert rows["s3://test-bucket/missing.mp4"]["error_stage"] == "source-read"
@@ -177,7 +177,7 @@ def assert_transnetv2_resume(config_json: str, log_dir: str, video_path: str) ->
     transnetv2.validate_weights = lambda: Path("/config/models/unused.pth")
     transnetv2.ray_data_gpu_runtime_env = lambda _: {}
     # The shared retune revalidates, which would restore the GPU reservation.
-    recipe = attrs.evolve(RECIPE, retune=partial(_without_gpus, parquet_rows_per_file=3, rows_per_fragment=5))
+    recipe = attrs.evolve(RECIPE, retune=partial(_without_gpus, rows_per_checkpoint=3, rows_per_fragment=5))
     summary = assert_fresh_cluster_resume(recipe, config, process=pipeline.cut_sources, work_logs=work_logs, num_cpus=4)
     assert (summary["appended_rows"], summary["errors"]) == (4, 1)
 

@@ -18,7 +18,7 @@ import lance
 import pyarrow as pa
 
 from cosmos_curator.next.core.lance_datasource import ROW_ADDRESS_FIELDS
-from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE, parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE
 from cosmos_curator.next.core.recovery_bindings import RecoveryBindings
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 from cosmos_curator.next.utils.identity import canonical_digest, json_snapshot
@@ -81,8 +81,8 @@ class EnrichmentSpec:
 
     The derived ``result_schema`` holds canonical processing results:
     ``ROW_ADDRESS_FIELDS``, the non-null ID, and the owned output
-    fields. The shared writer converts these to ``staged_schema`` for Parquet;
-    recipes use only the canonical schema exposed by ``ProcessingScope``.
+    fields. The shared writer stages them unchanged; recipes use only the
+    canonical schema exposed by ``ProcessingScope``.
     """
 
     id_column: str
@@ -92,10 +92,9 @@ class EnrichmentSpec:
     validate_batch: Callable[[pa.RecordBatch], None]
     validate_input: Callable[[lance.LanceDataset], None] | None = None
     result_schema: pa.Schema = attrs.field(init=False, eq=False)
-    staged_schema: pa.Schema = attrs.field(init=False, eq=False)
 
     def __attrs_post_init__(self) -> None:
-        """Reject malformed publication contracts and derive staged rows before any processing begins."""
+        """Reject malformed publication contracts and derive result rows before any processing begins."""
         for schema in (self.input_fields, self.output_fields):
             if len(schema.names) != len(set(schema.names)):
                 msg = "Enrichment schemas require unique field names"
@@ -122,7 +121,6 @@ class EnrichmentSpec:
             ]
         )
         object.__setattr__(self, "result_schema", result)
-        object.__setattr__(self, "staged_schema", parquet_stable_schema(result))
 
     @property
     def owner(self) -> str:
@@ -168,16 +166,10 @@ def canonical_results(staged: pa.Table, spec: EnrichmentSpec) -> pa.Table:
     Processing applies this before Ray checkpoints a result's ID, so every
     checkpointed result can be published. Publication applies it again.
     """
-    if not staged.schema.equals(spec.staged_schema, check_metadata=True):
-        msg = "Staged results do not match the enrichment's staged schema"
+    if not staged.schema.equals(spec.result_schema, check_metadata=True):
+        msg = "Staged results do not match the enrichment's result schema"
         raise ValueError(msg)
-    try:
-        canonical = staged.select([spec.id_column, *spec.output_fields.names]).cast(
-            pa.schema([spec.result_schema.field(spec.id_column), *spec.output_fields])
-        )
-    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
-        msg = "Staged results do not convert to the canonical output types"
-        raise ValueError(msg) from exc
+    canonical = staged.select([spec.id_column, *spec.output_fields.names])
     # Terminal validation sees the same canonical columns as pending-fragment scans.
     for batch in canonical.to_batches(max_chunksize=VALIDATION_BATCH_SIZE):
         spec.validate_batch(batch)

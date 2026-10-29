@@ -34,7 +34,7 @@ def config(tmp_path: Path) -> ResolvedVideoEmbedConfig:
             "kind": "video-embed",
             "input": {"media_root": str(tmp_path / "media")},
             "execution": {
-                "parquet_rows_per_file": 1,
+                "rows_per_checkpoint": 1,
                 "lance_read_batch_size": 2,
                 "media_attempts": 1,
                 "publication_memory_gib": 0.25,
@@ -128,7 +128,7 @@ def results(enrichment_input: inputs.EnrichmentInput, work_rows: list[dict[str, 
 
 
 def _retune(config: ResolvedVideoEmbedConfig) -> ResolvedVideoEmbedConfig:
-    execution = config.execution.model_copy(update={"inference_batch_size": 8, "parquet_rows_per_file": 7})
+    execution = config.execution.model_copy(update={"inference_batch_size": 8, "rows_per_checkpoint": 7})
     return config.model_copy(update={"execution": execution})
 
 

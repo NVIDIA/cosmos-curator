@@ -14,11 +14,13 @@ from cosmos_curator.next.append import contracts
 from tests.cosmos_curator.next.append.helpers import ITEM_FIELDS, RESULT_FIELDS, ROW_FIELDS, make_results
 
 
-def test_staged_schema_is_the_parquet_round_trip_of_item_results(spec: contracts.AppendSpec) -> None:
-    """Lists stage with Parquet's child names; staged rows convert back to the canonical result types."""
-    assert spec.staged_schema.field("values").type == pa.list_(pa.field("element", pa.int64()))
-    staged = make_results(spec, {"a": [1]}).cast(spec.staged_schema)
-    assert contracts.canonical_results(staged, spec).schema.equals(RESULT_FIELDS)
+def test_item_results_stage_in_their_canonical_types(spec: contracts.AppendSpec) -> None:
+    """Staged rows keep the canonical result schema; a converted storage representation is rejected."""
+    results = make_results(spec, {"a": [1]})
+    assert contracts.canonical_results(results, spec).equals(results)
+    converted = results.cast(RESULT_FIELDS.set(1, pa.field("values", pa.list_(pa.field("element", pa.int64())))))
+    with pytest.raises(ValueError, match="result schema"):
+        contracts.canonical_results(converted, spec)
 
 
 @pytest.mark.parametrize(
@@ -42,7 +44,6 @@ def test_staged_schema_is_the_parquet_round_trip_of_item_results(spec: contracts
             "same non-null string field",
         ),
         ({"input_fields": ITEM_FIELDS.append(pa.field("score", pa.float64()))}, "strings, integers, or booleans"),
-        ({"result_fields": RESULT_FIELDS.append(pa.field("day", pa.date64()))}, "reads back from Parquet"),
         ({"error_column": "missing"}, "error column must be an item result field"),
         ({"error_column": "item_id"}, "error column must be an item result field"),
         ({"error_column": "values"}, "nullable string"),
@@ -60,7 +61,6 @@ def test_staged_schema_is_the_parquet_round_trip_of_item_results(spec: contracts
         "id-type-differs",
         "non-string-id",
         "item-float",
-        "unstable-result",
         "error-not-a-result",
         "error-is-the-id",
         "error-not-a-string",
@@ -90,7 +90,7 @@ def test_canonical_results_validate_bounded_batches(spec: contracts.AppendSpec) 
     """Terminal validation sees canonical types in batches of at most 1,024 item results."""
     validator = Mock()
     checked = attrs.evolve(spec, validate_batch=validator)
-    staged = make_results(spec, {f"item-{index}": [index] for index in range(2_049)}).cast(spec.staged_schema)
+    staged = make_results(spec, {f"item-{index}": [index] for index in range(2_049)})
     contracts.canonical_results(staged, checked)
     sizes = [call.args[0].num_rows for call in validator.call_args_list]
     assert sizes == [1_024, 1_024, 1]
@@ -100,9 +100,9 @@ def test_canonical_results_validate_bounded_batches(spec: contracts.AppendSpec) 
 @pytest.mark.parametrize("fault", ["schema", "invalid"])
 def test_canonical_results_reject_unpublishable_rows(spec: contracts.AppendSpec, fault: str) -> None:
     """A row publication would reject fails processing before Ray can checkpoint its item."""
-    staged = make_results(spec, {"a": [1]}).cast(spec.staged_schema)
+    staged = make_results(spec, {"a": [1]})
     if fault == "schema":
-        with pytest.raises(ValueError, match="staged schema"):
+        with pytest.raises(ValueError, match="result schema"):
             contracts.canonical_results(staged.drop_columns(["values"]), spec)
     else:
         rows = staged.to_pylist()

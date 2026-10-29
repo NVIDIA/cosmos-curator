@@ -1,22 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Own the Ray Data checkpoint configuration for one complete processing plan, and the rows it stages."""
+"""Own the Ray Data checkpoint configuration for one complete processing plan, and the rows it stages.
+
+Staged rows are Arrow IPC files. They keep every canonical Arrow type, including
+null fixed-size lists, list child names, and metadata, so publication reads back
+exactly the rows processing validated. Ray's two-phase checkpointed write covers
+file sinks, so a staged file and its checkpointed IDs stay consistent.
+"""
 
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.fs as pafs
-import pyarrow.parquet as pq
 import ray
 from loguru import logger
+from ray.data.block import BlockAccessor
 from ray.data.checkpoint import CheckpointConfig
+from ray.data.datasource import BlockBasedFileDatasink, FileBasedDatasource
 
 _CHECKPOINT_CONFIG_LOCK = threading.Lock()
 # Terminal-value validation reads staged or published results in Arrow batches of at most this many rows.
 VALIDATION_BATCH_SIZE = 1_024
+# Staged files are zstd-compressed Arrow IPC files.
+STAGED_FILE_EXTENSION = "arrow"
+_STAGED_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="zstd")
 
 
 @contextmanager
@@ -120,36 +131,65 @@ def installed_checkpoint(
             context.checkpoint_config = None
 
 
-def _parquet_stable(data_type: pa.DataType) -> pa.DataType:
-    """Stage list types as Parquet reads them back, including lists nested in structs.
+def write_staged_table(table: pa.Table, sink: str | pa.NativeFile) -> None:
+    """Write staged rows as one file that reads back with the same schema and values."""
+    # An IPC file holds one dictionary per field, so every chunk must share it. Each
+    # chunk would also become its own record batch, which readers fetch with a
+    # separate request; a checkpoint group joins one chunk per processing block.
+    table = table.unify_dictionaries().combine_chunks()
+    with pa.ipc.new_file(sink, table.schema, options=_STAGED_WRITE_OPTIONS) as writer:
+        writer.write_table(table)
 
-    Parquet names every list child ``element``. Arrow cannot read back a null
-    ``fixed_size_list``, so fixed-size lists stage as variable lists; publishers
-    cast staged values to their canonical types and reject rows that do not convert.
+
+def read_staged_table(source: str | pa.NativeFile) -> pa.Table:
+    """Read one file written by ``write_staged_table``.
+
+    An open file must be random access; it is fetched whole with one read. A
+    staged file holds one checkpoint group, and object storage charges a round
+    trip for each of the footer, metadata, and body reads the IPC reader issues.
     """
-    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
-        value = data_type.value_field
-        element = value.with_name("element").with_type(_parquet_stable(value.type))
-        return pa.large_list(element) if pa.types.is_large_list(data_type) else pa.list_(element)
-    if pa.types.is_struct(data_type):
-        return pa.struct([field.with_type(_parquet_stable(field.type)) for field in data_type])
-    return data_type
+    if isinstance(source, pa.NativeFile):
+        source = pa.BufferReader(source.read_buffer())
+    return pa.ipc.open_file(source).read_all()
 
 
-def parquet_stable_schema(schema: pa.Schema) -> pa.Schema:
-    """Return the schema to stage checkpointed rows in: the fields as Parquet reads them back.
+class StagedResultsDatasink(BlockBasedFileDatasink):
+    """Write each write task's checkpoint group to one staged file.
 
-    Ray checkpoints a row's ID once its Parquet file is written, so a staged
-    schema that changed in that round trip would leave checkpointed results that
-    publication rejects. Reject any type Parquet would not read back unchanged,
-    such as ``date64``, before processing begins. Schema-level metadata is dropped.
+    Ray applies its two-phase checkpoint to file sinks: a pending checkpoint names
+    the file before it is written, and recovery deletes files whose checkpoints
+    never committed.
     """
-    staged = pa.schema([field.with_type(_parquet_stable(field.type)) for field in schema])
-    sink = pa.BufferOutputStream()
-    pq.write_table(staged.empty_table(), sink)
-    restored = pq.read_schema(pa.BufferReader(sink.getvalue()))
-    for field, read_back in zip(staged, restored, strict=True):
-        if not field.equals(read_back, check_metadata=True):
-            msg = f"Staged field {field.name!r} of type {field.type} reads back from Parquet as {read_back.type}"
-            raise ValueError(msg)
-    return staged
+
+    def __init__(self, path: str, *, filesystem: pafs.FileSystem, rows_per_file: int) -> None:
+        """Stage at least ``rows_per_file`` rows per file; a strict upstream repartition makes it exact."""
+        super().__init__(
+            path, filesystem=filesystem, min_rows_per_file=rows_per_file, file_format=STAGED_FILE_EXTENSION
+        )
+
+    def write_block_to_file(self, block: BlockAccessor, file: pa.NativeFile) -> None:
+        """Write the task's combined block."""
+        write_staged_table(block.to_arrow(), file)
+
+
+class StagedResultsDatasource(FileBasedDatasource):
+    """Read staged files with Ray Data, one block per file."""
+
+    def _open_input_source(self, filesystem: pafs.FileSystem, path: str, **open_args: object) -> pa.NativeFile:
+        # A random-access file knows its size, so it is read in one request; Ray opens sequential streams by default.
+        del open_args
+        return filesystem.open_input_file(path)
+
+    def _read_stream(self, f: pa.NativeFile, path: str) -> Iterator[pa.Table]:
+        del path
+        yield read_staged_table(f)
+
+
+def read_staged_results(paths: str | list[str], *, filesystem: pafs.FileSystem) -> ray.data.Dataset:
+    """Read staged files, or a directory of them, with Ray Data."""
+    return cast(
+        "ray.data.Dataset",
+        ray.data.read_datasource(
+            StagedResultsDatasource(paths, filesystem=filesystem, file_extensions=[STAGED_FILE_EXTENSION])
+        ),
+    )

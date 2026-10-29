@@ -8,13 +8,14 @@ table, resumes an attempt or discovers and selects new work, starts the recipe's
 Ray runtime when items are selected, runs the
 recipe's plan inside ``checkpointed_processing`` unless processing already
 completed, and publishes. The processing scope owns both ends of that
-items-to-Parquet plan: it reads the frozen selection and writes validated item
+checkpointed plan: it reads the frozen selection and stages validated item
 results inside one native Ray checkpoint. ``publish_append`` expands those
 results into packed fragments with Ray Data, appends successful, empty, and
 error outcomes together, then removes the verified workspace.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, cast
@@ -22,7 +23,6 @@ from typing import Any, cast
 import attrs
 import lance
 import pyarrow as pa
-import pyarrow.dataset as pads
 import pyarrow.fs as pafs
 import ray
 from lance.fragment import FragmentMetadata
@@ -32,9 +32,13 @@ from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.next.append import commit, contracts
 from cosmos_curator.next.append.attempts import AppendAttempt, reconcile_and_select_attempt
-from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE
+from cosmos_curator.next.core.ray_checkpoints import STAGED_FILE_EXTENSION, read_staged_results, read_staged_table
 from cosmos_curator.next.core.recovery_workspace import CheckpointWriter, RecoveryWorkspace, checkpoint_writer
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
+
+# Staged files the driver reads at once to prove coverage. Each costs an open and
+# one read, so object-storage latency, not bandwidth, bounds the check.
+_COVERAGE_READ_CONCURRENCY = 32
 
 
 def _read_items(rows: list[dict[str, Any]], schema: pa.Schema) -> Iterator[pa.Table]:
@@ -83,7 +87,7 @@ class SelectionDatasource(Datasource):
 
 @attrs.frozen
 class ProcessingScope:
-    """Both ends of one checkpointed items-to-Parquet plan over an attempt's selection.
+    """Both ends of one checkpointed plan from an attempt's selected items to staged results.
 
     Recipes use ``read``, ``write``, and ``result_schema``; ``checkpointed_processing``
     owns the attempt and the checkpoint writer behind them.
@@ -115,7 +119,7 @@ class ProcessingScope:
         )
 
     def write(self, results: ray.data.Dataset) -> None:
-        """Validate and encode canonical item results, checkpoint them, then record processing completion.
+        """Validate and stage canonical item results, checkpoint them, then record processing completion.
 
         Rows must match ``result_schema``, one per item; a checkpointed result can
         always be published.
@@ -147,12 +151,14 @@ def checkpointed_processing(attempt: AppendAttempt) -> Iterator[ProcessingScope]
 
 
 def staged_result_files(workspace: RecoveryWorkspace, *, filesystem: pafs.FileSystem) -> list[str]:
-    """List the workspace's staged Parquet files as filesystem paths, in a stable order."""
+    """List the workspace's staged result files as filesystem paths, in a stable order."""
     entries = filesystem.get_file_info(
         pafs.FileSelector(filesystem_path(workspace.results), recursive=True, allow_not_found=True)
     )
     return sorted(
-        entry.path for entry in entries if entry.type == pafs.FileType.File and entry.path.endswith(".parquet")
+        entry.path
+        for entry in entries
+        if entry.type == pafs.FileType.File and entry.path.endswith(f".{STAGED_FILE_EXTENSION}")
     )
 
 
@@ -193,22 +199,31 @@ def summary_message(kind: str, summary: Mapping[str, object]) -> str:
     )
 
 
+def _staged_columns(path: str, *, filesystem: pafs.FileSystem, columns: Sequence[str]) -> pa.Table:
+    with filesystem.open_input_file(path) as file:
+        return read_staged_table(file).select(columns)
+
+
 def _require_coverage(
     files: Sequence[str], *, filesystem: pafs.FileSystem, spec: contracts.AppendSpec, selected: tuple[str, ...]
 ) -> int:
-    """Check exact staged item coverage in batches and count terminal errors without retaining messages."""
+    """Check exact staged item coverage file by file and count terminal errors without retaining messages.
+
+    Files are read whole and concurrently; only their ID and error columns are kept.
+    """
     columns = [spec.id_column, *([spec.error_column] if spec.error_column is not None else [])]
-    staged = pads.dataset(list(files), schema=spec.staged_schema, filesystem=filesystem, format="parquet")
+    read = partial(_staged_columns, filesystem=filesystem, columns=columns)
     remaining = set(selected)
     errors = 0
-    for batch in staged.to_batches(columns=columns, batch_size=VALIDATION_BATCH_SIZE):
-        ids = batch.column(spec.id_column).to_pylist()
-        if None in ids or len(ids) != len(set(ids)) or not set(ids) <= remaining:
-            msg = f"Staged {spec.id_column} results do not exactly cover the selected items"
-            raise ValueError(msg)
-        remaining.difference_update(ids)
-        if spec.error_column is not None:
-            errors += batch.num_rows - batch.column(spec.error_column).null_count
+    with ThreadPoolExecutor(max_workers=_COVERAGE_READ_CONCURRENCY, thread_name_prefix="staged-coverage") as pool:
+        for staged in pool.map(read, files):
+            ids = staged[spec.id_column].to_pylist()
+            if None in ids or len(ids) != len(set(ids)) or not set(ids) <= remaining:
+                msg = f"Staged {spec.id_column} results do not exactly cover the selected items"
+                raise ValueError(msg)
+            remaining.difference_update(ids)
+            if spec.error_column is not None:
+                errors += staged.num_rows - staged[spec.error_column].null_count
     if remaining:
         msg = f"Staged {spec.id_column} results do not exactly cover the selected items"
         raise ValueError(msg)
@@ -237,7 +252,7 @@ def stage_append_fragments(
         # recipe's resources or storage environment.
         msg = "Start Ray with the recipe's runtime before publishing selected items"
         raise RuntimeError(msg)
-    staged = ray.data.read_parquet(list(files), filesystem=filesystem)
+    staged = read_staged_results(list(files), filesystem=filesystem)
     rows = staged.map_batches(partial(_appended_rows, spec=bindings.spec), batch_format="pyarrow", batch_size=None)
     packed = rows.repartition(target_num_rows_per_block=bindings.execution.rows_per_fragment, strict=True)
     descriptors = packed.map_batches(

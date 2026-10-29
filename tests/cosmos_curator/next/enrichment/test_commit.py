@@ -310,7 +310,7 @@ def test_staged_coverage_and_values_are_validated(
     rows = [row, row] if corruption == "duplicate_offset" else [row]
     with pytest.raises(ValueError, match=r"misaligned|Invalid test result"):
         commit.prepare_fragment(
-            pa.Table.from_pylist(rows, schema=spec.staged_schema),
+            pa.Table.from_pylist(rows, schema=spec.result_schema),
             version=int(dataset.version),
             bindings=make_bindings(dataset.uri, spec),
         )
@@ -353,7 +353,7 @@ def test_terminal_validation_sees_canonical_columns(tmp_path: Path) -> None:
     dataset = inputs.register_fields(make_bindings(uri, spec))
     staged = pa.table(
         {"fragment_id": [0, 0], "row_offset": [0, 1], "item_id": ["a", "b"], "vector": [[1.0, 0.0], [0.0, 1.0]]},
-        schema=spec.staged_schema,
+        schema=spec.result_schema,
     )
     bindings = make_bindings(uri, spec)
     candidates = [
@@ -365,7 +365,7 @@ def test_terminal_validation_sees_canonical_columns(tmp_path: Path) -> None:
     canonical = [("item_id", pa.string()), ("vector", vector.type)]
     assert seen == [canonical, canonical]
 
-    staged_vector = spec.staged_schema.field("vector")
-    short = staged.set_column(3, staged_vector, pa.array([[1.0], [0.0, 1.0]], staged_vector.type))
-    with pytest.raises(ValueError, match="do not convert to the canonical output types"):
+    # Staged rows keep the fixed-size type, so a short vector can only arrive in a different schema.
+    short = staged.set_column(3, "vector", pa.array([[1.0], [0.0, 1.0]], pa.list_(pa.float32())))
+    with pytest.raises(ValueError, match="Invalid staged enrichment schema"):
         commit.prepare_fragment(short, bindings=bindings, version=int(dataset.version))

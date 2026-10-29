@@ -29,7 +29,7 @@ def test_normalization_and_contract_scope(config: ResolvedVideoCutConfig) -> Non
     raw = config.model_dump(mode="json")
     raw["input"]["uris"] = list(reversed(raw["input"]["uris"])) * 2
     tuned = resolve_config_data(
-        raw, overrides=["execution.parquet_rows_per_file=10", "execution.rows_per_fragment=99", "execution.max_items=2"]
+        raw, overrides=["execution.rows_per_checkpoint=10", "execution.rows_per_fragment=99", "execution.max_items=2"]
     )
     assert tuned.execution.max_items == 2
     assert tuned.input == config.input
@@ -118,7 +118,7 @@ def test_root_config_renders_without_discovery(tmp_path: Path, monkeypatch: pyte
         'input.uris=["s3://test-bucket/a\\nb.mp4"]',
         "split.duration_s=0.0000000001",
         "split.min_duration_s=100.0",
-        "execution.parquet_rows_per_file=0",
+        "execution.rows_per_checkpoint=0",
         "execution.max_items=0",
         "execution.fixed_stride.probe_mode=auto",
         "execution.typo=1",
@@ -149,7 +149,7 @@ def test_cli_template_render_schema_and_dispatch(
     assert "derived from `media_root`" in template.stdout
     assert "root_uri" not in config_template()["input"]
     assert config_template()["execution"]["fixed_stride"] == {"probe_cpus": 0.25}
-    assert config_template()["execution"]["parquet_rows_per_file"] == 1_000
+    assert config_template()["execution"]["rows_per_checkpoint"] == 1_000
     assert config_template()["execution"]["rows_per_fragment"] == 100_000
     assert "max_items" not in config_template()["execution"]
     assert "Set execution.max_items" in template.stdout
@@ -170,9 +170,7 @@ def test_cli_template_render_schema_and_dispatch(
     path.write_text(config.model_dump_json())
     kind = pipeline_runtime.BUILTIN_PIPELINE_KINDS.get("video-cut")
     assert kind.validate(path, ()) == {"ok": True}
-    assert (
-        json.loads(kind.render(path, ("execution.parquet_rows_per_file=3",)))["execution"]["parquet_rows_per_file"] == 3
-    )
+    assert json.loads(kind.render(path, ("execution.rows_per_checkpoint=3",)))["execution"]["rows_per_checkpoint"] == 3
     seen = []
 
     def run(resolved: ResolvedVideoCutConfig) -> dict[str, int]:
@@ -211,11 +209,11 @@ def test_transnetv2_resolution_and_contract(config: ResolvedVideoCutConfig) -> N
             "execution.transnetv2.inference_cpus=0.5",
             "execution.transnetv2.inference_memory_gib=3",
             "execution.transnetv2.window_batch_size=8",
-            "execution.parquet_rows_per_file=1",
+            "execution.rows_per_checkpoint=1",
         ],
     )
     assert tuned.split.cutting_contract == resolved.split.cutting_contract
-    assert tuned.execution.parquet_rows_per_file == 1
+    assert tuned.execution.rows_per_checkpoint == 1
     assert tuned.execution.transnetv2.cpus == 4
     assert tuned.execution.transnetv2.memory_gib == 8
     assert tuned.execution.transnetv2.inference_cpus == 0.5

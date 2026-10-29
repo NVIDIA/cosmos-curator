@@ -73,7 +73,7 @@ Use the recipe's current design notes when changing publication or recovery. To 
    so saved selections resume without listing source storage. The
    [`enrichment`](enrichment/__init__.py) and [`append`](append/__init__.py) package docstrings list the recipe-facing
    API.
-4. Emit canonical results in `ProcessingScope.result_schema`; the shared writer owns Parquet conversion. Keep model
+4. Emit canonical results in `ProcessingScope.result_schema`; the shared writer stages them unchanged. Keep model
    prerequisites inside `process`. Append recipes declare terminal errors with `AppendSpec.error_column`, and shared
    publication counts them. Expansion must preserve every item's completion and error details in Lance rows,
    including an outcome row when an item has no derived records.

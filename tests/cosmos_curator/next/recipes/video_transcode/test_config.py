@@ -21,7 +21,7 @@ def test_defaults_and_cli_template() -> None:
     config = resolve_config_data(
         yaml.safe_load(kind.template_yaml()), overrides=["input.media_root=s3://test-bucket/actual-videos"]
     )
-    assert config.execution.parquet_rows_per_file == 1_000
+    assert config.execution.rows_per_checkpoint == 1_000
     assert config.execution.transcode_memory_gib == 4.0
     assert config.execution.publication_memory_gib == 8.0
     assert config.input.spans_lance_uri == f"{config.input.media_root}/lance"
@@ -37,7 +37,7 @@ def test_encoding_identity_and_execution_overrides() -> None:
     tuned = resolve_config_data(
         data,
         overrides=[
-            "execution.parquet_rows_per_file=17",
+            "execution.rows_per_checkpoint=17",
             "execution.ffmpeg_batch_size=3",
             "execution.transcode_memory_gib=1.5",
             "execution.publication_memory_gib=2.0",
@@ -53,7 +53,7 @@ def test_encoding_identity_and_execution_overrides() -> None:
 @pytest.mark.parametrize(
     "override",
     [
-        "execution.parquet_rows_per_file=0",
+        "execution.rows_per_checkpoint=0",
         "execution.transcode_memory_gib=0",
         "execution.transcode_memory_gib=-1",
         "execution.transcode_memory_gib=.inf",

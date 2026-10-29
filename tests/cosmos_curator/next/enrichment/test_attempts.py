@@ -81,7 +81,7 @@ def _publish(
         candidates.extend(
             commit.PreparedFragment.from_row(row)
             for row in commit.prepare_fragment(
-                pa.Table.from_pylist(rows, schema=spec.staged_schema),
+                pa.Table.from_pylist(rows, schema=spec.result_schema),
                 version=int(dataset.version),
                 bindings=make_bindings(dataset.uri, spec),
             ).to_pylist()

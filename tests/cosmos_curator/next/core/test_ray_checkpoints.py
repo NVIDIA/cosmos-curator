@@ -3,6 +3,7 @@
 
 """Checkpoint ownership and context isolation without executing Ray."""
 
+import io
 import pathlib
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import pyarrow as pa
 import pyarrow.fs as pafs
 import pytest
 import ray
+from ray.data.block import BlockAccessor
 from ray.data.checkpoint import CheckpointConfig
 
 from cosmos_curator.next.core import ray_checkpoints
@@ -286,20 +288,64 @@ def test_ray_checkpoints_imports_without_recipe_or_engine_dependencies(repo_root
     assert completed.stdout.strip() == ""
 
 
-def test_staged_schemas_read_back_from_parquet_unchanged() -> None:
-    """Lists stage with Parquet's child names; field metadata survives and schema metadata does not."""
+def test_staged_tables_read_back_with_their_canonical_types(tmp_path: pathlib.Path) -> None:
+    """Nested and fixed-size lists with nulls, ``date64``, and all metadata stage without conversion."""
+    poses = pa.list_(pa.list_(pa.float32(), 3))
     schema = pa.schema(
         [
             pa.field("id", pa.string(), nullable=False, metadata={b"owner": b"recipe"}),
             pa.field("vector", pa.list_(pa.float32(), 4)),
-            pa.field("spans", pa.large_list(pa.struct([("start", pa.int64())]))),
+            pa.field("cameras", pa.list_(pa.struct([("key", pa.string()), ("poses", poses)]))),
+            pa.field("ragged", pa.large_list(pa.list_(pa.int32()))),
+            pa.field("day", pa.date64()),
         ],
         metadata={b"table": b"binding"},
     )
-    staged = ray_checkpoints.parquet_stable_schema(schema)
-    assert staged.metadata is None
-    assert staged.field("id").equals(schema.field("id"), check_metadata=True)
-    assert staged.field("vector").type == pa.list_(pa.field("element", pa.float32()))
-    assert staged.field("spans").type == pa.large_list(pa.field("element", pa.struct([("start", pa.int64())])))
-    with pytest.raises(ValueError, match=r"'day' of type date64.* reads back from Parquet as date32"):
-        ray_checkpoints.parquet_stable_schema(pa.schema([("day", pa.date64())]))
+    table = pa.table(
+        {
+            "id": ["a", "b"],
+            "vector": [[1, 2, 3, 4], None],
+            "cameras": [[{"key": "front", "poses": [[1, 2, 3], None]}, {"key": "rear", "poses": None}], None],
+            "ragged": [[[1], None, []], None],
+            "day": [1_700_000_000_000, None],
+        },
+        schema=schema,
+    )
+    path = str(tmp_path / f"staged.{ray_checkpoints.STAGED_FILE_EXTENSION}")
+    ray_checkpoints.write_staged_table(table, path)
+
+    restored = ray_checkpoints.read_staged_table(path)
+    assert restored.schema.equals(schema, check_metadata=True)
+    assert restored.equals(table)
+
+
+def test_an_open_staged_file_is_fetched_with_one_read(tmp_path: pathlib.Path) -> None:
+    """Object storage charges a round trip per read, so a staged file is fetched whole rather than by section."""
+    path = tmp_path / f"staged.{ray_checkpoints.STAGED_FILE_EXTENSION}"
+    table = pa.table({"id": ["a", "b"], "value": [1, 2]})
+    ray_checkpoints.write_staged_table(table, str(path))
+    reads: list[int | None] = []
+
+    class CountingFile(io.FileIO):
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(size)
+            return super().read(size)
+
+    with CountingFile(path) as file:
+        assert ray_checkpoints.read_staged_table(pa.PythonFile(file, mode="r")).equals(table)
+    assert reads == [path.stat().st_size]
+
+
+def test_the_staged_datasink_writes_a_checkpoint_group_as_one_file(tmp_path: pathlib.Path) -> None:
+    """A write task's chunks may carry different dictionaries; its one staged file holds one batch sharing one."""
+    datasink = ray_checkpoints.StagedResultsDatasink(str(tmp_path), filesystem=pafs.LocalFileSystem(), rows_per_file=5)
+    assert datasink.min_rows_per_write == 5
+    assert datasink.file_format == ray_checkpoints.STAGED_FILE_EXTENSION
+    labels = pa.dictionary(pa.int32(), pa.string())
+    block = pa.table({"label": pa.chunked_array([pa.array(["x", "y"]).cast(labels), pa.array(["z"]).cast(labels)])})
+    path = tmp_path / f"group.{ray_checkpoints.STAGED_FILE_EXTENSION}"
+    with pa.OSFile(str(path), "wb") as file:
+        datasink.write_block_to_file(BlockAccessor.for_block(block), file)
+
+    assert ray_checkpoints.read_staged_table(str(path))["label"].to_pylist() == ["x", "y", "z"]
+    assert pa.ipc.open_file(str(path)).num_record_batches == 1

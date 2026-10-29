@@ -13,12 +13,12 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.fs as pafs
-import pyarrow.parquet as pq
 import pytest
 from ray.data.context import DataContext
 
 from cosmos_curator.next.append import commit, contracts, execution, inputs
 from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.ray_checkpoints import STAGED_FILE_EXTENSION, StagedResultsDatasink, write_staged_table
 from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.append.helpers import (
@@ -56,14 +56,14 @@ def test_processing_scope_owns_checkpoint_and_sink(
     bindings: contracts.AppendBindings, items: pa.Table, monkeypatch: pytest.MonkeyPatch, *, fail_write: bool
 ) -> None:
     """The item ID keys the checkpoint, the sink shares its filesystem, and only success records completion."""
-    tuned = attrs.evolve(bindings, execution=bindings.execution.model_copy(update={"parquet_rows_per_file": 5}))
+    tuned = attrs.evolve(bindings, execution=bindings.execution.model_copy(update={"rows_per_checkpoint": 5}))
     attempt = select(tuned, items, max_items=2)
     assert attempt.workspace is not None
     plan = Mock()
     plan.map_batches.return_value = plan
     plan.repartition.return_value = plan
     if fail_write:
-        plan.write_parquet.side_effect = RuntimeError("injected write failure")
+        plan.write_datasink.side_effect = RuntimeError("injected write failure")
     reads = []
 
     def read(datasource: execution.SelectionDatasource, **kwargs: object) -> Mock:
@@ -84,11 +84,12 @@ def test_processing_scope_owns_checkpoint_and_sink(
     assert [row["item_id"] for row in rows] == ["a", "b"]
     assert checkpoint.id_column == "item_id"
     assert checkpoint.checkpoint_path == attempt.workspace.checkpoints
-    assert checkpoint.filesystem is plan.write_parquet.call_args.kwargs["filesystem"]
     plan.repartition.assert_called_once_with(target_num_rows_per_block=5, strict=True)
-    assert plan.write_parquet.call_args.args == (attempt.workspace.results,)
-    assert plan.write_parquet.call_args.kwargs["min_rows_per_file"] == 5
-    assert plan.write_parquet.call_args.kwargs["max_rows_per_file"] == 5
+    ((datasink,), _) = plan.write_datasink.call_args
+    assert isinstance(datasink, StagedResultsDatasink)
+    assert checkpoint.filesystem is datasink.filesystem.unwrap()
+    assert datasink.unresolved_path == attempt.workspace.results
+    assert datasink.min_rows_per_write == 5
     assert DataContext.get_current().checkpoint_config is None
     assert attempt.processing_complete() is not fail_write
 
@@ -130,8 +131,8 @@ def test_processing_validates_results_before_ray_checkpoints_them(
     ((validate,), options) = plan.map_batches.call_args
     # Default remote args after the strict repartition let Ray fuse validation into each group's write task.
     assert options == {"batch_format": "pyarrow", "batch_size": None, "zero_copy_batch": True}
-    assert [call[0] for call in plan.method_calls] == ["repartition", "map_batches", "write_parquet"]
-    assert validate(results).equals(results.cast(attempt.bindings.spec.staged_schema), check_metadata=True)
+    assert [call[0] for call in plan.method_calls] == ["repartition", "map_batches", "write_datasink"]
+    assert validate(results).equals(results, check_metadata=True)
     assert validate(results.slice(0, 0)).num_rows == 0
     error_with_values = [{"item_id": "a", "values": [1], "error": "unreadable a"}]
     with pytest.raises(ValueError, match="Invalid test result"):
@@ -164,11 +165,29 @@ def test_incomplete_results_never_publish(
     else:
         staged = pa.concat_tables([results, make_results(bindings.spec, {"x": [1]})])
     Path(attempt.workspace.results).mkdir(parents=True)
-    pq.write_table(staged, Path(attempt.workspace.results, "staged.parquet"))
+    write_staged_table(staged, str(Path(attempt.workspace.results, f"staged.{STAGED_FILE_EXTENSION}")))
     with pytest.raises(ValueError, match="do not exactly cover the selected items"):
         publish_attempt(attempt)
     assert lance.dataset(bindings.uri).version == attempt.dataset.version
     assert Path(attempt.workspace.root, "workspace.json").exists()
+
+
+@pytest.mark.parametrize("duplicated", [False, True])
+def test_coverage_spans_every_staged_file(
+    bindings: contracts.AppendBindings, items: pa.Table, results: pa.Table, *, duplicated: bool
+) -> None:
+    """Results staged across files cover each item once; an item staged in two files never publishes."""
+    attempt = select(bindings, items)
+    for index in range(results.num_rows):
+        stage_results(attempt, results.slice(index, 1))
+    if not duplicated:
+        outcome = publish_attempt(attempt)
+        assert (outcome.appended_rows, outcome.errors) == (4, 1)
+        return
+    stage_results(attempt, results.slice(0, 1))
+    with pytest.raises(ValueError, match="do not exactly cover the selected items"):
+        publish_attempt(attempt)
+    assert lance.dataset(bindings.uri).version == attempt.dataset.version
 
 
 @pytest.mark.parametrize("cleaned", [True, False])
@@ -321,6 +340,6 @@ def test_staging_never_starts_a_default_ray_runtime(
 ) -> None:
     """Expanding and staging fragments requires the recipe's Ray runtime."""
     monkeypatch.setattr(execution.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(execution.ray.data, "read_parquet", Mock(side_effect=AssertionError("Read staged results")))
+    monkeypatch.setattr(execution, "read_staged_results", Mock(side_effect=AssertionError("Read staged results")))
     with pytest.raises(RuntimeError, match="Start Ray with the recipe's runtime"):
-        execution.stage_append_fragments(["results.parquet"], filesystem=pafs.LocalFileSystem(), bindings=bindings)
+        execution.stage_append_fragments(["results.arrow"], filesystem=pafs.LocalFileSystem(), bindings=bindings)

@@ -65,7 +65,7 @@ def test_unfinished_selection_resumes_before_new_items(
 
 
 def test_canonical_result_schema_isolates_saved_work(bindings: contracts.AppendBindings) -> None:
-    """Canonical list widths remain incompatible even when Parquet gives them the same storage schema."""
+    """A saved selection never resumes under a different canonical list width."""
     spec = bindings.spec
     values_index = spec.result_fields.get_field_index("values")
     values_field = spec.result_fields.field("values")
@@ -81,7 +81,6 @@ def test_canonical_result_schema_isolates_saved_work(bindings: contracts.AppendB
         spec,
         result_fields=spec.result_fields.set(values_index, values_field.with_type(pa.list_(pa.int64(), 3))),
     )
-    assert changed_spec.staged_schema.equals(spec.staged_schema, check_metadata=True)
     changed = select(attrs.evolve(bindings, spec=changed_spec), items)
     assert changed.selected == saved.selected
     assert changed.workspace != saved.workspace
@@ -171,7 +170,7 @@ def test_partial_cleanup_cannot_leak_results_into_the_next_selection(
             recovery_workspace.logger.remove(sink)
         assert "workspace cleanup failed" in capfd.readouterr().err
     assert Path(workspace.checkpoints, "old-checkpoint").exists()
-    assert list(Path(workspace.results).glob("*.parquet"))
+    assert list(Path(workspace.results).glob("*.arrow"))
     assert lance.dataset(bindings.uri).count_rows() == 1
 
     second = select(bindings, items, max_items=1)

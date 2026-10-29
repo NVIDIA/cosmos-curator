@@ -10,7 +10,7 @@ video-cut -> video-transcode --+--> video-caption
 
 pending Lance clips -> checkpoint filter
   -> CPU download tasks -> GPU decode / sample / pinned processor / embedding actors
-  -> strict repartition -> checkpointed Parquet
+  -> strict repartition -> checkpointed Arrow IPC
   -> group by original fragment -> prepare column files on workers
   -> ONE Lance Update containing every selected fragment
 ```
@@ -109,14 +109,13 @@ valid clip tables remain usable after upstream history is pruned. Empty tables a
 pinned snapshot; selecting individually ready fragments from a growing table remains follow-up work. Payload reads
 and decoding still validate the media during processing.
 
-Parquet stores `fragment_id`, `row_offset`, `clip_id`, the vector, and metadata. Encoded media and prepared tensors
-never enter durable result files. Processing emits canonical fixed-size vectors, including null vectors for terminal
-media errors. The shared writer converts them to variable-length lists because Arrow 25 cannot read back null
-fixed-size lists from Parquet. It validates the decoded values before checkpointing; publication repeats this check
-and restores the fixed-size canonical fields.
-`execution.parquet_rows_per_file` sets the strict repartition and checkpoint shard boundary, defaulting to 1,000 rows.
+Staged results store `fragment_id`, `row_offset`, `clip_id`, the vector, and metadata. Encoded media and prepared
+tensors never enter durable result files. Processing emits canonical fixed-size vectors, including null vectors for
+terminal media errors, and the shared writer stages them unchanged as Arrow IPC. It validates the values before
+checkpointing; publication repeats this check.
+`execution.rows_per_checkpoint` sets the strict repartition and checkpoint shard boundary, defaulting to 1,000 rows.
 Shared non-null `int64` fields define the fragment and row addresses; the logical `clip_id` retains its canonical field
-definition. These staged schema definitions isolate incompatible earlier development workspaces.
+definition. These result schema definitions isolate incompatible earlier development workspaces.
 
 The workspace is `<output.staging_root_uri>/<contract-namespace>/`. Embedding contributes its
 pinned model and result contract to the
@@ -199,7 +198,7 @@ cosmos-curator slurm ray submit CLUSTER_CONFIG -- pixi run --as-is run-pipeline 
 ```
 
 CPU unit coverage includes sample indices for short clips, media failure classification,
-Parquet null-vector round trips, output validation, and caption coexistence. The shared conformance suite runs against
+staged null-vector round trips, output validation, and caption coexistence. The shared conformance suite runs against
 embedding's clip fixtures, covering coverage rejection, concurrent writers, ambiguous publication, and recovery. A CPU
 integration test runs the shared fresh-cluster scenario with model stand-ins: the native Ray plan resumes across fresh
 local clusters with one `curator_io` slot, previously checkpointed clips are neither downloaded nor inferred again,

@@ -174,11 +174,11 @@ def selected_fragments(dataset: lance.LanceDataset, selected: Sequence[int]) -> 
 def _namespace_manifest(dataset: lance.LanceDataset, spec: EnrichmentSpec) -> dict[str, Any]:
     # Persisted manifest keys: renaming one changes every namespace and orphans saved work.
     return {
-        "workspace_version": 5,
+        "workspace_version": 6,
         "input_uri": dataset.uri,
         "input_fields": field_ids(dataset, spec.input_fields.names),
         "result_contract": spec.result_contract,
-        "result_schema": spec.staged_schema.serialize().to_pybytes().hex(),
+        "result_schema": spec.result_schema.serialize().to_pybytes().hex(),
     }
 
 

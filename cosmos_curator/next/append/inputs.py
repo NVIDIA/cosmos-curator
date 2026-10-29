@@ -136,14 +136,13 @@ def published_item_ids(dataset: lance.LanceDataset, bindings: AppendBindings, it
 def _namespace_manifest(dataset: lance.LanceDataset, spec: AppendSpec) -> dict[str, object]:
     # Persisted manifest keys: renaming one changes every namespace and orphans saved work.
     return {
-        "workspace_version": 4,
+        "workspace_version": 5,
         "output_uri": dataset.uri,
         "owner": spec.owner,
         "id_column": spec.id_column,
         "result_contract": spec.result_contract,
         "input_schema": spec.input_fields.serialize().to_pybytes().hex(),
         "result_schema": spec.result_fields.serialize().to_pybytes().hex(),
-        "staged_schema": spec.staged_schema.serialize().to_pybytes().hex(),
         "output_schema": spec.output_fields.serialize().to_pybytes().hex(),
         "error_column": spec.error_column,
     }

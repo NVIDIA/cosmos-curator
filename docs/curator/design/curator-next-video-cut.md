@@ -9,7 +9,7 @@
 The design separates source processing from tabular publication:
 
 ```text
-select new sources -> probe + plan each source -> checkpointed Parquet with spans[]
+select new sources -> probe + plan each source -> checkpointed Arrow IPC with spans[]
                    -> Arrow expansion -> packed Lance fragments -> atomic append
                    -> workspace cleanup
 ```
@@ -20,7 +20,7 @@ select new sources -> probe + plan each source -> checkpointed Parquet with span
 - **Append one finite selection.** One atomic Lance commit publishes the new spans and empty/error outcomes together,
   allowing staging to be deleted afterward while preserving earlier fragments and every source's completion.
 
-The tradeoff is that interrupted publication rebuilds fragments from Parquet. This repeats tabular work while reusing
+The tradeoff is that interrupted publication rebuilds fragments from staged plans. This repeats tabular work while reusing
 checkpointed source plans, avoiding a separate publication ledger. Video-cut is the reference recipe for
 [shared append publication](curator-next-checkpoint-recovery.md#append-publication), which owns selection, checkpoint
 scopes, publication of all source outcomes, and recovery proof. Video-cut owns discovery, source probing and planning,
@@ -96,7 +96,7 @@ reserves one `curator_io` slot and defaults to 0.25 CPU, following the
 [large-download guidance](ray-data.md#large-source-downloads-and-curator_io). The pool autoscales and accepts late
 workers without a startup-derived maximum.
 
-Native checkpoints use `source_id` and advance in groups controlled by `parquet_rows_per_file`. Both methods default
+Native checkpoints use `source_id` and advance in groups controlled by `rows_per_checkpoint`. Both methods default
 to 1,000 source plans per file. Lower this setting to reduce replay at the cost of more checkpoint writes; setting it
 to one gives single-source durability. An unfinished group and other in-flight sources can replay. Completed plans
 contain no frames or encoded bytes.
@@ -123,7 +123,7 @@ and GPU inference stages:
 checkpoint-filtered source blocks -> download actors (curator_io)
   -> encoded bytes through Ray -> CPU tasks: probe, PyAV decode, resize
   -> tiny RGB frames, timestamps, and media fields through Ray -> GPU actors: TransNetV2 inference
-  -> one complete source plan -> checkpointed Parquet -> shared Lance append
+  -> one complete source plan -> checkpointed Arrow IPC -> shared Lance append
 ```
 
 PyAV decode tasks default to 3 CPUs (`execution.transnetv2.cpus`) and 2 GiB of host memory (`memory_gib`). Inference

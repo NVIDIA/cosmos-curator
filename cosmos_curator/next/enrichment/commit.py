@@ -6,7 +6,7 @@
 One logical writer owns a selected fragment and result field set. Selected input
 rows and their file layout are immutable; other writers may append
 fragments or enrich disjoint columns or fragments. Workers prepare column files
-from validated Parquet results. The driver reopens latest, checks ownership,
+from validated staged results. The driver reopens latest, checks ownership,
 and rebuilds stale descriptors before committing.
 Only compact descriptors reach the driver; media and inference remain recipe-owned.
 
@@ -75,7 +75,7 @@ def prepare_fragment(
 ) -> pa.Table:
     """Validate every address, identity, and value before staging owned columns."""
     spec = bindings.spec
-    if not batch.schema.equals(spec.staged_schema, check_metadata=True):
+    if not batch.schema.equals(spec.result_schema, check_metadata=True):
         msg = "Invalid staged enrichment schema"
         raise ValueError(msg)
     if batch["fragment_id"].null_count or pc.count_distinct(batch["fragment_id"]).as_py() != 1:

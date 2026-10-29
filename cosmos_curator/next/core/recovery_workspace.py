@@ -25,7 +25,7 @@ import ray
 from loguru import logger
 
 from cosmos_curator.next.core.config import CheckpointedExecutionConfig
-from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint, parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import StagedResultsDatasink, installed_checkpoint
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
 from cosmos_curator.next.utils.identity import json_snapshot
 from cosmos_curator.next.utils.storage import download_bytes, remove_prefix, write_if_absent
@@ -174,17 +174,15 @@ def _stage_results(
     results: pa.Table,
     *,
     result_schema: pa.Schema,
-    staged_schema: pa.Schema,
     validate: Callable[[pa.Table], pa.Table],
 ) -> pa.Table:
-    """Encode canonical recipe results and prove that publication can read and accept them."""
+    """Prove that publication can accept canonical recipe results before they are staged."""
     if not results.schema.equals(result_schema, check_metadata=True):
         msg = "Processing results do not match the canonical result schema"
         raise ValueError(msg)
-    staged = results.cast(staged_schema)
-    if staged.num_rows:
-        validate(staged)
-    return staged
+    if results.num_rows:
+        validate(results)
+    return results
 
 
 @attrs.frozen
@@ -196,32 +194,26 @@ class CheckpointWriter:
 
     workspace: RecoveryWorkspace
     result_schema: pa.Schema
-    staged_schema: pa.Schema = attrs.field(repr=False)
     validate: Callable[[pa.Table], pa.Table] = attrs.field(repr=False)
     execution: CheckpointedExecutionConfig = attrs.field(repr=False)
     filesystem: pafs.FileSystem = attrs.field(repr=False, eq=False)
 
     def write(self, results: ray.data.Dataset) -> None:
-        """Group canonical results strictly, encode and validate each group, write it, then record completion.
+        """Group canonical results strictly, validate each group, stage it, then record completion.
 
-        Rows must match ``result_schema``; the writer owns their conversion to
-        ``staged_schema``. Ray checkpoints a result's ID once its Parquet file is
-        written, so every row is validated first: a checkpointed result can always
-        be published. Publication must still prove exact coverage before committing.
-        Validating after the repartition, with default remote args, lets Ray fuse
-        it into each group's write task instead of adding a task per plan block.
+        Rows must match ``result_schema`` and stage in it unchanged. Ray checkpoints
+        a result's ID once its staged file is written, so every row is validated
+        first: a checkpointed result can always be published. Publication must
+        still prove exact coverage before committing. Validating after the
+        repartition, with default remote args, lets Ray fuse it into each group's
+        write task instead of adding a task per plan block.
         """
-        rows_per_file = self.execution.parquet_rows_per_file
-        stage = partial(
-            _stage_results, result_schema=self.result_schema, staged_schema=self.staged_schema, validate=self.validate
-        )
-        groups = results.repartition(target_num_rows_per_block=rows_per_file, strict=True)
+        rows_per_checkpoint = self.execution.rows_per_checkpoint
+        stage = partial(_stage_results, result_schema=self.result_schema, validate=self.validate)
+        groups = results.repartition(target_num_rows_per_block=rows_per_checkpoint, strict=True)
         publishable = groups.map_batches(stage, batch_format="pyarrow", batch_size=None, zero_copy_batch=True)
-        publishable.write_parquet(
-            self.workspace.results,
-            filesystem=self.filesystem,
-            min_rows_per_file=rows_per_file,
-            max_rows_per_file=rows_per_file,
+        publishable.write_datasink(
+            StagedResultsDatasink(self.workspace.results, filesystem=self.filesystem, rows_per_file=rows_per_checkpoint)
         )
         self.workspace.record_completion(storage_profile=self.execution.storage_profile)
 
@@ -237,12 +229,11 @@ def checkpoint_writer(
 ) -> Iterator[CheckpointWriter]:
     """Install one plan's Ray checkpoint on ``id_column`` and yield a writer sharing its filesystem.
 
-    The writer stages ``result_schema`` rows in ``parquet_stable_schema(result_schema)``,
-    the staged schema specs derive and ``validate`` accepts. Construct and execute
-    the plan inside this context. The checkpoint stays in the workspace until
-    publication is verified; the ambient configuration is cleared on every exit.
+    The writer stages ``result_schema`` rows that ``validate`` accepts. Construct
+    and execute the plan inside this context. The checkpoint stays in the
+    workspace until publication is verified; the ambient configuration is
+    cleared on every exit.
     """
     filesystem = arrow_filesystem(workspace.root, storage_profile=execution.storage_profile)
-    staged_schema = parquet_stable_schema(result_schema)
     with installed_checkpoint(id_column=id_column, checkpoint_path=workspace.checkpoints, filesystem=filesystem):
-        yield CheckpointWriter(workspace, result_schema, staged_schema, validate, execution, filesystem)
+        yield CheckpointWriter(workspace, result_schema, validate, execution, filesystem)

@@ -32,7 +32,7 @@ def config(tmp_path: Path) -> ResolvedVideoTranscodeConfig:
                 "transcode_memory_gib": 0.5,
                 "publication_memory_gib": 0.25,
                 "source_partitions": 2,
-                "parquet_rows_per_file": 1,
+                "rows_per_checkpoint": 1,
                 "ffmpeg_batch_size": 2,
                 "transcode_attempts": 1,
                 "probe_attempts": 1,
@@ -127,7 +127,7 @@ def results(config: ResolvedVideoTranscodeConfig, dataset: lance.LanceDataset, r
 
 
 def _retune(config: ResolvedVideoTranscodeConfig) -> ResolvedVideoTranscodeConfig:
-    execution = config.execution.model_copy(update={"parquet_rows_per_file": 2, "transcode_memory_gib": 0.75})
+    execution = config.execution.model_copy(update={"rows_per_checkpoint": 2, "transcode_memory_gib": 0.75})
     return config.model_copy(update={"execution": execution})
 
 

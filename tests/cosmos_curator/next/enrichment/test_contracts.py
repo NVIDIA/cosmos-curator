@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Recipe-facing enrichment declarations: specs, owned fields, staged schemas, and bindings."""
+"""Recipe-facing enrichment declarations: specs, owned fields, staged results, and bindings."""
 
 from functools import partial
 from pathlib import Path
@@ -9,10 +9,10 @@ from pathlib import Path
 import attrs
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from cosmos_curator.next.core import recovery_bindings
+from cosmos_curator.next.core.ray_checkpoints import read_staged_table, write_staged_table
 from cosmos_curator.next.core.recovery_workspace import _stage_results
 from cosmos_curator.next.enrichment import contracts
 from cosmos_curator.next.utils.identity import canonical_digest
@@ -30,7 +30,6 @@ from tests.cosmos_curator.next.enrichment.helpers import make_bindings
         "mixed_owners",
         "overlapping_output",
         "reserved_name",
-        "unstable_staging",
     ],
 )
 def test_invalid_contracts_fail_at_construction(spec: contracts.EnrichmentSpec, fault: str) -> None:
@@ -71,19 +70,14 @@ def test_invalid_contracts_fail_at_construction(spec: contracts.EnrichmentSpec, 
             {"input_fields": spec.input_fields.append(pa.field("fragment_id", pa.int64()))},
             "reserved row addresses",
         ),
-        # Checkpointed rows must read back unchanged; Parquet stores date64 as date32.
-        "unstable_staging": (
-            {"output_fields": spec.output_fields.append(result.with_name("day").with_type(pa.date64()))},
-            "'day' of type date64.* reads back from Parquet as date32",
-        ),
     }
     changes, message = invalid[fault]
     with pytest.raises(ValueError, match=message):
         attrs.evolve(spec, **changes)
 
 
-def test_staged_lists_read_back_from_parquet_and_cast_to_canonical_types(tmp_path: Path) -> None:
-    """Fixed-size and nested lists stage as Parquet reads them back, including null rows."""
+def test_staged_lists_read_back_in_their_canonical_types(tmp_path: Path) -> None:
+    """Fixed-size and nested lists, including null rows and elements, stage without conversion."""
     items = pa.schema([pa.field("item_id", pa.string(), nullable=False)])
     labels = pa.struct([("tags", pa.list_(pa.string())), ("boxes", pa.large_list(pa.list_(pa.int32(), 4)))])
     fields = contracts.owned_fields(
@@ -96,15 +90,6 @@ def test_staged_lists_read_back_from_parquet_and_cast_to_canonical_types(tmp_pat
         result_contract={},
         validate_batch=lambda _batch: None,
     )
-
-    def element(value_type: pa.DataType) -> pa.Field:
-        return pa.field("element", value_type)
-
-    assert spec.staged_schema.names == ["fragment_id", "row_offset", "item_id", "vector", "labels"]
-    assert spec.staged_schema.field("vector").type == pa.list_(element(pa.float32()))
-    assert spec.staged_schema.field("labels").type == pa.struct(
-        [("tags", pa.list_(element(pa.string()))), ("boxes", pa.large_list(element(pa.list_(element(pa.int32())))))]
-    )
     results = pa.Table.from_pylist(
         [
             {
@@ -112,23 +97,20 @@ def test_staged_lists_read_back_from_parquet_and_cast_to_canonical_types(tmp_pat
                 "row_offset": 0,
                 "item_id": "a",
                 "vector": [1.0, 0.0],
-                "labels": {"tags": ["car"], "boxes": [[0, 0, 4, 4]]},
+                "labels": {"tags": ["car"], "boxes": [[0, 0, 4, 4], None]},
             },
             {"fragment_id": 0, "row_offset": 1, "item_id": "b", "vector": None, "labels": None},
         ],
         schema=spec.result_schema,
     )
     staged = _stage_results(
-        results,
-        result_schema=spec.result_schema,
-        staged_schema=spec.staged_schema,
-        validate=partial(contracts.canonical_results, spec=spec),
+        results, result_schema=spec.result_schema, validate=partial(contracts.canonical_results, spec=spec)
     )
-    path = tmp_path / "staged.parquet"
-    pq.write_table(staged, path)
-    restored = pq.read_table(path)
+    path = str(tmp_path / "staged.arrow")
+    write_staged_table(staged, path)
+    restored = read_staged_table(path)
 
-    assert restored.schema.equals(spec.staged_schema, check_metadata=True)
+    assert restored.equals(results, check_metadata=True)
     canonical = contracts.canonical_results(restored, spec)
     assert canonical.schema.equals(pa.schema([items.field("item_id"), *fields]), check_metadata=True)
     assert canonical["vector"].to_pylist() == [[1.0, 0.0], None]

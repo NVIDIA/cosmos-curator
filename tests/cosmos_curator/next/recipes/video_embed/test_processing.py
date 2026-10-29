@@ -10,10 +10,9 @@ from typing import Any
 import av
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import read_staged_table, write_staged_table
 from cosmos_curator.next.recipes.video_embed import processing
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_batch
 from cosmos_curator.next.recipes.video_embed.processing import download_clip, sample_indices, sample_video
@@ -111,15 +110,13 @@ def test_shared_faults_propagate(
         download_clip(work_rows[0], max_attempts=1)
 
 
-def test_nullable_vectors_survive_checkpoint_parquet(tmp_path: Path, results: pa.Table, spec: ModelSpec) -> None:
-    """Staging supports null vectors while the canonical schema enforces fixed dimension."""
-    path = tmp_path / "results.parquet"
-    staged = results.cast(parquet_stable_schema(results.schema))
-    pq.write_table(staged, path)
-    restored = pq.read_table(path)
-    assert restored.equals(staged, check_metadata=True)
-    assert restored.cast(results.schema).equals(results, check_metadata=True)
-    canonical = restored.select(spec.fields.names).cast(spec.fields)
+def test_nullable_vectors_survive_checkpoint_staging(tmp_path: Path, results: pa.Table, spec: ModelSpec) -> None:
+    """Staging keeps null error vectors in the canonical fixed-dimension type."""
+    path = str(tmp_path / "results.arrow")
+    write_staged_table(results, path)
+    restored = read_staged_table(path)
+    assert restored.equals(results, check_metadata=True)
+    canonical = restored.select(spec.fields.names)
     assert canonical[spec.vector_field].null_count == 1
     for batch in canonical.to_batches():
         validate_terminal_batch(batch, spec)

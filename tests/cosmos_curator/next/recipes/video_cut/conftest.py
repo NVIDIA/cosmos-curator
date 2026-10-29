@@ -55,7 +55,7 @@ def config(tmp_path: Path) -> ResolvedVideoCutConfig:
             "input": {"uris": list(SOURCE_URIS)},
             "output": {"media_root": str(tmp_path)},
             "split": {"duration_s": 2.0, "stride_s": 2.0, "min_duration_s": 1.0},
-            "execution": {"parquet_rows_per_file": 2, "rows_per_fragment": 2},
+            "execution": {"rows_per_checkpoint": 2, "rows_per_fragment": 2},
         }
     )
 
@@ -86,7 +86,7 @@ def results(config: ResolvedVideoCutConfig) -> pa.Table:
 
 def _retune(config: ResolvedVideoCutConfig) -> ResolvedVideoCutConfig:
     overrides = [
-        "execution.parquet_rows_per_file=3",
+        "execution.rows_per_checkpoint=3",
         "execution.rows_per_fragment=5",
         "execution.fixed_stride.probe_cpus=0.5",
     ]

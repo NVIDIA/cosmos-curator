@@ -158,7 +158,7 @@ def test_recovery_identity_binds_the_selection_and_contract(
     items = inputs.validate_items(items, bindings.spec)
     dataset = inputs.open_target(bindings)
     workspace = inputs.resolve_workspace(dataset, bindings, selection=items)
-    tuned = attrs.evolve(bindings, execution=bindings.execution.model_copy(update={"parquet_rows_per_file": 7}))
+    tuned = attrs.evolve(bindings, execution=bindings.execution.model_copy(update={"rows_per_checkpoint": 7}))
     assert inputs.resolve_workspace(dataset, tuned, selection=items) == workspace
     assert workspace.root == inputs.workspace_root(dataset, bindings)
     assert workspace.manifest["selected_items"] == items.to_pylist()

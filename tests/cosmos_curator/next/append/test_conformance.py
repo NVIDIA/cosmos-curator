@@ -39,7 +39,7 @@ def results(spec: contracts.AppendSpec) -> pa.Table:
 
 
 def _retune(config: ItemConfig) -> ItemConfig:
-    execution_config = config.bindings.execution.model_copy(update={"parquet_rows_per_file": 3, "rows_per_fragment": 3})
+    execution_config = config.bindings.execution.model_copy(update={"rows_per_checkpoint": 3, "rows_per_fragment": 3})
     return attrs.evolve(config, bindings=attrs.evolve(config.bindings, execution=execution_config))
 
 

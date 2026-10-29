@@ -88,7 +88,7 @@ def test_marker_write_failure_keeps_durable_results(
     workspace = RecoveryWorkspace(str(tmp_path / "workspace"), {"contract": "test"})
     workspace.ensure(storage_profile="default")
     Path(workspace.results).mkdir()
-    result = Path(workspace.results, "result.parquet")
+    result = Path(workspace.results, "result.arrow")
     result.write_bytes(b"durable-result")
 
     def fail_write(*_args: object, **_kwargs: object) -> bool:

@@ -14,14 +14,13 @@ import attrs
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.fs as pafs
-import pyarrow.parquet as pq
 import pytest
 from lance.fragment import FragmentMetadata
 
 from cosmos_curator.next.append import commit, contracts, execution
 from cosmos_curator.next.append.attempts import AppendAttempt, reconcile_and_select_attempt
 from cosmos_curator.next.append.config import AppendExecutionConfig
-from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import STAGED_FILE_EXTENSION, read_staged_table, write_staged_table
 
 ITEM_FIELDS = pa.schema(
     [pa.field("item_id", pa.string(), nullable=False), pa.field("uri", pa.string(), nullable=False)]
@@ -67,7 +66,7 @@ def expand_results(results: pa.Table) -> Iterator[pa.Table]:
 
 
 def make_spec(*, owner: str = "item-recipe", result_contract: Mapping[str, Any] | None = None) -> contracts.AppendSpec:
-    """Exercise lists that stage in Parquet-stable form and items with empty outcomes."""
+    """Exercise list results and items with empty outcomes."""
     return contracts.AppendSpec(
         owner=owner,
         id_column="item_id",
@@ -129,18 +128,17 @@ def select(bindings: contracts.AppendBindings, items: pa.Table, *, max_items: in
 
 
 def stage_results(attempt: AppendAttempt, results: pa.Table, *, complete: bool = True) -> None:
-    """Encode canonical results for Parquet and write the selection into its workspace without Ray.
+    """Stage the selection's results in its workspace as the shared writer does, without Ray.
 
-    Derive storage types from the supplied schema so fault tests can still stage
-    malformed results for the publisher to reject.
+    Results keep the supplied schema so fault tests can still stage malformed
+    results for the publisher to reject.
     """
     assert attempt.workspace is not None
     id_column = attempt.bindings.spec.id_column
     selected = results.filter(pc.is_in(results[id_column], value_set=attempt.selection[id_column].combine_chunks()))
     directory = Path(attempt.workspace.results)
     directory.mkdir(parents=True, exist_ok=True)
-    staged = selected.cast(parquet_stable_schema(selected.schema))
-    pq.write_table(staged, directory / f"staged-{len(list(directory.iterdir()))}.parquet")
+    write_staged_table(selected, str(directory / f"staged-{len(list(directory.iterdir()))}.{STAGED_FILE_EXTENSION}"))
     if complete:
         attempt.workspace.record_completion(storage_profile=attempt.bindings.execution.storage_profile)
 
@@ -155,9 +153,7 @@ def stage_locally(
     tables = [
         rows
         for path in files
-        for rows in execution._appended_rows(
-            pq.read_table(path, filesystem=filesystem).replace_schema_metadata(None), spec=bindings.spec
-        )
+        for rows in execution._appended_rows(read_staged_table(filesystem.open_input_file(path)), spec=bindings.spec)
     ]
     rows_per_fragment = bindings.execution.rows_per_fragment
     rows = pa.concat_tables(tables)

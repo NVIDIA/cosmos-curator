@@ -1,22 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Vector validation for staged batches and canonical slices."""
+"""Vector validation for canonical batches and their slices."""
 
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
 from cosmos_curator.next.recipes.video_embed.contracts import ModelSpec, validate_terminal_batch
 
 
-@pytest.mark.parametrize("canonical", [False, True])
-def test_terminal_batch_preserves_slices_and_error_rows(results: pa.Table, spec: ModelSpec, *, canonical: bool) -> None:
+def test_terminal_batch_preserves_slices_and_error_rows(results: pa.Table, spec: ModelSpec) -> None:
     """Offsets and a null error vector do not shift or invalidate neighboring vectors."""
-    table = results.select(spec.fields.names)
-    if not canonical:
-        table = table.cast(parquet_stable_schema(table.schema))
-    batch = table.combine_chunks().to_batches()[0]
+    batch = results.select(spec.fields.names).combine_chunks().to_batches()[0]
     for offset, count in ((0, len(batch)), (1, 2), (2, 2), (3, 1), (2, 0)):
         validate_terminal_batch(batch.slice(offset, count), spec)
 
@@ -44,8 +39,12 @@ def test_terminal_batch_rejects_invalid_results(results: pa.Table, spec: ModelSp
     row = results.to_pylist()[0]
     vector = row[spec.vector_field]
     metadata = row[spec.metadata_field]
+    schema = results.schema
     if fault == "dimension":
         row[spec.vector_field] = vector[:-1]
+        # Canonical fixed-size vectors cannot hold another dimension; a variable list reaches the validator's guard.
+        index = schema.get_field_index(spec.vector_field)
+        schema = schema.set(index, schema.field(index).with_type(pa.list_(schema.field(index).type.value_field)))
     elif fault == "zero":
         row[spec.vector_field] = [0.0] * spec.dimension
     elif fault in {"nan", "infinity", "nonunit", "null_element"}:
@@ -65,8 +64,7 @@ def test_terminal_batch_rejects_invalid_results(results: pa.Table, spec: ModelSp
     else:
         row[spec.vector_field] = None
         metadata.update(status="error", error_type="MediaError", error_message="")
-    # Storage uses variable lists, so malformed dimensions reach the validator.
-    table = pa.Table.from_pylist([*results.slice(0, 1).to_pylist(), row], schema=parquet_stable_schema(results.schema))
+    table = pa.Table.from_pylist([*results.slice(0, 1).to_pylist(), row], schema=schema)
     batch = table.to_batches()[0].slice(1)
     with pytest.raises(ValueError, match=r"embedding provenance|embeddings require"):
         validate_terminal_batch(batch, spec)

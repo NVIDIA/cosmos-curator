@@ -62,8 +62,8 @@ class CheckpointedExecutionConfig(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     storage_profile: str = Field(default="default", min_length=1)
-    parquet_rows_per_file: int = Field(
-        default=1_000, ge=1, description="Staged results per Parquet file, which is also the checkpoint group size."
+    rows_per_checkpoint: int = Field(
+        default=1_000, ge=1, description="Staged results per checkpoint group, each written as one staged file."
     )
     commit_attempts: int = Field(
         default=5, ge=1, description="Attempts for preparing the output table and for publication."

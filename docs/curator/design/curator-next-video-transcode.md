@@ -21,7 +21,7 @@ register nullable clip columns, then pin the latest Lance span table
   -> source bytes and span addresses through Ray's object store
   -> flat_map transcodes each source and yields individual clips from bounded FFmpeg batches
   -> independent clip uploads, dropping bytes
-  -> checkpointed result Parquet
+  -> checkpointed staged results
   -> regroup metadata by original Lance fragment
   -> validate coverage and stage column files on workers
   -> one atomic Lance column Update, including a run receipt
@@ -124,14 +124,14 @@ separate work.
 
 ## Checkpoints and recovery
 
-`execution.parquet_rows_per_file` defaults to **1,000 spans per Parquet/checkpoint group**, using the same setting name as
-video-embed. It replaces the development-era `spans_per_checkpoint` setting. At 650,000 spans, that is approximately 650
-result shards.
+`execution.rows_per_checkpoint` defaults to **1,000 spans per checkpoint group**, using the same setting name as
+video-embed. It replaces the development-era `spans_per_checkpoint` and `parquet_rows_per_file` settings. At 650,000
+spans, that is approximately 650 result shards.
 The 100,000-row fragment layout chosen by video-cut remains about seven Lance fragments. These are independent
 boundaries: checkpoint size controls durability granularity and fragment size controls canonical storage layout.
 Incomplete write groups and other in-flight work may replay; 1,000 is not a bound on total work in flight.
 
-The checkpoint ID is `span_id`. Result Parquet contains span IDs, original fragment IDs and row offsets, plus clip
+The checkpoint ID is `span_id`. Staged results contain span IDs, original fragment IDs and row offsets, plus clip
 metadata. It never contains media bytes. Upload must succeed before a result reaches the sink; an upload whose result
 was not checkpointed may repeat at the same deterministic clip destination.
 
@@ -182,7 +182,7 @@ input:
   media_root: s3://example-bucket/curated/videos
 execution:
   transcode_memory_gib: 4
-  parquet_rows_per_file: 1000
+  rows_per_checkpoint: 1000
 ```
 
 Clips are written under `<input.media_root>/clips`. `input.spans_lance_uri` defaults to `<input.media_root>/lance`, and

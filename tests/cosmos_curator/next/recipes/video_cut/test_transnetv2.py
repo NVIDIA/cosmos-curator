@@ -380,14 +380,14 @@ def test_transnetv2_actor_resources_and_checkpoint_scope(
     snapshot = Mock(side_effect=AssertionError("Actor pools must not freeze startup resource capacity"))
     monkeypatch.setattr(ray, "cluster_resources", snapshot)
     if fail_write:
-        plan.write_parquet.side_effect = RuntimeError("injected write failure")
+        plan.write_datasink.side_effect = RuntimeError("injected write failure")
     attempt = _cut_sources(config, fail=fail_write)
     assert attempt.processing_complete() is not fail_write
     download_args, download = plan.map.call_args
     assert download_args == (transnetv2.SourceDownloader,)
     assert download["resources"] == {"curator_io": 1.0}
     assert download["num_cpus"] == 0.25
-    # Decoding, inference, then the shared validation before checkpointed Parquet.
+    # Decoding, inference, then the shared validation before checkpointed staging.
     assert plan.map_batches.call_count == 3
     decode_args, decode = plan.map_batches.call_args_list[0]
     assert decode_args == (transnetv2.decode_sources,)

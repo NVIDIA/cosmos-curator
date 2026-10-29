@@ -123,14 +123,17 @@ def test_invalid_vectors_leave_all_fragments_pending(
 ) -> None:
     """Vector width and values are validated before the one canonical commit."""
     rows = results.to_pylist()
+    schema = enrichment_input.bindings.spec.result_schema
     if fault == "wrong_dimension":
         rows[0][spec.vector_field] = [1.0]
+        # Corrupt the stored representation: canonical fixed-size vectors cannot
+        # even be constructed with the wrong dimension.
+        index = schema.get_field_index(spec.vector_field)
+        schema = schema.set(index, schema.field(index).with_type(pa.list_(schema.field(index).type.value_field)))
     else:
         rows[0][spec.vector_field][0] = float("nan")
-    # Corrupt the stored representation: canonical fixed-size vectors cannot
-    # even be constructed with the wrong dimension.
-    staged = pa.Table.from_pylist(rows, schema=enrichment_input.bindings.spec.staged_schema)
-    with pytest.raises(ValueError, match=r"canonical output types|finite unit"):
+    staged = pa.Table.from_pylist(rows, schema=schema)
+    with pytest.raises(ValueError, match=r"Invalid staged enrichment schema|finite unit"):
         publish_results(staged, enrichment_input)
     assert lance.dataset(dataset.uri).version == dataset.version
     assert inputs.pending_fragment_ids(lance.dataset(dataset.uri), enrichment_input.bindings) == (0, 1)

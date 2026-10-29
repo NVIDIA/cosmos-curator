@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A real Ray read/group/upload/Parquet plan resumed on a fresh local cluster."""
+"""A real Ray read/group/upload/stage plan resumed on a fresh local cluster."""
 
 import json
 import time
@@ -11,7 +11,6 @@ from typing import Any
 
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import ray
 from ray._private.state import actors
@@ -26,6 +25,7 @@ from cosmos_curator.next.recipes.video_transcode import pipeline, processing
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
+from tests.cosmos_curator.next.core.helpers import staged_results
 from tests.cosmos_curator.next.enrichment.fresh_cluster import assert_fresh_cluster_resume
 from tests.cosmos_curator.next.fresh_driver import run_in_fresh_driver
 from tests.cosmos_curator.next.recipes.video_transcode.conftest import RECIPE
@@ -247,6 +247,6 @@ def test_sources_in_one_partition_stream_from_one_download_task(
     assert len({download["task_id"] for download in downloads}) == 1
     assert len({download["actor_id"] for download in downloads}) == 1
     assert all(len(download["span_ids"]) == 1 for download in downloads)
-    results = pq.read_table(attempt.workspace.results)
+    results = staged_results(attempt.workspace.results)
     assert results.num_rows == 3
     assert set(results["span_id"].to_pylist()) == {row["span_id"] for row in rows}

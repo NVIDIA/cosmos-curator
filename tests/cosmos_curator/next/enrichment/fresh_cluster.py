@@ -19,13 +19,13 @@ from typing import Any
 import attrs
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 import ray
 from ray.data.context import DataContext
 
 from cosmos_curator.next.enrichment import inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.enrichment.execution import ProcessingScope, checkpointed_processing
+from tests.cosmos_curator.next.core.helpers import staged_results
 from tests.cosmos_curator.next.enrichment.conformance import RecipeUnderTest
 from tests.cosmos_curator.next.fresh_driver import start_local_cluster
 
@@ -74,7 +74,7 @@ def assert_fresh_cluster_resume(
         with checkpointed_processing(attrs.evolve(attempt, selected=attempt.selected[:1])) as processing:
             process(processing, config)
         assert DataContext.get_current().checkpoint_config is None
-        staged = pq.read_table(workspace.results, columns=[id_column])[id_column].to_pylist()
+        staged = staged_results(workspace.results)[id_column].to_pylist()
         assert sorted(staged) == _selected_ids(dataset, id_column, attempt.selected[:1])
         assert inputs.pending_fragment_ids(lance.dataset(dataset.uri), bindings) == attempt.selected
         # Simulate a crash after some results are durable, before the processing marker.
@@ -90,7 +90,7 @@ def assert_fresh_cluster_resume(
         with checkpointed_processing(resumed) as processing:
             process(processing, tuned)
         assert DataContext.get_current().checkpoint_config is None
-        staged = pq.read_table(workspace.results, columns=[id_column])[id_column].to_pylist()
+        staged = staged_results(workspace.results)[id_column].to_pylist()
         assert sorted(staged) == selected_ids
         work = {step: sorted(ids) for step, ids in work_logs().items()}
         assert work, "Stand-ins must record the IDs each expensive step processes"

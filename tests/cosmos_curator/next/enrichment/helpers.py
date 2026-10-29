@@ -13,7 +13,7 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from cosmos_curator.next.core.ray_checkpoints import parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import read_staged_table, write_staged_table
 from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt
 from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
@@ -67,7 +67,7 @@ def prepare_items(
         candidates.extend(
             commit.PreparedFragment.from_row(row)
             for row in commit.prepare_fragment(
-                pa.Table.from_pylist(rows, schema=spec.staged_schema),
+                pa.Table.from_pylist(rows, schema=spec.result_schema),
                 version=int(dataset.version),
                 bindings=make_bindings(dataset.uri, spec),
             ).to_pylist()
@@ -102,12 +102,14 @@ def prepare_results(
     prepare_fragment: Callable[[pa.Table], pa.Table],
     **_kwargs: object,
 ) -> list[commit.PreparedFragment]:
-    """Encode canonical results for storage, then replace Ray's grouping and collection.
+    """Round-trip results through the staged format, then replace Ray's grouping and collection.
 
-    Derive storage types from the supplied schema so fault tests can still pass
-    malformed staged results to the production worker callable.
+    Results keep the supplied schema so fault tests can still pass malformed
+    staged results to the production worker callable.
     """
-    staged = results.cast(parquet_stable_schema(results.schema))
+    sink = pa.BufferOutputStream()
+    write_staged_table(results, sink)
+    staged = read_staged_table(pa.BufferReader(sink.getvalue()))
     candidates = []
     for fragment_id in pc.unique(staged["fragment_id"]).to_pylist():
         if fragment_id in selected:

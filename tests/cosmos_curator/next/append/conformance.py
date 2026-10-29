@@ -15,9 +15,8 @@ When the spec declares an ``error_column``, at least one result must be a termin
 Recipe-specific summary keys are unrestricted. The recipe's ``run_config`` must run through
 its pipeline module's ``run_append``; the suite replaces the ``start_ray`` and ``process``
 callbacks passed there, stages ``results`` into the selection's workspace as processing
-would, converting canonical results to Parquet storage types, and stages fragments
-locally instead of with Ray. It uses real Lance and Parquet files. Recipe test modules
-keep only the checks specific to their own contract.
+would, and stages fragments locally instead of with Ray. It uses real Lance and staged
+result files. Recipe test modules keep only the checks specific to their own contract.
 """
 
 import json
@@ -322,7 +321,7 @@ class AppendConformance:
             message = "do not exactly cover the selected items"
         else:
             staged = results.drop_columns([name for name in results.schema.names if name != id_column][:1])
-            message = "staged schema"
+            message = "result schema"
         attempt = reconcile_and_select_attempt(bindings, lambda: recipe.discover(config))
         stage_results(attempt, staged)
         _replace_ray(recipe, monkeypatch, results=None)

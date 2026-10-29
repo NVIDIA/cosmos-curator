@@ -1,7 +1,7 @@
 # Curator Next Checkpointing and Recovery
 
 Curator Next separates **saving computation** from **publishing results**. Ray checkpoints track which logical IDs have
-durable Parquet results; a Lance commit makes those results visible to readers. Keeping both the results and checkpoint
+durable staged results; a Lance commit makes those results visible to readers. Keeping both the results and checkpoint
 index until publication is verified lets a fresh driver or Ray cluster finish the run without repeating checkpointed
 work.
 
@@ -63,10 +63,10 @@ Both kinds build on these recipe-agnostic pieces in `cosmos_curator.next.core`:
 | Component | Responsibility |
 | --- | --- |
 | [`RecoveryWorkspace`, `RecoveryStateError`, `checkpoint_writer`](../../../cosmos_curator/next/core/recovery_workspace.py) | Durable recovery state: the manifest, staged results, native checkpoints, and processing marker of one selection; direct loading of the saved selection and `resume_or_clear`, which resumes it or clears it once fully published; best-effort cleanup. `checkpoint_writer` installs one plan's Ray checkpoint and yields the writer that validates, stages, and checkpoints its results, then records the marker. |
-| [`installed_checkpoint`, `parquet_stable_schema`, `VALIDATION_BATCH_SIZE`](../../../cosmos_curator/next/core/ray_checkpoints.py) | Own Ray Data's ambient checkpoint configuration for one plan, derive staged schemas that Parquet reads back unchanged, and bound terminal-validation batches. |
+| [`installed_checkpoint`, `StagedResultsDatasink`, `read_staged_results`, `VALIDATION_BATCH_SIZE`](../../../cosmos_curator/next/core/ray_checkpoints.py) | Own Ray Data's ambient checkpoint configuration for one plan, write and read staged Arrow IPC files with Ray Data or plain Arrow, and bound terminal-validation batches. |
 | [`find_transaction`, `iter_transactions`, `KIND_KEY`, `CONTRACT_DIGEST_KEY`](../../../cosmos_curator/next/core/lance_transactions.py) | Find publication evidence in the retained history of a pinned Lance snapshot; name the provenance every shared publication records. |
 | [`RecoveryBindings`](../../../cosmos_curator/next/core/recovery_bindings.py) | Resolve a binding's storage credentials and Ray worker storage environment at runtime. |
-| [`CheckpointedExecutionConfig`](../../../cosmos_curator/next/core/config.py) | Execution settings both kinds share: storage profile, checkpoint group size (`parquet_rows_per_file`), commit attempts, and progress reporting. |
+| [`CheckpointedExecutionConfig`](../../../cosmos_curator/next/core/config.py) | Execution settings both kinds share: storage profile, checkpoint group size (`rows_per_checkpoint`), commit attempts, and progress reporting. |
 
 Recipes use the API of their kind's package, [`enrichment`](../../../cosmos_curator/next/enrichment/__init__.py) or
 [`append`](../../../cosmos_curator/next/append/__init__.py), whose docstring lists it. Each package has the same
@@ -103,15 +103,18 @@ runtime from `execution.storage_profile`, and execution tuning never enters reco
 The `ProcessingScope` reads the frozen selection at Ray's native checkpoint-filter boundary, so checkpointed IDs are
 skipped before expensive work. Recipes keep the ID through the plan and emit canonical results in
 `scope.result_schema`. `scope.write` delegates to the core checkpoint writer, which repartitions results into strict
-groups of `execution.parquet_rows_per_file` rows, converts each group to the spec's `staged_schema` (the representation
-Parquet reads back), validates every row as publication would, writes the group through the checkpoint's filesystem,
-and records the processing marker. Validation runs after the repartition with default remote args, so Ray fuses it
-into each group's write task rather than adding a task per plan block. Parquet names list children `element`, and
-Arrow cannot read back a null `fixed_size_list`, so lists stage with `element` children and fixed-size lists stage as
-variable lists. Ray checkpoints a row's ID once its Parquet file is written, so specs reject any other result type
-that would not read back unchanged, such as `date64`. A row that publication would reject fails processing before Ray
-checkpoints its ID. The scope keys the checkpoint on the spec's ID column, retains checkpoints, and clears the ambient
-configuration on every exit. Publication runs outside this scope so it can read all staged results.
+groups of `execution.rows_per_checkpoint` rows, validates every row as publication would, writes each group as one
+staged file through the checkpoint's filesystem, and records the processing marker. Validation runs after the
+repartition with default remote args, so Ray fuses it into each group's write task rather than adding a task per plan
+block. A row that publication would reject fails processing before Ray checkpoints its ID. The scope keys the
+checkpoint on the spec's ID column, retains checkpoints, and clears the ambient configuration on every exit.
+Publication runs outside this scope so it can read all staged results.
+
+Staged files are zstd-compressed Arrow IPC files. IPC is Arrow's own serialization, so staged rows keep their canonical
+schema exactly: nested and fixed-size lists with null rows or elements, list child names, `date64`, and all metadata
+read back unchanged, and publication needs no storage conversion. Ray applies its two-phase checkpointed write to file
+sinks, recording a pending checkpoint before each file and committing it afterward, so a staged file and its
+checkpointed IDs stay consistent. Ray's own checkpoint ID files remain Parquet.
 
 `validate_batch` always receives the ID and result columns in their canonical types, in batches of at most
 `VALIDATION_BATCH_SIZE` (1,024) rows that claim to be terminal. Processing applies it to every staged row before Ray
@@ -133,7 +136,7 @@ in current rows.
 | Artifact | Meaning and lifetime |
 | --- | --- |
 | `workspace.json` | Contract and selection manifest, atomically created or compared as equivalent JSON. A mismatch fails without changing the workspace. |
-| `results/` | Parquet results needed for publication. |
+| `results/` | Staged Arrow IPC results needed for publication. |
 | `checkpoints/` | Ray's index of safely written result IDs. Retain it with the corresponding results. |
 | `processing-complete.json` | Optional marker naming the manifest digest, written after processing succeeds, allowing publication retries to skip processing setup. |
 
@@ -159,8 +162,8 @@ such as `workspace_version` in the manifest. Property keys are never versioned.
 
 | Interruption or invalid state | Recovery behavior |
 | --- | --- |
-| Processing or a Parquet write is interrupted | Ray reconciles pending/committed writes and replays uncheckpointed work. |
-| Results are checkpointed but Lance has not committed | Rebuild publication from staged Parquet; prepared or staged Lance files can be regenerated. |
+| Processing or a staged-file write is interrupted | Ray reconciles pending/committed writes and replays uncheckpointed work. |
+| Results are checkpointed but Lance has not committed | Rebuild publication from staged results; prepared or staged Lance files can be regenerated. |
 | Processing marker is missing, unreadable, malformed, or incompatible | Resume through native checkpoints. Marker write failure is only a warning. |
 | Staged results are missing, duplicated, or invalid | Processing rejects invalid values before checkpointing their IDs. Publication fails validation and retains recovery state, even if a completion marker exists. |
 | Lance committed but its response was lost | Verify the canonical files, plus the receipt for enrichment, before accepting success; results are not published twice. |
@@ -271,7 +274,7 @@ flowchart TD
     input["Open latest input and register fields"] --> recovery["Load the saved selection for this contract"]
     recovery --> workspace["Resume unfinished selection or select pending fragments"]
     recovery -. "Published selection" .-> cleanup
-    workspace --> processing["Process missing IDs into checkpointed Parquet"]
+    workspace --> processing["Process missing IDs into checkpointed staged results"]
     processing --> prepare["Validate results and prepare column files"]
     workspace -. "Valid processing marker" .-> prepare
     prepare --> commit["Commit one Lance update with a receipt"]
@@ -282,8 +285,8 @@ flowchart TD
 
 ### Enrichment recovery identity
 
-The contract namespace binds the dataset URI, declared input field IDs, result-defining settings, staged result schema,
-and workspace format version. Workspace format 5 isolates earlier layouts. The fixed workspace's manifest records the
+The contract namespace binds the dataset URI, declared input field IDs, result-defining settings, result schema, and
+workspace format version. Workspace format 6 isolates earlier layouts, including Parquet staging. The fixed workspace's manifest records the
 selection's explicit fragment IDs and the file layout of **those selected fragments**: their physical rows and the files
 and column positions holding input fields. File layouts do not hash external media. Unselected fragments and unrelated
 columns do not participate in selection compatibility.
@@ -296,7 +299,7 @@ Processing and publication use the frozen `selected` fragments.
 | Change | Current recovery behavior |
 | --- | --- |
 | Execution tuning or unrelated schema/column writes | Resume the saved selection with its intact results and checkpoints. |
-| Result contract, input field identities, or staged schema changes | Use a different contract namespace; canonical schema and input validation still apply. |
+| Result contract, input field identities, or result schema changes | Use a different contract namespace; canonical schema and input validation still apply. |
 | Fragments appended before a new invocation | Resume an unfinished saved selection first. New fragments remain eligible for a later selection. |
 | Fragments appended during an attempt | Finish the pinned selection and leave new fragments for a later run. |
 | Existing rows compacted, replaced, deleted, or rebound | Unsupported by the immutable-dataset contract; a changed selected file layout fails recovery or publication and retains state. |
@@ -319,7 +322,7 @@ latest table, it verifies the selected input field identities and file layout an
 rows and all other columns. Unselected fragments remain outside that publication's coverage and completion checks.
 All selected results become visible in one Lance `Update`; prepared files alone expose no partial results.
 
-If a concurrent update to other columns makes descriptors stale, rebuild only those fragments from staged Parquet
+If a concurrent update to other columns makes descriptors stale, rebuild only those fragments from staged results
 against the latest version and retry. The preparation callback receives that version and the stale fragment IDs.
 Unchanged descriptors remain reusable. Changed selected inputs or competing writes to the owned fields are rejected.
 
@@ -476,8 +479,8 @@ it, in item-ID order. Rerun while `remaining_items` is nonzero or null.
 
 ### Append selection and recovery identity
 
-The namespace binds table URI, owner, result contract, ID and error columns, and input, result, staged, and output
-schemas. Workspace format 4 isolates earlier layouts. One fixed workspace at
+The namespace binds table URI, owner, result contract, ID and error columns, and input, result, and output schemas.
+Workspace format 5 isolates earlier layouts, including Parquet staging. One fixed workspace at
 `<staging-prefix>/<contract-namespace>/` records the selected items in its manifest. Subsequent selections reuse that
 path only after verified publication and successful cleanup. Changes to processing, validation, or expansion semantics
 require a result-contract change.
@@ -502,10 +505,12 @@ Cleanup failure after publication reports `cleanup_complete=false`; the successf
 
 ### Append commits and concurrent writers
 
-The driver streams only staged IDs and the error column to require exactly one result per selected item and count
-errors, without retaining diagnostic messages. Workers validate and expand the full results, pack rows across items
-with strict `rows_per_fragment` repartitioning, and write uncommitted Lance fragments. Only descriptors reach the
-driver; media processing, expansion, and writes remain distributed.
+The driver reads staged files concurrently, each whole in one request, and keeps only staged IDs and the error column
+to require exactly one result per selected item and count errors, without retaining diagnostic messages. A staged file
+holds one checkpoint group of item outcomes, so a whole-file read costs less than the round trips of a column-projected
+one. Workers validate and expand the full results, pack rows across items with strict `rows_per_fragment`
+repartitioning, and write uncommitted Lance fragments. Only descriptors reach the driver; media processing, expansion,
+and writes remain distributed.
 
 The driver appends all fragments in one transaction. The transaction carries `kind` and `contract_digest` provenance;
 completion and diagnostics are in the rows. Each attempt reopens the current table and validates the binding. After
@@ -644,7 +649,7 @@ def run_config(config: ResolvedConfig) -> dict[str, object]:
 For a discovery of three items and `execution.max_items: 2`, the first invocation selects two and reports
 `remaining_items: 1`. The next invocation selects the remaining item. If the first invocation is interrupted, it
 resumes those same two items even if the limit is changed to one, skips discovery, and reports `input_items: null`
-and `remaining_items: null`. Rerun afterward to discover any pending items. `parquet_rows_per_file` and
+and `remaining_items: null`. Rerun afterward to discover any pending items. `rows_per_checkpoint` and
 `rows_per_fragment` control checkpoint and output packing independently of that selection.
 
 ### Append migration decisions
@@ -654,7 +659,7 @@ Record these decisions in the recipe's contract before replacing its existing re
 | Decision | What the shared mechanism requires |
 | --- | --- |
 | Work item and identity | One stable ID exists at the read boundary and in its complete staged result. Output rows also carry it, but can have a separate row identity: a source produces many spans, or an item produces words distinguished by `word_index`. Do not checkpoint an item after emitting only some of its results. |
-| Durable result and payloads | Emit one complete canonical result per item in `scope.result_schema`; the shared writer converts it for Parquet. Large payloads belong in durable, replay-safe external storage before checkpointing; return their references. Discovery records must fit the shared scalar input schema and survive in the selection manifest. |
+| Durable result and payloads | Emit one complete canonical result per item in `scope.result_schema`; the shared writer stages it unchanged. Large payloads belong in durable, replay-safe external storage before checkpointing; return their references. Discovery records must fit the shared scalar input schema and survive in the selection manifest. |
 | Publication and visibility | One frozen selection becomes visible atomically. By default it holds every pending item, so nothing is visible until the run publishes; set `execution.max_items` to publish in smaller selections, and arrange later invocations for `remaining_items`. Migrating incremental producers changes when downstream consumers can see results. |
 | Failure policy | Every item has a canonical row, including empty outcomes and terminal errors with diagnostic fields. Retryable failures must propagate without a terminal result. Retrying a published terminal failure needs a deliberate contract extension or a fresh output, not deletion of checkpoints. |
 | Compatibility and ownership | One producer and result contract own the table. Version changes to validation, expansion, or processing semantics; keep execution tuning outside the contract. Preserve immutable source content and table files, and retain required history. |
@@ -722,8 +727,8 @@ Shared tests cover [checkpoint isolation](../../../tests/cosmos_curator/next/cor
 Each adopting recipe runs its kind's conformance suite against its own data,
 [enrichment](../../../tests/cosmos_curator/next/enrichment/conformance.py) or
 [append](../../../tests/cosmos_curator/next/append/conformance.py); each suite's module docstring lists the fixtures a
-recipe supplies. Result fixtures use the same canonical types as processing; shared test helpers own conversion to
-Parquet storage types. The suites drive the recipe's `run_config` without Ray and exercise publication, missing and invalid
+recipe supplies. Result fixtures use the same canonical types as processing, and shared test helpers stage them as
+the writer does. The suites drive the recipe's `run_config` without Ray and exercise publication, missing and invalid
 results, lost commit responses, workspace identity, reruns, processing markers, incompatible workspaces, and cleanup
 failures. The enrichment suite adds misaligned results, concurrent writers, and appended fragments; the append suite
 adds empty/error outcomes, newly discovered items, resumed selections, the table's contract

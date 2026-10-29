@@ -7,8 +7,8 @@
 recipe's input, resumes or selects an attempt, starts the recipe's Ray runtime
 when fragments are selected, runs the recipe's plan inside
 ``checkpointed_processing`` unless processing already completed, and publishes.
-The processing scope owns both ends of that read-to-Parquet plan: it reads the
-frozen selection and writes validated staged results inside one native Ray
+The processing scope owns both ends of that checkpointed plan: it reads the
+frozen selection and stages validated results inside one native Ray
 checkpoint. ``publish_enrichment`` prepares those results with Ray Data, commits
 them with the shared recovery receipt, and removes the verified workspace.
 """
@@ -27,6 +27,7 @@ from ray.data.expressions import col
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
 from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.ray_checkpoints import read_staged_results
 from cosmos_curator.next.core.recovery_workspace import CheckpointWriter, RecoveryWorkspace, checkpoint_writer
 from cosmos_curator.next.enrichment import commit, contracts, inputs
 from cosmos_curator.next.enrichment.attempts import EnrichmentAttempt, reconcile_and_select_attempt
@@ -53,7 +54,7 @@ def selection_datasource(attempt: EnrichmentAttempt, *, columns: Sequence[str]) 
 
 @attrs.frozen
 class ProcessingScope:
-    """Both ends of one checkpointed read-to-Parquet plan over an attempt's selection.
+    """Both ends of one checkpointed plan from an attempt's selected fragments to staged results.
 
     Recipes use ``read``, ``write``, and ``result_schema``; ``checkpointed_processing``
     owns the attempt and the checkpoint writer behind them.
@@ -81,7 +82,7 @@ class ProcessingScope:
         )
 
     def write(self, results: ray.data.Dataset) -> None:
-        """Validate and encode canonical results, checkpoint them, then record processing completion.
+        """Validate and stage canonical results, checkpoint them, then record processing completion.
 
         Rows must match ``result_schema``; a checkpointed result can always be published.
         """
@@ -241,7 +242,7 @@ def prepare_enrichment_fragments(
         # recipe's resources or storage environment.
         msg = "Start Ray with the recipe's runtime before publishing selected fragments"
         raise RuntimeError(msg)
-    staged = ray.data.read_parquet(results_uri, filesystem=filesystem)
+    staged = read_staged_results(results_uri, filesystem=filesystem)
     staged = staged.filter(expr=col("fragment_id").is_in(list(selected)))
     prepared = staged.groupby("fragment_id", num_partitions=len(selected)).map_groups(
         cast("Any", prepare_fragment),

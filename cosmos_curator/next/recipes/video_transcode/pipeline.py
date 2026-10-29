@@ -44,7 +44,7 @@ def start_ray(bindings: EnrichmentBindings, config: ResolvedVideoTranscodeConfig
 
 
 def transcode_spans(processing: ProcessingScope, config: ResolvedVideoTranscodeConfig) -> None:
-    """Execute one read-to-Parquet plan with span filtering before source grouping."""
+    """Execute one checkpointed plan with span filtering before source grouping."""
     execution = config.execution
     # Sort shuffle uses the read block count to size its partitions.
     spans = processing.read(READ_COLUMNS, override_num_blocks=execution.source_partitions)

@@ -4,9 +4,9 @@
 """Recipe-facing append declarations: the data contract and its bindings.
 
 Recipes describe their work items, staged item results, appended rows, result
-contract, validation, and expansion in an ``AppendSpec``, which derives the
-staged result schema. ``AppendBindings`` binds the spec to one invocation's
-table, staging root, and execution settings; ``run_append`` does the rest.
+contract, validation, and expansion in an ``AppendSpec``. ``AppendBindings``
+binds the spec to one invocation's table, staging root, and execution settings;
+``run_append`` does the rest.
 """
 
 import json
@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from cosmos_curator.next.append.config import AppendExecutionConfig
-from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE, parquet_stable_schema
+from cosmos_curator.next.core.ray_checkpoints import VALIDATION_BATCH_SIZE
 from cosmos_curator.next.core.recovery_bindings import RecoveryBindings
 from cosmos_curator.next.utils.identity import canonical_digest, json_snapshot
 
@@ -62,11 +62,11 @@ class AppendSpec:
     the recipe's decision; retryable failures must propagate without a result.
 
     Processing emits canonical ``result_fields`` rows, also exposed as
-    ``ProcessingScope.result_schema``. The shared writer converts them to the
-    derived ``staged_schema`` for Parquet; recipes do not manage storage types.
-    Recovery identity includes both schemas, the input and output schemas, and
-    the declared ID and error column settings automatically. The table binding
-    also names ``id_column``, so current rows keep one meaning for their IDs.
+    ``ProcessingScope.result_schema``. The shared writer stages them unchanged;
+    recipes do not manage storage types. Recovery identity includes the input,
+    result, and output schemas and the declared ID and error column settings
+    automatically. The table binding also names ``id_column``, so current rows
+    keep one meaning for their IDs.
     """
 
     owner: str
@@ -78,10 +78,9 @@ class AppendSpec:
     validate_batch: Callable[[pa.RecordBatch], None]
     expand: Callable[[pa.Table], Iterable[pa.Table]]
     error_column: str | None = None
-    staged_schema: pa.Schema = attrs.field(init=False, eq=False)
 
     def __attrs_post_init__(self) -> None:
-        """Reject malformed append contracts and derive staged rows before any processing begins."""
+        """Reject malformed append contracts before any processing begins."""
         if not self.owner:
             msg = "Append publication requires an owner"
             raise ValueError(msg)
@@ -105,8 +104,6 @@ class AppendSpec:
             msg = "Work item fields must be strings, integers, or booleans"
             raise ValueError(msg)
         self._validate_errors()
-        # Frozen attrs classes assign derived fields once, through object.__setattr__.
-        object.__setattr__(self, "staged_schema", parquet_stable_schema(self.result_fields))
 
     def _validate_errors(self) -> None:
         if self.error_column is None:
@@ -139,22 +136,17 @@ class AppendSpec:
 
 
 def canonical_results(staged: pa.Table, spec: AppendSpec) -> pa.Table:
-    """Validate staged rows as terminal item results and return them in their canonical types.
+    """Validate staged rows as terminal item results in their canonical types.
 
     Processing applies this before Ray checkpoints an item's ID, so every
     checkpointed result can be published. Publication applies it again.
     """
-    if not staged.schema.equals(spec.staged_schema, check_metadata=True):
-        msg = "Staged results do not match the append's staged schema"
+    if not staged.schema.equals(spec.result_fields, check_metadata=True):
+        msg = "Staged results do not match the append's result schema"
         raise ValueError(msg)
-    try:
-        canonical = staged.cast(spec.result_fields)
-    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
-        msg = "Staged results do not convert to the canonical result types"
-        raise ValueError(msg) from exc
-    for batch in canonical.to_batches(max_chunksize=VALIDATION_BATCH_SIZE):
+    for batch in staged.to_batches(max_chunksize=VALIDATION_BATCH_SIZE):
         spec.validate_batch(batch)
-    return canonical
+    return staged
 
 
 def expanded_rows(results: pa.Table, spec: AppendSpec) -> Iterator[pa.Table]:

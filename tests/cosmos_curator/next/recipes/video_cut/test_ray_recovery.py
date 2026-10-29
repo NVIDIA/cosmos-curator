@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import ray
 from botocore.exceptions import ClientError
@@ -25,6 +24,7 @@ from ray.data.context import DataContext
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
 from cosmos_curator.next.append import commit
 from cosmos_curator.next.append.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.core.ray_checkpoints import STAGED_FILE_EXTENSION, read_staged_table, write_staged_table
 from cosmos_curator.next.media.ffmpeg import ProbeError, VideoMetadata
 from cosmos_curator.next.recipes.video_cut import discovery, fixed_stride, pipeline
 from cosmos_curator.next.recipes.video_cut.bindings import resolve_bindings
@@ -224,14 +224,14 @@ def test_probe_retries_never_checkpoint_an_inconclusive_failure(
     uri = "s3://test-bucket/long.mp4"
     raw = config.model_dump(mode="json")
     raw["input"]["uris"] = [uri]
-    config = resolve_config_data(raw, overrides=["execution.parquet_rows_per_file=1"])
+    config = resolve_config_data(raw, overrides=["execution.rows_per_checkpoint=1"])
     exhausted = probe_failures == 4
     fails_with = "injected FFprobe failure" if exhausted else None
     _attempt(config, tmp_path, "probe", (uri,), probe_failures=probe_failures, fails_with=fails_with)
     if exhausted:
         dataset = lance.dataset(config.output.spans_lance_uri)
         assert dataset.count_rows() == 0
-        assert not list(Path(_workspace_root(config), "results").glob("*.parquet"))
+        assert not list(Path(_workspace_root(config), "results").glob(f"*.{STAGED_FILE_EXTENSION}"))
         _attempt(config, tmp_path, "probe", (uri,))
     summary = _summary(tmp_path, "probe")
     assert (summary["errors"], summary["selected_items"], summary["appended_rows"]) == (0, 1, 3)
@@ -245,7 +245,7 @@ def test_interrupted_publication_resumes_without_media_work_and_matches_a_clean_
 ) -> None:
     """Staged but uncommitted fragments are rebuilt from checkpoints; a root discovery resumes explicit URIs."""
     config = resolve_config_data(
-        config.model_dump(mode="json"), overrides=["execution.parquet_rows_per_file=1", "execution.rows_per_fragment=4"]
+        config.model_dump(mode="json"), overrides=["execution.rows_per_checkpoint=1", "execution.rows_per_fragment=4"]
     )
     _attempt(
         config,
@@ -259,14 +259,14 @@ def test_interrupted_publication_resumes_without_media_work_and_matches_a_clean_
     unpublished = lance.dataset(config.output.spans_lance_uri)
     assert (unpublished.count_rows(), len(unpublished.get_fragments())) == (0, 0)
     workspace = _workspace_root(config)
-    staged = list(Path(workspace, "results").glob("*.parquet"))
-    assert sorted(pq.read_metadata(path).num_rows for path in staged) == [1, 1, 1, 1]
+    staged = list(Path(workspace, "results").glob(f"*.{STAGED_FILE_EXTENSION}"))
+    assert sorted(read_staged_table(str(path)).num_rows for path in staged) == [1, 1, 1, 1]
 
     expected_uris = config.input.uris or ()
     (tmp_path / "listed-sources.json").write_text(json.dumps(list(expected_uris)))
     raw = config.model_dump(mode="json")
     raw["input"] = {"root_uri": "s3://test-bucket/"}
-    resumed = resolve_config_data(raw, overrides=["execution.parquet_rows_per_file=2", "execution.rows_per_fragment=5"])
+    resumed = resolve_config_data(raw, overrides=["execution.rows_per_checkpoint=2", "execution.rows_per_fragment=5"])
     _attempt(resumed, tmp_path, "resumed", ())
     assert not workspace.exists()
     summary = _summary(tmp_path, "resumed")
@@ -282,7 +282,7 @@ def test_interrupted_publication_resumes_without_media_work_and_matches_a_clean_
         overrides=[
             f"output.spans_lance_uri={tmp_path / 'reference.lance'}",
             f"output.staging_root_uri={tmp_path / 'reference-staging'}",
-            "execution.parquet_rows_per_file=3",
+            "execution.rows_per_checkpoint=3",
         ],
     )
     _attempt(reference, tmp_path, "clean", tuple(expected_uris))
@@ -313,9 +313,9 @@ def test_native_pending_write_is_replayed_within_the_saved_selection(
     row = plan_outcome(uri, config)
     writer.write_pending_checkpoint(pa.array([row["source_id"]]), "interrupted")
     Path(workspace, "results").mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist([row], schema=resolve_bindings(config).spec.staged_schema),
-        workspace / "results" / "interrupted_000000.parquet",
+    write_staged_table(
+        pa.Table.from_pylist([row], schema=resolve_bindings(config).spec.result_fields),
+        str(workspace / "results" / f"interrupted_000000.{STAGED_FILE_EXTENSION}"),
     )
     _attempt(config, tmp_path, "pending", config.input.uris or ())
     assert not workspace.exists()
@@ -324,16 +324,16 @@ def test_native_pending_write_is_replayed_within_the_saved_selection(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("parquet_rows_per_file", [1, 2])
+@pytest.mark.parametrize("rows_per_checkpoint", [1, 2])
 def test_full_sized_fragments_pack_source_plans(
-    config: ResolvedVideoCutConfig, tmp_path: Path, parquet_rows_per_file: int
+    config: ResolvedVideoCutConfig, tmp_path: Path, rows_per_checkpoint: int
 ) -> None:
-    """Two 60k-span plans pack into 100k/20k fragments within and across Parquet files."""
+    """Two 60k-span plans pack into 100k/20k fragments within and across staged files."""
     raw = config.model_dump(mode="json")
     raw["input"] = {"uris": ["s3://test-bucket/large-1.mp4", "s3://test-bucket/large-2.mp4"]}
     config = resolve_config_data(
         raw,
-        overrides=[f"execution.parquet_rows_per_file={parquet_rows_per_file}", "execution.rows_per_fragment=100000"],
+        overrides=[f"execution.rows_per_checkpoint={rows_per_checkpoint}", "execution.rows_per_fragment=100000"],
     )
     _attempt(config, tmp_path, "large", config.input.uris or ())
     dataset = lance.dataset(config.output.spans_lance_uri)

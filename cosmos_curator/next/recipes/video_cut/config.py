@@ -220,7 +220,7 @@ class FixedStrideExecutionConfig(_Config):
 class ExecutionConfig(AppendExecutionConfig):
     """Tuning excluded from cutting identity and workspace compatibility.
 
-    ``parquet_rows_per_file`` counts source plans per checkpoint group, and
+    ``rows_per_checkpoint`` counts source plans per checkpoint group, and
     ``rows_per_fragment`` counts spans per appended Lance fragment.
     """
 

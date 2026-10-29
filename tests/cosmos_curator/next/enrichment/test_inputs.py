@@ -25,7 +25,7 @@ def test_workspace_tracks_input_file_layout_only(
     workspace = inputs.resolve_workspace(
         dataset, make_bindings(dataset.uri, spec, staging_root=root, result_contract={"version": 1}), selected=(0, 1)
     )
-    assert workspace.manifest["workspace_version"] == 5
+    assert workspace.manifest["workspace_version"] == 6
     assert [fragment["fragment_id"] for fragment in workspace.manifest["input_fragments"]] == [0, 1]
     current = lance.dataset(dataset.uri)
     current.add_columns(pa.schema([("unrelated", pa.string())]))

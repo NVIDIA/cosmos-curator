@@ -18,6 +18,7 @@ from ray.data.context import DataContext
 
 from cosmos_curator.next.core.lance_datasource import LanceFragmentDatasource
 from cosmos_curator.next.core.lance_transactions import CONTRACT_DIGEST_KEY, KIND_KEY
+from cosmos_curator.next.core.ray_checkpoints import StagedResultsDatasink
 from cosmos_curator.next.core.recovery_workspace import RecoveryWorkspace
 from cosmos_curator.next.enrichment import commit, contracts, execution, inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
@@ -232,7 +233,7 @@ def test_processing_scope_owns_checkpoint_and_sink(
 ) -> None:
     """The spec's ID keys the checkpoint, the sink shares its filesystem, and only success records completion."""
     bindings = enrichment_input.bindings
-    tuned = bindings.execution.model_copy(update={"lance_read_batch_size": 7, "parquet_rows_per_file": 5})
+    tuned = bindings.execution.model_copy(update={"lance_read_batch_size": 7, "rows_per_checkpoint": 5})
     attempt = reconcile_and_select_attempt(inputs.open_enrichment_input(attrs.evolve(bindings, execution=tuned)))
     assert attempt.workspace is not None
     context = DataContext.get_current()
@@ -241,7 +242,7 @@ def test_processing_scope_owns_checkpoint_and_sink(
     plan.map_batches.return_value = plan
     plan.repartition.return_value = plan
     if fail_write:
-        plan.write_parquet.side_effect = RuntimeError("injected write failure")
+        plan.write_datasink.side_effect = RuntimeError("injected write failure")
     reads = []
 
     def read(datasource: LanceFragmentDatasource, **kwargs: object) -> Mock:
@@ -267,11 +268,12 @@ def test_processing_scope_owns_checkpoint_and_sink(
         assert [row["uri"] for row in rows] == enrichment_input.dataset.to_table(columns=["uri"])["uri"].to_pylist()
     assert checkpoint.id_column == "item_id"
     assert checkpoint.checkpoint_path == attempt.workspace.checkpoints
-    assert checkpoint.filesystem is plan.write_parquet.call_args.kwargs["filesystem"]
     plan.repartition.assert_called_once_with(target_num_rows_per_block=5, strict=True)
-    assert plan.write_parquet.call_args.args == (attempt.workspace.results,)
-    assert plan.write_parquet.call_args.kwargs["min_rows_per_file"] == 5
-    assert plan.write_parquet.call_args.kwargs["max_rows_per_file"] == 5
+    ((datasink,), _) = plan.write_datasink.call_args
+    assert isinstance(datasink, StagedResultsDatasink)
+    assert checkpoint.filesystem is datasink.filesystem.unwrap()
+    assert datasink.unresolved_path == attempt.workspace.results
+    assert datasink.min_rows_per_write == 5
     assert context.checkpoint_config is None
     assert attempt.processing_complete() is not fail_write
 
@@ -291,8 +293,8 @@ def test_processing_validates_results_before_ray_checkpoints_them(
     ((validate,), options) = plan.map_batches.call_args
     # Default remote args after the strict repartition let Ray fuse validation into each group's write task.
     assert options == {"batch_format": "pyarrow", "batch_size": None, "zero_copy_batch": True}
-    assert [call[0] for call in plan.method_calls] == ["repartition", "map_batches", "write_parquet"]
-    assert validate(results).equals(results.cast(attempt.input.bindings.spec.staged_schema), check_metadata=True)
+    assert [call[0] for call in plan.method_calls] == ["repartition", "map_batches", "write_datasink"]
+    assert validate(results).equals(results, check_metadata=True)
     assert validate(results.slice(0, 0)).num_rows == 0
     rows = results.to_pylist()
     rows[0]["result"] = None
@@ -356,7 +358,7 @@ def test_run_enrichment_limits_only_a_new_selection(
 def test_preparation_never_starts_a_default_ray_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Preparing selected fragments requires the recipe's Ray runtime."""
     monkeypatch.setattr(execution.ray, "is_initialized", lambda: False)
-    monkeypatch.setattr(execution.ray.data, "read_parquet", Mock(side_effect=AssertionError("Read staged results")))
+    monkeypatch.setattr(execution, "read_staged_results", Mock(side_effect=AssertionError("Read staged results")))
     options = {"filesystem": pafs.LocalFileSystem(), "prepare_fragment": Mock(), "memory_bytes": 1}
     with pytest.raises(RuntimeError, match="Start Ray with the recipe's runtime"):
         execution.prepare_enrichment_fragments(str(tmp_path), selected=(0,), **options)

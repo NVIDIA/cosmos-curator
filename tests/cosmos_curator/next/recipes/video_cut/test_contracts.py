@@ -28,12 +28,11 @@ from tests.cosmos_curator.next.recipes.video_cut.conftest import plan_outcome
 
 
 def test_bindings_bind_spans_to_the_cutting_contract(config: ResolvedVideoCutConfig) -> None:
-    """The cutting contract is the result contract, and source plans stage exactly as Parquet reads them."""
+    """The cutting contract is the result contract, and source plans stage in their canonical schema."""
     spec = resolve_bindings(config).spec
     assert (spec.owner, spec.id_column) == ("video-cut", "source_id")
     assert spec.result_contract == config.split.cutting_contract
-    assert not spec.staged_schema.equals(SOURCE_SCHEMA, check_metadata=True)
-    assert spec.staged_schema.field("spans").type.value_field.name == "element"
+    assert spec.result_fields.equals(SOURCE_SCHEMA, check_metadata=True)
     assert spec.output_fields.equals(SPAN_SCHEMA)
     assert spec.error_column == "error_stage"
 
@@ -74,7 +73,7 @@ def test_expansion_keeps_spans_with_their_sources_across_chunks(config: Resolved
     ]
     rows[2] |= {"error_stage": "source-probe", "error_message": "bad media"}
     spec = resolve_bindings(config).spec
-    outcomes = canonical_results(pa.Table.from_pylist(rows, schema=spec.staged_schema), spec)
+    outcomes = canonical_results(pa.Table.from_pylist(rows, schema=spec.result_fields), spec)
     expanded = list(expand_sources(outcomes, max_rows=2))
     assert [batch.num_rows for batch in expanded] == [2, 2, 2, 1]
     assert expanded[0]["error_stage"].to_pylist() == [None, "source-probe"]
