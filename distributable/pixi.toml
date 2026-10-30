@@ -130,10 +130,10 @@ nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
 [feature.vllm.dependencies]
-transformers = ">=5.16.1,<5.20.0"
+transformers = ">=5.16.1,<5.18.0"
 
 [feature.vllm.pypi-dependencies]
-vllm = "==0.32.0"
+vllm = "==0.31.0"
 
 [feature.vllm-omni.dependencies]
 transformers = ">=5.16.1,<5.20.0"

@@ -73,8 +73,8 @@ def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
     uri = config.input.clips_lance_uri
     storage_options = get_lance_storage_options(uri, profile_name=config.execution.storage_profile)
     spec = resolve_model_spec(config.model.variant)
-    digest = caption_contract_digest(spec)
-    result_contract = normalized_caption_contract(spec)
+    digest = caption_contract_digest(spec, max_model_len=config.execution.max_model_len)
+    result_contract = normalized_caption_contract(spec, max_model_len=config.execution.max_model_len)
     bindings = CaptionRunBindings(
         input=CaptionInputBindings(
             source_columns=("clip_id", "clip_uri", "clip_size_bytes"),
@@ -113,6 +113,7 @@ def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
         max_concurrent_batches=config.execution.max_concurrent_batches,
         tensor_parallel_size=config.execution.tensor_parallel_size,
         pipeline_parallel_size=config.execution.pipeline_parallel_size,
+        max_model_len=config.execution.max_model_len,
         media_concurrency=config.execution.media_concurrency,
         media_batch_size=config.execution.media_batch_size,
         media_cpus=config.execution.media_cpus,

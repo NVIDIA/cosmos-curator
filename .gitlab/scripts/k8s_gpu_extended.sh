@@ -105,6 +105,27 @@ fi
 : "${CI_JOB_ID:?CI_JOB_ID must be set}"
 K8S_OUTPUT_PATH="${S3_OUTPUT_PATH}/jobs/${CI_JOB_ID}/k8s-gpu-extended/${SCENARIO}"
 
+# vnext recipes (examples/ci/${SCENARIO}/*.yaml) run through run-pipeline rather than the
+# run_pipeline config below. Cut, transcode and caption share one table under this media root.
+if [ "${SCENARIO}" = "vnext_fixed_stride_caption" ]; then
+    VNEXT_CONFIG_DIR="${REPO_ROOT}/examples/ci/${SCENARIO}"
+    export VNEXT_MEDIA_ROOT="${K8S_OUTPUT_PATH}/media"
+    # Must match model.variant in video-caption.yaml.
+    CAPTION_VARIANT="qwen3_8_27b_fp8"
+
+    pixi run --as-is -e model-download python "${REPO_ROOT}/.gitlab/scripts/stage_ngc_model.py" "${CAPTION_VARIANT}"
+    bash "${REPO_ROOT}/.gitlab/scripts/run_vnext_recipes.sh" \
+        "${VNEXT_CONFIG_DIR}/video-cut.yaml" \
+        "${VNEXT_CONFIG_DIR}/video-transcode.yaml" \
+        "${VNEXT_CONFIG_DIR}/video-caption.yaml"
+    pixi run --as-is python "${REPO_ROOT}/.gitlab/scripts/verify_vnext_split.py" "${VNEXT_MEDIA_ROOT}/lance"
+    pixi run --as-is python "${REPO_ROOT}/.gitlab/scripts/verify_vnext_caption.py" \
+        "${VNEXT_MEDIA_ROOT}/lance" --variant "${CAPTION_VARIANT}"
+
+    echo "✓ K8s GPU extended pipeline test (${SCENARIO}) completed successfully"
+    exit 0
+fi
+
 run_pipeline_from_config "${CONFIG_PATH}" "${K8S_OUTPUT_PATH}"
 pixi run --as-is python -m cosmos_curator.pipelines.video.output_validation \
     "${CONFIG_PATH}" "${K8S_OUTPUT_PATH}"

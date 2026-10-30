@@ -610,6 +610,65 @@ def test_llm_processor_applies_model_runtime_bindings(
     assert processor_config.engine_kwargs["mm_encoder_tp_mode"] == "data"
 
 
+@pytest.mark.parametrize(
+    ("execution", "binding_engine_kwargs", "expected"),
+    [
+        pytest.param({}, {}, None, id="unset-leaves-vllm-default"),
+        pytest.param({"max_model_len": 32_768}, {}, 32_768, id="execution-setting-reaches-engine"),
+        pytest.param({"max_model_len": 32_768}, {"max_model_len": 8_192}, 32_768, id="execution-wins-over-binding"),
+        pytest.param({}, {"max_model_len": 8_192}, 8_192, id="binding-kept-when-unset"),
+    ],
+)
+def test_llm_processor_max_model_len_resolution(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    execution: dict[str, object],
+    binding_engine_kwargs: dict[str, object],
+    expected: int | None,
+) -> None:
+    """An explicit execution limit overrides the model binding; otherwise the engine default is untouched."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+            "execution": execution,
+        }
+    )
+    captured_configs: list[object] = []
+
+    class _BuiltProcessor:
+        def __init__(self, processor_config: object) -> None:
+            self.config = processor_config
+
+        def list_stage_names(self) -> list[str]:
+            return ["vLLMEngineStage"]
+
+    def build_processor(processor_config: object, **_: object) -> object:
+        captured_configs.append(processor_config)
+        return _BuiltProcessor(processor_config)
+
+    monkeypatch.setattr(ray_data_llm, "build_processor", build_processor)
+
+    inference._build_llm_processor(
+        config.execution,
+        caption_spec.runtime_model_dir,
+        ("clip_id",),
+        inference_bindings=CaptionInferenceBindings(engine_kwargs=binding_engine_kwargs),
+        initial_inference_workers=1,
+        inference_worker_ceiling=1,
+    )
+
+    (processor_config,) = (cast("Any", captured) for captured in captured_configs)
+    assert processor_config.engine_kwargs.get("max_model_len") == expected
+
+
 def test_llm_processor_deep_copies_model_engine_kwargs(
     tmp_path: Path,
     caption_spec: CaptionModelSpec,

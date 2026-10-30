@@ -89,6 +89,7 @@ class CaptionExecutionConfig:
     media_attempts: int
     lance_read_batch_size: int
     parquet_rows_per_file: int
+    max_model_len: int | None = None
 
 
 MAPPED_INPUT_SCHEMA = pa.schema(
@@ -744,6 +745,15 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
         raise ValueError(msg)
     cpu_stage_concurrency = (initial_inference_workers, inference_worker_ceiling)
     video_media_io_kwargs = {"video": {"num_frames": VIDEO_NUM_FRAMES, "fps": bindings.video_fps}}
+    engine_kwargs = {
+        "tensor_parallel_size": config.tensor_parallel_size,
+        "pipeline_parallel_size": config.pipeline_parallel_size,
+        "media_io_kwargs": copy.deepcopy(video_media_io_kwargs),
+        **copy.deepcopy(dict(bindings.engine_kwargs)),
+    }
+    if config.max_model_len is not None:
+        # An explicit execution setting wins over the model binding's own.
+        engine_kwargs["max_model_len"] = config.max_model_len
     processor_config = vLLMEngineProcessorConfig(
         model_source=str(model_dir),
         batch_size=config.inference_batch_size,
@@ -768,12 +778,7 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
         ),
         tokenize_stage=TokenizerStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
         detokenize_stage=DetokenizeStageConfig(enabled=True, concurrency=cpu_stage_concurrency),
-        engine_kwargs={
-            "tensor_parallel_size": config.tensor_parallel_size,
-            "pipeline_parallel_size": config.pipeline_parallel_size,
-            "media_io_kwargs": copy.deepcopy(video_media_io_kwargs),
-            **copy.deepcopy(dict(bindings.engine_kwargs)),
-        },
+        engine_kwargs=engine_kwargs,
     )
     preprocess = partial(
         caption_llm_preprocess,

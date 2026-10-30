@@ -153,9 +153,14 @@ def resolve_model_spec(variant: ModelVariant) -> CaptionModelSpec:
     )
 
 
-def normalized_caption_contract(spec: CaptionModelSpec) -> dict[str, Any]:
-    """Return every result-defining value in a JSON-compatible shape."""
-    return {
+def normalized_caption_contract(spec: CaptionModelSpec, *, max_model_len: int | None = None) -> dict[str, Any]:
+    """Return every result-defining value in a JSON-compatible shape.
+
+    A context limit ends a generation early once prompt plus output reaches it, and the result still
+    validates as ``success`` below the output cap. A set limit is therefore result-defining. Null keeps
+    vLLM's default and leaves the contract, and its digest, unchanged.
+    """
+    contract: dict[str, Any] = {
         "caption_schema_version": CAPTION_SCHEMA_VERSION,
         "model": {
             "id": spec.model_id,
@@ -212,11 +217,14 @@ def normalized_caption_contract(spec: CaptionModelSpec) -> dict[str, Any]:
             },
         },
     }
+    if max_model_len is not None:
+        contract["model_runtime"] = {"max_model_len": max_model_len}
+    return contract
 
 
-def caption_contract_digest(spec: CaptionModelSpec) -> str:
+def caption_contract_digest(spec: CaptionModelSpec, *, max_model_len: int | None = None) -> str:
     """Hash the normalized caption result contract with canonical JSON rules."""
-    return canonical_digest(normalized_caption_contract(spec))
+    return canonical_digest(normalized_caption_contract(spec, max_model_len=max_model_len))
 
 
 def _arrow_field_contract(field: pa.Field) -> dict[str, Any]:

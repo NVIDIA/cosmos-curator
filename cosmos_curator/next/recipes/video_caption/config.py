@@ -111,6 +111,18 @@ class VideoCaptionExecutionConfig(BaseModel):
     )
     tensor_parallel_size: int = Field(default=1, ge=1)
     pipeline_parallel_size: int = Field(default=1, ge=1)
+    max_model_len: int | None = Field(
+        default=None,
+        ge=2,
+        description=(
+            "Longest request, prompt plus generated tokens, the vLLM engine accepts. Null preserves vLLM's own "
+            "default, the model's maximum (262,144 tokens for Qwen3.8). vLLM refuses to start unless one request "
+            "of this length fits in the KV cache, so lowering it lets the model load on GPUs with less memory "
+            "left after the weights. A clip whose prompt exceeds it fails the run, and a caption cut short because "
+            "prompt plus output reached it is still recorded as success, so a set limit is part of the caption "
+            "contract: results written under different limits do not share a digest."
+        ),
+    )
     media_concurrency: int | Literal["auto"] = Field(
         default="auto",
         description=(
@@ -194,7 +206,7 @@ _TEMPLATE_BASE: dict[str, Any] = {
     "output": {},
     "execution": {"storage_profile": "default"},
 }
-_TEMPLATE = ResolvedVideoCaptionConfig.model_validate(_TEMPLATE_BASE).model_dump(mode="json", exclude_none=True)
+_TEMPLATE = ResolvedVideoCaptionConfig.model_validate(_TEMPLATE_BASE).model_dump(mode="json")
 _TEMPLATE_PREAMBLE = """\
 # All supported settings and their defaults are shown. Unchanged settings may be removed.
 # clips_lance_uri and staging_root_uri are derived from input.media_root when omitted.

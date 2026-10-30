@@ -326,6 +326,7 @@ The reference settings are execution choices, not result-contract inputs:
 | Multimodal preparation | 24 GiB scheduling reservation per actor | Covers measured batch-32 heap peaks without host overcommit. |
 | Chat-template stage | 16 GiB scheduling reservation per actor | Bounds CPU actor growth on large nodes. |
 | vLLM | Batch 32, 8 concurrent batch calls | Matches the benchmarked legacy Ray Data captioning baseline. |
+| vLLM context length | Unset, the model's own maximum | `execution.max_model_len` caps prompt plus generated tokens per request. vLLM refuses to start unless one request of that length fits in the KV cache, so lowering it lets the model load on GPUs with less memory beyond the weights; a clip over the limit fails the run. A set limit is part of the caption contract and digest; null leaves both unchanged. |
 | Result/checkpoint shard | 4,096 rows | Amortizes object listing and validation while bounding replay work. |
 
 Memory values are Ray scheduling reservations rather than eager allocations. Media fetch uses the per-node

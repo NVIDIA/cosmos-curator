@@ -61,6 +61,8 @@ def test_defaults_derive_absolute_local_paths(tmp_path: Path) -> None:
         {"execution": {"inference_batch_size": "32"}},
         {"execution": {"inference_concurrency": 0}},
         {"execution": {"media_concurrency": 0}},
+        {"execution": {"max_model_len": 1}},
+        {"execution": {"max_model_len": "32768"}},
         {"input": {"media_root": "https://example.com/clips"}},
     ],
 )
@@ -74,6 +76,18 @@ def test_config_rejects_non_contract_values(update: dict[str, object]) -> None:
 
     with pytest.raises(ValidationError):
         resolve_config_data(raw)
+
+
+def test_max_model_len_defaults_to_vllm_and_accepts_an_override() -> None:
+    """Null leaves the engine at vLLM's default; a dotted override sets the limit."""
+    default = resolve_config_data(_minimal("s3://example-bucket/media"))
+    overridden = resolve_config_data(
+        _minimal("s3://example-bucket/media"),
+        overrides=["execution.max_model_len=32768"],
+    )
+
+    assert default.execution.max_model_len is None
+    assert overridden.execution.max_model_len == 32_768
 
 
 def test_bf16_variant_and_execution_overrides_resolve() -> None:

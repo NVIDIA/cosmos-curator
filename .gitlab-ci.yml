@@ -1547,6 +1547,10 @@ k8s_gpu_tests:
 #                            omits both), runs the torchvision.io video I/O import
 #                            guard, then runs the full SeedVR2-3B SR pipeline
 #                            end-to-end (weights pulled from the CI NGC org).
+#   - vnext_fixed_stride_caption: vnext fixed-stride video-cut -> video-transcode ->
+#                            video-caption (video-caption reads the transcode output). The
+#                            caption step runs Ray Data LLM + vLLM, so Ray/vLLM version
+#                            mismatches fail here.
 # Opt-in via slurm_nvcf_e2e_rules (run-e2e-tests label / manual on MRs).
 k8s_gpu_extended:
   extends: k8s_gpu_tests
@@ -1562,6 +1566,8 @@ k8s_gpu_extended:
       - SCENARIO: split_openai
         RUNNER_TAG: k8s-cpu
       - SCENARIO: split_super_resolution
+        RUNNER_TAG: k8s-gpu
+      - SCENARIO: vnext_fixed_stride_caption
         RUNNER_TAG: k8s-gpu
   script:
     - .gitlab/scripts/k8s_gpu_extended.sh

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# k8s_gpu_extended scenario `vnext_fixed_stride_caption`, step 3/3: the Ray Data LLM + vLLM path,
+# including Ray's multimodal preparation stage. run_vnext_recipes.sh renders the environment
+# variable VNEXT_MEDIA_ROOT into this file before running it.
+schema_version: 1
+kind: video-caption
+input:
+  media_root: ${VNEXT_MEDIA_ROOT}
+model:
+  variant: qwen3_8_27b_fp8
+execution:
+  storage_profile: default
+  inference_concurrency: 1
+  # Without a limit vLLM sizes the KV cache for the model's 262,144-token maximum, which
+  # does not fit beside the 27B weights on the 48 GB CI GPU.
+  max_model_len: 32768

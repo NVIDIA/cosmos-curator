@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# k8s_gpu_extended scenario `vnext_fixed_stride_caption`, step 2/3. video-caption reads the clip
+# table this step writes. run_vnext_recipes.sh renders the environment variable VNEXT_MEDIA_ROOT
+# into this file before running it.
+schema_version: 1
+kind: video-transcode
+input:
+  media_root: ${VNEXT_MEDIA_ROOT}
+transcode:
+  video_encoder: libopenh264
+execution:
+  # CI GPU pods have 8 cores; keep a transcode task well inside that.
+  transcode_cpus: 2

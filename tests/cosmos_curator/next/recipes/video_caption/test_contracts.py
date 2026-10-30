@@ -57,6 +57,19 @@ def test_model_resolution_and_contract_digest_are_pinned(
     assert caption_contract_digest(spec) == digest
 
 
+def test_max_model_len_is_result_defining_only_when_set(caption_spec: CaptionModelSpec) -> None:
+    """A context limit can end a caption early, so a set limit changes the digest; null leaves it as is."""
+    default_digest = caption_contract_digest(caption_spec)
+
+    assert "model_runtime" not in normalized_caption_contract(caption_spec)
+    assert caption_contract_digest(caption_spec, max_model_len=None) == default_digest
+    assert normalized_caption_contract(caption_spec, max_model_len=32_768)["model_runtime"] == {"max_model_len": 32_768}
+    assert caption_contract_digest(caption_spec, max_model_len=32_768) != default_digest
+    assert caption_contract_digest(caption_spec, max_model_len=32_768) != caption_contract_digest(
+        caption_spec, max_model_len=65_536
+    )
+
+
 def test_arrow_field_set_is_exact_and_owned(caption_spec: CaptionModelSpec) -> None:
     """Both nullable top-level fields carry exact ownership and child schemas."""
     caption, metadata = caption_spec.fields
