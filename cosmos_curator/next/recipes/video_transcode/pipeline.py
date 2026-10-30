@@ -65,12 +65,11 @@ def transcode_spans(processing: ProcessingScope, config: ResolvedVideoTranscodeC
     downloaded = sources.map(
         cast("Any", SourceDownloader),
         fn_constructor_kwargs={"config": config},
-        compute=ray.data.ActorPoolStrategy(min_size=1, max_tasks_in_flight_per_actor=1),
+        compute=ray.data.ActorPoolStrategy(
+            min_size=1, max_tasks_in_flight_per_actor=1, max_concurrent_calls_per_actor=1
+        ),
         num_cpus=0.25,
-        max_concurrency=1,
         resources={environment.CURATOR_IO_RESOURCE_NAME: 1.0},
-        max_restarts=-1,
-        max_task_retries=-1,
     )
     encoded = downloaded.flat_map(
         cast("Any", transcode_source),

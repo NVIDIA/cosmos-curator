@@ -47,12 +47,11 @@ def test_download_admission_is_actor_bound_and_plan_scoped(
     assert kwargs["fn_constructor_kwargs"] == {"config": config}
     assert kwargs["num_cpus"] == 0.25
     assert kwargs["resources"] == {"curator_io": 1.0}
-    assert kwargs["max_concurrency"] == 1
-    assert kwargs["max_restarts"] == kwargs["max_task_retries"] == -1
     strategy = kwargs["compute"]
     assert isinstance(strategy, ActorPoolStrategy)
     assert strategy.min_size == strategy.initial_size == 1
     assert strategy.max_size == float("inf")
+    assert strategy.max_concurrent_calls_per_actor == 1
     assert strategy.max_tasks_in_flight_per_actor == 1
     assert plan.context.autoscaling_config.actor_pool_util_upscaling_threshold == 1.0
     assert plan.context.custom_execution_callback_classes == [ExecutionCallback, ReleasePendingDownloadActors]

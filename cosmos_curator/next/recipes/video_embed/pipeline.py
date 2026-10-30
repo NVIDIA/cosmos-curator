@@ -39,6 +39,7 @@ def _actor_pool(concurrency: Concurrency) -> ray.data.ActorPoolStrategy:
     return ray.data.ActorPoolStrategy(
         min_size=1,
         max_size=None if concurrency == "auto" else concurrency,
+        max_concurrent_calls_per_actor=1,
     )
 
 
@@ -65,7 +66,6 @@ def embed_clips(processing: ProcessingScope, config: ResolvedVideoEmbedConfig, s
         num_cpus=0.25,
         # Backpressured tasks retain encoded buffers on their worker heap.
         resources={environment.CURATOR_IO_RESOURCE_NAME: 1.0},
-        max_retries=-1,
     )
     inferred = downloaded.map_batches(
         VideoEmbedder,
@@ -76,9 +76,6 @@ def embed_clips(processing: ProcessingScope, config: ResolvedVideoEmbedConfig, s
         num_cpus=1,
         num_gpus=1,
         runtime_env=ray_data_gpu_runtime_env("legacy-transformers"),
-        max_concurrency=1,
-        max_restarts=-1,
-        max_task_retries=-1,
     )
     processing.write(inferred)
 
