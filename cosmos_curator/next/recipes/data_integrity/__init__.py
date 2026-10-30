@@ -18,9 +18,9 @@
 The reusable half -- the metrics themselves, their pass/fail policy and the
 per-stream engine that runs them -- lives in
 :mod:`cosmos_curator.core.sensors.data_integrity`. What lives here is everything
-that makes those metrics a Cosmos Curator workflow: the ``di-check`` and
-``di-session`` entry points, cloud/local stream discovery, the concurrent session
-runner, report rendering, the Lance-backed result store, and the
+that makes those metrics a Cosmos Curator workflow: the ``di`` tool and the
+``data-integrity`` pipeline, their shared config, cloud/local stream discovery, the
+concurrent session runner, report rendering, the Lance-backed result store, and the
 ``check_video_index`` diagnostic.
 
 See ``docs/curator/design/data-integrity-design.md`` for the architecture and the

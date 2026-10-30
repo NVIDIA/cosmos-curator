@@ -76,7 +76,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 
 # Reason attached to a rate-dependent check that has no usable expected rate.
-REASON_MISSING_HZ = "skipped: --expected-hz not provided and container header lacks a nominal frame rate"
+REASON_MISSING_HZ = "skipped: no expected rate provided and container header lacks a nominal frame rate"
 
 #: What a session was measured on, for the reason on a check that needed sensor times.
 #: ``None`` is its own phrase because "no sensor reported a clock" is not a clock.
@@ -144,8 +144,8 @@ def resolve_expected_hz(user_hz: float | None, sensor: IntegritySensor) -> Resol
     because they measure variation *between* samples: an irregular cadence shows
     up whatever the baseline. The rate check does not, and cannot be relied on to
     catch a uniformly wrong sensor sampling rate, since a stream that ran entirely
-    at the wrong speed tends to declare a header rate that matches it. Pass
-    ``--expected-hz`` whenever that distinction matters.
+    at the wrong speed tends to declare a header rate that matches it. Supply an
+    expected rate explicitly whenever that distinction matters.
 
     ``Fraction(0)`` -- the sentinel used in
     :mod:`cosmos_curator.core.sensors.utils.video` when the header lacks a usable
@@ -238,7 +238,7 @@ def run_metrics(
     -- is reported ``SKIPPED`` and never handed to an evaluator.
 
     Pure compute: the sensor is already open, so this performs no I/O and is the
-    unit both CLIs share.
+    unit every entry point shares.
 
     Args:
         sensor: an opened sensor exposing the :class:`IntegritySensor` surface.

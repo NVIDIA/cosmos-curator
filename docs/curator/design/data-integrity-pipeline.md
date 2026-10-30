@@ -7,9 +7,9 @@ data-integrity metrics across many autonomous-vehicle sessions with Ray Data, an
 the resulting measurements and evaluations into one store root. The first target is a large
 multi-session autonomous-vehicle recording bucket.
 
-Where `di-check` measures one video and `di-session` measures one session, this recipe
-takes an input that identifies many sessions, fans out to one Ray task per session, and
-commits everything a single invocation measured under one `run_id`.
+Where `di` measures one session, this recipe takes an input that identifies many sessions,
+fans out to one Ray task per session, and commits everything a single invocation measured
+under one `run_id`.
 
 It adds no metric, no modality and no evaluation policy: the metric kernel
 (`cosmos_curator/core/sensors/data_integrity/`) is consumed as it is. It does add to the
@@ -23,9 +23,9 @@ reader of sections 1–4 of the [store schema][store-schema] is untouched.
 
 [Data Integrity Design](data-integrity-design.md) draws its boundary explicitly: the kernel
 "measures and judges", and "everything needed to *run* it at recording scale is
-deliberately not designed here". Of the six open problems that section lists, `di-check` and
-`di-session` answered one — an end-to-end entry point — at single-input and single-session
-granularity. This recipe carries that same problem to many sessions. Of the other five it
+deliberately not designed here". Of the six open problems that section lists, `di` answered
+one — an end-to-end entry point — at single-session granularity. This recipe carries that
+same problem to many sessions. Of the other five it
 resolves none outright: full-fidelity sensor input, composing metrics into checks, declaring
 checks as data, and generalizing one-read-many-metrics past the camera path all stand. The
 fifth, multi-sensor metrics, is under way rather than untouched — two of them exist in the
@@ -57,9 +57,9 @@ without touching the kernel:
   failed write — or could not cover everything it was asked to.
 - Data-quality failures and unreadable inputs are persisted as findings; the run continues.
 - A failure to *reach* data is not a finding about it, and is never persisted as one.
-- Consume the recipe's library APIs, not the internals of its CLIs.
+- Consume the recipe's library APIs, not the internals of its entry points.
 - The recipe package must not import Ray at import time, so
-  `python -m cosmos_curator.next.recipes.data_integrity.cli --help` stays fast and
+  `python -m cosmos_curator.next.recipes.data_integrity.session_cli --help` stays fast and
   Ray-free.
 
 ---
@@ -99,7 +99,7 @@ spent before filtering would come back holding mostly excluded keys.
 The session layout is already settled, and already exercised against the target bucket.
 `session_cli.py` defines a session as "one recording -- typically a `clips/<uuid>/`
 directory (or cloud prefix) holding one video per camera", and its usage block gives
-`--session-path s3://<bucket>/clips/<uuid>/` as a worked example.
+`input.sessions: ["s3://<bucket>/clips/<uuid>/"]` as a worked example.
 
 One recording can span several recorder computers: a vehicle with multiple recorders writes
 a `recorder-<NN>/` directory per recorder under one session uuid, and their clocks are
@@ -269,9 +269,9 @@ difference has to be handled.
 
 `output.store_root` must be a local directory or an `s3://` prefix.
 `get_lance_storage_options` raises on an `az://` root rather than silently writing an
-unauthenticated store, and `store_cli.validate_store_path` rejects one at parse time for the
-two CLIs — because the store is written last, so a typo should not cost a whole session. This
-config should validate it the same way. Reading *sessions* from `az://` is unaffected.
+unauthenticated store, so the config rejects one while resolving — because the store is
+written last, and a typo should not cost a whole session. Both entry points share that one
+check, in `DataIntegrityOutputConfig`. Reading *sessions* from `az://` is unaffected.
 
 ### Input Contract
 
@@ -283,7 +283,7 @@ config should validate it the same way. Reading *sessions* from `az://` is unaff
 - **`session_roots`** with **`session_depth`** — expand a dataset root by listing the
   prefixes below it. This is what makes a whole recording bucket usable directly.
   `session_depth` is validated at 1, the shared lister's native scope and the layout
-  `di-session` documents; a deeper root is rejected rather than silently flattened, and
+  `di` documents; a deeper root is rejected rather than silently flattened, and
   supporting one is additive (see [Open Questions](#open-questions)).
 
 At least one must be non-empty, and an expansion that yields zero sessions is a
@@ -428,12 +428,13 @@ the create-or-append race that `robot_action_split/lance_sink.py` flags as an op
 and there is no reason to inherit it.
 
 `stream_idx` is not in the record: it selects which video stream to open *inside* a
-container, and stays at the `run_checks` default of 0, as `di-session` does — so a container
-holding more than one video stream has only its first measured. `check_session` packages each
-successful run through the shared `results.stream_result` helper and takes the default
-selector, exactly as the session runner does, because `stream_key` hashes the selector
-alongside the source: hand-building a `StreamResult` with a different selector would fork
-stream identity from what the CLIs write for the same file. `run_id` and `created_at` are
+container, and stays at the `run_checks` default of 0, which is also `di`'s default — so a
+container holding more than one video stream has only its first measured, and reaching a
+secondary track stays a single-session operation. `check_session` packages each successful
+run through the shared `results.stream_result` helper and takes the default selector,
+exactly as the session runner does, because `stream_key` hashes the selector alongside the
+source: hand-building a `StreamResult` with a different selector would fork stream identity
+from what `di` writes for the same file. `run_id` and `created_at` are
 computed once on the driver and passed into `check_session`, so every row in one run shares
 them.
 
@@ -522,7 +523,8 @@ The retry that does fire is `run_one_stream`'s `max_attempts`, which `check_sess
 from `execution.stream_attempts`. Per-stream isolation is unchanged — a stream that fails
 every attempt is still one row rather than a failed session — and a read timeout stops being
 recorded as a data-quality finding manufactured by the network. `max_attempts` defaults to 1,
-so `di-session` retries nothing and behaves exactly as before.
+so a caller that says nothing retries nothing; `di` passes the same `execution.stream_attempts`
+through `run_session`, so one config cannot mean three attempts under Ray and one without it.
 
 Listing has no retry, which is a real cost of catching it here rather than letting it escape:
 a transient blip while listing costs that session its measurement for this run, where the
@@ -609,13 +611,14 @@ Sensor timestamps then took it to 3 by adding `timestamp_source` to `stream.lanc
 *not* additive: an append has to match the dataset's schema, so a store written at 1 or 2 needs
 a fresh root rather than a migration.
 What did not change is the commit rule, or `write_run`'s one production call site,
-`store_cli.persist_run`, which is what both CLIs go through, so neither CLI changes.
+`store_cli.persist_run`, which is what both entry points go through, so neither changes.
 
 ### The run row's `session_path` is null
 
 `commit_run` and `write_manifest` both take a scalar `session_path` describing the run as a
 whole. A multi-session run passes `None`, which the schema permits
-(`store_schema.py:157`) and which `di-check` already writes today for a single-stream run.
+(`store_schema.py:157`). A single-session run has one session path to name and passes it;
+this is the only caller that has none.
 
 This is not the rejected alternative below. That one passes `None` *down into every row*,
 erasing `session_id`, `session_path` and `relative_key` per stream. Here only the
@@ -626,7 +629,7 @@ sorts by `(committed_at, run_id)` without filtering.
 ### `session_rollup` answers a wider question now
 
 `session_rollup(root)` takes no session argument: it reads every committed stream and verdict
-under the root and reduces them to one status. On a store `di-session` wrote, that is a session
+under the root and reduces them to one status. On a store `di` wrote, that is a session
 verdict; on a store this recipe wrote, it is a whole-dataset verdict under the same name. No
 stored row changes, and nothing in the pipeline calls it — `session_id` and `session_path` are
 on every row, so a per-session rollup is a group-by away. Adding that argument is follow-up
@@ -637,8 +640,8 @@ work rather than part of this recipe.
 `stream.lance` and the metric tables de-duplicate on `stream_id` alone, ordered by
 `created_at` DESC then `run_id` DESC. `stream_id` hashes the absolute
 `(source, selector_type, selector_value)` triple, deliberately independent of the session it
-was discovered under, so `di-check` and `di-session` produce one row for the same bytes
-rather than two (store schema, "Dedup keys" and "Stream identity").
+was discovered under, so `di` and this recipe produce one row for the same bytes rather than
+two (store schema, "Dedup keys" and "Stream identity").
 
 Every row in one invocation shares one `run_id` and one `created_at`. So if a source is
 reached through two session paths — overlapping `session_roots`, a repeated entry, or a root
@@ -664,9 +667,8 @@ Two spellings of one path and two paths for one source are all this catches. Two
 distinct sessions that both point at the same bytes — through a symlink, or a bucket alias —
 would still collide, and are out of scope: nothing in a listing distinguishes them.
 
-`tool` is `"data-integrity"`, joining the existing `di-check` / `di-session` /
-`di-reevaluate` values; the comment in `store_schema` that enumerates them needs the new
-entry.
+`tool` is `"data-integrity"`, joining the existing `di` / `di-reevaluate` values; the comment
+in `store_schema` that enumerates them needs the new entry.
 
 One invocation applies one threshold policy. `commit_run` takes a single `thresholds` and
 stamps `policy_id(thresholds)` on the run row and on every evaluation row, so the `checks:`
@@ -692,9 +694,9 @@ manufactured — and because readers resolve to the newest row per `stream_id`, 
 supersedes a healthy measurement from an earlier run, so a token that expires halfway through
 a fleet run leaves every stream after it reading back as broken. Writing nothing leaves the
 last real answer standing. `run_one_stream` raises `InfrastructureError` for these, under an
-opt-in `raise_infrastructure_errors` flag: `di-session` keeps the old contract, where the
-operator is watching and every failure is one line of a report, and only a run over thousands
-of streams needs the distinction.
+opt-in `raise_infrastructure_errors` flag: `di` leaves it off, because an operator is watching
+and every failure is one line of a report, and only a run over thousands of streams needs the
+distinction.
 
 Classification is `is_infrastructure_error`, reading three signals in order — the exception's
 class hierarchy (`NoCredentialsError`, `ProfileNotFound`, our own `StorageCliError`, which on
@@ -847,25 +849,30 @@ composition-root tests that pin the registered names —
 `tests/cosmos_curator/pipelines/test_builtin_pipeline_kinds.py` and
 `test_pipeline_app.py`, which spells the same list into an error message — change with it.
 
-## Relationship to `di-check` and `di-session`
+## Relationship to the `di` tool
 
-| Concern | `di-check` | `di-session` | `data-integrity` |
-| --- | --- | --- | --- |
-| Unit of input | one video | one session | many sessions |
-| Session enumeration | n/a | caller supplies the path | expanded from config |
-| Concurrency | none | `ThreadPoolExecutor` | Ray Data |
-| Entry point | argparse CLI | argparse CLI | config file + `pipeline_runtime` |
-| Metric kernel | shared | shared | shared |
-| Store write | `write_run` | `write_run` | `append_rows` then `commit_run` |
-| Exit status | `PASS` / `FAIL` / `ERROR` as 0 / 1 / 2 | same | 0 on full coverage, nonzero on operational failure or short coverage |
-| Unreachable input | that stream's `ERROR`, in the report | same | counted, not recorded, and the run exits nonzero |
+`di` is the single-session tool, and takes the same config this recipe does rather than its
+own flags; a lone video is simply a session of one stream.
 
-The last two rows are the only ones where this recipe deliberately behaves *differently*
-rather than simply doing more, and both follow from scale. A nonzero code on FAIL is useful in
-an interactive CLI; a pipeline over thousands of sessions must not report a data-quality
-finding as a job failure. Likewise, for one session an unreachable stream is a line in a
-report the operator is already reading, while for a fleet run it is a row that would outlive
-the run that wrote it.
+| Concern | `di` | `data-integrity` |
+| --- | --- | --- |
+| Unit of input | one session, which may be a lone video | many sessions |
+| Session enumeration | `input.sessions`, exactly one entry | expanded from `input`, all three forms |
+| Concurrency | `ThreadPoolExecutor` over streams (`execution.stream_concurrency`) | Ray Data over sessions (`execution.session_concurrency`) |
+| Entry point | config file + four output flags | config file + `pipeline_runtime` |
+| Metric kernel | shared | shared |
+| Store | optional (`output.store_root` may be null); `write_run` | required; `append_rows` then `commit_run` |
+| Exit status | `PASS` / `FAIL` / `ERROR` as 0 / 1 / 2 | 0 on full coverage, nonzero on operational failure or short coverage |
+| Unreachable input | that stream's `ERROR`, in the report | counted, not recorded, and the run exits nonzero |
+
+The last three rows are the only ones where this recipe deliberately behaves *differently*
+rather than simply doing more, and all three follow from scale. A nonzero code on FAIL is
+useful in an interactive tool; a pipeline over thousands of sessions must not report a
+data-quality finding as a job failure. Likewise, for one session an unreachable stream is a
+line in a report the operator is already reading, while for a fleet run it is a row that
+would outlive the run that wrote it. And a pipeline run's committed rows are its entire
+output, so it cannot be allowed the null store root that lets `di` print a report in an
+environment carrying neither Lance nor Ray.
 
 ---
 
@@ -936,12 +943,12 @@ liveness. It fails rather than falling back because the index decides which *clo
 measures on: scanning the videos instead would put part of the run on media PTS where the
 rest is on indexed DTS, a difference no stored row explains. A manifest that is readable but
 does not cover a video, or whose row no longer matches its bytes, still falls back to reading
-that one video — that is a miss, not a misconfiguration. The single-session `di-check` and
-`di-session` keep `--index-manifest`'s softer reading, where an absent manifest means "not
-built yet"; an operator watching one session can afford to scan, a thousand-session run
-cannot afford to do it silently.
+that one video — that is a miss, not a misconfiguration. Where the two part is a configured
+manifest that does not exist: `di` reads that as "not built yet" and scans, while a run reads
+it as a typo and fails. An operator watching one session can afford to scan, a
+thousand-session run cannot afford to do it silently.
 
-**A bespoke argparse entry point reusing `di-session`'s exit codes.** Rejected: that returns
+**A bespoke argparse entry point reusing `di`'s exit codes.** Rejected: that returns
 1 on a data-quality FAIL. `pipeline.py` keeps an argparse `main()` for local iteration, but
 it mirrors the runtime's contract.
 
@@ -1006,8 +1013,8 @@ the choice:
 - The two store row builders are public, so a driver can compose a run from one place instead
   of per-call `noqa`s or one run per session.
 - `check_session` reuses `run_one_stream` rather than restating its wide catch, and the
-  bounded retry rides on that helper's new `max_attempts` — default 1, so `di-session` is
-  unchanged.
+  bounded retry rides on that helper's new `max_attempts` — default 1, so a caller that does
+  not ask for retries does not get them.
 - `session_concurrency` takes a plain default. `next/AGENTS.md` forbids `next/` importing
   the legacy `pipelines/ray_data` tree, which is where the helpers that would size it from
   the live cluster live, so promoting them is that migration's work rather than this
@@ -1033,17 +1040,17 @@ The first implementation is complete when:
 - an input set that expands to zero sessions is rejected as a configuration error
 - a session path nested inside another configured session is measured once, under the session
   enclosing it, so no two rows in a run collide on `stream_id`
-- a store written by `di-session` is readable and appendable by the pipeline, and a store
+- a store written by `di` is readable and appendable by the pipeline, and a store
   written by the pipeline is re-judgeable by `reevaluate.reevaluate()` (which stamps
   `tool="di-reevaluate"` and keys off `measurement_run_id`), across both grains and with
   only additive schema change — a version-1 store still reads
-- `di-check` and `di-session` keep their current output and exit codes
+- `di` keeps its current output and exit codes
 - `cosmos-curator pipeline template` and `pipeline schema` accept `data-integrity` as their
   kind argument, `pipeline validate` / `pipeline render` accept a `kind: data-integrity`
   config, and the underscored spelling is not accepted anywhere
 - `pixi run run-pipeline` executes the recipe from a config file
-- `python -m cosmos_curator.next.recipes.data_integrity.cli --help` still does not import
-  Ray
+- `python -m cosmos_curator.next.recipes.data_integrity.session_cli --help` still does not
+  import Ray
 - the pipeline runs end to end over a multi-session subset of the target bucket and
   persists a committed run
 
@@ -1052,7 +1059,7 @@ The first implementation is complete when:
 - new metrics or new modalities
 - distributed re-evaluation from stored measurements
 - restarts after failure, and idempotent re-runs
-- any change to the shared storage CLI helpers, or to `di-check` / `di-session` behavior
+- any change to the shared storage CLI helpers, or to `di` behavior
 - any *non-additive* change to the Lance schema: the session-grain tables were added at
   `STORE_SCHEMA_VERSION` 2, and no existing dataset, column or dedup key moved. (Scoped to
   this recipe. Sensor timestamps later took the store to version 3 non-additively, on their

@@ -14,34 +14,36 @@
 # limitations under the License.
 #
 
-# LOCAL DEV SETUP
+# The `di` pixi environment carries this tool's whole import closure and nothing that
+# pins a CUDA platform, so it installs on a laptop as well as on a node:
 #
-# Same environment as the single-video di-check CLI (see cli.py). Once that venv
-# exists:
+#   pixi install -e di
+#   pixi run -e di di di.yaml
 #
-#   alias di-session="$VENV/bin/python -m cosmos_curator.next.recipes.data_integrity.session_cli"
+# On a node that already has `default` installed, skip the extra environment:
 #
-# Run against one session (a clips/<uuid>/ directory or cloud prefix):
-#
-#   di-session --session-path /path/to/clips/<uuid>
-#   di-session --session-path s3://bucket/clips/<uuid>/ --s3-profile-name my-profile --json
-#   di-session --session-path s3://bucket/clips/<uuid>/ --endpoint-url <endpoint-url> --limit 5
-#
-# Where a session prefix holds copies of its cameras beside the originals, name the
-# subprefixes that hold the real streams:
-#
-#   di-session --session-path s3://bucket/clips/<uuid>/ --stream-glob 'recorder-*/*'
+#   pixi run --as-is python -m cosmos_curator.next.recipes.data_integrity.session_cli di.yaml
 #
 
-"""Run every data-integrity metric against every stream of a single session.
+"""Run every data-integrity metric over one session, or one video, without Ray.
 
-A *session* is one recording -- typically a ``clips/<uuid>/`` directory (or cloud
-prefix) holding one video per camera. This CLI discovers those streams, runs the
-shared per-stream engine
-(:mod:`cosmos_curator.core.sensors.data_integrity.engine`) on each, and prints
-a per-stream + session-level verdict. It is the session-level companion to the
-single-video ``di-check`` CLI (:mod:`.cli`) and reuses the same engine, cloud
-credential flags, and reason strings.
+The companion to the ``data-integrity`` pipeline: same config, same engine, same
+report, one session at a time and no cluster. That is the whole of its reason to
+exist -- it is how a scan is iterated on and profiled, and how a single file is
+checked, with Ray and Lance out of the picture.
+
+A *session* is one recording, typically a ``clips/<uuid>/`` directory or cloud prefix
+holding one video per camera. A lone video file is a session of one stream, which is
+why there is no separate single-video tool: :func:`~.discovery.discover_streams`
+already resolves a file, a directory and a prefix the same way.
+
+Settings come from the config file rather than from flags
+(:mod:`.config`), so the two executors cannot drift apart, and so a config iterated on
+here is the config a pipeline run takes. The flags left here are the ones with no
+config twin: they shape what this process prints, not what gets measured. Per-session
+settings the config carries for the pipeline alone -- ``execution.session_concurrency``,
+``append_batch_size``, ``progress`` and ``no_progress_timeout_s`` -- have nothing to
+act on here and are ignored.
 """
 
 import argparse
@@ -52,34 +54,32 @@ import time
 from collections.abc import Callable
 from typing import BinaryIO, cast
 
-from cosmos_curator.core.sensors.data_integrity.results import OverallStatus, StreamResult
+from cosmos_curator.core.sensors.data_integrity.results import OverallStatus, SessionReport, StreamResult
 from cosmos_curator.core.utils.storage.s3_client import resolve_s3_endpoint_url
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
-from cosmos_curator.core.utils.storage_cli import StorageCliError, add_storage_credential_args
+from cosmos_curator.core.utils.storage_cli import StorageCliError
 from cosmos_curator.next.recipes.data_integrity import storage_io
 from cosmos_curator.next.recipes.data_integrity.cli_support import (
     ERROR_EXIT_CODE,
     FAIL_EXIT_CODE,
     PASS_EXIT_CODE,
-    add_index_args,
-    add_session_threshold_args,
-    add_threshold_args,
-    available_cpu_count,
     interrupt_guard,
-    non_empty_str,
     non_negative_int,
     open_index_manifest,
-    positive_finite_float,
-    positive_int,
     raise_if_interrupted,
     report_error,
     report_interrupted,
-    thresholds_from_args,
 )
+from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig, resolve_config
 from cosmos_curator.next.recipes.data_integrity.report import render_text, to_json
 from cosmos_curator.next.recipes.data_integrity.session_runner import run_session
-from cosmos_curator.next.recipes.data_integrity.store_cli import add_store_args, persist_run
+from cosmos_curator.next.recipes.data_integrity.sessions import single_session
+from cosmos_curator.next.recipes.data_integrity.store_cli import persist_run
+
+#: What the store records as the writer of this tool's rows. Write-only and
+#: unvalidated, so rows written by another entry point keep their own value.
+TOOL = "di"
 
 # Session verdict -> process exit code. Uses the shared CLI exit-code contract:
 # PASS = 0, FAIL = 1, and anything that could not be checked (ERROR) = 2.
@@ -92,10 +92,10 @@ _EXIT_CODES = {
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="di-session",
+        prog="di",
         description=(
-            "Run every data-integrity metric against every stream of a single session, "
-            "then the session-grain metrics across all of them."
+            "Run every data-integrity metric over one session -- or one video -- from a config file, "
+            "then the session-grain metrics across its streams."
         ),
         epilog=(
             "Exit codes: 0 = everything PASS; 1 = at least one FAIL, of a stream or of the session itself; "
@@ -104,78 +104,51 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--session-path",
-        required=True,
-        metavar="PATH",
+        "config",
+        metavar="CONFIG",
         help=(
-            "Local directory or file, or an s3:// / az:// prefix for one session (typically a single clips/<uuid>/)."
+            "A data-integrity config (YAML or JSON), as `cosmos-curator pipeline template data-integrity` "
+            "prints. input.sessions must name exactly one session; output.store_root may be null to "
+            "report without persisting."
         ),
     )
     parser.add_argument(
-        "--expected-hz",
-        type=positive_finite_float,
-        default=None,
-        metavar="HZ",
-        help=(
-            "Authoritative expected sample rate for the rate, gap, and jitter checks, applied to every "
-            "stream. Defaults to each stream's declared rate, which is best-effort and will not catch a "
-            "uniformly wrong sensor sampling rate; SKIPs those checks where neither is available."
-        ),
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=non_negative_int,
-        default=0,
-        metavar="N",
-        help="Timestamps per metric update; 0 (default) feeds each stream's whole array at once.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=non_negative_int,
-        default=0,
-        metavar="N",
-        help="Cap the number of streams checked; 0 (default) means all. Useful for sampling a large session.",
-    )
-    parser.add_argument(
-        "--stream-glob",
+        "--set",
         action="append",
-        type=non_empty_str,
-        default=None,
-        metavar="GLOB",
+        metavar="PATH=VALUE",
         help=(
-            "Check only streams whose path below the session matches this glob; repeatable, and every "
-            "video is checked when it is omitted. '*' does not cross '/', '**' spans subdirectories. "
-            "Pass --stream-glob 'recorder-*/*' where a session prefix also holds copies of its own "
-            "cameras, which would otherwise be measured twice and inflate the session's sensor count."
+            "Override one config setting, e.g. --set checks.expected_hz=30. Repeatable. "
+            "VALUE is parsed as YAML, so `null`, numbers, booleans and JSON lists all work."
         ),
     )
-    default_max_workers = available_cpu_count()
     parser.add_argument(
-        "--max-workers",
-        type=positive_int,
-        default=default_max_workers,
+        "--stream-idx",
+        type=non_negative_int,
+        default=0,
         metavar="N",
         help=(
-            f"Streams to check concurrently (default: one per usable CPU, so {default_max_workers} here). "
-            "Each stream spends most of its time waiting on the source, so overlapping them helps most "
-            "on cloud sessions. Use 1 for serial checking and a live byte counter."
+            "Video stream index to open inside each container (default: 0). For reaching a secondary "
+            "track of one file; a session normally holds one video per file. The store keys on it, so "
+            "index 0 and index 1 of a file are two streams rather than one overwriting the other."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit the JSON report to stdout.")
     parser.add_argument(
+        "--perf-profile",
+        action="store_true",
+        help="Emit per-phase wall-clock timings to stderr after the report.",
+    )
+    parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
-            "Print a per-stream progress line to stderr as each stream is opened and finished "
-            "(default: on). stdout stays a clean report / JSON payload. Use --no-progress to silence."
+            "Print a per-stream progress line to stderr as each stream is opened and finished. "
+            "Default: on for a multi-stream session, off for a single video, where the report "
+            "itself arrives at the same moment the progress would. stdout stays a clean report / "
+            "JSON payload either way."
         ),
     )
-    add_index_args(parser)
-    add_threshold_args(parser)
-    add_session_threshold_args(parser)
-    add_store_args(parser)
-    add_storage_credential_args(parser)
     return parser.parse_args(argv)
 
 
@@ -240,6 +213,11 @@ class _Progress:
     total still lands on the finish line. All output goes to stderr so the report /
     ``--json`` on stdout stays a clean single document.
 
+    Also where the run's ``HEAD`` responses are collected for the store, which is why
+    this is constructed even when nothing will be printed: silencing the display must
+    not cost the store its content identity, nor make it issue a second round of
+    lookups of its own.
+
     Hooks are called from :func:`run_session`'s worker threads, so writes are
     serialised on a lock to keep lines from interleaving mid-write.
     """
@@ -248,12 +226,17 @@ class _Progress:
         self,
         stat_lookup: Callable[[str], StorageStat | None] | None = None,
         *,
+        display: bool | None = True,
         live_byte_counter: bool = True,
         collect_stats: bool = False,
     ) -> None:
         self._bytes: dict[int, int] = {}
         self._last_emit: dict[int, float] = {}
         self._stat_lookup = stat_lookup
+        #: ``None`` defers to the stream count, which is only known once the session has
+        #: been listed -- hence resolved per call from the ``total`` the hooks are given
+        #: rather than once up front.
+        self._display = display
         self._live_byte_counter = live_byte_counter
         self._collect_stats = collect_stats
         self._lock = threading.Lock()
@@ -261,15 +244,27 @@ class _Progress:
         #: run that persists still issues exactly one per stream.
         self.stats: dict[str, StorageStat] = {}
 
+    def _shows(self, total: int) -> bool:
+        """Whether a session of ``total`` streams gets progress output."""
+        # A single stream's start line is immediately followed by the report itself, so
+        # it tells the operator nothing they are not about to be told anyway; a session
+        # of many is the case where knowing which stream is being waited on matters.
+        return total > 1 if self._display is None else self._display
+
     def _write(self, text: str) -> None:
         with self._lock:
             sys.stderr.write(text)
             sys.stderr.flush()
 
     def start(self, index: int, total: int, source: str) -> None:
+        if not self._shows(total):
+            return
         self._write(f"[{index}/{total}] {source}\n")
 
     def make_wrapper(self, index: int, total: int, source: str) -> Callable[[BinaryIO], BinaryIO]:
+        counting = self._shows(total)
+        live = counting and self._live_byte_counter
+
         # One cheap HEAD up front so the counter can show read / total (pct%);
         # None (unknown / lookup disabled) falls back to a bare "read" figure. The lookup
         # is injected, so guard it here instead of trusting every implementation to be
@@ -282,7 +277,7 @@ class _Progress:
         # read, so it needs no total) and the store, which records the same response as
         # content identity rather than issuing a second HEAD of its own.
         stat: StorageStat | None = None
-        if self._stat_lookup is not None and (self._live_byte_counter or self._collect_stats):
+        if self._stat_lookup is not None and (live or self._collect_stats):
             try:
                 stat = self._stat_lookup(source)
             except Exception:  # noqa: BLE001 - advisory only; unknown size is fine
@@ -296,10 +291,14 @@ class _Progress:
                     self.stats[source] = stat
         total_bytes = stat.size_bytes if stat is not None else None
 
+        if not counting:
+            # Nothing reads the count, so do not pay a Python-level call per read for it.
+            return lambda stream: stream
+
         def _wrap(stream: BinaryIO) -> BinaryIO:
             def _on_bytes(count: int) -> None:
                 self._bytes[index] = count
-                if not self._live_byte_counter:
+                if not live:
                     return
                 now = time.monotonic()
                 if now - self._last_emit.get(index, 0.0) >= _PROGRESS_MIN_INTERVAL_S:
@@ -316,6 +315,8 @@ class _Progress:
         return _wrap
 
     def finish(self, index: int, total: int, result: StreamResult) -> None:
+        if not self._shows(total):
+            return
         mb = self._bytes.get(index, 0) / 1e6
         tail = f" ({mb:.1f} MB read)" if mb else ""
         # Leading \r + trailing pad overwrite the in-place byte counter on this line;
@@ -324,33 +325,94 @@ class _Progress:
         self._write(f"{prefix}[{index}/{total}] -> {result.status.value}{tail}{pad}\n")
 
 
+def _render_perf(  # noqa: PLR0913 -- one argument per thing measured, all independent
+    stats: dict[str, dict[str, float]],
+    report: SessionReport,
+    *,
+    batch_size: int,
+    stream_concurrency: int,
+    render_ms: float,
+    total_ms: float,
+) -> str:
+    """Format per-phase wall-clock timings for stderr.
+
+    One ``key = value`` line per field, greppable and stable for scripting. Timing keys
+    are milliseconds. Emitted on stderr so ``--json`` stdout stays a clean
+    single-document payload.
+
+    The phases are per stream because that is the grain they are measured at, and a
+    single sum across them would be the one number a profile must not report above
+    concurrency 1: concurrent streams overlap, so their phases add up to more than the
+    session took. ``total_ms`` is the session's own elapsed time instead, which is
+    true at any concurrency. ``render_ms`` is session-grain for the plainer reason that
+    one report is rendered, not one per stream.
+    """
+    lines = [
+        f"  batch_size         = {batch_size}",
+        f"  stream_concurrency = {stream_concurrency}",
+    ]
+    if stream_concurrency > 1:
+        lines.append("  (streams overlap: the per-stream phases below do not sum to total_ms)")
+    for index, stream in enumerate(report.streams, start=1):
+        lines.append(f"  [{index}/{len(report.streams)}] {stream.source}")
+        stream_stats = stats.get(stream.source)
+        if stream_stats is None:
+            # Only a measured stream is timed, so say so rather than printing zeros that
+            # would read as a stream that was instant.
+            lines.append(f"    not measured  = {stream.status.value}")
+            continue
+        lines.extend(
+            [
+                f"    sensor_init_ms = {stream_stats.get('sensor_init_ms', 0.0):.3f}",
+                f"    stream_ms      = {stream_stats.get('stream_ms', 0.0):.3f}",
+                f"    evaluate_ms    = {stream_stats.get('evaluate_ms', 0.0):.3f}",
+                f"    num_samples    = {stream.num_samples}",
+                f"    has_bframes    = {stream.has_bframes}",
+                f"    codec          = {stream.codec_name}",
+            ]
+        )
+    lines.extend([f"  render_ms          = {render_ms:.3f}", f"  total_ms           = {total_ms:.3f}"])
+    # Leading newline so the block visually separates from the report above (which ends
+    # with "Session overall: <status>\n" in human mode or the closing "}\n" in JSON mode).
+    return "\nPer-phase performance stats:\n" + "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Discover and check every stream in the session, then print the report."""
+    """Resolve the config, check every stream of its one session, and print the report."""
     args = _parse_args(argv)
-    endpoint_url = resolve_s3_endpoint_url(args.endpoint_url)
+    try:
+        config = resolve_config(args.config, overrides=tuple(args.set or ()))
+        session_path = single_session(config.input)
+    # Resolved before the interrupt guard because none of it reads a source: a bad
+    # config is a usage error, and reporting it needs no cooperative shutdown.
+    # ``OSError`` and not just its missing-file subclass, matching
+    # :mod:`cosmos_curator.pipelines.pipeline_runtime`: a path can also be a directory
+    # or be unreadable, and an operator who mistyped one is owed the same one-line
+    # error as one who mistyped the other, not a traceback.
+    except (OSError, TypeError, ValueError) as e:
+        return report_error(str(e))
+
+    endpoint_url = resolve_s3_endpoint_url(config.execution.endpoint_url)
 
     def _stat_lookup(source: str) -> StorageStat | None:
         if not is_remote_path(source):
             return None
         return storage_io.object_stat(
             source,
-            s3_profile_name=args.s3_profile_name,
-            azure_profile_name=args.azure_profile_name,
+            s3_profile_name=config.execution.s3_profile_name,
+            azure_profile_name=config.execution.azure_profile_name,
             endpoint_url=endpoint_url,
         )
 
-    progress = (
-        _Progress(
-            stat_lookup=_stat_lookup,
-            live_byte_counter=args.max_workers == 1,
-            collect_stats=args.store_path is not None,
-        )
-        if args.progress
-        else None
+    progress = _Progress(
+        stat_lookup=_stat_lookup,
+        display=args.progress,
+        live_byte_counter=config.execution.stream_concurrency == 1,
+        collect_stats=config.output.store_root is not None,
     )
     with interrupt_guard() as interrupted:
         try:
-            return _run(args, endpoint_url, progress, interrupted)
+            return _run(args, config, session_path, endpoint_url, progress, interrupted)
         # Caught out here rather than inside _run so that an abort recognised *while*
         # another failure is being handled still lands on it: a handler cannot be caught
         # by its own siblings.
@@ -358,8 +420,13 @@ def main(argv: list[str] | None = None) -> int:
             return report_interrupted()
 
 
-def _run(
-    args: argparse.Namespace, endpoint_url: str | None, progress: "_Progress | None", interrupted: threading.Event
+def _run(  # noqa: PLR0913 -- the resolved config plus the per-process concerns around it
+    args: argparse.Namespace,
+    config: ResolvedDataIntegrityConfig,
+    session_path: str,
+    endpoint_url: str | None,
+    progress: "_Progress",
+    interrupted: threading.Event,
 ) -> int:
     """Body of :func:`main`, split out so the interrupt guard wraps the whole attempt.
 
@@ -368,27 +435,35 @@ def _run(
             abort as a decode error. :func:`main` turns it into the exit code.
 
     """
-    thresholds = thresholds_from_args(args)
+    thresholds = config.checks.thresholds.to_thresholds()
+    stats: dict[str, dict[str, float]] | None = {} if args.perf_profile else None
+    started = time.perf_counter()
     try:
         index_lookup = open_index_manifest(
-            args.index_manifest, s3_profile_name=args.s3_profile_name, endpoint_url=endpoint_url
+            config.input.mp4_index_uri,
+            s3_profile_name=config.execution.s3_profile_name,
+            endpoint_url=endpoint_url,
         )
         report = run_session(
-            args.session_path,
-            expected_hz=args.expected_hz,
+            session_path,
+            expected_hz=config.checks.expected_hz,
             thresholds=thresholds,
-            batch_size=args.batch_size,
-            limit=args.limit,
-            stream_globs=tuple(args.stream_glob or ()),
-            s3_profile_name=args.s3_profile_name,
-            azure_profile_name=args.azure_profile_name,
+            batch_size=config.checks.batch_size,
+            # The config spells "no cap" as null and the runner as 0.
+            limit=config.input.limit or 0,
+            stream_globs=config.input.stream_globs,
+            s3_profile_name=config.execution.s3_profile_name,
+            azure_profile_name=config.execution.azure_profile_name,
             endpoint_url=endpoint_url,
+            stream_idx=args.stream_idx,
             index_lookup=index_lookup,
-            max_workers=args.max_workers,
+            max_workers=config.execution.stream_concurrency,
+            max_attempts=config.execution.stream_attempts,
             cancel=interrupted,
-            on_stream_start=progress.start if progress else None,
-            on_stream_finish=progress.finish if progress else None,
-            make_stream_wrapper=progress.make_wrapper if progress else None,
+            on_stream_start=progress.start,
+            on_stream_finish=progress.finish,
+            make_stream_wrapper=progress.make_wrapper,
+            stats=stats,
         )
         # Checked after a *successful* run too, and not only inside the runner: libav
         # can swallow the abort and finish off a truncated stream, while discovery
@@ -398,28 +473,44 @@ def _run(
         # Rendering and writing stay inside the handler: serializing a report can fail
         # (non-finite measurements) and so can the write itself (a closed pipe), and both
         # owe the caller exit code 2 rather than a traceback.
-        sys.stdout.write((to_json(report) if args.json else render_text(report)) + "\n")
-        if args.store_path is not None:
+        render_started = time.perf_counter()
+        output = (to_json(report) if args.json else render_text(report)) + "\n"
+        render_ms = (time.perf_counter() - render_started) * 1000
+        sys.stdout.write(output)
+        if stats is not None:
+            # Flush the report first so interactive users see it above the perf block.
+            sys.stdout.flush()
+            sys.stderr.write(
+                _render_perf(
+                    stats,
+                    report,
+                    batch_size=config.checks.batch_size,
+                    stream_concurrency=config.execution.stream_concurrency,
+                    render_ms=render_ms,
+                    total_ms=(time.perf_counter() - started) * 1000,
+                )
+            )
+        if config.output.store_root is not None:
             # After the report, so the operator keeps the verdict even when persisting
             # fails -- but a failure is still exit code 2, because saving the results
             # was part of what was asked for.
             try:
                 persist_run(
-                    args.store_path,
+                    config.output.store_root,
                     report.streams,
                     session_path=report.session_path,
                     thresholds=thresholds,
-                    tool="di-session",
+                    tool=TOOL,
                     # The same verdicts the report printed, so what this exited on is
                     # what reads back.
                     session_metrics=report.metrics,
-                    storage_stats=progress.stats if progress is not None else None,
-                    s3_profile_name=args.s3_profile_name,
-                    azure_profile_name=args.azure_profile_name,
+                    storage_stats=progress.stats,
+                    s3_profile_name=config.execution.s3_profile_name,
+                    azure_profile_name=config.execution.azure_profile_name,
                     endpoint_url=endpoint_url,
                 )
             except Exception as e:  # noqa: BLE001 - the store can fail in as many ways as its backend
-                return report_error(f"checked session {args.session_path!r} but could not write the store: {e}")
+                return report_error(f"checked session {session_path!r} but could not write the store: {e}")
         return _EXIT_CODES[report.status]
     except (StorageCliError, FileNotFoundError) as e:
         return report_error(str(e))
@@ -427,7 +518,7 @@ def _run(
         # A Ctrl-C inside a libav read arrives here as a decode error rather than a
         # KeyboardInterrupt, so trust the recorded signal over the exception type.
         raise_if_interrupted(interrupted)
-        return report_error(f"could not check session {args.session_path!r}: {e}")
+        return report_error(f"could not check session {session_path!r}: {e}")
 
 
 if __name__ == "__main__":

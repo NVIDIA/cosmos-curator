@@ -39,9 +39,14 @@ def _template_payload() -> dict[str, object]:
 
 
 def _validate(config: Path, overrides: Sequence[str]) -> dict[str, object]:
-    from cosmos_curator.next.recipes.data_integrity.config import resolve_config  # noqa: PLC0415
+    from cosmos_curator.next.recipes.data_integrity.config import (  # noqa: PLC0415
+        require_store_root,
+        resolve_config,
+    )
 
-    resolve_config(config, overrides=overrides)
+    # Checked here as well as in _prepare_run so `pipeline validate` cannot pass a config
+    # that `run-pipeline` then refuses.
+    require_store_root(resolve_config(config, overrides=overrides))
     return {"ok": True}
 
 
@@ -69,11 +74,15 @@ def _prepare_run(
     *,
     set_overrides: list[str],
 ) -> PreparedPipelineRun:
-    from cosmos_curator.next.recipes.data_integrity.config import resolve_config  # noqa: PLC0415
+    from cosmos_curator.next.recipes.data_integrity.config import (  # noqa: PLC0415
+        require_store_root,
+        resolve_config,
+    )
 
     # Resolved before the closure is returned, so a bad config fails here rather than
     # after Ray has started.
     resolved = resolve_config(config, overrides=set_overrides)
+    require_store_root(resolved)
 
     def run() -> PipelineRunOutput:
         from cosmos_curator.next.recipes.data_integrity.pipeline import run_config  # noqa: PLC0415

@@ -218,11 +218,13 @@ def run_one_stream(  # noqa: PLR0913
     s3_profile_name: str | None,
     azure_profile_name: str,
     endpoint_url: str | None,
+    stream_idx: int = 0,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
     cancel: threading.Event | None = None,
     max_attempts: int = 1,
     raise_infrastructure_errors: bool = False,
     index_lookup: Mp4IndexLookup | None = None,
+    stats: dict[str, float] | None = None,
 ) -> StreamResult:
     """Open a single stream and run the integrity metrics, capturing failures as ERROR.
 
@@ -234,6 +236,8 @@ def run_one_stream(  # noqa: PLR0913
         s3_profile_name: AWS profile for ``s3://`` sources.
         azure_profile_name: Azure profile for ``az://`` sources.
         endpoint_url: S3 endpoint override for S3-compatible stores.
+        stream_idx: which video stream to open inside the container (default 0). Only 0
+            may be paired with a sensor timeline; see :func:`~.sources.run_checks`.
         stream_wrapper: optional wrapper around the opened byte stream.
         cancel: optional event that aborts the read.
         max_attempts: how many times to open the stream when the failure looks like a
@@ -254,6 +258,11 @@ def run_one_stream(  # noqa: PLR0913
             finding about the data, and outlive the run that manufactured it.
         index_lookup: optional opened ``mp4-index`` manifest; a stream it covers is
             measured from the index rather than by opening the video.
+        stats: optional out-parameter collecting this stream's per-phase timings
+            (``sensor_init_ms`` / ``stream_ms`` / ``evaluate_ms``). Left untouched when
+            the stream could not be measured, so a caller can tell a stream that was
+            never timed from one that was timed at zero. On a retry the final attempt's
+            timings win, which is the attempt the result describes.
 
     Returns:
         The stream's result, carrying ``error`` when it could not be measured.
@@ -269,15 +278,21 @@ def run_one_stream(  # noqa: PLR0913
     max_attempts = validate_positive_int("max_attempts", max_attempts)
     attempt = 1
     while True:
+        # Both returns below carry ``selector_value``, because the store keys on it: index
+        # 0 and index 1 of one container are two streams. A failure has to carry it for the
+        # same reason a success does -- left at the default it claims stream 0's identity
+        # and, being the newer row, buries what stream 0 actually measured.
         try:
             metrics, video_info, resolved_cfg = run_checks(
                 source,
                 expected_hz=expected_hz,
                 thresholds=thresholds,
+                stream_idx=stream_idx,
                 batch_size=batch_size,
                 s3_profile_name=s3_profile_name,
                 azure_profile_name=azure_profile_name,
                 endpoint_url=endpoint_url,
+                stats=stats,
                 stream_wrapper=stream_wrapper,
                 index_lookup=index_lookup,
             )
@@ -327,8 +342,9 @@ def run_one_stream(  # noqa: PLR0913
                 end_ns=None,
                 metrics=[],
                 error=str(exc),
+                selector_value=str(stream_idx),
             )
-        return stream_result(source, metrics, video_info, resolved_cfg)
+        return stream_result(source, metrics, video_info, resolved_cfg, selector_value=str(stream_idx))
 
 
 def session_metrics(streams: list[StreamResult], thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckResult]:
@@ -360,12 +376,15 @@ def run_session(  # noqa: PLR0913
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
     endpoint_url: str | None = None,
+    stream_idx: int = 0,
     max_workers: int = 1,
+    max_attempts: int = 1,
     cancel: threading.Event | None = None,
     on_stream_start: Callable[[int, int, str], None] | None = None,
     on_stream_finish: Callable[[int, int, StreamResult], None] | None = None,
     make_stream_wrapper: Callable[[int, int, str], Callable[[BinaryIO], BinaryIO]] | None = None,
     index_lookup: Mp4IndexLookup | None = None,
+    stats: dict[str, dict[str, float]] | None = None,
 ) -> SessionReport:
     """Discover and run integrity metrics over every stream in one session.
 
@@ -384,11 +403,17 @@ def run_session(  # noqa: PLR0913
         s3_profile_name: optional AWS profile for ``s3://`` sources.
         azure_profile_name: Azure profile for ``az://`` sources.
         endpoint_url: optional S3 endpoint override for S3-compatible stores.
+        stream_idx: which video stream to open inside each container (default 0). A
+            session normally holds one video per file, so this is for pointing the tool
+            at a secondary track of a single container rather than for ordinary use.
         max_workers: how many streams to check concurrently. ``1`` (default) keeps
             everything on the calling thread. Higher values overlap the per-stream
             waits, which dominate on cloud sources. Hooks are then called from
             worker threads and must be thread-safe; results stay in discovery order
             either way.
+        max_attempts: attempts per stream when the failure looks like a transport
+            hiccup, forwarded to :func:`run_one_stream`. ``1`` (default) does not
+            retry, so a caller that says nothing keeps the behaviour it had.
         cancel: optional event that asks the session to stop. Cloud reads abort at
             their next boundary once it is set, and no further stream is opened; the
             run then ends by raising ``KeyboardInterrupt``, since a session stopped
@@ -409,6 +434,12 @@ def run_session(  # noqa: PLR0913
             stream in the session. Streams it covers are measured from the index
             instead of being opened; the rest are unaffected, and discovery still
             lists the session either way.
+        stats: optional out-parameter collecting per-phase timings per stream, keyed by
+            source. Only streams that were measured get an entry, so a caller can tell
+            those apart from streams that errored. Written from worker threads when
+            ``max_workers`` is above 1, which is safe because each stream owns a
+            distinct key; note that the phases of concurrent streams then overlap in
+            wall-clock terms, so they do not sum to the session's elapsed time.
 
     Returns:
         A :class:`SessionReport` with one :class:`StreamResult` per discovered stream,
@@ -455,6 +486,9 @@ def run_session(  # noqa: PLR0913
         raise_if_interrupted(cancel)
         if on_stream_start is not None:
             on_stream_start(index, total, source)
+        # A fresh dict per stream, published to the shared map only once the stream is
+        # measured, so an errored stream leaves no half-filled entry behind.
+        stream_stats: dict[str, float] | None = {} if stats is not None else None
         result = run_one_stream(
             source,
             expected_hz=expected_hz,
@@ -463,10 +497,18 @@ def run_session(  # noqa: PLR0913
             s3_profile_name=s3_profile_name,
             azure_profile_name=azure_profile_name,
             endpoint_url=endpoint_url,
+            stream_idx=stream_idx,
+            max_attempts=max_attempts,
             stream_wrapper=_wrapper_for(index, source),
             cancel=cancel,
             index_lookup=index_lookup,
+            stats=stream_stats,
         )
+        # Keyed on the verdict and not merely on the dict being non-empty: a stream that
+        # failed partway through measurement already has the phases it got through, so
+        # emptiness alone would publish a half-filled entry for a stream with no result.
+        if stats is not None and stream_stats and result.error is None:
+            stats[source] = stream_stats
         # Checked again because the stream may have *succeeded* despite the abort: libav
         # can swallow it and finish off a truncated source, and that verdict is no more
         # reportable than the aborted one, nor are the streams still queued behind it.

@@ -80,8 +80,9 @@ def test_a_non_overlap_share_above_a_hundred_percent_is_rejected() -> None:
     """The one threshold with a ceiling: a share of a session cannot exceed all of it.
 
     So a limit above 100 describes no session that exists, and asking for one is a
-    typo rather than a laxer policy -- 100 already tolerates everything. The bound is
-    the same one ``--max-non-overlap-percent`` enforces, both read off ``MAX_PERCENT``.
+    typo rather than a laxer policy -- 100 already tolerates everything. The config is
+    the surface that enforces it, off ``MAX_PERCENT``: ``Thresholds`` validates nothing
+    and takes whatever it is handed.
     """
     assert config.resolve_config_data(
         _config_data(checks={"thresholds": {"max_non_overlap_percent": 100.0}})
@@ -168,6 +169,49 @@ def test_an_s3_store_root_is_left_verbatim() -> None:
     resolved = config.resolve_config_data(_config_data(output={"store_root": "s3://bucket/di-store/"}))
 
     assert resolved.output.store_root == "s3://bucket/di-store/"
+
+
+@pytest.mark.parametrize("output_block", [None, {}, {"store_root": None}])
+def test_a_config_may_name_no_store_at_all(output_block: dict[str, Any] | None) -> None:
+    """The Ray-free ``di`` tool reports without persisting, which is what keeps it Ray-free.
+
+    ``store_cli.persist_run`` defers its ``lance`` / ``pyarrow`` import, so a run that
+    asked for no store never loads either -- and the ``di`` environment does not ship
+    them. Accepted at the model level for every caller because both executors share one
+    ``kind``, leaving no discriminator a field validator could key on; a pipeline run is
+    held to a non-null root by ``require_store_root`` instead.
+    """
+    data = _config_data() if output_block is None else _config_data(output=output_block)
+    if output_block is None:
+        del data["output"]
+
+    assert config.resolve_config_data(data).output.store_root is None
+
+
+def test_a_pipeline_run_is_refused_a_config_with_no_store() -> None:
+    """A pipeline run's committed rows are its whole output, so a null root measures for nothing."""
+    resolved = config.resolve_config_data(_config_data(output={"store_root": None}))
+    with pytest.raises(ValueError, match=r"output\.store_root is required"):
+        config.require_store_root(resolved)
+
+    with_store = config.resolve_config_data(_config_data(output={"store_root": "/data/di-store"}))
+    assert config.require_store_root(with_store) == "/data/di-store"
+
+
+def test_stream_concurrency_is_serial_by_default() -> None:
+    """The second concurrency axis: streams within one session, as opposed to sessions.
+
+    Defaulted to 1 because the Ray path parallelises across sessions instead -- a session
+    is its unit of work -- so raising it there would oversubscribe a worker. The
+    single-session tool has no sessions to spread over and is where it gets raised.
+    """
+    assert config.resolve_config_data(_config_data()).execution.stream_concurrency == 1
+
+    resolved = config.resolve_config_data(_config_data(), overrides=["execution.stream_concurrency=8"])
+    assert resolved.execution.stream_concurrency == 8
+
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        config.resolve_config_data(_config_data(), overrides=["execution.stream_concurrency=0"])
 
 
 def test_no_mp4_index_is_the_default() -> None:

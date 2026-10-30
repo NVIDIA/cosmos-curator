@@ -81,7 +81,7 @@ def measured(
         [make_stream(DRIFT, drifting(percent=1.0))],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
     )
     return store_root, run_id
 
@@ -100,7 +100,7 @@ def session_measured(
         streams,
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
         session_metrics=run_session_metrics(
             _sensor_bounds((0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)),
             thresholds=DEFAULT_THRESHOLDS,
@@ -165,7 +165,7 @@ def test_a_re_judge_ignores_measurements_that_never_committed(
             [make_stream("/data/session/torn.mp4", drifting(percent=1.0))],
             session_path="/data/session",
             thresholds=DEFAULT_THRESHOLDS,
-            tool="di-session",
+            tool="di",
         )
 
     monkeypatch.undo()
@@ -234,9 +234,7 @@ def test_a_metric_that_never_ran_stays_skipped(
 ) -> None:
     """A null row has no measurement to rebuild, and no threshold can change that."""
     stream = make_stream("/data/session/no_rate.mp4", perfect(), expected_hz=None, avg_frame_rate=NO_HEADER_RATE)
-    store.write_run(
-        store_root, [stream], session_path="/data/session", thresholds=DEFAULT_THRESHOLDS, tool="di-session"
-    )
+    store.write_run(store_root, [stream], session_path="/data/session", thresholds=DEFAULT_THRESHOLDS, tool="di")
     reevaluate.reevaluate(store_root, thresholds=STRICT)
 
     rejudged = _rate_verdicts(store_root)[store.policy_id(STRICT)]
@@ -254,7 +252,7 @@ def test_an_undefined_measurement_stays_skipped(
         [make_stream("/data/session/one_frame.mp4", perfect(1))],
         session_path="/data/session",
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
     )
     reevaluate.reevaluate(store_root, thresholds=STRICT)
     assert _rate_verdicts(store_root)[store.policy_id(STRICT)]["check_status"] == "SKIPPED"
@@ -269,7 +267,7 @@ def test_re_evaluating_an_errored_stream_produces_nothing(
         [make_errored_stream("/data/session/broken.mp4")],
         session_path="/data/session",
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
     )
     reevaluate.reevaluate(store_root, thresholds=STRICT)
     assert store.read_evaluations(store_root) == []
@@ -334,7 +332,7 @@ def test_an_undefined_session_measurement_stays_skipped(
         [make_stream(DRIFT, perfect(), timestamp_source=TimestampSource.SENSOR)],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
         session_metrics=run_session_metrics(_sensor_bounds((0, _ONE_MINUTE_NS)), thresholds=DEFAULT_THRESHOLDS),
     )
     reevaluate.reevaluate(store_root, thresholds=NO_SKEW)
@@ -371,7 +369,7 @@ def test_a_session_metric_that_never_ran_names_the_clock_instead(
         streams,
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
         session_metrics=run_session_metrics(
             [
                 SensorBounds(start_ns=0, end_ns=_ONE_MINUTE_NS, timestamp_source=TimestampSource.CONTAINER_PTS)
@@ -411,7 +409,7 @@ def test_a_never_ran_row_is_explained_by_the_run_that_measured_it(
         ],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
         created_at=measured_at,
         session_metrics=run_session_metrics(
             [
@@ -426,7 +424,7 @@ def test_a_never_ran_row_is_explained_by_the_run_that_measured_it(
         [],
         session_path=SESSION,
         thresholds=DEFAULT_THRESHOLDS,
-        tool="di-session",
+        tool="di",
         created_at=measured_at + datetime.timedelta(hours=1),
     )
     # The precondition the test turns on: the session's newest row names no clock, so

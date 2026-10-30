@@ -15,6 +15,10 @@
 
 """Turn the ``input`` config block into the session paths one run covers.
 
+Two resolvers over the same block, because the two executors cover different ground:
+:func:`single_session` for the Ray-free tool, which measures one session, and
+:func:`expand_sessions` for a pipeline run, which measures a dataset.
+
 Three forms -- an explicit list, a file of paths, and dataset roots to expand --
 unioned into one deduplicated, sorted tuple. Deduplication is not cosmetic: two
 spellings of one session would be measured twice and then collide on ``stream_id``
@@ -97,7 +101,7 @@ def list_sessions_under_root(
 ) -> list[str]:
     """List the session paths one level below ``root``.
 
-    A session is a direct child of the root -- the layout ``session_cli`` documents,
+    A session is a direct child of the root -- the layout the ``di`` tool documents,
     ``clips/<uuid>/`` under ``clips/``. Both branches delegate to the shared
     storage-level listers, which ``multimodal-split`` also uses, so the two recipes
     cannot disagree about what a child prefix is.
@@ -182,6 +186,55 @@ def _drop_nested(sessions: list[str]) -> list[str]:
         kept.append(session)
         seen.add(session)
     return kept
+
+
+def single_session(input_config: DataIntegrityInputConfig) -> str:
+    """Resolve the ``input`` block to the one session the Ray-free ``di`` tool measures.
+
+    Deliberately not :func:`expand_sessions` with a count check afterwards. The two
+    expanding forms are rejected on the config rather than on what they expand to, so
+    the error costs no listing and no manifest read, and is the same error whether the
+    root holds one session or ten thousand -- a run that happened to pass today because
+    a root held exactly one session would start failing the day a second one landed.
+
+    Canonicalized with the same :func:`identity.normalize_source` the expanding path
+    uses, so one session measured by this tool and by a pipeline run carries one
+    ``session_id`` in the store rather than two.
+
+    Args:
+        input_config: the resolved ``input`` block.
+
+    Returns:
+        The session path: a directory, a cloud prefix, or a single video file, all of
+        which :func:`~.discovery.discover_streams` handles.
+
+    Raises:
+        ValueError: if the config names the expanding forms, or names anything other
+            than exactly one session. Both messages point at ``run-pipeline``, which is
+            the tool that does cover many sessions.
+
+    """
+    multi = [
+        name
+        for name, is_set in (
+            ("session_list_uri", input_config.session_list_uri is not None),
+            ("session_roots", bool(input_config.session_roots)),
+        )
+        if is_set
+    ]
+    if multi:
+        msg = (
+            f"{' and '.join(multi)} describe more than one session, which this tool does not run; "
+            "name the one session in input.sessions, or use run-pipeline to cover a dataset"
+        )
+        raise ValueError(msg)
+    if len(input_config.sessions) != 1:
+        msg = (
+            f"this tool measures exactly one session, but input.sessions names {len(input_config.sessions)}; "
+            "use run-pipeline to cover more than one"
+        )
+        raise ValueError(msg)
+    return identity.normalize_source(input_config.sessions[0])
 
 
 def expand_sessions(

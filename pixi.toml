@@ -357,6 +357,41 @@ memray = ">=1.14"
 kernels = "==0.14.1"
 transformers = ">=5.6.0,<6.0.0"
 
+# The Ray-free single-session data-integrity tool (`di`), paired with `media` for PyAV.
+#
+# Its own dependency table rather than a slice of `core`, which is what a thin environment
+# would normally be built from, because `core` cannot be installed on a laptop at all:
+# cosmos-xenna publishes no osx-arm64 wheel and its Rust build fails there, and
+# conda-forge's nvtx is Linux-only. Neither is reachable from this tool -- it imports no
+# Ray and no Xenna, by design -- so what is listed here is its actual import closure
+# instead, which is short enough to keep honest. Note that this duplicates no *policy*:
+# every threshold, input and credential still comes from the one shared config model, and
+# that is the duplication worth avoiding.
+[feature.di]
+channels = ["conda-forge"]
+
+[feature.di.dependencies]
+attrs = "*"
+azure-identity = "*"
+azure-storage-blob = "*"
+boto3 = "*"
+loguru = "*"
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
+pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
+pydantic = ">=2.12,<3"
+pyyaml = "*"
+smart_open = "*"
+tqdm = "*"
+
+[feature.di.pypi-dependencies]
+pylance = ">=14.0.0,<15.0.0" # conda-forge package is too old; keep in step with `core`
+
+[feature.di.tasks]
+# Run from the project root, which is where pixi puts you: `python -m` adds the working
+# directory to sys.path, so the checkout is importable without an editable install (the
+# same mechanism `unit-test` and `run-pipeline` rely on).
+di = "python -m cosmos_curator.next.recipes.data_integrity.session_cli"
+
 [feature.sensors.pypi-dependencies]
 hydra4 = "==0.2.0" # Hesai Pandar UDP decoder; alpha upstream, pin exactly
 pypcd4 = "*" # direct import in hesai_lidar_parser; declare, don't inherit
@@ -367,6 +402,10 @@ cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
 default = ["core", "runtime", "vllm", "media", "transformers", "tracing", "profiling", "sensors"]
 dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev", "sensors"]
+# The only environment that decodes video and still solves for osx-arm64, which is the
+# point of it: a tool whose reason to exist is iterating on a scan without a cluster is
+# not much use if it only installs where a cluster would run.
+di = ["di", "media"]
 legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["linux", "core", "tracing"]
 paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]

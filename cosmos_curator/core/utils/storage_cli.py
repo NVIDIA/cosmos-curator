@@ -474,6 +474,49 @@ def list_storage_objects(  # noqa: PLR0913 -- a prefix, two backends' credential
     return [str(entry) for entry in listed if not str(entry).endswith("/")]
 
 
+def storage_object_exists(
+    uri: str,
+    *,
+    client: StorageClient | None = None,
+    s3_profile_name: str | None = None,
+    azure_profile_name: str = "default",
+    endpoint_url: str | None = None,
+) -> bool:
+    """Whether one exact object exists at ``uri``.
+
+    The counterpart to :func:`list_storage_objects` for a caller holding a URI that
+    names an object rather than a prefix. A listing cannot answer this question, since
+    both backends match keys by prefix: ``clip.mp4`` and ``clip.mp4.backup.mp4`` are
+    listed together, and only one of them is the object that was named.
+
+    Only absence answers ``False``. :meth:`StorageClient.object_exists` translates "not
+    found" and nothing else, so a bucket the credentials cannot read raises rather than
+    reporting an object that is really there as missing.
+
+    Args:
+        uri: ``s3://`` or ``az://`` URI naming one object.
+        client: Pre-built storage client (overrides the profile arguments).
+        s3_profile_name: Optional AWS profile used when ``client`` is absent.
+        azure_profile_name: Azure profile used when ``client`` is absent.
+        endpoint_url: Optional S3 endpoint override used when ``client`` is absent.
+
+    Raises:
+        StorageCliError: If ``uri`` is not a supported storage URI.
+
+    """
+    if not is_remote_path(uri):
+        msg = f"storage_object_exists requires an s3:// or az:// URI, got {uri!r}"
+        raise StorageCliError(msg)
+    if client is None:
+        client = make_storage_client(
+            uri,
+            s3_profile_name=s3_profile_name,
+            azure_profile_name=azure_profile_name,
+            endpoint_url=endpoint_url,
+        )
+    return client.object_exists(storage_prefix(uri))
+
+
 def get_lance_storage_options(
     uri: str,
     *,

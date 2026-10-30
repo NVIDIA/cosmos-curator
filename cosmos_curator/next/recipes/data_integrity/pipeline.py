@@ -16,7 +16,7 @@
 r"""Ray Data entry point for the Curator Next ``data-integrity`` recipe.
 
 The only module in the recipe that imports Ray, so
-``python -m cosmos_curator.next.recipes.data_integrity.cli --help`` stays Ray-free.
+``python -m cosmos_curator.next.recipes.data_integrity.session_cli --help`` stays Ray-free.
 
 One stage, one commit. Each task takes one session, lists it and measures every
 stream in it, and every Lance write stays on the driver -- concurrent ``append_rows``
@@ -57,6 +57,7 @@ from cosmos_curator.next.recipes.data_integrity import processing, store
 from cosmos_curator.next.recipes.data_integrity.config import (
     TOOL_NAME,
     ResolvedDataIntegrityConfig,
+    require_store_root,
     resolve_config,
 )
 from cosmos_curator.next.recipes.data_integrity.sessions import expand_sessions
@@ -92,18 +93,24 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
         store root.
 
     Raises:
-        ValueError: if a configured ``input.mp4_index_uri`` cannot be opened, if the
-            input expands to no sessions, or if nothing at all was measured. The first
-            two are mistakes in the config, caught before anything is measured. The
-            third means the run has no answer to record, and is only knowable once
-            every session has been listed, so it is raised after the appends and
-            before the commit -- leaving rows that no reader believes, which is the
-            same outcome as any other run that does not reach its commit.
+        ValueError: if ``output.store_root`` is null, if a configured
+            ``input.mp4_index_uri`` cannot be opened, if the input expands to no
+            sessions, or if nothing at all was measured. The first three are mistakes
+            in the config, caught before anything is measured. The last means the run
+            has no answer to record, and is only knowable once every session has been
+            listed, so it is raised after the appends and before the commit -- leaving
+            rows that no reader believes, which is the same outcome as any other run
+            that does not reach its commit.
         IncompleteRunError: if some sessions could not be listed, or some streams could
             not be reached, while others were measured. Raised after the commit, so
             the measurements survive the nonzero exit.
 
     """
+    # Ahead of the index and the listing because it costs nothing and is the one failure
+    # that would otherwise surface only at the commit, with every session already
+    # measured and nowhere to put the rows.
+    root = require_store_root(config)
+
     # Opened here only to fail early; the lookup is discarded because each worker opens
     # its own. Without this, the first worker to hit an unusable index raises mid-run,
     # and past the first batch that discards every session already measured.
@@ -114,7 +121,6 @@ def run_config(config: ResolvedDataIntegrityConfig) -> dict[str, object]:
 
     run_id = store.new_run_id()
     created_at = datetime.datetime.now(datetime.UTC)
-    root = config.output.store_root
     thresholds = config.checks.thresholds.to_thresholds()
     storage_options = get_lance_storage_options(
         root,
@@ -314,7 +320,7 @@ def _measured_batches(
 def main(argv: Sequence[str] | None = None) -> int:
     """Run from a JSON/YAML config path.
 
-    Mirrors ``pipeline_runtime``'s exit contract rather than ``di-session``'s: findings
+    Mirrors ``pipeline_runtime``'s exit contract rather than the ``di`` tool's: findings
     never reach the exit status, so a run that covered its input exits 0 however many
     streams failed their thresholds. Nonzero means the run either could not do its job
     or could not finish it, both of which surface here as an exception.

@@ -37,7 +37,7 @@ believed, instead of a half-finished run passing itself off as the newest state.
 The full schema rationale lives in
 ``docs/curator/design/data-integrity-store-schema.md``.
 
-Imported lazily by the CLIs, only when ``--store-path`` is given, so a plain check
+Imported lazily, only when ``output.store_root`` is set, so a run that persists nothing
 never pays for ``lance`` / ``pyarrow``.
 """
 
@@ -556,10 +556,9 @@ def write_run(  # noqa: PLR0913 -- a run's provenance is genuinely many independ
         streams: the run's per-stream results, errored ones included -- an errored
             stream is the case the store exists to preserve.
         session_path: the session these streams were discovered under, or ``None``
-            for a single-stream run. The only structural difference between what the
-            two CLIs write.
+            for a run that spans more than one.
         thresholds: the policy the verdicts were produced under.
-        tool: which CLI wrote this run, recorded in the manifest.
+        tool: which entry point wrote this run, recorded in the manifest.
         session_metrics: the session's own verdicts, from
             :func:`~.session_runner.session_metrics`. Written to the three
             session-grain datasets, which a single-stream run has no subject for --
@@ -794,11 +793,11 @@ def write_manifest(  # noqa: PLR0913 -- a manifest records many provenance field
       and registry of the build that wrote it** -- every dataset this store's schema
       defines and every metric it knows, not the subset whose rows this run happened
       to produce. A run whose only stream failed to open writes no measurement rows at
-      all, and still lists ``measurements``; a ``di-check`` run writes no session rows,
-      and still lists the session datasets.
+      all, and still lists ``measurements``; a ``di-reevaluate`` run writes no stream
+      rows at all, and still lists ``stream.lance``.
 
     That is the useful way round, because the manifest is overwritten rather than
-    appended: a store ``di-session`` filled and ``di-check`` then wrote to would
+    appended: a store that one build filled and an older build then wrote to would
     otherwise end up with a manifest denying the ``session.lance`` sitting beside it.
     A reader asking what a *particular* run wrote has ``run_id`` and the rows.
     """
@@ -1365,7 +1364,7 @@ def session_rollup(
         "stream_status_counts": counts,
         "streams": per_stream,
         # Empty for a store written before the session datasets existed, and for one
-        # written by di-check, which has no session to key a row on.
+        # written by a run over a lone video, which has no session to key a row on.
         "num_sessions": len(per_session),
         "session_status_counts": session_counts,
         "sessions": per_session,

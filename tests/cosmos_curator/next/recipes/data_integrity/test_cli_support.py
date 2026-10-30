@@ -13,43 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the argparse surface and Ctrl-C plumbing shared by both data-integrity CLIs."""
+"""Unit tests for the cancellation plumbing behind the ``di`` tool."""
 
 import io
-import os
 import threading
 
 import pytest
 
 from cosmos_curator.core.sensors.utils.io import open_data_source
-from cosmos_curator.next.recipes.data_integrity.cli_support import available_cpu_count, cancellable_reader
-
-
-def test_prefers_the_affinity_mask_over_the_host_core_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Under a cpuset the mask is narrower than the machine, and the mask is what binds."""
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1, 2}, raising=False)
-    monkeypatch.setattr(os, "cpu_count", lambda: 64)
-    assert available_cpu_count() == 3
-
-
-def test_falls_back_to_the_host_core_count_without_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
-    """sched_getaffinity is Linux-only, so macOS and Windows take the cpu_count path."""
-    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
-    monkeypatch.setattr(os, "cpu_count", lambda: 8)
-    assert available_cpu_count() == 8
-
-
-@pytest.mark.parametrize("cpu_count", [None, 0])
-def test_never_returns_less_than_one(monkeypatch: pytest.MonkeyPatch, cpu_count: int | None) -> None:
-    """An undetectable CPU count must still yield a usable worker count, not 0 or None."""
-    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
-    monkeypatch.setattr(os, "cpu_count", lambda: cpu_count)
-    assert available_cpu_count() == 1
-
-
-def test_reports_a_plausible_count_on_the_real_host() -> None:
-    """Unmocked, the helper returns something a thread pool can actually be sized with."""
-    assert available_cpu_count() >= 1
+from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader
 
 
 class _NotSeekable(io.BufferedIOBase):

@@ -80,7 +80,7 @@ The orchestration that was out of scope for v1 now exists, and lives outside the
 
 `cosmos_curator/next/recipes/data_integrity/`
 
-That package owns the `di-check` and `di-session` CLIs, stream discovery, the concurrent session runner, report rendering and the Lance result store ([store schema](data-integrity-store-schema.md)) — the half that takes URIs, credentials and command-line flags. What remains undecided is the orchestration *above* a single session: declaring checks as data, and driving many metrics from one read — see [Future integration](#future-integration).
+That package owns the `di` tool and the `data-integrity` pipeline, stream discovery, the concurrent session runner, report rendering and the Lance result store ([store schema](data-integrity-store-schema.md)) — the half that takes URIs, credentials and configs. What remains undecided is the orchestration *above* a single session: declaring checks as data, and driving many metrics from one read — see [Future integration](#future-integration).
 
 Repo convention note:
 

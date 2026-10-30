@@ -248,6 +248,54 @@ def test_run_session_aggregates_streams(monkeypatch: pytest.MonkeyPatch) -> None
     assert report.status is OverallStatus.FAIL
 
 
+def test_run_session_forwards_the_retry_budget_to_each_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retries are decided per stream, so the session has to hand the budget down.
+
+    Without this hop a configured budget stops at the session boundary and every stream
+    quietly runs with the one-attempt default.
+    """
+    captured: list[object] = []
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["x", "y"])
+
+    def _one(source: str, **kwargs: object) -> StreamResult:
+        captured.append(kwargs["max_attempts"])
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "run_one_stream", _one)
+
+    run_session("sess", max_attempts=4)
+
+    assert captured == [4, 4]
+
+
+def test_a_stream_that_failed_midway_publishes_no_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Timings are published per verdict, not per phase that happened to complete.
+
+    ``run_checks`` records ``sensor_init_ms`` before handing off to the measurement
+    phase, so a decode failure leaves a non-empty dict for a stream that has no result.
+    Publishing it would defeat the one thing the stats map is for -- telling a stream
+    that was never measured from one measured at zero.
+    """
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["bad", "good"])
+
+    def _fail_after_sensor_init(source: str, *_a: object, **kwargs: object) -> tuple[object, object, object]:
+        kwargs["stats"]["sensor_init_ms"] = 12.5
+        if source == "bad":
+            msg = "Invalid data found when processing input"
+            raise ValueError(msg)
+        kwargs["stats"]["stream_ms"] = 30.0
+        return [], SimpleNamespace(), SimpleNamespace()
+
+    monkeypatch.setattr(session_runner, "run_checks", _fail_after_sensor_init)
+    monkeypatch.setattr(session_runner, "stream_result", lambda source, *_a, **_k: _canned(source, CheckStatus.PASS))
+
+    stats: dict[str, dict[str, float]] = {}
+    report = run_session("sess", stats=stats)
+
+    assert report.streams[0].error is not None, "the stub was supposed to fail the first stream"
+    assert set(stats) == {"good"}, "published timings for a stream with no measurement"
+
+
 def test_run_session_forwards_the_stream_globs_to_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     """The globs decide which streams a session even has, so dropping them changes its verdict."""
     captured: dict[str, object] = {}
@@ -626,6 +674,39 @@ def test_a_cancelled_stream_is_not_logged_as_a_failed_run(monkeypatch: pytest.Mo
     assert logged == [], "diagnosed an operator abort as a failed run"
 
 
+@pytest.mark.parametrize("stream_idx", [0, 1])
+def test_an_errored_stream_is_filed_against_the_index_it_asked_for(
+    monkeypatch: pytest.MonkeyPatch, stream_idx: int
+) -> None:
+    """A failure on stream 1 must not be recorded as stream 0's.
+
+    The store keys on the selector and serves the newest row per key, so an error left
+    at the default would both claim stream 0's identity and, being newer, bury whatever
+    stream 0 really measured. Parametrized over the default too, since the point is that
+    the error and the success agree on identity, not that index 1 is special.
+    """
+
+    def _explode(*_a: object, **_k: object) -> tuple[object, object, object]:
+        msg = "Invalid data found when processing input"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(session_runner, "run_checks", _explode)
+
+    result = session_runner.run_one_stream(
+        "s3://b/k.mp4",
+        expected_hz=None,
+        thresholds=DEFAULT_THRESHOLDS,
+        batch_size=0,
+        s3_profile_name=None,
+        azure_profile_name="default",
+        endpoint_url=None,
+        stream_idx=stream_idx,
+    )
+
+    assert result.error is not None, "the stub was supposed to fail"
+    assert result.selector_value == str(stream_idx)
+
+
 def test_interrupt_stops_starting_queued_streams(monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt propagates and the pool abandons its backlog rather than draining it.
 
@@ -703,8 +784,8 @@ def _count_attempts(
     return result, attempts
 
 
-def test_a_single_session_does_not_retry_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``di-session`` behaviour is unchanged: one attempt, then the errored result."""
+def test_a_budget_of_one_attempt_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A budget of one is a budget, not a floor: one attempt, then the errored result."""
     result, attempts = _count_attempts(monkeypatch, TimeoutError("read timed out"), max_attempts=1)
 
     assert attempts == 1
@@ -871,7 +952,7 @@ def test_a_stream_that_is_genuinely_gone_or_broken_still_gets_one(
 
 
 def test_the_same_failure_stays_a_verdict_for_a_single_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``di-session`` is unchanged: its operator is watching, and wants the line in the report."""
+    """Off by default: the operator is watching, and wants the line in the report."""
     result, _ = _count_attempts(monkeypatch, NoCredentialsError(), max_attempts=1)
 
     assert result is not None

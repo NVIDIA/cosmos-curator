@@ -105,8 +105,7 @@ def test_id_does_not_depend_on_how_the_stream_was_discovered() -> None:
     """Checking a video directly and checking its session must produce one identity.
 
     This is why the id hashes the absolute source rather than a session root plus a
-    relative key: otherwise di-check and di-session would write two rows for the same
-    bytes.
+    relative key: otherwise the two would write two rows for the same bytes.
     """
     direct = identity.stream_id("s3://bucket/clips/uuid/front.mp4")
     within_session = identity.stream_id("s3://bucket/clips/uuid/front.mp4")

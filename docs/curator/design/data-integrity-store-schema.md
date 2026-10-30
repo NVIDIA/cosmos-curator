@@ -3,8 +3,9 @@
 **Status:** built, and this doc is its reference. Persistence only — no new metric math and no curation filter; the
 thresholds it names are the policy the metrics already carry.
 
-The DI CLIs (`di-check` for one stream, `di-session` for a whole session) and the Ray pipeline run the checks and
-print the results; given `--store-path` they also save them. This doc is where those results go, and why.
+The `di` tool (one session, which may be a lone video) and the `data-integrity` Ray pipeline (many sessions) run the
+checks and print the results; given an `output.store_root` they also save them. This doc is where those results go,
+and why.
 
 ---
 
@@ -49,7 +50,7 @@ that does not care about sessions never learns they exist. Section 5 is their sp
 │   ├── jitter.lance
 │   └── frame_reordering_present.lance
 ├── evaluation.lance
-├── session.lance             # session-grain; absent from a store di-check wrote
+├── session.lance             # session-grain; absent from a store only re-judges wrote
 ├── session_measurements/
 │   ├── multi_sensor_spread.lance
 │   └── multi_sensor_overlap.lance
@@ -84,19 +85,18 @@ key empty. Re-evaluation commits the same way, so a partial generation of verdic
 Its fields split two ways, and the split is worth knowing before reading one. `run_id`, `created_at`, `tool`,
 `session_path`, `num_streams` and the policy fields describe *that run*. `store_schema_version`, `datasets` and
 `instruments` describe *the layout and registry of the build that wrote it* — every dataset the schema defines and
-every metric it knows, not the subset whose rows the run happened to produce. So a `di-check` run lists the
-session datasets it could not have written, and a run whose only stream failed to open lists `measurements` while
-writing no measurement row. That is the useful way round for an overwritten file: the alternative is a store
-`di-session` filled and `di-check` later wrote to ending up with a manifest that denies the `session.lance` sitting
-next to it. What a *particular* run wrote is answered by `run_id` and the rows.
+every metric it knows, not the subset whose rows the run happened to produce. So a re-judge lists the stream
+datasets it could not have written, and a run whose only stream failed to open lists `measurements` while writing no
+measurement row. That is the useful way round for an overwritten file: the alternative is a store one build filled
+and an older build later wrote to ending up with a manifest that denies the `session.lance` sitting next to it. What a *particular* run wrote is answered by `run_id` and the rows.
 
 | Column | Type | Null? | Meaning |
 |---|---|---|---|
 | `run_id` | `string` | no | the run this row completes |
 | `created_at` | `timestamp[us, UTC]` | no | the stamp every row of the run carries |
 | `committed_at` | `timestamp[us, UTC]` | no | when the run finished writing |
-| `tool` | `string` | no | `di-check` \| `di-session` \| `di-reevaluate` \| `data-integrity` (the Ray recipe) |
-| `session_path` | `string` | yes | `null` for a single-video run and for a re-judge |
+| `tool` | `string` | no | `di` \| `di-reevaluate` \| `data-integrity` (the Ray recipe). Write-only and unvalidated, so a row carrying any other value is read unchanged. |
+| `session_path` | `string` | yes | the run's one session; `null` for a multi-session run and for a re-judge |
 | `policy_id` | `string` | no | the policy the run's verdicts were produced under |
 | `num_streams` | `int64` | yes | `null` for a re-judge, which touches no stream |
 | `store_schema_version` | `int32` | no | layout version at write time |
@@ -116,7 +116,7 @@ Version 2 was additive: a dataset that was never written reads as no rows, so no
 not. Appends go through `lance.write_dataset(..., mode="append")`, which requires the incoming schema to match the
 dataset's, so a root written at version 1 or 2 rejects new `stream.lance` or `session.lance` rows and needs a fresh
 one. That is a deliberate choice rather than an oversight: migration machinery for a store whose only readers are the
-two CLIs and the rollup would cost more than re-measuring, and re-measuring is cheap because the sources have not
+store's entry points and the rollup would cost more than re-measuring, and re-measuring is cheap because the sources have not
 changed.
 
 Version 3 also spans the timestamp-source terminology transition without a version bump: historical rows may contain
@@ -172,12 +172,12 @@ demoted to a display column — readable, but not the key.
 
 Deriving the id from the *absolute* source rather than from `(session_id, relative_key, ...)` is deliberate, even
 though the two are equivalent (a session root plus a relative key reconstructs the source). The absolute form is
-invariant to **how the stream was discovered**: check one video directly with `di-check`, then check its whole
-session with `di-session`, and both runs produce the same `stream_id` instead of two rows for the same bytes.
+invariant to **how the stream was discovered**: check one video directly with `di`, then check its whole session
+with the pipeline, and both runs produce the same `stream_id` instead of two rows for the same bytes.
 
 For a plain video file there is one stream to address, so `selector_value` is the `--stream-idx` that was opened —
 `0` unless someone asks for another. It's part of the hash rather than a display column because two indices of one
-file are two timelines: without it, `di-check --stream-idx 1` would overwrite the rows written for index `0`.
+file are two timelines: without it, `di --stream-idx 1` would overwrite the rows written for index `0`.
 
 Normalization is narrow on purpose: lowercase the URI scheme, strip trailing slashes, and make local paths absolute
 (which folds `.` / `..`). Paths and S3 keys are case-sensitive, so case is never touched below the scheme.
@@ -401,7 +401,7 @@ would blame it for the others — and `stream_id` / `source` are `nullable=False
 prefix and `evaluation.lance`, so there is nowhere to put one among them.
 
 So the three tables below are parallel to sections 2–4 rather than folded into them. Both writers fill them: the
-`di-session` CLI writes the verdicts it just printed, and the Ray pipeline writes one set per session it measured.
+`di` tool writes the verdicts it just printed, and the Ray pipeline writes one set per session it measured.
 `reevaluate` re-judges them alongside the per-stream ones, so tightening a policy moves both grains together.
 
 ### `session.lance`
@@ -630,7 +630,7 @@ untouched — both verdicts coexist.
 ## 9. One note on where the code lives
 
 The store lives at `cosmos_curator/next/recipes/data_integrity/`, alongside the CLIs that write it. It began under
-`core/sensors/data_integrity/` because both CLIs did, and a CI test forbids anything under `core/sensors/` from
+`core/sensors/data_integrity/` because the kernel did, and a CI test forbids anything under `core/sensors/` from
 importing the rest of `cosmos_curator` — so a store that had to be reachable from a CLI had to live inside that
 boundary too. Moving the CLIs out of the sensor library moved the store with them, and the constraint no longer
 applies to it: what stays behind is the reusable half (the metrics, their policy, the result vocabulary and the

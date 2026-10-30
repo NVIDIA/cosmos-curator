@@ -209,7 +209,7 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
     """Turn one session's measured streams into the session-grain store rows.
 
     Reaches the session's verdict through :func:`~.session_runner.session_metrics`,
-    the same function ``di-session`` reports from, so the pipeline and the CLI cannot
+    the same function the ``di`` tool reports from, so the pipeline and the tool cannot
     judge one session two ways.
 
     Args:
@@ -327,7 +327,7 @@ def open_mp4_index(config: ResolvedDataIntegrityConfig) -> Mp4IndexLookup | None
         raise ValueError(msg) from exc
     if lookup is None:
         # Mp4IndexLookup.open returns None for a manifest that does not exist, which the
-        # single-session CLIs read as "not built yet". A run that names one reads it as a typo.
+        # ``di`` reads as "not built yet". A run that names one reads it as a typo.
         msg = (
             f"input.mp4_index_uri {uri} holds no mp4-index manifest; build it with the "
             f"mp4-index recipe, or unset input.mp4_index_uri to read the videos directly"

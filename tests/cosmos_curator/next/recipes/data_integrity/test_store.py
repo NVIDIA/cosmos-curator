@@ -70,7 +70,7 @@ def _write(
         streams,
         session_path=session_path,
         thresholds=thresholds,
-        tool="di-session",
+        tool="di",
         session_metrics=session_metrics,
         created_at=created_at,
         storage_stats=storage_stats,
@@ -178,7 +178,6 @@ def _append_session(
 #: depending on how a CLI happens to render or parse anything.
 _CLI_MODULES = frozenset(
     {
-        "cosmos_curator.next.recipes.data_integrity.cli",
         "cosmos_curator.next.recipes.data_integrity.cli_support",
         "cosmos_curator.next.recipes.data_integrity.session_cli",
         "cosmos_curator.next.recipes.data_integrity.session_runner",
@@ -220,8 +219,8 @@ def test_the_two_verdict_schemas_agree_on_every_shared_column() -> None:
     schemas have to agree about them: if they drift, a row that builder produces fits
     only one of the two tables. What may legitimately differ is the subject --
     ``stream_id`` and ``source`` against ``session_id`` -- and ``session_path``, which
-    only a per-stream verdict can leave null, ``di-check`` judging a stream that
-    belongs to no session.
+    only a per-stream verdict can leave null, judging a stream that belongs to no
+    session.
     """
     subject = {"stream_id", "source", "session_id", "session_path"}
 
@@ -306,10 +305,31 @@ def test_two_stream_indices_of_one_file_are_two_streams(
     assert len({row["stream_id"] for row in store.read_measurements(store_root, "rate")}) == 2
 
 
+def test_an_errored_secondary_track_leaves_the_primary_result_standing(
+    store_root: str,
+    make_stream: Callable[..., StreamResult],
+    make_errored_stream: Callable[..., StreamResult],
+    perfect: Callable[..., list[int]],
+) -> None:
+    """``di --stream-idx 1`` failing must not bury what ``--stream-idx 0`` measured.
+
+    The newest-row-per-key rule is what makes this sharp: the error is written second,
+    so filing it under the default selector would not merely add a wrong row, it would
+    win the sort and become stream 0's current state.
+    """
+    _write(store_root, [make_stream(FRONT, perfect(), selector_value="0")])
+    _write(store_root, [make_errored_stream(FRONT, selector_value="1")])
+
+    rows = {str(row["selector_value"]): row for row in store.read_streams(store_root)}
+    assert set(rows) == {"0", "1"}
+    assert rows["0"]["error"] is None, "the secondary track's failure was filed against the primary"
+    assert rows["1"]["error"] == "moov atom not found"
+
+
 def test_single_stream_run_has_no_session(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> None:
-    """A null session_path is the only structural difference between the two CLIs' rows."""
+    """A run with no session to name leaves the column null rather than inventing one."""
     _write(store_root, [make_stream("/data/front.mp4", perfect())], session_path=None)
     (row,) = store.read_streams(store_root)
     assert row["session_path"] is None
@@ -497,7 +517,7 @@ def test_the_run_ledger_records_every_finished_run(
 
     (row,) = store.read_runs(store_root)
     assert row["run_id"] == run_id
-    assert row["tool"] == "di-session"
+    assert row["tool"] == "di"
     assert row["session_path"] == SESSION
     assert row["policy_id"] == store.policy_id(DEFAULT_THRESHOLDS)
     assert row["num_streams"] == 1
@@ -685,7 +705,7 @@ def test_a_row_from_a_newer_schema_is_refused_rather_than_half_written(store_roo
 def test_a_single_stream_run_writes_no_session_rows(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> None:
-    """``di-check`` has no session to key a row on, so it must write none even if handed verdicts."""
+    """A run with no session has nothing to key a session row on, even when handed verdicts."""
     _write(
         store_root,
         [make_stream("/data/front.mp4", perfect())],
@@ -938,7 +958,7 @@ def test_manifest_records_the_run(
     run_id = _write(store_root, [make_stream(FRONT, perfect())])
     manifest = store.read_manifest(store_root)
     assert manifest["run_id"] == run_id
-    assert manifest["tool"] == "di-session"
+    assert manifest["tool"] == "di"
     assert manifest["store_schema_version"] == store_schema.STORE_SCHEMA_VERSION
     assert manifest["policy_id"] == store.policy_id(DEFAULT_THRESHOLDS)
     assert manifest["instruments"] == {spec.name: spec.version for spec in (*INSTRUMENTS, *SESSION_INSTRUMENTS)}

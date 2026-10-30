@@ -21,8 +21,8 @@ them, the vocabulary their results are expressed in, and the per-stream engine
 throughout -- nothing here accepts a URI, imports a cloud client, or parses an
 argument, which is what lets the sensor library use it directly.
 
-The workflow built on top -- the ``di-check`` / ``di-session`` CLIs, stream
-discovery, report rendering and the Lance result store -- lives in
+The workflow built on top -- the ``di`` tool, stream discovery, report rendering
+and the Lance result store -- lives in
 :mod:`cosmos_curator.next.recipes.data_integrity`.
 
 See ``docs/curator/design/data-integrity-design.md`` for the architecture and the

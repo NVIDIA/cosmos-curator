@@ -50,8 +50,8 @@ class CheckStatus(enum.Enum):
     Kernel evaluators only ever return PASS/FAIL over a well-defined measurement.
     ``SKIPPED`` lives here because it covers the cases the kernel cannot evaluate
     at all: an undefined measurement (a kernel invariant not to evaluate) or a
-    missing prerequisite (no usable expected rate from either ``--expected-hz`` or
-    the container header).
+    missing prerequisite (no usable expected rate from either the caller or the
+    container header).
     """
 
     PASS = "PASS"  # noqa: S105
@@ -79,7 +79,7 @@ class ExpectedHzSource(enum.Enum):
 
     Variants, in fallback priority:
 
-    * ``USER`` -- user-supplied ``--expected-hz``; the authoritative baseline.
+    * ``USER`` -- an expected rate supplied by the caller; the authoritative baseline.
     * ``HEADER`` -- from the sensor's :attr:`IntegritySensor.avg_frame_rate`; best-effort
       only, and not a sound basis for the rate check (see :func:`resolve_expected_hz`).
     * ``UNAVAILABLE`` -- neither is usable; rate-dependent metrics SKIP.
@@ -362,9 +362,9 @@ class StreamResult:
             encoder rather than the recording.
         selector_type / selector_value: which stream *inside* ``source`` this is
             (see :mod:`~cosmos_curator.core.sensors.data_integrity.identity`).
-            Carried so the store can key on it: two runs of ``di-check`` over one
-            file with different ``--stream-idx`` are two streams, and without this
-            they would overwrite each other's rows.
+            Carried so the store can key on it: two runs over one file with
+            different ``--stream-idx`` are two streams, and without this they
+            would overwrite each other's rows.
 
     """
 
@@ -402,12 +402,12 @@ def stream_result(
 ) -> StreamResult:
     """Package one successful engine run as a :class:`StreamResult`.
 
-    Shared so the single-video CLI and the session runner describe a checked stream
-    identically -- which is what lets both write the same rows to the store.
+    Shared so every entry point describes a checked stream identically -- which is
+    what lets them write the same rows to the store.
 
-    ``selector_value`` is the stream index that was opened: the single-video CLI
-    passes its ``--stream-idx``, while the session runner takes the default because
-    it opens one stream per file.
+    ``selector_value`` is the stream index that was opened: ``di`` passes its
+    ``--stream-idx``, while the pipeline takes the default because it opens one stream
+    per file.
     """
     return StreamResult(
         source=source,

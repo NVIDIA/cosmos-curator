@@ -13,76 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The ``--store-path`` surface shared by both data-integrity CLIs.
+"""Writing a store from the Ray-free ``di`` tool, without importing one to do it.
 
 Kept apart from :mod:`.cli_support` for one reason: the store pulls in ``lance`` and
-``pyarrow``, and a plain check should not pay for them. Everything here imports the
-store lazily, inside the call, so the cost lands only on a run that actually asked
-to persist.
+``pyarrow``, and a plain check should not pay for them. The import is deferred into
+the call below, so that cost lands only on a run whose ``output.store_root`` is set.
+
+Where a store root is *shaped* is :class:`~.config.DataIntegrityOutputConfig`, which
+validates it when the config is resolved -- before any source is read, since the store
+is written last and a typo would otherwise cost a whole session.
 """
 
-import argparse
-import pathlib
 from collections.abc import Mapping
 
 from cosmos_curator.core.sensors.data_integrity.instruments import Thresholds
 from cosmos_curator.core.sensors.data_integrity.results import CheckResult, StreamResult
-from cosmos_curator.core.utils.storage.azure_client import is_azure_path
-from cosmos_curator.core.utils.storage.s3_client import is_s3path
 from cosmos_curator.core.utils.storage.storage_client import StorageStat
-
-
-def validate_store_path(value: str) -> str:
-    """Validate and normalize a ``--store-path`` value, for use as an argparse ``type``.
-
-    Checked at parse time because the store is written last: an unusable root would
-    otherwise surface only after every source had been read and the report printed,
-    turning a typo into a wasted session. Nothing here touches the backend, so it
-    stays cheap enough to run before any work starts.
-
-    Raises:
-        argparse.ArgumentTypeError: if the value is blank, names an unsupported
-            scheme, or is an ``az://`` URI.
-
-    """
-    if not value.strip():
-        msg = "store path is empty; give a local directory or an s3:// prefix"
-        raise argparse.ArgumentTypeError(msg)
-    if is_azure_path(value):
-        msg = f"the data-integrity store does not support az:// yet: {value!r}; use a local path or an s3:// prefix"
-        raise argparse.ArgumentTypeError(msg)
-    if is_s3path(value):
-        # A bucket is the least an S3 store needs. Without this, "s3://" is accepted
-        # here and fails far deeper, where the message belongs to Lance rather than us.
-        if not value.removeprefix("s3://").strip(" /"):
-            msg = f"store URI {value!r} names no bucket; use s3://bucket/prefix"
-            raise argparse.ArgumentTypeError(msg)
-        return value
-    # Anything else carrying a scheme would be taken for a local path and quietly
-    # create a directory named after it, so refuse rather than guess.
-    if "://" in value:
-        msg = f"unsupported store URI {value!r}; use a local path or an s3:// prefix"
-        raise argparse.ArgumentTypeError(msg)
-    return str(pathlib.Path(value).expanduser())
-
-
-def add_store_args(parser: argparse.ArgumentParser) -> None:
-    """Attach ``--store-path`` to ``parser``.
-
-    Shared by both CLIs so the flag means one thing, and so a store written by
-    ``di-check`` and one written by ``di-session`` are the same store.
-    """
-    parser.add_argument(
-        "--store-path",
-        default=None,
-        metavar="PATH",
-        type=validate_store_path,
-        help=(
-            "Persist measurements and verdicts to a Lance store at this local directory or s3:// prefix "
-            "(created if absent, appended to if not). Stored measurements can be re-judged under new "
-            "thresholds without re-reading any source. Omit to check without saving anything."
-        ),
-    )
 
 
 def persist_run(  # noqa: PLR0913 -- provenance plus credentials, all independent
@@ -104,11 +50,11 @@ def persist_run(  # noqa: PLR0913 -- provenance plus credentials, all independen
     run has; see :func:`~.store.write_run`.
 
     Errors propagate: the operator asked for the results to be saved, so a store that
-    could not be written is a failed run even when every check passed, and the CLIs
-    turn that into exit code 2.
+    could not be written is a failed run even when every check passed, and the tool
+    turns that into exit code 2.
     """
     # Imported here, not at module scope, so `lance` / `pyarrow` load only for a run
-    # that passed --store-path.
+    # whose config set output.store_root.
     from cosmos_curator.next.recipes.data_integrity import store  # noqa: PLC0415
 
     return store.write_run(

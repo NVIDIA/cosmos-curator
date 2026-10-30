@@ -156,7 +156,7 @@ def make_stream() -> Callable[..., StreamResult]:
 
 @pytest.fixture
 def run_engine() -> Callable[..., tuple[list[CheckResult], VideoInfo, ResolvedConfig]]:
-    """Run the engine and return its output unpackaged, the shape the single-video CLI works in.
+    """Run the engine and return its output unpackaged, the shape ``run_checks`` returns.
 
     :func:`make_stream` packages the same run; this returns it unpackaged, for tests
     that stand in for ``run_checks`` itself.
@@ -180,7 +180,12 @@ def run_engine() -> Callable[..., tuple[list[CheckResult], VideoInfo, ResolvedCo
 def make_errored_stream() -> Callable[..., StreamResult]:
     """Build a stream that could not be opened at all -- no metrics, no measurements."""
 
-    def _make(source: str, message: str = "moov atom not found") -> StreamResult:
+    def _make(
+        source: str,
+        message: str = "moov atom not found",
+        *,
+        selector_value: str = identity.DEFAULT_SELECTOR_VALUE,
+    ) -> StreamResult:
         return StreamResult(
             source=source,
             codec_name=None,
@@ -190,6 +195,7 @@ def make_errored_stream() -> Callable[..., StreamResult]:
             end_ns=None,
             metrics=[],
             error=message,
+            selector_value=selector_value,
         )
 
     return _make

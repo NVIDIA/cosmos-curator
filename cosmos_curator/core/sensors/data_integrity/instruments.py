@@ -17,8 +17,8 @@
 
 The kernel (:mod:`.metrics` / :mod:`.evaluation`) deliberately knows nothing about
 which threshold applies to which measurement, or how a verdict is worded. That
-knowledge used to be spelled out once per metric in the CLI and would have had to
-be spelled out again by the store and again by re-evaluation. Here it is declared
+knowledge would otherwise be spelled out once per metric by each entry point, again
+by the store and again by re-evaluation. Here it is declared
 once, so a new metric is a new :class:`InstrumentSpec` rather than a new branch in
 three places -- and so a re-evaluated verdict is produced by exactly the same code
 that produced the original: :func:`evaluate_metric`, the tool's one path from a
@@ -34,8 +34,8 @@ meaningful next to the accessor that reads it.
 
 No ``pyarrow`` import: field *shapes* are declared as :class:`FieldSpec` and
 translated to Arrow types by :mod:`.store_schema`, so importing the registry (which
-the CLIs always do) never pulls in the storage stack (which they only do with
-``--store-path``).
+every entry point always does) never pulls in the storage stack (which they only do
+when a store root is configured).
 """
 
 import enum
@@ -66,7 +66,7 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     measurement_to_dict,
 )
 
-# Metric identifiers used verbatim in both CLIs' human and JSON reports, and as the
+# Metric identifiers used verbatim in the human and JSON reports, and as the
 # name of each metric's stored dataset.
 NAME_ORDERING = "timestamp_ordering"
 NAME_RATE = "rate"
@@ -469,8 +469,8 @@ def instrument_versions() -> dict[str, int]:
 
     For the store's manifest, whose ``instruments`` field records every metric the
     build knows rather than the subset whose rows a run happened to write -- so a
-    ``di-check`` run, which has no session to measure, still lists the session-grain
-    metrics. Flat rather than split by grain, because a name is unique across the two
+    run over a lone video, which has no session to measure, still lists the
+    session-grain metrics. Flat rather than split by grain, because a name is unique across the two
     registries and the datasets they land in already say which is which.
     """
     return {spec.name: spec.version for spec in (*INSTRUMENTS, *SESSION_INSTRUMENTS)}
@@ -479,7 +479,7 @@ def instrument_versions() -> dict[str, int]:
 def evaluate_metric(spec: InstrumentSpec, measurement: Measurement, thresholds: Thresholds) -> CheckResult:
     """Judge one finalized measurement under ``thresholds`` and package the verdict.
 
-    The single evaluation path for the whole tool: both CLIs and re-evaluation of a
+    The single evaluation path for the whole tool: every entry point and re-evaluation of a
     stored measurement come through here, so a re-judged verdict cannot drift from
     the original by running slightly different policy code. It lives with the registry
     for that reason -- policy and wording are declared here, and re-evaluation needs

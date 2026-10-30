@@ -290,7 +290,7 @@ def test_the_manifest_describes_the_run_rather_than_a_session(
 @pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_a_run_with_findings_still_exits_zero(dataset: pathlib.Path, tmp_path: pathlib.Path) -> None:
-    """The runtime's contract, not ``di-session``'s: findings are results, not failures."""
+    """The runtime's contract, not the single-session tool's: findings are results, not failures."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(_config_data(dataset, tmp_path / "di-store")))
 

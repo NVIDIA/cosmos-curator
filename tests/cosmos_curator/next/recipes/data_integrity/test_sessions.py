@@ -51,6 +51,48 @@ def _stub_s3_listing(monkeypatch: pytest.MonkeyPatch, children_by_prefix: dict[s
     return seen
 
 
+def test_a_single_session_comes_back_canonicalized() -> None:
+    """Same normalization as the expanding path, so one session has one ``session_id``.
+
+    Without this, a session measured by the ``di`` tool and the same session measured by
+    a pipeline run would land in the store as two, differing only by a trailing slash.
+    """
+    assert sessions.single_session(DataIntegrityInputConfig(sessions=["s3://bucket/clips/one/"])) == (
+        "s3://bucket/clips/one"
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_fields", "expected"),
+    [
+        ({"sessions": ["/data/one"], "session_roots": ["/data"]}, "session_roots"),
+        ({"session_list_uri": "/data/list.txt"}, "session_list_uri"),
+        ({"session_roots": ["/data"], "session_list_uri": "/data/list.txt"}, "session_list_uri and session_roots"),
+    ],
+)
+def test_the_expanding_forms_are_refused_without_being_expanded(
+    monkeypatch: pytest.MonkeyPatch, input_fields: dict[str, object], expected: str
+) -> None:
+    """Judged on the config, not on the expansion, so it costs no listing and cannot flip.
+
+    Checking the result instead would *pass* for a root that happens to hold exactly one
+    session today, and start failing the day a second one lands -- and would pay for a
+    bucket listing to reach either answer.
+    """
+    monkeypatch.setattr(sessions, "make_s3_client", lambda *_a, **_k: pytest.fail("listed a root anyway"))
+    monkeypatch.setattr(sessions, "list_sessions_under_root", lambda *_a, **_k: pytest.fail("listed a root anyway"))
+
+    with pytest.raises(ValueError, match=expected) as excinfo:
+        sessions.single_session(DataIntegrityInputConfig(**input_fields))
+    assert "run-pipeline" in str(excinfo.value), "the message has to name the tool that does cover a dataset"
+
+
+def test_more_than_one_explicit_session_is_refused() -> None:
+    """One invocation measures one session; the count is the whole of the rule."""
+    with pytest.raises(ValueError, match="names 2"):
+        sessions.single_session(DataIntegrityInputConfig(sessions=["/data/one", "/data/two"]))
+
+
 def test_explicit_sessions_come_back_canonicalized() -> None:
     """The same normalization the store uses, so a session path means one session."""
     assert _expand(sessions=["s3://bucket/clips/one/", "s3://bucket/clips/two"]) == (
@@ -99,7 +141,7 @@ def test_a_session_list_on_an_unsupported_scheme_is_rejected() -> None:
 
 
 def test_a_local_root_expands_to_its_child_directories(tmp_path: pathlib.Path) -> None:
-    """A root holds sessions as immediate children, the layout ``di-session`` documents."""
+    """A root holds sessions as immediate children, the layout ``di`` documents."""
     root = tmp_path / "clips"
     for name in ("b-session", "a-session"):
         (root / name).mkdir(parents=True)

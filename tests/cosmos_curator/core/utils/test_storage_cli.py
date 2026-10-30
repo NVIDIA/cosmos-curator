@@ -60,6 +60,7 @@ from typing import Any, BinaryIO
 import boto3
 import pytest
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils import storage_cli
 from cosmos_curator.core.utils.storage import azure_client as azure_client_module
@@ -140,6 +141,28 @@ class _FakeListS3:
     def paginate_kwargs(self) -> dict[str, object] | None:
         """The arguments the listing paged the bucket with."""
         return self._paginator.last_paginate_kwargs
+
+
+class _FakeHeadS3:
+    """S3 stand-in whose only wired-up call is ``HeadObject``.
+
+    Separate from :class:`_FakeListS3` because the point of the subject it serves is
+    that it issues no listing at all: a fake carrying both calls could not show that.
+    """
+
+    def __init__(self, keys: set[str], *, error: ClientError | None = None) -> None:
+        self._keys = keys
+        self._error = error
+        self.head_keys: list[str] = []
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803 -- boto3's own parameter names
+        del Bucket
+        self.head_keys.append(Key)
+        if self._error is not None:
+            raise self._error
+        if Key not in self._keys:
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        return {"ContentLength": 7}
 
 
 class _FakeAzureCredential:
@@ -451,6 +474,16 @@ def _s3_lister(pages: list[dict[str, Any]]) -> tuple[_ObjectLister, _FakeListS3]
         return storage_cli.list_storage_objects(prefix, client=s3_client(fake), limit=limit, suffixes=suffixes)
 
     return _list, fake
+
+
+def _s3_existence(keys: set[str], *, error: ClientError | None = None) -> tuple[Callable[[str], bool], _FakeHeadS3]:
+    """Return an existence callable bound to a fake S3 holding ``keys``, plus that fake."""
+    fake = _FakeHeadS3(keys, error=error)
+
+    def _exists(uri: str) -> bool:
+        return storage_cli.storage_object_exists(uri, client=s3_client(fake))
+
+    return _exists, fake
 
 
 def _azure_lister(blob_names: list[str]) -> tuple[_ObjectLister, FakeAzureContainer]:
@@ -1613,3 +1646,42 @@ def test_the_credential_flags_parse_supplied_values() -> None:
     assert args.s3_profile_name == "curator-test"
     assert args.azure_profile_name == "prod"
     assert args.endpoint_url == "https://s3.example.invalid"
+
+
+# --------------------------------------------------------------------------------------
+# 10. storage_object_exists
+# --------------------------------------------------------------------------------------
+
+
+def test_an_object_that_is_there_is_found_by_its_exact_key() -> None:
+    """The question is about one key, so a neighbour sharing its prefix is not consulted."""
+    exists, fake = _s3_existence({"clips/u/camera.mp4", "clips/u/camera.mp4.backup.mp4"})
+
+    assert exists("s3://bucket/clips/u/camera.mp4") is True
+    assert fake.head_keys == ["clips/u/camera.mp4"]
+
+
+def test_an_absent_object_answers_false_rather_than_raising() -> None:
+    """Absence is a normal answer here, which is what separates this from ``stat``."""
+    exists, _ = _s3_existence({"clips/u/camera.mp4.backup.mp4"})
+
+    assert exists("s3://bucket/clips/u/camera.mp4") is False
+
+
+def test_a_denied_bucket_raises_rather_than_reporting_the_object_as_absent() -> None:
+    """A 403 means "not allowed to look", and calling that "not there" hides data.
+
+    Only the literal 404 is translated, so a caller that would otherwise skip the
+    object is made to see the permissions problem instead.
+    """
+    denied = ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject")
+    exists, _ = _s3_existence({"clips/u/camera.mp4"}, error=denied)
+
+    with pytest.raises(ClientError, match="403"):
+        exists("s3://bucket/clips/u/camera.mp4")
+
+
+def test_asking_about_a_local_path_is_a_storage_cli_error() -> None:
+    """Same contract as the listing: only cloud URIs are this helper's business."""
+    with pytest.raises(StorageCliError, match="storage_object_exists requires an s3:// or az:// URI"):
+        storage_cli.storage_object_exists("/data/clips/u/camera.mp4")

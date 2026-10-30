@@ -23,8 +23,9 @@ the sensor library backend-agnostic -- it never accepts a URI and imports no clo
 client (see :mod:`cosmos_curator.core.sensors.utils.io`) -- and it is why these two
 functions sit in the recipe rather than beside the metrics they call.
 
-Both entry points build on :func:`run_checks`: the single-video ``di-check`` CLI
-(:mod:`.cli`) and the concurrent session runner (:mod:`.session_runner`).
+Both entry points build on :func:`run_checks` through the concurrent session runner
+(:mod:`.session_runner`): the ``di`` tool (:mod:`.session_cli`) and the Ray Data
+pipeline (:mod:`.pipeline`).
 
 Given an ``mp4-index`` manifest, a stream the manifest covers takes its timeline from
 the index instead of being opened
@@ -442,8 +443,8 @@ def run_checks(  # noqa: PLR0913
     The I/O wrapper around :func:`~cosmos_curator.core.sensors.data_integrity.engine.run_metrics`:
     it resolves the local path or cloud stream, constructs the sensor, and delegates
     the compute. Any open / decode failure propagates as an exception for the caller
-    to classify (the single-video CLI maps it to exit code 2; the session tool records
-    a per-stream ERROR).
+    to classify (``di`` records a per-stream ERROR; the pipeline additionally sorts
+    unreachable from unreadable).
 
     Also where a sensor timeline is preferred over the container's PTS, when the source
     has one beside it (:func:`read_sensor_timestamps`). Done here rather than at either

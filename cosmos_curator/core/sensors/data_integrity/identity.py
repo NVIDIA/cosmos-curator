@@ -48,7 +48,7 @@ NAMESPACE_AZURE = "az"
 SELECTOR_VIDEO_STREAM = "video_stream"
 SELECTOR_MCAP_TOPIC = "mcap_topic"
 
-#: Default selector for the one-video-per-file sources the CLIs handle today.
+#: Default selector for the one-video-per-file sources handled today.
 DEFAULT_SELECTOR_TYPE = SELECTOR_VIDEO_STREAM
 DEFAULT_SELECTOR_VALUE = "0"
 

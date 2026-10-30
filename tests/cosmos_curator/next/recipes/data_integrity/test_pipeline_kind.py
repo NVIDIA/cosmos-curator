@@ -32,7 +32,7 @@ from cosmos_curator.next.recipes.data_integrity.pipeline_kind import DATA_INTEGR
 _HEAVY_MODULES = ("ray", "lance", "pyarrow")
 
 
-def _write_config(tmp_path: pathlib.Path, store_root: str = "/data/di-store") -> pathlib.Path:
+def _write_config(tmp_path: pathlib.Path, store_root: str | None = "/data/di-store") -> pathlib.Path:
     """Write the smallest valid config to a file the kind's callables can take."""
     path = tmp_path / "config.yaml"
     path.write_text(
@@ -91,6 +91,19 @@ def test_validation_reports_a_bad_config_rather_than_a_bad_run(tmp_path: pathlib
     """The store root is checked before any stream is read."""
     with pytest.raises(ValidationError, match="az://"):
         DATA_INTEGRITY_KIND.validate(_write_config(tmp_path, store_root="az://container/store"), [])
+
+
+def test_validation_refuses_a_config_that_names_no_store(tmp_path: pathlib.Path) -> None:
+    """``validate`` has to refuse exactly what ``run`` would, or it is not validation.
+
+    A null ``store_root`` is legal on the model, because the Ray-free ``di`` tool may
+    report without persisting and both tools share one ``kind``. A pipeline run has no
+    report to fall back on, so the check lives on this side of the seam -- and it has to
+    sit on both callables, since passing ``pipeline validate`` and then being rejected by
+    ``run-pipeline`` is worse than a single clear refusal.
+    """
+    with pytest.raises(ValueError, match=r"output\.store_root is required"):
+        DATA_INTEGRITY_KIND.validate(_write_config(tmp_path, store_root=None), [])
 
 
 def test_the_schema_it_publishes_names_the_four_blocks() -> None:

@@ -42,7 +42,7 @@ The sidecar is also not proof, which is why finding one is the recipe's job rath
 
 **When there is no sidecar.** Most sources have none, so its absence is not a finding: the stream is measured on container PTS and says so. A sidecar that exists but is unreadable, or whose length disagrees with the video's frame count, is a different matter and fails the stream — silently falling back would hide the one thing an operator can act on. Because a timeline is matched to frames by position, a count that disagrees leaves *every* frame's sensor time in doubt rather than only the missing ones'.
 
-Reading provenance beside the numbers is therefore how a reader tells a rig that is genuinely steady from a mux that invented the timeline; both produce near-zero jitter, and only one of them is a measurement. It is reported in both CLIs' output and persisted as a `stream.lance` column, so a query for streams whose cadence is real can filter on it.
+Reading provenance beside the numbers is therefore how a reader tells a rig that is genuinely steady from a mux that invented the timeline; both produce near-zero jitter, and only one of them is a measurement. It is reported in the tool's output and persisted as a `stream.lance` column, so a query for streams whose cadence is real can filter on it.
 
 ### The session grain skips without a shared sensor clock
 
@@ -174,7 +174,7 @@ Keeping the measurement single and the policy in the evaluator keeps the catalog
 
 The two metrics below measure a **session**, not a stream: their subject is a set of sensors, and no one stream in it can carry the answer. They take recording bounds rather than timelines — one `(start_ns, end_ns)` pair per sensor, folded one sensor at a time — so a caller that has just measured a session's streams can feed them what it already has.
 
-They live in a separate registry (`SESSION_INSTRUMENTS`) from the five above, because everything that iterates the per-stream registry does so once per stream. `di-session` and the Ray pipeline both run them, print or log them, and store them in the three session-grain Lance tables specified in [data-integrity-store-schema.md](data-integrity-store-schema.md) section 5. A failure exits `di-session` nonzero; the pipeline counts it, since findings never reach its exit status.
+They live in a separate registry (`SESSION_INSTRUMENTS`) from the five above, because everything that iterates the per-stream registry does so once per stream. The `di` tool and the Ray pipeline both run them, print or log them, and store them in the three session-grain Lance tables specified in [data-integrity-store-schema.md](data-integrity-store-schema.md) section 5. A failure exits `di` nonzero; the pipeline counts it, since findings never reach its exit status.
 
 Bounds are validated at the boundary like every other input: a non-integer bound → `TypeError` (a `bool` included, since it is an `int` subclass), one outside `int64` nanoseconds → `ValueError`. Ordering is deliberately *not* required — a sensor whose last sample precedes its first is corrupt rather than unrepresentable, and each metric reports that through its own arithmetic instead of raising, leaving `TimestampOrderingMetric` to name the stream responsible.
 

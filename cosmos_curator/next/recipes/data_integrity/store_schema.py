@@ -73,7 +73,7 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #: ``lance.write_dataset(..., mode="append")``, which requires the incoming schema to
 #: match the dataset's, so a store written at version 1 or 2 cannot take new rows and
 #: needs a fresh root. Deliberate rather than mitigated -- migration machinery for a
-#: store whose only readers are the two CLIs and the rollup would cost more than
+#: store whose only readers are this recipe's entry points and the rollup would cost more than
 #: re-measuring, and re-measuring is cheap because the sources are unchanged.
 #:
 #: Version 3 rows may contain historical ``timestamp_source="capture"`` or the
@@ -127,8 +127,8 @@ STREAM_SCHEMA: pa.Schema = pa.schema(
         pa.field("stream_id", pa.string(), nullable=False),
         pa.field("run_id", pa.string(), nullable=False),
         pa.field("created_at", _TIMESTAMP, nullable=False),
-        # Session context. Null for a single-stream run, which is the only structural
-        # difference between what di-check and di-session write.
+        # Session context. Null for a run over a lone video rather than a recording,
+        # which is the only structural difference between the two.
         pa.field("session_id", pa.string()),
         pa.field("session_path", pa.string()),
         pa.field("locator_namespace", pa.string(), nullable=False),
@@ -198,8 +198,8 @@ EVALUATION_SCHEMA: pa.Schema = pa.schema(
     [
         pa.field("stream_id", pa.string(), nullable=False),
         *_VERDICT_PROVENANCE_FIELDS,
-        # Nullable, unlike its session-grain twin: di-check judges a stream that
-        # belongs to no session.
+        # Nullable, unlike its session-grain twin: a run over a lone video judges a
+        # stream that belongs to no session.
         pa.field("session_path", pa.string()),
         pa.field("source", pa.string(), nullable=False),
         *_VERDICT_OUTCOME_FIELDS,
@@ -216,8 +216,10 @@ RUN_SCHEMA: pa.Schema = pa.schema(
         # them is how long the run took to write.
         pa.field("created_at", _TIMESTAMP, nullable=False),
         pa.field("committed_at", _TIMESTAMP, nullable=False),
-        # Which entry point wrote it: "di-check", "di-session", "di-reevaluate", or
-        # "data-integrity" for the Ray Data pipeline, which writes many sessions per run.
+        # Which entry point wrote it: "di" for the single-session tool, "di-reevaluate",
+        # or "data-integrity" for the Ray Data pipeline, which writes many sessions per
+        # run. Write-only and unvalidated, so a row carrying any other value -- one
+        # written by an entry point this version does not have -- is read unchanged.
         pa.field("tool", pa.string(), nullable=False),
         pa.field("session_path", pa.string()),
         pa.field("policy_id", pa.string(), nullable=False),

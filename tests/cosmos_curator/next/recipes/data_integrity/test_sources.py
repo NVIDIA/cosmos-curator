@@ -132,7 +132,7 @@ def test_an_abort_stops_a_real_local_check(tmp_path: pathlib.Path, h264_video: C
 
 
 def test_a_missing_local_path_raises_at_open(tmp_path: pathlib.Path) -> None:
-    """Opening eagerly moves the failure to open_source, where both CLIs report exit 2."""
+    """Opening eagerly moves the failure to open_source, where a missing path is exit 2."""
     with pytest.raises(FileNotFoundError):
         _open_local(tmp_path / "nope.mp4")
 

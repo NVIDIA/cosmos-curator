@@ -216,3 +216,74 @@ def test_stream_outside_the_session_is_dropped_with_a_warning(monkeypatch: pytes
     )
 
     assert discover_streams("s3://b/clips/u/", stream_globs=("recorder-*/*",)) == []
+
+
+def test_a_named_cloud_video_resolves_to_that_object_rather_than_a_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named video is one object, and both backends would list it as a prefix.
+
+    ``camera.mp4.backup.mp4`` starts with the key that was asked for and ends in a
+    video suffix, so a listing cannot tell it from the video itself and would measure
+    it as a second stream of this session. Resolving the object directly is also what
+    keeps a single-file check from needing permission to list the bucket, so the
+    absence of a listing is part of the contract rather than an optimisation.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_exists(uri: str, **kwargs: object) -> bool:
+        captured["uri"] = uri
+        captured.update(kwargs)
+        return True
+
+    def _fail_if_listed(*_a: object, **_k: object) -> list[str]:
+        pytest.fail("a named object must not be resolved by listing its prefix")
+
+    monkeypatch.setattr(discovery, "storage_object_exists", _fake_exists)
+    monkeypatch.setattr(discovery, "list_storage_objects", _fail_if_listed)
+
+    found = discover_streams("s3://b/camera.mp4", s3_profile_name="maglev", endpoint_url="https://endpoint.io")
+
+    assert found == ["s3://b/camera.mp4"]
+    assert captured["uri"] == "s3://b/camera.mp4"
+    assert captured["s3_profile_name"] == "maglev"
+    assert captured["endpoint_url"] == "https://endpoint.io"
+
+
+def test_a_named_cloud_video_that_is_no_object_is_listed_as_a_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing stops a prefix being named like a video, and absence is what tells them apart.
+
+    The trailing delimiter would have said so, but ``normalize_source`` drops it before
+    discovery sees the path, so the lookup is the only thing left to ask.
+    """
+    monkeypatch.setattr(discovery, "storage_object_exists", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        discovery,
+        "list_storage_objects",
+        lambda *_a, **_k: ["s3://b/odd.mp4/recorder-00/front.mp4"],
+    )
+
+    assert discover_streams("s3://b/odd.mp4") == ["s3://b/odd.mp4/recorder-00/front.mp4"]
+
+
+def test_a_sibling_prefix_sharing_the_session_name_is_not_measured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session's name is the prefix of its neighbours' names, and listing matches prefixes.
+
+    Without globs there was nothing between the listing and the report, so the cameras
+    of ``abc123-backup`` were counted among ``abc123``'s sensors -- which the two
+    cross-sensor metrics read as a wider spread and a worse overlap, inventing a
+    finding out of a session nobody asked about.
+    """
+    monkeypatch.setattr(
+        discovery,
+        "list_storage_objects",
+        lambda *_a, **_k: [
+            "s3://b/clips/abc123-backup/recorder-00/front.mp4",
+            "s3://b/clips/abc123/recorder-00/front.mp4",
+            "s3://b/clips/abc1234/recorder-00/front.mp4",
+        ],
+    )
+
+    found = discover_streams("s3://b/clips/abc123")
+
+    assert found == ["s3://b/clips/abc123/recorder-00/front.mp4"]

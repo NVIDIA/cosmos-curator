@@ -406,7 +406,7 @@ def test_an_empty_session_produces_a_result_but_no_stream_rows(tmp_path: pathlib
     assert session_row["timestamp_source"] is None
     # Its own metrics are still considered and judged, and come back SKIPPED. Nothing
     # here forks on `num_streams == 0` -- both shapes go through `session_metrics`,
-    # which is what stops the pipeline and di-session from judging a session two ways.
+    # which is what stops the pipeline and ``di`` from judging a session two ways.
     # The rows are the "never ran" shape rather than a measured-but-undefined one:
     # with no clock to compare on, the metrics were never reachable.
     assert record["failed_session_metrics"] == 0

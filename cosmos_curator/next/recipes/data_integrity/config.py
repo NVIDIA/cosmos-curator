@@ -53,7 +53,7 @@ DataIntegrityKind = Literal["data-integrity"]
 KIND_NAME = "data-integrity"
 
 #: What the store's ``run.lance`` row and ``manifest.json`` record as the writer,
-#: alongside ``di-check`` / ``di-session`` / ``di-reevaluate``.
+#: alongside ``di`` / ``di-reevaluate``.
 TOOL_NAME = KIND_NAME
 
 #: The value Ray Data reads as "do not watch for progress at all", and so the one
@@ -163,9 +163,9 @@ class ThresholdsConfig(BaseModel):
     max_gaps: int = Field(default=0, ge=0)
     max_jitter_percent: float = Field(default=10.0, ge=0.0, allow_inf_nan=False)
     allow_frame_reordering: bool = False
-    # Session-grain, judging the rig rather than one stream. Here rather than only on
-    # di-session because a pipeline run measures sessions too, and a policy it cannot
-    # state is a policy it is stuck with.
+    # Session-grain, judging the rig rather than one stream. Here rather than only on the
+    # single-session tool because a pipeline run measures sessions too, and a policy it
+    # cannot state is a policy it is stuck with.
     max_sensor_spread_ns: int = Field(default=1_000_000_000, ge=0)
     max_non_overlap_percent: float = Field(default=5.0, ge=0.0, le=MAX_PERCENT, allow_inf_nan=False)
 
@@ -211,18 +211,36 @@ class DataIntegrityChecksConfig(BaseModel):
 
 
 class DataIntegrityOutputConfig(BaseModel):
-    """Where the run's rows land."""
+    """Where the run's rows land, or nothing at all.
+
+    ``store_root`` is optional because the Ray-free ``di`` tool prints a report and may
+    persist nothing: ``store_cli.persist_run`` defers its ``lance`` / ``pyarrow`` import
+    so a run that asked for no store never loads either, which is what keeps that tool
+    usable without them. A pipeline run has no such option -- the store is its only
+    durable output -- so ``pipeline_kind`` requires a non-null value before Ray starts.
+    """
 
     model_config = _MODEL_CONFIG
 
-    store_root: str = Field(min_length=1, examples=["s3://example-bucket/di_store/"])
+    store_root: str | None = Field(
+        default=None,
+        description=(
+            "Local directory or s3:// prefix the run's rows are written to; null persists "
+            "nothing, which only the Ray-free tool may do."
+        ),
+        examples=["s3://example-bucket/di_store/"],
+    )
 
     @field_validator("store_root")
     @classmethod
-    def _validate_store_root(cls, store_root: str) -> str:
-        # The same rule store_cli.validate_store_path enforces for the two CLIs, and for
-        # the same reason: the store is written last, so a root that cannot be written
-        # must fail before any stream is read rather than after all of them.
+    def _validate_store_root(cls, store_root: str | None) -> str | None:
+        # Only the shape is checked here. Whether a null is *allowed* depends on which
+        # executor is about to run, which this model cannot see -- both share one
+        # ``kind`` -- so that lives in pipeline_kind instead.
+        if store_root is None:
+            return None
+        # The store is written last, so a root that cannot be written must fail before
+        # any stream is read rather than after all of them.
         value = store_root.strip()
         if not value:
             msg = "output.store_root is empty; give a local directory or an s3:// prefix"
@@ -272,10 +290,21 @@ class DataIntegrityExecutionConfig(BaseModel):
         ge=1,
         description="Concurrent session-measurement tasks.",
     )
+    # The other axis: streams in flight *within* one session. The Ray path leaves this
+    # at 1 and parallelises across sessions instead, because a session is its unit of
+    # work; the single-session tool has no sessions to spread over and raises it to
+    # overlap the per-stream waits, which dominate on cloud sources.
+    stream_concurrency: int = Field(
+        default=1,
+        ge=1,
+        description="Streams measured concurrently within one session; 1 keeps them on the calling thread.",
+    )
     # Attempts per stream when the failure looks like a transport hiccup. Retried in the
     # worker rather than by Ray: nothing escapes the map function, so Ray's own map retry
-    # never sees a failure here. Exhausting these attempts makes the stream unreachable
-    # rather than unreadable -- see session_runner.InfrastructureError.
+    # never sees a failure here. Honoured by both executors, so one config cannot mean
+    # three attempts under Ray and one under `di`; what exhausting them *means* does
+    # differ, because only a pipeline run asks for unreachable streams to be raised
+    # rather than reported -- see session_runner.InfrastructureError.
     stream_attempts: int = Field(default=3, ge=1)
     # Sessions per driver-side append. Bounds how much row payload the driver holds at
     # once, and how many Lance fragments a run leaves behind.
@@ -318,7 +347,10 @@ class ResolvedDataIntegrityConfig(BaseModel):
     kind: DataIntegrityKind
     input: DataIntegrityInputConfig
     checks: DataIntegrityChecksConfig = Field(default_factory=DataIntegrityChecksConfig)
-    output: DataIntegrityOutputConfig
+    # Defaulted now that ``store_root`` is optional, so a ``di`` config that only wants a
+    # report on stdout need not carry an ``output`` block at all. A pipeline config still
+    # must name a store; ``pipeline_kind`` enforces that rather than this model.
+    output: DataIntegrityOutputConfig = Field(default_factory=DataIntegrityOutputConfig)
     execution: DataIntegrityExecutionConfig = Field(default_factory=DataIntegrityExecutionConfig)
 
 
@@ -333,8 +365,29 @@ _TEMPLATE_PREAMBLE = """\
 # All supported settings and their defaults are shown. Unchanged settings may be removed.
 # `input` accepts any combination of `sessions`, `session_list_uri` and `session_roots`;
 # at least one must be non-empty, and an expansion yielding zero sessions is an error.
+# The single-session `di` tool takes only `sessions`, with exactly one entry.
 # `output.store_root` must be a local directory or an s3:// prefix; az:// is not supported.
+# It may be null only for `di`, which then prints its report without persisting anything;
+# a pipeline run requires it, since the store is the only thing such a run leaves behind.
 """
+
+
+def require_store_root(config: ResolvedDataIntegrityConfig) -> str:
+    """Return the store root, rejecting the null only the Ray-free ``di`` tool may have.
+
+    ``output.store_root`` is optional in the model because both executors share one
+    ``kind``, leaving no discriminator a field validator could key on. A pipeline run has
+    no report to fall back on -- the committed rows are its entire output -- so a null
+    there would measure a whole dataset and record none of it.
+
+    Lives here rather than in ``pipeline_kind`` because ``pipeline.run_config`` needs it
+    too: ``python -m ...pipeline`` reaches the run without going through the kind, and
+    the narrowed return type is what lets the run treat the root as a plain ``str``.
+    """
+    if config.output.store_root is None:
+        msg = "output.store_root is required for a pipeline run; it is the run's only durable output"
+        raise ValueError(msg)
+    return config.output.store_root
 
 
 def load_config_data(config_path: str | Path) -> dict[str, Any]:
