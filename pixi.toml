@@ -214,13 +214,12 @@ nvidia-nvtx = "*"
 
 # Regular inference can upgrade vLLM independently of the Omni-compatible pair.
 [feature.vllm.dependencies]
-transformers = ">=5.16.1,<5.18.0" # keep the conda solve within vLLM 0.31's supported range
+transformers = ">=5.16.1,<5.20.0" # keep the conda solve within vLLM's supported range
 
-# Capped at 0.31.0: Ray 2.59.0's ray.data.llm multimodal stage imports
-# vllm.entrypoints.chat_utils.parse_chat_messages_async, which vLLM 0.32 moved to
-# vllm.renderers.chat_utils. Raise past 0.31.0 only once Ray supports the new path.
+# Ray 2.59.0's ray.data.llm multimodal stage imports vLLM's chat utilities from their
+# pre-0.32 path; cosmos_curator/next/core/ray_llm_compat.py bridges it until Ray catches up.
 [feature.vllm.pypi-dependencies]
-vllm = "==0.31.0" # not available on conda-forge
+vllm = "==0.32.0" # not available on conda-forge
 
 # Cosmos3 Generator Transfer runs in-process through vLLM-Omni's offline `Omni`
 # API. Keep it out of the shared runtime feature: its large, transfer-specific

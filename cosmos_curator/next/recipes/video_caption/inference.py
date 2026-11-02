@@ -727,6 +727,8 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
         vLLMEngineProcessorConfig,
     )
 
+    from cosmos_curator.next.core.ray_llm_compat import install_prepare_multimodal_shim  # noqa: PLC0415
+
     if not 1 <= initial_inference_workers <= inference_worker_ceiling:
         msg = (
             "initial_inference_workers must be between one and inference_worker_ceiling, got "
@@ -796,6 +798,7 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
             carried_result_columns=carried_result_columns,
         ),
     )
+    install_prepare_multimodal_shim(processor)
     return _ExactVLLMBatchProcessor(processor, batch_size=config.inference_batch_size)
 
 

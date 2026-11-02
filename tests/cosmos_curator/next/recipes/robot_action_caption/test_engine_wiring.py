@@ -25,7 +25,9 @@ from typing import Any
 import attrs
 import pytest
 from ray.data import ActorPoolStrategy
+from ray.llm._internal.batch.stages import prepare_multimodal_stage
 
+from cosmos_curator.next.core import ray_llm_compat
 from cosmos_curator.next.recipes.robot_action_caption.engine import (
     ACTOR_RESTART_BOUNDS,
     VllmProcessorConfig,
@@ -35,9 +37,10 @@ from cosmos_curator.next.recipes.robot_action_caption.engine import (
 
 @attrs.define
 class _StubStage:
-    """Stage that accepts a kwargs assignment, like the pinned pydantic stage."""
+    """Stage that accepts kwargs and UDF assignments, like the pinned pydantic stage."""
 
     map_batches_kwargs: dict[str, Any]
+    fn: type | None = None
 
 
 @attrs.define
@@ -113,7 +116,9 @@ def _passthrough(row: dict[str, Any]) -> dict[str, Any]:
 def _actor_backed_stages() -> dict[str, _StubStage]:
     """Return two actor-backed stages named after the pinned stage layout."""
     return {
-        "PrepareMultimodalStage": _StubStage({"compute": ActorPoolStrategy(size=1)}),
+        "PrepareMultimodalStage": _StubStage(
+            {"compute": ActorPoolStrategy(size=1)}, fn=prepare_multimodal_stage.PrepareMultimodalUDF
+        ),
         "vLLMEngineStage": _StubStage({"compute": ActorPoolStrategy(size=1)}),
     }
 
@@ -194,6 +199,16 @@ def test_transform_enables_the_media_preparation_stage_when_media_is_requested(
     stage = recorded.engine_config.kwargs["prepare_multimodal_stage"]
     assert isinstance(stage, _RecordedPrepareMultimodalConfig)
     assert stage.enabled is True
+
+
+def test_transform_runs_media_preparation_through_the_vllm_compat_udf(
+    make_config: Callable[..., VllmProcessorConfig],
+    build_transform: TransformBuilder,
+) -> None:
+    """Ray's own preparation UDF cannot import the pinned vLLM's chat parser."""
+    recorded = build_transform(make_config(prepare_multimodal=True, media_bytes_per_row=11 * 1024 * 1024))
+
+    assert recorded.processor.get_stage_by_name("PrepareMultimodalStage").fn is ray_llm_compat.PrepareMultimodalUDF
 
 
 def test_transform_leaves_the_media_preparation_stage_off_for_text_only_rows(

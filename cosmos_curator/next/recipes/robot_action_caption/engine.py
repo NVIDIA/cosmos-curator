@@ -567,6 +567,8 @@ def build_vllm_transform(
         vLLMEngineProcessorConfig,
     )
 
+    from cosmos_curator.next.core.ray_llm_compat import install_prepare_multimodal_shim  # noqa: PLC0415
+
     engine_kwargs = config.engine_kwargs_payload()
     # Two figures, not one. The preparation stage decodes and so peaks above the
     # two that only carry the decoded column onward; giving all three the larger
@@ -646,6 +648,7 @@ def build_vllm_transform(
         preprocess=_timed_hook(preprocess, "preprocess"),
         postprocess=_timed_hook(postprocess, "postprocess"),
     )
+    install_prepare_multimodal_shim(processor)
     bounded = apply_restart_bounds(processor)
     # ``min_size`` is a FLOOR, not a starting point: Ray Data never scales an
     # actor pool below it, so those GPUs are reserved for the whole run whether

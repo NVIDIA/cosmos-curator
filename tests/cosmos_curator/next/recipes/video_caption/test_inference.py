@@ -20,7 +20,9 @@ import ray.cloudpickle as ray_cloudpickle
 import ray.data.llm as ray_data_llm
 from botocore.exceptions import ClientError
 from lance.fragment import LanceFragment
+from ray.llm._internal.batch.stages import prepare_multimodal_stage
 
+from cosmos_curator.next.core import ray_llm_compat
 from cosmos_curator.next.recipes.video_caption import inference
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings, CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.config import resolve_config_data
@@ -525,6 +527,53 @@ def test_llm_processor_uses_public_builtin_multimodal_stage(
     assert chat_template_config.concurrency == (3, 4)
     assert chat_template_config.memory == 16 * 1024**3
     assert processor_config.engine_kwargs["media_io_kwargs"] == expected_media_io_kwargs["media_io_kwargs"]
+
+
+def test_llm_processor_runs_media_preparation_through_the_vllm_compat_udf(
+    tmp_path: Path,
+    caption_spec: CaptionModelSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ray's own preparation UDF cannot import the pinned vLLM's chat parser."""
+    config = resolve_config_data(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {
+                "media_root": str(tmp_path / "media"),
+                "clips_lance_uri": str(tmp_path / "clips.lance"),
+            },
+            "model": {"variant": caption_spec.variant},
+            "output": {"staging_root_uri": str(tmp_path / "staging")},
+        }
+    )
+    stage = prepare_multimodal_stage.PrepareMultimodalStage(fn_constructor_kwargs={}, map_batches_kwargs={})
+
+    class _BuiltProcessor:
+        def __init__(self, processor_config: object) -> None:
+            self.config = processor_config
+
+        def list_stage_names(self) -> list[str]:
+            return [ray_llm_compat.PREPARE_MULTIMODAL_STAGE, "vLLMEngineStage"]
+
+        def get_stage_by_name(self, name: str) -> object:
+            assert name == ray_llm_compat.PREPARE_MULTIMODAL_STAGE
+            return stage
+
+    def build_processor(processor_config: object, **_: object) -> object:
+        return _BuiltProcessor(processor_config)
+
+    monkeypatch.setattr(ray_data_llm, "build_processor", build_processor)
+
+    inference._build_llm_processor(
+        config.execution,
+        caption_spec.runtime_model_dir,
+        ("clip_id",),
+        initial_inference_workers=1,
+        inference_worker_ceiling=1,
+    )
+
+    assert stage.fn is ray_llm_compat.PrepareMultimodalUDF
 
 
 def test_llm_processor_applies_model_runtime_bindings(
