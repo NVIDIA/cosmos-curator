@@ -42,19 +42,30 @@ def _list_local_relative_paths(path_prefix: str) -> list[str]:
 
 
 def _list_s3_relative_paths_concurrently(path_prefix: str, *, client: S3Client) -> list[str]:
-    """List every object beneath *path_prefix*, walking each top-level "directory" concurrently."""
+    """List direct objects and child subtrees, walking each child concurrently."""
     prefix = S3Prefix(path_prefix)
-    try:
-        session_names = client.list_child_prefixes(prefix)
-    except FileNotFoundError:
-        return []
+    listing_key = f"{prefix.prefix.rstrip('/')}/" if prefix.prefix else ""
+    session_names: list[str] = []
+    direct_files: list[str] = []
+    # A delimited listing returns loose objects in Contents as well as child prefixes.
+    for page in client.s3.get_paginator("list_objects_v2").paginate(
+        Bucket=prefix.bucket, Prefix=listing_key, Delimiter="/"
+    ):
+        session_names.extend(
+            child["Prefix"][len(listing_key) :].rstrip("/") for child in page.get("CommonPrefixes", [])
+        )
+        direct_files.extend(
+            obj["Key"][len(listing_key) :] for obj in page.get("Contents", []) if not obj["Key"].endswith("/")
+        )
     if not session_names:
-        return get_files_relative(path_prefix, client=client)
+        return direct_files
 
     base = str(prefix).rstrip("/")
     with ThreadPoolExecutor(max_workers=min(_S3_LISTING_CONCURRENCY, len(session_names))) as pool:
         batches = pool.map(lambda name: get_files_relative(f"{base}/{name}", client=client), session_names)
-        return [f"{name}/{relative}" for name, batch in zip(session_names, batches, strict=True) for relative in batch]
+        return direct_files + [
+            f"{name}/{relative}" for name, batch in zip(session_names, batches, strict=True) for relative in batch
+        ]
 
 
 def _list_remote_relative_paths(path_prefix: str, *, client: StorageClient) -> list[str]:

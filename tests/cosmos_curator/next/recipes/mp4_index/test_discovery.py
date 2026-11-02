@@ -20,6 +20,7 @@ listing. The S3 fast path is tested separately with a fake ``S3Client``.
 """
 
 import pathlib
+from unittest.mock import Mock
 
 import pytest
 
@@ -111,18 +112,23 @@ def test_no_matches_returns_empty_not_an_error(tmp_path: pathlib.Path) -> None:
 
 
 class _FakeS3Client(S3Client):
-    """A duck-typed stand-in for ``S3Client`` -- only the two methods this module calls."""
+    """A duck-typed stand-in for ``S3Client`` -- delimited top-level listing and recursive directory reads."""
 
     def __init__(self, keys: list[str]) -> None:  # no real boto3 session wanted, so super().__init__() is skipped
         self._keys = keys
+        self.s3 = Mock()
+        self.s3.get_paginator.return_value.paginate.side_effect = self._pages
 
-    def list_child_prefixes(self, uri: S3Prefix) -> list[str]:
-        prefix = str(uri).rstrip("/") + "/"
-        matching = [key for key in self._keys if key.startswith(prefix)]
-        if not matching:
-            msg = f"Prefix does not exist or contains no objects: {prefix}"
-            raise FileNotFoundError(msg)
-        return sorted({key[len(prefix) :].split("/", 1)[0] for key in matching if "/" in key[len(prefix) :]})
+    def _pages(self, *, Bucket: str, Prefix: str, Delimiter: str) -> list[dict]:  # noqa: N803
+        assert Delimiter == "/"
+        relative = [key.removeprefix(f"s3://{Bucket}/") for key in self._keys]
+        matching = [key[len(Prefix) :] for key in relative if key.startswith(Prefix)]
+        children = sorted({key.split("/", 1)[0] for key in matching if "/" in key})
+        # Separate pages exercise keeping direct objects even when child prefixes arrive first.
+        return [
+            {"CommonPrefixes": [{"Prefix": Prefix + child + "/"} for child in children]},
+            {"Contents": [{"Key": Prefix + key} for key in matching if "/" not in key]},
+        ]
 
     def list_recursive_directory(self, uri: S3Prefix, limit: int = 0) -> list[str]:  # type: ignore[override]
         del limit  # unused -- this fake never truncates
@@ -259,3 +265,23 @@ def test_resolve_input_selection_path_prefix_mode_dispatches_to_discover_videos(
     sources = discovery.resolve_input_selection(input_config)
 
     assert [s.media_location for s in sources] == [f"{tmp_path}/sess-a/unit-00/camera.mp4"]
+
+
+@pytest.mark.parametrize("limit", [None, 1])
+def test_discover_videos_s3_keeps_direct_objects_in_mixed_layout(
+    monkeypatch: pytest.MonkeyPatch, limit: int | None
+) -> None:
+    """Loose camera objects remain selectable alongside child prefixes across listing pages."""
+    client = _FakeS3Client(
+        [
+            "s3://bucket/clips/a.mp4",
+            "s3://bucket/clips/session/camera.mp4",
+            "s3://bucket/clips/excluded.mp4",
+        ]
+    )
+    monkeypatch.setattr(discovery, "get_storage_client", lambda *_a, **_k: client)
+    sources = discovery.discover_videos(
+        path_prefix="s3://bucket/clips", globs=["*.mp4"], exclude_globs=["excluded.mp4"], limit=limit
+    )
+    expected = ["s3://bucket/clips/a.mp4", "s3://bucket/clips/session/camera.mp4"]
+    assert [source.media_location for source in sources] == (expected if limit is None else expected[:limit])
