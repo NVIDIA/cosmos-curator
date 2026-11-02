@@ -15,6 +15,7 @@
 """Test cosmos-curator local commands."""
 
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,15 +23,19 @@ from unittest.mock import patch
 import pytest
 import typer
 from _pytest.monkeypatch import MonkeyPatch
+from loguru import logger
 from typer.testing import CliRunner
 
 from cosmos_curator.client.cli import cosmos_curator  # type: ignore[import-untyped]
+from cosmos_curator.client.environment import CONTAINER_PATHS_CODE_DIR  # type: ignore[import-untyped]
 from cosmos_curator.client.local_cli.launch_local import (  # type: ignore[import-untyped]
     _get_config_file_mount_strings,
     _get_identity_mounts,
+    _get_python_version_from_pixi_toml,
     _parse_extra_volumes,
     _verify_local_path_exists,
 )
+from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND  # type: ignore[import-untyped]
 
 runner = CliRunner()
 
@@ -141,6 +146,142 @@ def test_launch_command_with_empty_docker_network_omits_network_arg() -> None:
         called_args = mock_call.call_args[0][0]
 
     assert all(not arg.startswith("--network=") for arg in called_args)
+
+
+def _make_workspace(root: Path) -> Path:
+    """Create a minimal curator checkout with installed pixi environments."""
+    (root / ".pixi").mkdir(parents=True)
+    (root / "cosmos_curator" / "pipelines").mkdir(parents=True)
+    (root / "pixi.toml").write_text('[dependencies]\npython = "==3.13.14"\n')
+    return root.resolve()
+
+
+def _launched_docker_args(args: list[str]) -> list[str]:
+    """Return the docker command a local launch runs for ``echo hello``."""
+    with patch("cosmos_curator.client.local_cli.launch_local.subprocess.call") as mock_call:
+        mock_call.return_value = 0
+        result = runner.invoke(cosmos_curator, ["local", "launch", *args, "--", "echo", "hello"])
+    assert result.exit_code == 0, result.output
+    return list(mock_call.call_args.args[0])
+
+
+def _volumes(docker_args: list[str]) -> list[str]:
+    return [docker_args[index + 1] for index, arg in enumerate(docker_args) if arg == "-v"]
+
+
+def test_host_workspace_runs_at_its_host_path(tmp_path: Path) -> None:
+    """Pixi rejects environments found anywhere but where it installed them, so a workspace keeps its path."""
+    workspace = _make_workspace(tmp_path / "ws")
+
+    docker_args = _launched_docker_args(["--curator-path", str(workspace), "--pixi-path", str(workspace)])
+
+    volumes = _volumes(docker_args)
+    assert f"{workspace}:{workspace}" in volumes
+    assert docker_args[docker_args.index("-w") + 1] == str(workspace)
+    assert f"{workspace / 'cosmos_curator'}:{CONTAINER_PATHS_CODE_DIR}/cosmos_curator" in volumes
+    assert not any(volume.endswith(":/opt/cosmos-curator/.pixi") for volume in volumes)
+    assert not any(volume.startswith(f"{workspace / 'cosmos_curator'}:{workspace}") for volume in volumes)
+    # Host pixi installs and updates the workspace's environments.
+    assert SLIM_IMAGE_WARMUP_COMMAND not in docker_args[-1]
+    assert docker_args[-1] == "exec < /dev/null && echo hello"
+
+
+def test_curator_path_code_covers_the_host_workspace(tmp_path: Path) -> None:
+    """Code from another checkout replaces the workspace's where commands run and where the image keeps code."""
+    workspace = _make_workspace(tmp_path / "ws")
+    code = _make_workspace(tmp_path / "code")
+
+    volumes = _volumes(_launched_docker_args(["--curator-path", str(code), "--pixi-path", str(workspace)]))
+
+    for code_dir in (CONTAINER_PATHS_CODE_DIR, workspace):
+        assert f"{code / 'cosmos_curator'}:{code_dir}/cosmos_curator" in volumes
+        assert f"{code / 'tests' / 'cosmos_curator'}:{code_dir}/tests/cosmos_curator" in volumes
+
+
+_INSTALLED_XENNA = Path(".pixi/envs/default/lib/python3.13/site-packages/cosmos_xenna")
+
+
+def test_xenna_overlay_uses_the_workspace_environment(tmp_path: Path) -> None:
+    """The workspace's environment, not the code checkout's pixi.toml, decides where cosmos_xenna is installed."""
+    workspace = _make_workspace(tmp_path / "ws")
+    (workspace / _INSTALLED_XENNA).mkdir(parents=True)
+    code = _make_workspace(tmp_path / "code")
+    (code / "pixi.toml").write_text('[dependencies]\npython = "==3.14.0"\n')
+    (code / "cosmos-xenna" / "cosmos_xenna").mkdir(parents=True)
+
+    volumes = _volumes(
+        _launched_docker_args(["--curator-path", str(code), "--pixi-path", str(workspace), "--mount-xenna"])
+    )
+
+    xenna = workspace / _INSTALLED_XENNA / "pipelines"
+    assert f"{code / 'cosmos-xenna' / 'cosmos_xenna' / 'pipelines'}:{xenna}" in volumes
+
+
+def test_xenna_overlay_maps_a_bare_pixi_directory_to_the_image_path(tmp_path: Path) -> None:
+    """A bare .pixi directory is searched on the host and mounted where the image keeps its environments."""
+    code = _make_workspace(tmp_path / "code")
+    (code / "cosmos-xenna" / "cosmos_xenna").mkdir(parents=True)
+    envs = tmp_path / "envs"
+    (envs / _INSTALLED_XENNA).mkdir(parents=True)
+
+    volumes = _volumes(_launched_docker_args(["--curator-path", str(code), "--pixi-path", str(envs), "--mount-xenna"]))
+
+    xenna = CONTAINER_PATHS_CODE_DIR / _INSTALLED_XENNA / "pipelines"
+    assert f"{code / 'cosmos-xenna' / 'cosmos_xenna' / 'pipelines'}:{xenna}" in volumes
+
+
+def test_xenna_overlay_skips_a_host_environment_without_cosmos_xenna(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Docker would create the missing mount points in the host environment as root."""
+    workspace = _make_workspace(tmp_path / "ws")
+    (workspace / "cosmos-xenna" / "cosmos_xenna").mkdir(parents=True)
+
+    # Other tests can remove Loguru's default sinks; bind the captured stderr explicitly.
+    sink_id = logger.add(sys.stderr, format="{message}", level="WARNING")
+    try:
+        volumes = _volumes(_launched_docker_args(["--pixi-path", str(workspace), "--mount-xenna"]))
+    finally:
+        logger.remove(sink_id)
+
+    assert not any("site-packages" in volume for volume in volumes)
+    assert "Not mounting cosmos_xenna" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("python_spec", ["==3.13.14", ">=3.13.1,<3.14", "3.13.*"])
+def test_python_version_from_pixi_toml(tmp_path: Path, python_spec: str) -> None:
+    """Pins, ranges, and wildcards all name the image environment's python3.13 directory."""
+    (tmp_path / "pixi.toml").write_text(f'[dependencies]\npython = "{python_spec}"\n')
+
+    assert _get_python_version_from_pixi_toml(tmp_path) == "3.13"
+
+
+def test_bare_pixi_directory_replaces_the_images(tmp_path: Path) -> None:
+    """Shared storage for container environments keeps the image's paths and the slim install."""
+    (tmp_path / ".pixi").mkdir()
+
+    docker_args = _launched_docker_args(["--pixi-path", str(tmp_path)])
+
+    assert f"{tmp_path / '.pixi'}:{CONTAINER_PATHS_CODE_DIR / '.pixi'}" in _volumes(docker_args)
+    assert "-w" not in docker_args
+    assert SLIM_IMAGE_WARMUP_COMMAND in docker_args[-1]
+
+
+def test_host_workspace_under_home_gets_a_real_mount_point(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Docker follows links on mount paths, so links that earlier launches left there are replaced."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("COSMOS_CURATOR_LOCAL_HOME_DIR", raising=False)
+    workspace = _make_workspace(home / "src" / "ws")
+    mount_point = home / ".cache" / "cosmos-curator-home" / "src" / "ws"
+    mount_point.parent.mkdir(parents=True)
+    mount_point.symlink_to("/opt/cosmos-curator")
+
+    docker_args = _launched_docker_args(["--pixi-path", str(workspace)])
+
+    assert f"{workspace}:{workspace}" in _volumes(docker_args)
+    assert mount_point.is_dir()
+    assert not mount_point.is_symlink()
 
 
 def test_verify_local_path_exists(monkeypatch: MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

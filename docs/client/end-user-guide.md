@@ -402,8 +402,10 @@ cosmos-curator local launch --image-name cosmos-curator --image-tag slim \
     -- pixi run --as-is hello-world
 ```
 
-The `--pixi-path .` option mounts the `.pixi` directory from the given path into the container, so the container
-uses your pre-installed environments directly — no environment installation at runtime.
+The `--pixi-path .` option mounts the pixi workspace at the given path into the container at that same path and runs
+the command there, so the container uses your pre-installed environments directly — no environment installation at
+runtime. Install or update them on the host first (for example, `pixi install --frozen -e default`): pixi refuses to
+run environments found anywhere but where it installed them, and the container leaves them to host pixi.
 
 The container runs as your host UID:GID, so files written to bind-mounted paths are owned by you on the host;
 `$HOME` caches (Triton, NVIDIA kernel caches, etc.) persist in `~/.cache/cosmos-curator-home/` across runs. Set

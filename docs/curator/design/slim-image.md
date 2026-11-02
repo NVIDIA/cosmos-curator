@@ -36,8 +36,8 @@
 - `--slim` — lockfile (`pixi.toml` + `pixi.lock`) and source code only. `--envs` selects which environments to
   install at runtime (same default as full mode). The image stores the env list in `COSMOS_CURATOR_SLIM_ENVS` and the
   launch flow runs `pixi install --frozen` before the user command. Combined with `--pixi-path .`, this is ideal for
-  local development (near-instant rebuilds, the install is a fast no-op). Cluster use (Slurm/k8s with shared storage)
-  is promising but needs validation.
+  local development (near-instant rebuilds; the launch skips the install and runs the environments installed on the
+  host). Cluster use (Slurm/k8s with shared storage) is promising but needs validation.
 
 **Dependency strategy:**
 
@@ -145,7 +145,8 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 
 - [x] **3b. Add `--pixi-path` flag to `cosmos-curator local launch`**
     - Mount the host `.pixi` directory into the container (envs, cache, config)
-    - For local dev, `--curator-path . --pixi-path .` mounts both source and `.pixi` from the project root
+    - For local dev, `--curator-path . --pixi-path .` mounts the project root at its host path and runs there. Pixi
+      0.82.1+ refuses to run any environment found anywhere but where it was installed, even through a symlink
     - For cluster deployments, `--pixi-path /mnt/shared/pixi` can point to shared storage independently
     - Enables near-instant iteration: slim image + host envs + host source, no image rebuild needed
 
@@ -159,7 +160,8 @@ while `pynvc` is measurably faster. This removal is justified independently of t
 - [x] **3d. Auto-warmup for local launch**
     - `local launch` prepends a conditional `pixi install --frozen` to the container command
     - Reads `COSMOS_CURATOR_SLIM_ENVS` from the image; no-op when the variable is unset (full images)
-    - With `--pixi-path`, environments are already present so the install is a fast no-op
+    - With `--pixi-path` on a pixi workspace (e.g. `--pixi-path .`), skips the install: host pixi installs and updates
+      the workspace's environments. A `.pixi` directory without a workspace, such as shared storage, keeps it
     - Without `--pixi-path`, installs environments into the container's ephemeral filesystem
 
 - [x] **3e. Mount pixi cache from shared storage for cluster deployments**

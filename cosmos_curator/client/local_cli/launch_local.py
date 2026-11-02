@@ -18,6 +18,7 @@
 import grp
 import os
 import pwd
+import re
 import shlex
 import subprocess
 import sys
@@ -126,7 +127,10 @@ def launch(  # noqa: PLR0913
         Option(
             help=(
                 "Path to a directory containing a .pixi subdirectory to mount into the container. "
-                "Use with --curator-path to avoid reinstalling environments at runtime (e.g. --pixi-path .)."
+                "For a pixi workspace (e.g. --pixi-path .), the command runs in that workspace at its host path, "
+                "using the environments host pixi installed there and the workspace's code unless --curator-path "
+                "names other code. Otherwise the .pixi directory replaces the image's, and slim images install "
+                "their environments into it."
             ),
             rich_help_panel="local-docker",
         ),
@@ -295,19 +299,46 @@ def _get_python_version_from_pixi_toml(curator_path: Path) -> str | None:
         if not python_version or not isinstance(python_version, str):
             logger.warning("Python version not found or invalid in pixi.toml")
             return None
-        # strip the possible ">=" or "<=" prefix
-        if python_version.startswith((">=", "<=")):
-            python_version = python_version[2:]
-        # strip the minor version
-        version_parts = python_version.split(".")
-        _TARGET_PYTHON_VERSION_PARTS = 2
-        if len(version_parts) < _TARGET_PYTHON_VERSION_PARTS:
+        # take the first major.minor version: "==3.13.14", ">=3.13,<3.14", and "3.13.*" all give 3.13
+        version_match = re.search(r"\d+\.\d+", python_version)
+        if version_match is None:
             logger.warning(f"Invalid python version format in pixi.toml: {python_version}")
             return None
-        return ".".join(version_parts[:_TARGET_PYTHON_VERSION_PARTS])
+        return version_match.group()
 
 
-def _get_pixi_mount_strings(opts: LaunchDocker) -> list[str]:
+def _host_pixi_workspace(opts: LaunchDocker) -> Path | None:
+    """Return the host pixi workspace that ``--pixi-path`` names, or None for a bare ``.pixi`` directory.
+
+    Pixi records where it installed each environment and refuses to run in a
+    workspace whose environments appear anywhere else, so the container must
+    see a host workspace at its host path.
+    """
+    if opts.pixi_path is None:
+        return None
+    root = Path(opts.pixi_path).resolve()
+    return root if (root / "pixi.toml").is_file() else None
+
+
+def _prepare_workspace_mount_point(workspace: Path, *, home_dir: Path, scratch_home: Path) -> None:
+    """Create a host workspace's mount point inside the scratch home mounted over ``$HOME``.
+
+    Docker would otherwise create it as root on the host, or follow a link that
+    earlier launches left on the path and mount the workspace at its target.
+    """
+    try:
+        parts = workspace.relative_to(home_dir).parts
+    except ValueError:
+        return
+    mount_point = scratch_home
+    for part in parts:
+        mount_point /= part
+        if mount_point.is_symlink():
+            mount_point.unlink()
+    mount_point.mkdir(parents=True, exist_ok=True)
+
+
+def _get_pixi_mount_strings(opts: LaunchDocker, workspace: Path | None) -> list[str]:
     if opts.pixi_path is None:
         return []
     pixi_root = Path(opts.pixi_path)
@@ -315,6 +346,8 @@ def _get_pixi_mount_strings(opts: LaunchDocker) -> list[str]:
     if not pixi_dir.is_dir():
         logger.error(f"Pixi directory not found at {pixi_dir}")
         sys.exit(1)
+    if workspace is not None:
+        return ["-v", f"{workspace}:{workspace}"]
     mount_strings = ["-v", f"{pixi_dir.absolute()}:{CONTAINER_PATHS_CODE_DIR / '.pixi'}"]
     # Also mount pixi.toml and pixi.lock so they stay in sync with the environments
     for name in ("pixi.toml", "pixi.lock"):
@@ -324,36 +357,69 @@ def _get_pixi_mount_strings(opts: LaunchDocker) -> list[str]:
     return mount_strings
 
 
-def _get_code_mount_strings(opts: LaunchDocker) -> list[str]:
+def _get_code_mount_strings(opts: LaunchDocker, workspace: Path | None) -> list[str]:
+    """Mount curator code where the image keeps it and, over a host workspace, where the command runs.
+
+    A host workspace supplies its own code unless ``--curator-path`` names other code.
+    """
+    curator_path = Path(opts.curator_path) if opts.curator_path is not None else workspace
+    if curator_path is None:
+        return []
+    curator_code_path = curator_path / Path("cosmos_curator")
+    pipeline_code_path = curator_code_path / Path("pipelines")
+    if not pipeline_code_path.exists():
+        logger.error(f"Curator pipelines code does not exist at {pipeline_code_path}")
+        sys.exit(1)
+    code_dirs = [CONTAINER_PATHS_CODE_DIR]
+    if workspace is not None and curator_path.resolve() != workspace:
+        code_dirs.append(workspace)
+
     code_path_strings = []
-    if opts.curator_path is not None:
-        curator_code_path = Path(opts.curator_path) / Path("cosmos_curator")
-        pipeline_code_path = curator_code_path / Path("pipelines")
-        if not pipeline_code_path.exists():
-            logger.error(f"Curator pipelines code does not exist at {pipeline_code_path}")
-            sys.exit(1)
-        code_path_strings += ["-v", f"{curator_code_path.absolute()}:{CONTAINER_PATHS_CODE_DIR}/cosmos_curator"]
-
-        if opts.mount_xenna:
-            xenna_path = (Path(opts.curator_path) / Path("cosmos-xenna") / Path("cosmos_xenna")).absolute()
-            _python_version = _get_python_version_from_pixi_toml(Path(opts.curator_path))
-            if xenna_path.exists() and _python_version is not None:
-                xenna_lib_path = (
-                    CONTAINER_PATHS_CODE_DIR
-                    / Path(".pixi/envs/default/lib")
-                    / f"python{_python_version}"
-                    / Path("site-packages/cosmos_xenna")
-                )
-                for python_module in ["pipelines", "ray_utils", "utils"]:
-                    code_path_strings += ["-v", f"{xenna_path / python_module}:{xenna_lib_path / python_module}"]
-
-        tests_path = Path(opts.curator_path) / Path("tests") / Path("cosmos_curator")
-        code_path_strings += ["-v", f"{tests_path.absolute()}:{CONTAINER_PATHS_CODE_DIR}/tests/cosmos_curator"]
-
-        tools_path = Path(opts.curator_path) / Path("tools")
+    tests_path = curator_path / Path("tests") / Path("cosmos_curator")
+    tools_path = curator_path / Path("tools")
+    for code_dir in code_dirs:
+        code_path_strings += ["-v", f"{curator_code_path.absolute()}:{code_dir}/cosmos_curator"]
+        code_path_strings += ["-v", f"{tests_path.absolute()}:{code_dir}/tests/cosmos_curator"]
         if tools_path.is_dir():
-            code_path_strings += ["-v", f"{tools_path.absolute()}:{CONTAINER_PATHS_CODE_DIR}/tools"]
+            code_path_strings += ["-v", f"{tools_path.absolute()}:{code_dir}/tools"]
+
+    if opts.mount_xenna:
+        xenna_path = (curator_path / Path("cosmos-xenna") / Path("cosmos_xenna")).absolute()
+        xenna_lib_path = _get_xenna_lib_path(opts, workspace, curator_path)
+        if xenna_path.exists() and xenna_lib_path is not None:
+            for python_module in ["pipelines", "ray_utils", "utils"]:
+                code_path_strings += ["-v", f"{xenna_path / python_module}:{xenna_lib_path / python_module}"]
     return code_path_strings
+
+
+def _get_xenna_lib_path(opts: LaunchDocker, workspace: Path | None, curator_path: Path) -> Path | None:
+    """Return where the container's default environment installed ``cosmos_xenna``, or None if it can't be found.
+
+    Docker creates a missing mount point as root, inside the host environment when
+    ``--pixi-path`` supplies one, so a host environment is searched for the package.
+    The image's environment can only be inferred from ``pixi.toml``.
+    """
+    if opts.pixi_path is None:
+        python_version = _get_python_version_from_pixi_toml(curator_path)
+        if python_version is None:
+            return None
+        return (
+            CONTAINER_PATHS_CODE_DIR
+            / Path(".pixi/envs/default/lib")
+            / f"python{python_version}"
+            / Path("site-packages/cosmos_xenna")
+        )
+    host_pixi_dir = Path(opts.pixi_path).absolute() / ".pixi"
+    host_lib_paths = list(host_pixi_dir.glob("envs/default/lib/python*/site-packages/cosmos_xenna"))
+    if len(host_lib_paths) != 1:
+        logger.warning(
+            f"Not mounting cosmos_xenna: expected one installed package under {host_pixi_dir / 'envs/default'}, "
+            f"found {len(host_lib_paths)}"
+        )
+        return None
+    # A workspace runs at its host path; a bare .pixi directory replaces the image's.
+    container_pixi_dir = workspace / ".pixi" if workspace is not None else CONTAINER_PATHS_CODE_DIR / ".pixi"
+    return container_pixi_dir / host_lib_paths[0].relative_to(host_pixi_dir)
 
 
 # Structured-logging and tracing toggles forwarded from the host into the container (when
@@ -440,9 +506,8 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     user_strings = ["-u", f"{os.getuid()}:{os.getgid()}"]
     # $HOME doesn't exist inside the image for an arbitrary UID; bind-mount a
     # dedicated host scratch dir so libs can write there (caches persist across
-    # runs) and the --pixi-path symlink preamble works. The scratch path can be
-    # overridden via COSMOS_CURATOR_LOCAL_HOME_DIR (useful for remote homedirs or
-    # tight quotas).
+    # runs). The scratch path can be overridden via COSMOS_CURATOR_LOCAL_HOME_DIR
+    # (useful for remote homedirs or tight quotas).
     home_dir = Path.home()
     scratch_home_override = os.environ.get("COSMOS_CURATOR_LOCAL_HOME_DIR")
     scratch_home = (
@@ -452,6 +517,10 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
     )
     scratch_home.mkdir(parents=True, exist_ok=True)
     home_strings = ["-v", f"{scratch_home}:{home_dir}", "-e", f"HOME={home_dir}"]
+    # A host pixi workspace runs at its host path, where its environments were installed.
+    workspace = _host_pixi_workspace(opts)
+    if workspace is not None:
+        _prepare_workspace_mount_point(workspace, home_dir=home_dir, scratch_home=scratch_home)
 
     docker_command = [
         "docker",
@@ -481,8 +550,10 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
             f"{LOCAL_WORKSPACE_PATH}:{CONTAINER_PATHS_DEFAULT_WORKSPACE_DIR}",
         ]
     )
-    docker_command.extend(_get_code_mount_strings(opts))
-    docker_command.extend(_get_pixi_mount_strings(opts))
+    docker_command.extend(_get_code_mount_strings(opts, workspace))
+    docker_command.extend(_get_pixi_mount_strings(opts, workspace))
+    if workspace is not None:
+        docker_command.extend(["-w", str(workspace)])
     docker_command.extend(_get_s3_creds_mount_strings(opts))
     docker_command.extend(_get_azure_creds_mount_strings(opts))
     docker_command.extend(_get_config_file_mount_strings(is_model_cli=is_model_cli))
@@ -501,25 +572,17 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
         ]
     )
 
-    # When pixi environments are bind-mounted from the host (--pixi-path), scripts
-    # in .pixi/envs/*/bin/ carry shebangs with the host's absolute path (e.g.
-    # #!/home/user/project/.pixi/envs/default/bin/python3.13) which don't exist
-    # inside the container.  Create a symlink so the kernel can resolve them.
     # Ray workers run in background process groups. Disconnect stdin before
     # starting them so inherited terminal reads cannot stop children with SIGTTIN.
     preamble_parts: list[str] = ["exec < /dev/null"]
-    if opts.pixi_path is not None:
-        host_code_dir = Path(opts.pixi_path).resolve()
-        if host_code_dir != CONTAINER_PATHS_CODE_DIR:
-            host_parent = shlex.quote(str(host_code_dir.parent))
-            container = shlex.quote(str(CONTAINER_PATHS_CODE_DIR))
-            host = shlex.quote(str(host_code_dir))
-            preamble_parts.append(f"mkdir -p {host_parent} && ln -sfn {container} {host}")
 
     # Prepend slim-image environment warmup. When COSMOS_CURATOR_SLIM_ENVS is set
     # (slim images only), install the declared environments before running the user command.
-    # With --pixi-path this is a fast no-op since environments are already present.
-    preamble_parts.append(SLIM_IMAGE_WARMUP_COMMAND)
+    # A host workspace's environments are installed and updated by host pixi. A .pixi
+    # directory without a workspace, such as shared storage for container environments,
+    # keeps the warmup.
+    if workspace is None:
+        preamble_parts.append(SLIM_IMAGE_WARMUP_COMMAND)
     container_command = " && ".join(preamble_parts) + f" && {opts.command}"
 
     docker_command_to_print = " ".join([*docker_command, f'"{container_command}"'])
