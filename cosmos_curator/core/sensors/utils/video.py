@@ -44,6 +44,9 @@ from loguru import logger
 from cosmos_curator.core.sensors.data.camera_data import MotionVectorData, MotionVectorFrameData
 from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.data.video import VideoIndex, VideoMetadata, VideoProbe
+from cosmos_curator.core.sensors.mp4.box_layout import boxes_only_stream
+from cosmos_curator.core.sensors.mp4.box_locate import get_moov_full_walk
+from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
 from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.io import open_data_source
 from cosmos_curator.core.sensors.utils.validation import require_1d
@@ -509,6 +512,14 @@ def pts_to_ns(pts: int | npt.NDArray[np.int64], time_base: Fraction) -> int | np
     return int(pts * 1_000_000_000 * time_base.numerator // time_base.denominator)
 
 
+def mp4_track_id(stream: av.stream.Stream) -> int:
+    """Return *stream*'s MP4 track ID as the container stores it, an unsigned 32-bit integer.
+
+    libav reads ``tkhd``'s track ID into a signed int, so IDs of 2**31 and above come back negative.
+    """
+    return stream.id & 0xFFFFFFFF
+
+
 @contextmanager
 def open_video_container(
     stream: BinaryIO,
@@ -561,7 +572,7 @@ def open_video_container(
         if track_id is None:
             video_stream = container.streams.video[stream_idx]
         else:
-            video_stream = next((video for video in container.streams.video if video.id == track_id), None)
+            video_stream = next((video for video in container.streams.video if mp4_track_id(video) == track_id), None)
             if video_stream is None:
                 msg = f"Video track ID {track_id} not found"
                 raise ValueError(msg)
@@ -1396,6 +1407,15 @@ def make_streaming_decode_plan(index: Mp4FrameIndex, frame_indices: npt.NDArray[
     raise ValueError(msg)
 
 
+class _PacketIdentity(int):
+    """A frame index that is a distinct object for each packet.
+
+    PyAV registers ``opaque`` values by object identity and unregisters one when the packet and
+    frames carrying it are freed. CPython shares small ``int`` objects, so freeing another decoder's
+    frame with the same plain index would unregister this packet's.
+    """
+
+
 def iter_indexed_video_packets(
     stream: BinaryIO, index: Mp4FrameIndex, *, start_decode_index: int = 0
 ) -> Generator[tuple[int, "av.Packet[Any]"]]:
@@ -1431,7 +1451,7 @@ def iter_indexed_video_packets(
         packet.time_base = time_base
         packet.is_keyframe = bool(index.is_keyframe[frame_idx])
         # Preserve the index row through frame reordering and duplicate PTS values.
-        packet.opaque = frame_idx
+        packet.opaque = _PacketIdentity(frame_idx)
         yield frame_idx, packet
 
 
@@ -1445,13 +1465,17 @@ class StreamingVideoDecoder:
 
     Call ``close()`` to release owned resources. Caller-supplied streams
     remain open.
+
+    The decoder is configured from ``moov_bytes``, the source's ``moov`` box, when
+    supplied; otherwise from the ``moov`` read from the source.
     """
 
     source: DataSource
     metadata: Mp4Metadata
     frame_index: Mp4FrameIndex
     config: CpuVideoDecodeConfig = DEFAULT_VIDEO_DECODE_CONFIG
-    resources: ExitStack = attrs.field(factory=ExitStack, init=False, repr=False)
+    moov_bytes: bytes | None = attrs.field(default=None, kw_only=True, repr=False)
+    exit_stack: ExitStack = attrs.field(factory=ExitStack, init=False, repr=False)
     context: VideoCodecContext | None = attrs.field(default=None, init=False, repr=False)
     packets: "Iterator[tuple[int, av.Packet[Any]]]" = attrs.field(factory=lambda: iter(()), init=False, repr=False)
     pending: Iterator[av.VideoFrame] = attrs.field(factory=lambda: iter(()), init=False, repr=False)
@@ -1463,7 +1487,7 @@ class StreamingVideoDecoder:
 
     def __attrs_post_init__(self) -> None:
         """Register cleanup of owned media when the decoder is released."""
-        self._finalizer = weakref.finalize(self, self.resources.close)
+        self._finalizer = weakref.finalize(self, self.exit_stack.close)
 
     def close(self) -> None:
         """Cancel the shared pass and release codec buffers and owned media."""
@@ -1473,6 +1497,58 @@ class StreamingVideoDecoder:
         self.context = None
         self.last_pixels = None
         self._finalizer()
+
+
+class DecoderSetupError(ValueError):
+    """The video's ``moov`` cannot set up a decoder for the indexed video track."""
+
+
+def _open_track_codec_context(
+    stream: BinaryIO, metadata: Mp4Metadata, moov_bytes: bytes | None, exit_stack: ExitStack
+) -> VideoCodecContext:
+    """Return the unopened codec context libav configures for ``metadata``'s track.
+
+    libav reads ``metadata.ftyp_bytes`` and the track's ``moov``. That is ``moov_bytes`` when supplied,
+    in which case ``stream`` is only measured for its size. Otherwise the ``moov`` is read from the
+    seekable ``stream``.
+
+    The returned context belongs to a container opened on the boxes-only layout. That container is
+    registered on the decoder's ``exit_stack``, which keeps it open until the decoder closes. Its media
+    is zeros, so packets to decode are read from the source.
+
+    Raises:
+        DecoderSetupError: no ``moov`` is supplied and ``stream`` has no readable top-level ``moov``,
+            libav cannot open the boxes, or they have no video track with ``metadata.track_id``
+            coded with ``metadata.codec_name``.
+
+    """
+    file_size = stream.seek(0, os.SEEK_END)
+
+    def fetch_range(offset: int, length: int) -> bytes:
+        stream.seek(offset)
+        return stream.read(length)
+
+    try:
+        if moov_bytes is None:
+            moov_bytes = get_moov_full_walk(file_size, fetch_range)
+        boxes = boxes_only_stream(file_size, moov_bytes, ftyp_bytes=metadata.ftyp_bytes)
+        container = exit_stack.enter_context(av.open(boxes, mode="r", options={"ignore_editlist": "1"}))
+    except (av.error.FFmpegError, UnindexableVideoError) as exc:
+        msg = f"cannot set up a decoder from the moov: {exc}"
+        raise DecoderSetupError(msg) from exc
+    video_stream = next((video for video in container.streams.video if mp4_track_id(video) == metadata.track_id), None)
+    if video_stream is None:
+        msg = f"the moov has no video track with ID {metadata.track_id}"
+        raise DecoderSetupError(msg)
+    context = video_stream.codec_context
+    try:
+        codec_matches = context.codec.id == av.Codec(metadata.codec_name, "r").id
+    except av.codec.codec.UnknownCodecError:
+        codec_matches = False
+    if not codec_matches:
+        msg = f"metadata names codec {metadata.codec_name!r}, but track {metadata.track_id} is {context.name!r}"
+        raise DecoderSetupError(msg)
+    return context
 
 
 def _start_streaming_decode(state: StreamingVideoDecoder, plan: StreamingDecodePlan) -> None:
@@ -1486,15 +1562,13 @@ def _start_streaming_decode(state: StreamingVideoDecoder, plan: StreamingDecodeP
     ):
         msg = "metadata and frame index disagree on frame count or time base"
         raise ValueError(msg)
-    context = cast("VideoCodecContext", av.CodecContext.create(metadata.codec_name, "r"))
-    context.extradata = metadata.extradata
-    context.width, context.height = metadata.width, metadata.height
+    stream = state.exit_stack.enter_context(open_data_source(state.source))
+    context = _open_track_codec_context(stream, metadata, state.moov_bytes, state.exit_stack)
     context.thread_type = av.codec.context.ThreadType[state.config.thread_type]
     context.thread_count = state.config.thread_count
     context.copy_opaque = True
     if state.config.export_mvs:
         context.flags2 |= av.codec.context.Flags2.export_mvs
-    stream = state.resources.enter_context(open_data_source(state.source))
     state.packets = iter_indexed_video_packets(stream, index, start_decode_index=plan.preceding_keyframe_idx)
     state.context = context
 

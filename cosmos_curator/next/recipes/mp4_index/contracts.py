@@ -41,7 +41,7 @@ CONTAINER_KIND_FRAGMENTED = "fragmented"
 CONTAINER_KIND_NONFRAGMENTED = "nonfragmented"
 
 #: VIDEO_MANIFEST_SCHEMA's row-shape version -- extraction_contract_id versions behavior, not shape.
-RECORD_SCHEMA_VERSION = 8
+RECORD_SCHEMA_VERSION = 9
 
 #: Which indexer built a video's frames and metadata, part of ``extraction_contract_id``.
 Indexer = Literal["pyav", "box_walker"]
@@ -195,6 +195,9 @@ VIDEO_METADATA_SCHEMA = pa.schema(
         # edts/elst box, verbatim, header included; null when the track has no edit list --
         # query presence directly (IS NOT NULL), no separate bool
         pa.field("elst_bytes", pa.binary(), nullable=True),
+        # The source's first top-level ftyp ahead of moov, verbatim, header included; null when it has
+        # none. Decoder setup lays it out ahead of moov, so libav reads the brand it would from the source.
+        pa.field("ftyp_bytes", pa.binary(), nullable=True),
         pa.field("avg_frame_rate_num", pa.int32(), nullable=False),
         pa.field("avg_frame_rate_den", pa.int32(), nullable=False),
         pa.field("bit_rate_bps", pa.int64(), nullable=False),

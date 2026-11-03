@@ -163,6 +163,7 @@ class StreamingCameraSensor:
         frame_index: Mp4FrameIndex | None = None,
         alignment_field: VideoFrameAlignmentField = VideoFrameAlignmentField.PTS_NS,
         indexer: Mp4Indexer = Mp4Indexer.PYAV,
+        moov_bytes: bytes | None = None,
     ) -> None:
         """Initialize the streaming camera sensor.
 
@@ -174,10 +175,14 @@ class StreamingCameraSensor:
             frame_index: MP4 frame index. Must be supplied together with metadata.
             alignment_field: Frame-index timestamp field used for alignment.
             indexer: Backend used when metadata and the frame index are not supplied.
+            moov_bytes: The source's ``moov`` box, header included, which the supplied
+                metadata and frame index describe. Decoding then reads only packet bytes
+                from the source; otherwise it also reads the ``moov`` from the source. An
+                index built from the source keeps the ``moov`` it read.
 
         Raises:
-            ValueError: Only one of metadata and frame_index is supplied, or no source
-                is available to build them.
+            ValueError: Only one of metadata and frame_index is supplied, no source
+                is available to build them, or moov_bytes is supplied without them.
             TypeError: The alignment field or indexer is not an enum member.
             IndexRecordUnusableError: The supplied index is empty or disagrees with metadata.
 
@@ -187,6 +192,9 @@ class StreamingCameraSensor:
             raise ValueError(msg)
         if source is None and frame_index is None:
             msg = "source is required when metadata and frame_index are not supplied"
+            raise ValueError(msg)
+        if moov_bytes is not None and frame_index is None:
+            msg = "moov_bytes requires the metadata and frame_index it was indexed with"
             raise ValueError(msg)
         alignment_value: object = alignment_field
         indexer_value: object = indexer
@@ -210,6 +218,7 @@ class StreamingCameraSensor:
         self._frame_index = frame_index
         self._alignment_field = alignment_field
         self._indexer = indexer
+        self._moov_bytes = moov_bytes
 
     def _ensure_index(self) -> tuple[Mp4Metadata, Mp4FrameIndex]:
         """Return metadata and the frame index, building both if needed."""
@@ -219,8 +228,9 @@ class StreamingCameraSensor:
             if source is None:
                 msg = "source is required to build metadata and the frame index"
                 raise ValueError(msg)
-            metadata, frame_index = index_video(source, indexer=self._indexer, stream_idx=self._stream_idx)
-            self._metadata, self._frame_index = metadata, frame_index
+            video = index_video(source, indexer=self._indexer, stream_idx=self._stream_idx)
+            metadata, frame_index = video.metadata, video.frame_index
+            self._metadata, self._frame_index, self._moov_bytes = metadata, frame_index, video.moov_bytes
         return metadata, frame_index
 
     @property
@@ -380,7 +390,8 @@ class StreamingCameraSensor:
         Split from :meth:`sample` so that method's checks run when it is called
         rather than when its first payload is pulled.
         """
-        decoder = StreamingVideoDecoder(source, self.metadata, self.frame_index, self._decode_config)
+        metadata, frame_index = self._ensure_index()
+        decoder = StreamingVideoDecoder(source, metadata, frame_index, self._decode_config, moov_bytes=self._moov_bytes)
         yield from _stream_indexed_camera_windows(decoder, timeline_ns, spec, policy=policy)
 
 

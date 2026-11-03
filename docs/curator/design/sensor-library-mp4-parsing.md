@@ -7,8 +7,9 @@ PyAV and the FFmpeg CLI do not provide a general interface for retrieving arbitr
 payloads.
 
 `box_probe.index_from_boxes` is an independent indexer: it indexes a video with PyAV from the
-extracted `moov` and `moof` boxes alone. Its synthetic stream places `moov` at offset zero, keeps
-each `moof` at its original source offset, and replaces media with zeros. It returns a `VideoProbe`
+extracted `ftyp`, `moov`, and `moof` boxes alone. Its synthetic stream
+(`box_layout.boxes_only_stream`) places `ftyp` at offset zero and `moov` right after it, keeps each
+`moof` at its original source offset, and replaces media with zeros. It returns a `VideoProbe`
 with `Mp4Metadata` built from it. It indexes the requested video stream, defaulting to libav's
 preferred stream when `stream_idx` is omitted. It keeps libav's timestamps, reads fragment layouts
 this parser refuses, and leaves null the metadata fields libav does not report; it does not run
@@ -116,10 +117,48 @@ datasets or depend on a storage client.
 
 `Mp4Metadata.track_id` is the selected track's native unsigned MP4 ID, preserved by both indexers.
 `StreamingCameraSensor(source, metadata=metadata, frame_index=frame_index)` reads the selected track's
-encoded samples directly from the index's byte ranges and configures its codec from the metadata.
-The caller must pair the index with the media it describes. Decoding validates byte ranges and output
-sample identities without reopening the container to look up `track_id`. Without a supplied pair,
+encoded samples directly from the index's byte ranges. The caller must pair the index with the media
+it describes. Decoding validates byte ranges and output sample identities. Without a supplied pair,
 `stream_idx` selects the video stream for lazy indexing.
+
+Decoder setup opens the source's `ftyp` and `moov` boxes with `av.open()`, through the boxes-only
+layout the PyAV indexer also reads, and decodes with the codec context of the stream whose ID is
+`track_id`. Encoded samples are read from the source using the frame index. libav therefore
+applies the same codec parameters and stream side data as an `av.open()` of the source. These include
+the sample entry's pixel format, color range and other color properties, codec tag, and bit depth,
+along with display-matrix, mastering-display, and content-light-level annotations. This holds for
+fragmented sources too, since `moov` alone describes the decoder.
+
+The `moov` comes from one of three places:
+
+- **Supplied by the caller**, as `StreamingCameraSensor(..., moov_bytes=...)`. The mp4-index manifest
+  stores it as a sidecar, which `Mp4IndexLookup.require_indexed_video_for()` reads, returning the
+  record and `moov` as an `IndexedVideo`. Decoding then reads the source only at packet byte ranges.
+- **Kept from the sensor's own indexing.** `index_video()` returns the same `IndexedVideo`: metadata,
+  a frame index, and the `moov` it read them from. A sensor built without metadata and a frame index
+  indexes the source this way and hands that `moov` to its decoder.
+- **Read from the source** otherwise, when metadata and a frame index are supplied without the `moov`:
+  the decoder walks the source's top-level box headers to `moov`, then reads packet byte ranges. On a
+  file with many top-level boxes ahead of `moov`, such as a recorder's interleaved `mdat` chunks, that
+  is one read per box, so remote callers should supply the `moov`.
+
+libav may probe the boxes-only stream's zero-filled samples during setup, without reading source
+media. Output frames are decoded from indexed packets read from the source. Setup fails with `DecoderSetupError`
+when no `moov` is supplied and the source has no top-level `moov`, libav cannot open the boxes, or
+they have no video track with `track_id` in the indexed codec.
+
+`ftyp` comes from `Mp4Metadata.ftyp_bytes`, which both indexers fill with the source's first top-level
+`ftyp` ahead of `moov`, verbatim, or leave `None` when there is none. It is laid out because libav
+parses differently without it. FFmpeg's MP4 demuxer treats any major brand other than `qt  ` as ISO
+BMFF and records the brands; without an `ftyp` it parses as QuickTime. For video sample entries that
+changes only how 16 reserved bytes are read, but audio sample entries and some metadata boxes differ,
+and later FFmpeg versions may depend on the brand more.
+
+Display annotations are preserved, not applied. Decoded frames carry them as side data, as an
+`av.open()` decode would, but pixels are neither rotated by the display matrix nor tone mapped.
+Packets are built from the index and carry no per-packet side data, so a track whose `stsd` lists
+several sample descriptions decodes every sample with libav's initial configuration. The box parser
+refuses such tracks at indexing; PyAV indexing does not.
 
 ## Sampling windows and decoded-frame memory
 
@@ -148,7 +187,8 @@ preceding sync sample and discards dependency frames without converting them to 
 plans continue through the same codec context. Packet DTS/PTS in stream time-base ticks and opaque
 sample identities preserve frame associations through B-frame reordering, duplicate packet PTS,
 and sensor-clock alignment.
-Decoding performs no `av.open()`, demuxing, or container index scan; lazy index creation remains explicit.
+Decoding opens only the boxes-only `ftyp`/`moov` layout and performs no demuxing or container index scan
+of the source; lazy index creation remains explicit.
 The existing `CameraSensor` and its `DecodePlan` are unchanged.
 
 Encoded MP4 samples enter the codec as `av.Packet` objects. The codec returns decoded `av.VideoFrame`
@@ -230,7 +270,10 @@ def parse_with_labels(moov_bytes: bytes) -> tuple[VideoTrack, list[tuple[BoxLoca
 Transport belongs to the caller. `FetchRange` is an `(offset, length) -> bytes` callable, which can
 be backed by a local file or a storage client. `get_moov_auto` tries a head range, then a tail range,
 then a top-level header walk. The guesses default to 8 MiB with one 4x retry. A successful guess
-returns the bytes already fetched, avoiding a second request for the same box.
+returns the bytes already fetched, avoiding a second request for the same box. `get_ftyp` walks the
+same top-level headers and returns the first `ftyp` ahead of `moov`, or `None`. Both it and
+`index_video()` raise `BoxTooLargeError` for an `ftyp` declaring more than 64 KiB, before reading
+it; a real one is well under a kilobyte.
 
 `walk_moofs` reads an already-open stream in chunks and yields complete `moof` boxes with their
 absolute offsets. It carries partial boxes across chunk boundaries and skips other box contents
@@ -292,6 +335,7 @@ and as its cause. Callers decide whether that exception represents invalid sourc
 | `box_primitives.py` | Box headers, basic path lookup, and video-track selection |
 | `box_traversal.py` | Scoped child scans, UUID dispatch, and location context |
 | `byte_range.py`, `box_locate.py` | Range-fetch contract and `moov` location strategies |
+| `box_layout.py` | Boxes-only layout of extracted `moov` and `moof` boxes, opened by libav in place of the source |
 | `moof_walk.py`, `moof_schema.py` | Sequential fragment extraction and the Arrow schema for caching fragment bytes and offsets |
 | `moov_track.py` | `VideoTrack`, track headers, sample descriptions, and composition-offset runs |
 | `moov.py` | Nonfragmented sample-table parsing |

@@ -24,39 +24,40 @@ from tests.cosmos_curator.core.sensors.mp4 import _real_fixtures as real_mp4
 def test_metadata_and_frame_index_are_built_together_once(
     monkeypatch: pytest.MonkeyPatch, first_property: str, indexer: Mp4Indexer
 ) -> None:
-    """Construction does no I/O, and accessing either object populates both."""
-    metadata, frame_index = index_video(real_mp4.CLIP)
-    builder = Mock(return_value=(metadata, frame_index))
+    """Construction does no I/O, and accessing either object populates both, keeping the moov read."""
+    video = index_video(real_mp4.CLIP)
+    builder = Mock(return_value=video)
     monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.index_video", builder)
     sensor = StreamingCameraSensor(real_mp4.CLIP, indexer=indexer)
     builder.assert_not_called()
     assert sensor._metadata is None
     assert sensor._frame_index is None
     assert getattr(sensor, first_property) is not None
-    assert sensor.metadata is metadata
-    assert sensor.frame_index is frame_index
-    np.testing.assert_array_equal(sensor.timestamps_ns, frame_index.pts_ns[frame_index.pts_sort_order])
+    assert sensor.metadata is video.metadata
+    assert sensor.frame_index is video.frame_index
+    assert sensor._moov_bytes is video.moov_bytes
+    np.testing.assert_array_equal(sensor.timestamps_ns, video.frame_index.pts_ns[video.frame_index.pts_sort_order])
     builder.assert_called_once_with(real_mp4.CLIP, indexer=indexer, stream_idx=0)
 
 
 def test_supplied_metadata_and_index_are_used_without_reading_the_source(monkeypatch: pytest.MonkeyPatch) -> None:
     """A precomputed pair can answer timestamps and metadata without source media."""
-    metadata, frame_index = index_video(real_mp4.CLIP)
+    video = index_video(real_mp4.CLIP)
     builder = Mock(side_effect=AssertionError("unexpected indexing"))
     monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.index_video", builder)
-    sensor = StreamingCameraSensor(None, metadata=metadata, frame_index=frame_index)
-    assert sensor.metadata is metadata
-    assert sensor.frame_index is frame_index
-    assert len(sensor.timestamps_ns) == metadata.frame_count
+    sensor = StreamingCameraSensor(None, metadata=video.metadata, frame_index=video.frame_index)
+    assert sensor.metadata is video.metadata
+    assert sensor.frame_index is video.frame_index
+    assert len(sensor.timestamps_ns) == video.metadata.frame_count
     builder.assert_not_called()
 
 
 @pytest.mark.parametrize("provided", ["metadata", "frame_index"])
 def test_metadata_and_index_must_be_supplied_together(provided: str) -> None:
     """A half-supplied pair cannot be reconciled by indexing a potentially different source."""
-    metadata, frame_index = index_video(real_mp4.CLIP)
+    video = index_video(real_mp4.CLIP)
     with pytest.raises(ValueError, match="supplied together"):
-        StreamingCameraSensor(real_mp4.CLIP, **{provided: metadata if provided == "metadata" else frame_index})
+        StreamingCameraSensor(real_mp4.CLIP, **{provided: getattr(video, provided)})
 
 
 def test_without_precomputed_metadata_a_source_is_required() -> None:
@@ -67,9 +68,9 @@ def test_without_precomputed_metadata_a_source_is_required() -> None:
 
 def test_supplied_metadata_and_index_must_have_the_same_frame_count() -> None:
     """An inconsistent pair cannot provide reliable metadata for the selected timeline."""
-    metadata, frame_index = index_video(real_mp4.CLIP)
+    video = index_video(real_mp4.CLIP)
     with pytest.raises(IndexRecordUnusableError, match="count disagrees"):
-        StreamingCameraSensor(metadata=attrs.evolve(metadata, frame_count=1), frame_index=frame_index)
+        StreamingCameraSensor(metadata=attrs.evolve(video.metadata, frame_count=1), frame_index=video.frame_index)
 
 
 def test_a_borrowed_source_can_be_decoded_after_lazy_indexing() -> None:
@@ -123,14 +124,62 @@ def test_lazy_indexing_rejects_an_unavailable_alignment_field(alignment_field: V
 
 def test_default_pts_preserves_media_time_and_edited_pts_is_an_explicit_choice() -> None:
     """The default reports media PTS without silently applying a playback edit."""
-    metadata, frame_index = index_video(real_mp4.BFRAME_CLIP)
-    media_sensor = StreamingCameraSensor(None, metadata=metadata, frame_index=frame_index)
+    video = index_video(real_mp4.BFRAME_CLIP)
+    frame_index = video.frame_index
+    media_sensor = StreamingCameraSensor(None, metadata=video.metadata, frame_index=frame_index)
     edited_sensor = StreamingCameraSensor(
         None,
-        metadata=metadata,
+        metadata=video.metadata,
         frame_index=frame_index,
         alignment_field=VideoFrameAlignmentField.EDITED_PTS_NS,
     )
     np.testing.assert_array_equal(media_sensor.timestamps_ns, frame_index.pts_ns[frame_index.pts_sort_order])
     np.testing.assert_array_equal(edited_sensor.timestamps_ns, frame_index.edited_pts_ns[frame_index.pts_sort_order])
     assert media_sensor.timestamps_ns[0] != edited_sensor.timestamps_ns[0]
+
+
+def test_a_supplied_moov_requires_the_metadata_and_index_it_describes() -> None:
+    """A moov alone cannot be paired with an index built later from a potentially different source."""
+    with pytest.raises(ValueError, match="moov_bytes requires"):
+        StreamingCameraSensor(real_mp4.CLIP, moov_bytes=real_mp4.moov_box(real_mp4.CLIP.read_bytes()))
+
+
+def test_a_supplied_moov_sets_up_decoding_without_reading_boxes_from_the_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampling hands the supplied moov to the decoder rather than locating one in the source."""
+    data = real_mp4.CLIP.read_bytes()
+    video = index_video(data)
+    walk = Mock(side_effect=AssertionError("unexpected moov read from the source"))
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video.get_moov_full_walk", walk)
+    sensor = StreamingCameraSensor(
+        data, metadata=video.metadata, frame_index=video.frame_index, moov_bytes=video.moov_bytes
+    )
+    timestamps = sensor.timestamps_ns[:2]
+    start, end = int(timestamps[0]), int(timestamps[-1]) + 1
+    spec = SamplingSpec(grid=SamplingGrid(start, end, timestamps, stride_ns=end - start, duration_ns=end - start))
+    rows = [
+        row
+        for payload in sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
+        for row in payload.frames()
+    ]
+    assert [timestamp for _, timestamp, _ in rows] == timestamps.tolist()
+    walk.assert_not_called()
+
+
+@pytest.mark.parametrize("indexer", list(Mp4Indexer))
+def test_lazy_indexing_hands_its_moov_to_the_decoder(monkeypatch: pytest.MonkeyPatch, indexer: Mp4Indexer) -> None:
+    """Decoding after a lazy build reuses the moov the build read rather than locating it again."""
+    walk = Mock(side_effect=AssertionError("unexpected moov read from the source"))
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video.get_moov_full_walk", walk)
+    sensor = StreamingCameraSensor(real_mp4.CLIP, indexer=indexer)
+    timestamps = sensor.timestamps_ns[:2]
+    start, end = int(timestamps[0]), int(timestamps[-1]) + 1
+    spec = SamplingSpec(grid=SamplingGrid(start, end, timestamps, stride_ns=end - start, duration_ns=end - start))
+    rows = [
+        row
+        for payload in sensor.sample(spec, policy=NearestTimestampPolicy(max_delta_ns=0))
+        for row in payload.frames()
+    ]
+    assert [timestamp for _, timestamp, _ in rows] == timestamps.tolist()
+    walk.assert_not_called()

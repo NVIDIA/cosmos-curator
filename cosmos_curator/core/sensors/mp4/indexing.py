@@ -8,7 +8,7 @@ import os
 import struct
 from typing import BinaryIO
 
-from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
+from cosmos_curator.core.sensors.data.mp4 import IndexedVideo, Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.mp4.box_primitives import (
     EXTENDED_HEADER_BYTES,
     BoxNotFoundError,
@@ -16,6 +16,7 @@ from cosmos_curator.core.sensors.mp4.box_primitives import (
     find_all_boxes,
     find_box,
     read_box_header,
+    require_ftyp_size,
 )
 from cosmos_curator.core.sensors.mp4.box_probe import check_frame_byte_ranges, index_from_boxes
 from cosmos_curator.core.sensors.mp4.fragment_table import parse_fragment_table
@@ -31,9 +32,22 @@ class Mp4Indexer(enum.Enum):
     CUSTOM = "custom"
 
 
-def _read_boxes(stream: BinaryIO) -> tuple[int, bytes, list[tuple[int, bytes]]]:
-    """Read moov and moof boxes, seeking past media payloads."""
+def _read_whole_box(stream: BinaryIO, box_type: str, position: int, box_size: int) -> bytes:
+    """Read the *box_size*-byte box at *position*, refusing an oversized ``ftyp`` before reading it."""
+    if box_type == "ftyp":
+        require_ftyp_size(box_size, position)
+    stream.seek(position)
+    content = stream.read(box_size)
+    if len(content) != box_size:
+        msg = f"truncated {box_type} box at offset {position}"
+        raise MalformedBoxHeaderError(msg)
+    return content
+
+
+def _read_boxes(stream: BinaryIO) -> tuple[int, bytes | None, bytes, list[tuple[int, bytes]]]:
+    """Read the first ftyp ahead of moov, then moov and moof boxes, seeking past media payloads."""
     file_size = stream.seek(0, os.SEEK_END)
+    ftyp: bytes | None = None
     moov: bytes | None = None
     moofs: list[tuple[int, bytes]] = []
     position = 0
@@ -48,13 +62,11 @@ def _read_boxes(stream: BinaryIO) -> tuple[int, bytes, list[tuple[int, bytes]]]:
         if position + box_size > file_size:
             msg = f"box {box_type!r} at offset {position} extends past the source end"
             raise MalformedBoxHeaderError(msg)
-        if box_type in ("moov", "moof"):
-            stream.seek(position)
-            content = stream.read(box_size)
-            if len(content) != box_size:
-                msg = f"truncated {box_type} box at offset {position}"
-                raise MalformedBoxHeaderError(msg)
-            if box_type == "moov":
+        if box_type in ("moov", "moof") or (box_type == "ftyp" and ftyp is None and moov is None):
+            content = _read_whole_box(stream, box_type, position, box_size)
+            if box_type == "ftyp":
+                ftyp = content
+            elif box_type == "moov":
                 if moov is not None:
                     msg = "MP4 contains multiple moov boxes"
                     raise MalformedBoxHeaderError(msg)
@@ -65,7 +77,7 @@ def _read_boxes(stream: BinaryIO) -> tuple[int, bytes, list[tuple[int, bytes]]]:
     if moov is None:
         msg = "no top-level moov box found in the source"
         raise BoxNotFoundError(msg)
-    return file_size, moov, moofs
+    return file_size, ftyp, moov, moofs
 
 
 def _require_single_video_track(moov: bytes, stream_idx: int) -> None:
@@ -80,10 +92,11 @@ def _require_single_video_track(moov: bytes, stream_idx: int) -> None:
         raise ValueError(msg)
 
 
-def index_video(
-    source: DataSource, *, indexer: Mp4Indexer = Mp4Indexer.PYAV, stream_idx: int = 0
-) -> tuple[Mp4Metadata, Mp4FrameIndex]:
+def index_video(source: DataSource, *, indexer: Mp4Indexer = Mp4Indexer.PYAV, stream_idx: int = 0) -> IndexedVideo:
     """Build metadata and a frame index without requiring extracted box artifacts.
+
+    Also returns the source's ``moov`` box, header included. Indexed decoding sets up its
+    decoder from that ``moov``, so passing it on saves reading it again.
 
     Raises:
         TypeError: The indexer is not an Mp4Indexer.
@@ -95,11 +108,14 @@ def index_video(
         msg = f"Unknown MP4 indexer: {indexer!r}"
         raise TypeError(msg)
     with open_data_source(source) as stream:
-        file_size, moov, moofs = _read_boxes(stream)
+        file_size, ftyp, moov, moofs = _read_boxes(stream)
     if indexer is Mp4Indexer.PYAV:
-        result = index_from_boxes(file_size, moov, moofs, stream_idx=stream_idx)
-        return result.metadata, Mp4FrameIndex.from_video_probe(result.probe, elst_bytes=result.metadata.elst_bytes)
+        result = index_from_boxes(file_size, moov, moofs, ftyp_bytes=ftyp, stream_idx=stream_idx)
+        frame_index = Mp4FrameIndex.from_video_probe(result.probe, elst_bytes=result.metadata.elst_bytes)
+        return IndexedVideo(frame_index, result.metadata, moov)
     _require_single_video_track(moov, stream_idx)
     track = parse_fragment_table(moov, moofs) if moofs else parse_video_track(moov)
     check_frame_byte_ranges(track.offset, track.size, file_size)
-    return Mp4Metadata.from_video_track(track), Mp4FrameIndex.from_video_track(track)
+    return IndexedVideo(
+        Mp4FrameIndex.from_video_track(track), Mp4Metadata.from_video_track(track, ftyp_bytes=ftyp), moov
+    )

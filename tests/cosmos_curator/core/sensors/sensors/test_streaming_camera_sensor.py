@@ -657,6 +657,7 @@ def _metadata_row(**overrides: object) -> dict[str, Any]:
         "track_display_width": 0,
         "track_display_height": 0,
         "elst_bytes": None,
+        "ftyp_bytes": None,
         "avg_frame_rate_num": 30,
         "avg_frame_rate_den": 1,
         "bit_rate_bps": 1000,

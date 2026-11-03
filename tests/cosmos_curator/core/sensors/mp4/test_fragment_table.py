@@ -252,7 +252,7 @@ def test_parse_fragment_table_duration_uses_trex_for_a_single_fragment() -> None
     moof = _moof(moof_start=1000, decode_time=0, data_offset=32, sample_size=500, default_sample_duration=None)
 
     track = ft.parse_fragment_table(moov, [moof])
-    metadata = Mp4Metadata.from_video_track(track)
+    metadata = Mp4Metadata.from_video_track(track, ftyp_bytes=None)
 
     assert track.duration == 3000
     assert metadata.duration_ns == 33_333_333

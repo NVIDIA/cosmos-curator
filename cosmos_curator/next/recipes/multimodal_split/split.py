@@ -755,9 +755,13 @@ def _open_camera_sensor(  # noqa: PLR0913 -- source, planned clock/timeline, and
 ) -> StreamingCameraSensor:
     """Build a streaming sensor from the configured manifest record."""
     lookup = Mp4IndexLookup.open_required(mp4_index_uri, storage_profile=storage_profile)
-    frame_index, metadata = lookup.require_index_for(sensor_uri, storage_profile=storage_profile)
+    indexed = lookup.require_indexed_video_for(sensor_uri, storage_profile=storage_profile)
     sensor = StreamingCameraSensor(
-        source, metadata=metadata, frame_index=frame_index, alignment_field=VideoFrameAlignmentField(alignment_field)
+        source,
+        metadata=indexed.metadata,
+        frame_index=indexed.frame_index,
+        alignment_field=VideoFrameAlignmentField(alignment_field),
+        moov_bytes=indexed.moov_bytes,
     )
     if not np.array_equal(sensor.timestamps_ns, timeline_ns):
         msg = "indexed camera timestamps changed since planning"

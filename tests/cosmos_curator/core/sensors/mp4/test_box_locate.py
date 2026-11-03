@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for finding a non-fragmented file's moov box and returning its bytes.
+"""Tests for finding a file's top-level moov and ftyp boxes and returning their bytes.
 
 Focus is on the bytes-back contract: get_moov_tail_guess/get_moov_full_walk
 return moov's own content directly, never leaving a caller to make a second
@@ -24,7 +24,7 @@ import struct
 import pytest
 
 from cosmos_curator.core.sensors.mp4 import box_locate as bl
-from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError
+from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, BoxTooLargeError
 from tests.cosmos_curator.core.sensors.mp4._box_fixtures import pack_box as _box
 
 
@@ -328,3 +328,52 @@ def test_get_moov_auto_raises_when_absent_everywhere() -> None:
 
     with pytest.raises(BoxNotFoundError):
         bl.get_moov_auto(len(buf), fetcher)
+
+
+# ---------------------------------------------------------------------------
+# get_ftyp -- the leading brand box, ahead of moov
+# ---------------------------------------------------------------------------
+
+
+def test_get_ftyp_returns_a_leading_ftyp_in_one_fetch() -> None:
+    """A conforming file opens with ftyp, whose brand list fits the first fetch."""
+    ftyp = _box("ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomiso2mp41")
+    buf = ftyp + _box("mdat", b"x" * 100_000) + _box("moov", b"payload")
+    fetcher = _CountingFetcher(buf)
+
+    assert bl.get_ftyp(len(buf), fetcher) == ftyp
+    assert len(fetcher.calls) == 1
+
+
+def test_get_ftyp_walks_past_earlier_boxes_and_fetches_a_long_brand_list() -> None:
+    """An ftyp after another top-level box, longer than one probe, still comes back whole."""
+    ftyp = _box("ftyp", b"isom" + struct.pack(">I", 0) + b"mp41" * 200)
+    buf = _box("free", b"\0" * 32) + ftyp + _box("moov", b"payload")
+
+    assert bl.get_ftyp(len(buf), _CountingFetcher(buf)) == ftyp
+
+
+@pytest.mark.parametrize(
+    "boxes",
+    [
+        [_box("moov", b"payload"), _box("ftyp", b"isom\0\0\0\0")],
+        [_box("mdat", b"data"), _box("moov", b"payload")],
+        [],
+    ],
+    ids=["after moov", "absent", "empty file"],
+)
+def test_get_ftyp_returns_none_without_an_ftyp_ahead_of_moov(boxes: list[bytes]) -> None:
+    """Libav reads a file without a leading ftyp as QuickTime, so none is reported."""
+    buf = b"".join(boxes)
+
+    assert bl.get_ftyp(len(buf), _CountingFetcher(buf)) is None
+
+
+def test_get_ftyp_refuses_an_oversized_ftyp_before_fetching_its_body() -> None:
+    """An in-bounds ftyp declaring more than the limit is refused after the one header probe."""
+    declared = 1 << 32
+    fetcher = _CountingFetcher(struct.pack(">I4sQ", 1, b"ftyp", declared) + b"isom")
+
+    with pytest.raises(BoxTooLargeError, match="ftyp at offset 0 declares 4294967296 bytes"):
+        bl.get_ftyp(declared + 1024, fetcher)
+    assert len(fetcher.calls) == 1

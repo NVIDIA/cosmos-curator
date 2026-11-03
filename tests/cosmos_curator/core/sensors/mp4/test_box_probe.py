@@ -29,11 +29,9 @@ from cosmos_curator.core.sensors.data.video import VideoProbe
 from cosmos_curator.core.sensors.mp4 import box_probe
 from cosmos_curator.core.sensors.mp4.box_primitives import BoxNotFoundError, find_all_boxes, find_box, find_box_bytes
 from cosmos_curator.core.sensors.mp4.box_probe import (
-    BoxLayoutUnsupportedError,
     BoxProbeMismatchError,
     BoxProbeReadError,
     UnsupportedTimescaleError,
-    boxes_only_stream,
     index_from_boxes,
 )
 from cosmos_curator.core.sensors.mp4.fragment_table import CompositionOffsetUnsupportedError
@@ -171,7 +169,7 @@ def test_index_from_boxes_indexes_the_video_stream_libav_ranks_best() -> None:
 def test_index_from_boxes_metadata_agrees_with_the_box_walker_on_fields_libav_reports(data: bytes) -> None:
     """Decoder setup, time base, counts, rates, duration, and the copied ``elst`` match the walker's."""
     index_metadata = attrs.asdict(index_from_boxes(*_boxes(data)).metadata)
-    walker_metadata = attrs.asdict(Mp4Metadata.from_video_track(real_mp4.walker_track(data)))
+    walker_metadata = attrs.asdict(Mp4Metadata.from_video_track(real_mp4.walker_track(data), ftyp_bytes=None))
 
     reported = {name for name, value in index_metadata.items() if value is not None} - {"encoder_tag"}
     assert {"codec_name", "extradata", "time_base_den", "duration_ns", "bit_rate_bps"} <= reported
@@ -197,7 +195,7 @@ def test_index_from_boxes_duration_takes_libavs_estimate_for_a_final_sample_stor
     assert index.probe.duration[-1] == dts[-1] - dts[-2] > 0
     assert walker.duration == dts[-1] - dts[0]
     assert index.metadata.duration_ns == int((dts[-1] - dts[0] + dts[-1] - dts[-2]) * index.probe.time_base * 10**9)
-    assert index.metadata.duration_ns > Mp4Metadata.from_video_track(walker).duration_ns
+    assert index.metadata.duration_ns > Mp4Metadata.from_video_track(walker, ftyp_bytes=None).duration_ns
 
 
 @pytest.mark.parametrize("swap", [False, True], ids=["mjpeg trak first", "h264 trak first"])
@@ -284,65 +282,27 @@ def test_index_from_boxes_indexes_a_timescale_of_one() -> None:
     np.testing.assert_array_equal(index.probe.dts, parse_video_track(moov).dts_ticks)
 
 
-def test_boxes_only_stream_places_moov_first_each_moof_at_its_source_offset_and_zeros_between() -> None:
-    """Filler box headers span every gap, and the media they hold is zeros."""
-    data = real_mp4.fragmented_clip()
-    file_size, moov, moofs = _boxes(data)
-
-    laid_out = boxes_only_stream(file_size, moov, moofs).read()
-
-    assert len(laid_out) == file_size
-    assert laid_out[: len(moov)] == moov
-    assert laid_out[len(moov) + 4 : len(moov) + 8] == b"free"
-    for start, moof_bytes in moofs:
-        assert laid_out[start : start + len(moof_bytes)] == moof_bytes
-        mdat_start = start + len(moof_bytes)
-        assert laid_out[mdat_start + 4 : mdat_start + 8] == b"mdat"
-    first, second = moofs[0], moofs[1]
-    media = laid_out[first[0] + len(first[1]) + 8 : second[0]]
-    assert media
-    assert not media.strip(b"\0")
-
-
-def test_boxes_only_stream_seeks_and_reads_across_box_boundaries() -> None:
-    """A read spanning zeros and a box returns both, and a read past the end returns nothing."""
-    moov = b"\x00\x00\x00\x10moov" + b"m" * 8
-    moof = b"\x00\x00\x00\x0cmoof" + b"f" * 4
-    stream = boxes_only_stream(64, moov, [(32, moof)])
-
-    stream.seek(28)
-    assert stream.read(8) == b"\0\0\0\0" + moof[:4]
-    assert stream.seek(-4, 2) == 60
-    assert stream.read() == b"\0\0\0\0"
-    assert stream.read(1) == b""
-
-
-@pytest.mark.parametrize(
-    ("moof_rows", "match"),
-    [
-        ([(20, b"\x00\x00\x00\x08moof")], "does not fit before the first moof"),
-        ([(24, b"\x00\x00\x00\x08moof"), (28, b"\x00\x00\x00\x08moof")], "overlaps the next box"),
-        ([(28, b"\x00\x00\x00\x08moof"), (40, b"\x00\x00\x00\x08moof")], "4-byte gap"),
-        ([(48, b"\x00\x00\x00\x0cmoof" + b"f" * 4)], "4-byte gap"),
-    ],
-)
-def test_boxes_only_stream_refuses_boxes_it_cannot_lay_out_as_libav_would_walk_them(
-    moof_rows: list[tuple[int, bytes]], match: str
+@pytest.mark.parametrize("with_ftyp", [True, False])
+def test_index_from_boxes_reads_the_brand_libav_reads_from_the_source(
+    monkeypatch: pytest.MonkeyPatch, *, with_ftyp: bool
 ) -> None:
-    """Without a box header in every gap, libav would read zeros as a box and walk a different file."""
-    moov = b"\x00\x00\x00\x18moov" + b"m" * 16
+    """A supplied ftyp is laid out for libav and recorded verbatim; without one libav reads no brand."""
+    data = real_mp4.CLIP.read_bytes()
+    ftyp = data[: struct.unpack_from(">I", data)[0]]
+    open_container = av.open
+    brands: list[str | None] = []
 
-    with pytest.raises(BoxLayoutUnsupportedError, match=match):
-        boxes_only_stream(64, moov, moof_rows)
+    def recording_open(*args: object, **kwargs: object) -> object:
+        container = open_container(*args, **kwargs)
+        brands.append(container.metadata.get("major_brand"))
+        return container
 
+    monkeypatch.setattr(av, "open", recording_open)
+    index = index_from_boxes(len(data), real_mp4.moov_box(data), ftyp_bytes=ftyp if with_ftyp else None)
 
-def test_boxes_only_stream_writes_a_large_size_header_for_a_gap_past_four_gibibytes() -> None:
-    """A 32-bit box size cannot span the gap, so the filler box uses the 64-bit form."""
-    moov = b"\x00\x00\x00\x08moov"
-    stream = boxes_only_stream(8 + (1 << 32) + 16, moov)
-
-    stream.seek(8)
-    assert stream.read(16) == struct.pack(">I4sQ", 1, b"free", (1 << 32) + 16)
+    with open_container(io.BytesIO(data)) as source:
+        assert brands == [source.metadata["major_brand"] if with_ftyp else None]
+    assert index.metadata.ftyp_bytes == (ftyp if with_ftyp else None)
 
 
 def test_index_from_boxes_takes_sync_flags_from_the_header_index(monkeypatch: pytest.MonkeyPatch) -> None:

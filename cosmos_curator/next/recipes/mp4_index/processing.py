@@ -232,6 +232,22 @@ def _make_fetch_range(uri: str, transport_params: dict[str, Any] | None) -> Fetc
     return fetch_range
 
 
+def _reusing_head(fetch_range: FetchRange) -> FetchRange:
+    """Wrap *fetch_range* to serve reads within the longest range fetched from offset 0 without refetching."""
+    head = b""
+
+    def fetch(offset: int, length: int) -> bytes:
+        nonlocal head
+        if offset + length <= len(head):
+            return head[offset : offset + length]
+        data = fetch_range(offset, length)
+        if offset == 0 and len(data) > len(head):
+            head = data
+        return data
+
+    return fetch
+
+
 def _ensure_moov(  # noqa: PLR0913 -- one caller-supplied identity/location/tuning field per arg; all independent
     media_location: str,
     moov_sidecar_location: str,
@@ -241,17 +257,21 @@ def _ensure_moov(  # noqa: PLR0913 -- one caller-supplied identity/location/tuni
     output_storage_client: StorageClient | None,
     input_transport_params: dict[str, Any] | None,
     output_transport_params: dict[str, Any] | None,
-) -> tuple[bytes, bool]:
-    """Return (this video's ``moov`` bytes, whether they came from an already-extracted sidecar)."""
+) -> tuple[bytes | None, bytes, bool]:
+    """Return ``(ftyp_bytes, moov_bytes, moov_from_cache)``; ``moov_from_cache`` marks an already-extracted sidecar.
+
+    ``ftyp`` is always read from the source; a fresh ``moov`` fetch's head range usually holds it.
+    """
+    fetch_range = _reusing_head(_make_fetch_range(media_location, input_transport_params))
     if skip_existing_sidecars and path_exists(moov_sidecar_location, output_storage_client):
         try:
-            return read_bytes_sidecar(moov_sidecar_location, transport_params=output_transport_params), True
+            moov_bytes = read_bytes_sidecar(moov_sidecar_location, transport_params=output_transport_params)
         except FileNotFoundError as exc:
             raise _CachedBoxReadError(exc) from exc
-    fetch_range = _make_fetch_range(media_location, input_transport_params)
+        return box_locate.get_ftyp(file_size, fetch_range), moov_bytes, True
     moov_bytes = box_locate.get_moov_auto(file_size, fetch_range, source_name=media_location)
     write_bytes_sidecar(moov_bytes, moov_sidecar_location, transport_params=output_transport_params)
-    return moov_bytes, False
+    return box_locate.get_ftyp(file_size, fetch_range), moov_bytes, False
 
 
 def _ensure_moof(  # noqa: PLR0913 -- one caller-supplied identity/location/tuning field per arg; all independent
@@ -332,16 +352,17 @@ def indexer_for(extension_factory: Mp4ExtensionFactory | None) -> Indexer:
     return INDEXER_PYAV if extension_factory is None else INDEXER_BOX_WALKER
 
 
-def _parse_mp4(
+def _parse_mp4(  # noqa: PLR0913 -- the video's location, each extracted box, size, and extension
     media_location: str,
     moov_bytes: bytes,
     moof_rows: list[tuple[int, bytes]] | None,
     extension_factory: Mp4ExtensionFactory | None,
     *,
     file_size: int,
+    ftyp_bytes: bytes | None,
 ) -> tuple[Mp4Metadata, pa.LargeListArray]:
     if extension_factory is None:
-        index = index_from_boxes(file_size, moov_bytes, moof_rows or ())
+        index = index_from_boxes(file_size, moov_bytes, moof_rows or (), ftyp_bytes=ftyp_bytes)
         probe = index.probe
         standard = _standard_frame_columns(
             probe.dts, probe.composition_offset, probe.is_keyframe, probe.offset, probe.size
@@ -374,7 +395,7 @@ def _parse_mp4(
         raise
     except Exception as exc:
         raise _ExtensionContractError(exc) from exc
-    return Mp4Metadata.from_video_track(track), frames
+    return Mp4Metadata.from_video_track(track, ftyp_bytes=ftyp_bytes), frames
 
 
 def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing settings
@@ -396,7 +417,7 @@ def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing s
         use_cache = skip_existing_sidecars and attempt == 0
         moov_from_cache = moof_from_cache = parsing = False
         try:
-            moov_bytes, moov_from_cache = _ensure_moov(
+            ftyp_bytes, moov_bytes, moov_from_cache = _ensure_moov(
                 media_location,
                 moov_sidecar_location,
                 file_size=file_size,
@@ -418,7 +439,9 @@ def _extract_mp4(  # noqa: PLR0913 -- source, sidecars, transport, and parsing s
                     output_transport_params=output_transport_params,
                 )
             parsing = True
-            return _parse_mp4(media_location, moov_bytes, moof_rows, extension_factory, file_size=file_size)
+            return _parse_mp4(
+                media_location, moov_bytes, moof_rows, extension_factory, file_size=file_size, ftyp_bytes=ftyp_bytes
+            )
         except _ExtensionSetupError as exc:
             raise exc.error from exc
         except (UnindexableVideoError, pa.ArrowInvalid, OverflowError, _CachedBoxReadError) as exc:
@@ -445,8 +468,8 @@ def process_one_video(
     """Extract or reuse moov/moof sidecars and build one complete video record.
 
     PyAV indexes the frames from those boxes alone, so a video whose sidecars are cached is
-    indexed without reading its media. With *extension_factory*, the box walker indexes
-    instead, so the extension's UUID decoders run.
+    indexed reading only its leading ``ftyp``, which no sidecar holds. With *extension_factory*,
+    the box walker indexes instead, so the extension's UUID decoders run.
 
     Returns manifest fields plus ``status``, ``error_type``, and ``error_message``.
     ``metadata`` and ``frames`` are single-row Arrow arrays whose buffers are retained

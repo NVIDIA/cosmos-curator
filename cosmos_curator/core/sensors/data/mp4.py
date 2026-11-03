@@ -441,6 +441,8 @@ class Mp4Metadata:
     track_display_width: int | None
     track_display_height: int | None
     elst_bytes: bytes | None
+    # The source's top-level ftyp ahead of moov, verbatim, or None if it has none.
+    ftyp_bytes: bytes | None
     avg_frame_rate_num: int
     avg_frame_rate_den: int
     bit_rate_bps: int
@@ -453,10 +455,11 @@ class Mp4Metadata:
         return cls(**{field.name: row[field.name] for field in attrs.fields(cls)})
 
     @classmethod
-    def from_video_track(cls, video_track: VideoTrack) -> Self:
+    def from_video_track(cls, video_track: VideoTrack, *, ftyp_bytes: bytes | None) -> Self:
         """Build directly from a real, already-parsed ``VideoTrack`` -- no sidecar round-trip.
 
-        ``encoder_tag`` stays ``None`` -- nothing in a ``VideoTrack`` states it.
+        ``encoder_tag`` stays ``None`` -- nothing in a ``VideoTrack`` states it. *ftyp_bytes* is
+        the source's ``ftyp``, which lies outside the ``moov`` a ``VideoTrack`` is parsed from.
         """
         sd = video_track.sample_description
         avg_frame_rate, bit_rate_bps = _stream_rate_stats(
@@ -501,6 +504,7 @@ class Mp4Metadata:
             track_display_width=video_track.track_header.width,
             track_display_height=video_track.track_header.height,
             elst_bytes=video_track.elst_bytes,
+            ftyp_bytes=ftyp_bytes,
             avg_frame_rate_num=avg_frame_rate.numerator,
             avg_frame_rate_den=avg_frame_rate.denominator,
             bit_rate_bps=bit_rate_bps,
@@ -510,7 +514,13 @@ class Mp4Metadata:
 
     @classmethod
     def from_video_probe(
-        cls, probe: VideoProbe, *, track_id: int, encoder_tag: str | None, elst_bytes: bytes | None
+        cls,
+        probe: VideoProbe,
+        *,
+        track_id: int,
+        encoder_tag: str | None,
+        elst_bytes: bytes | None,
+        ftyp_bytes: bytes | None,
     ) -> Self:
         """Build from libav's reading of one stream; fields libav does not report are ``None``.
 
@@ -551,9 +561,19 @@ class Mp4Metadata:
             track_display_width=None,
             track_display_height=None,
             elst_bytes=elst_bytes,
+            ftyp_bytes=ftyp_bytes,
             avg_frame_rate_num=avg_frame_rate.numerator,
             avg_frame_rate_den=avg_frame_rate.denominator,
             bit_rate_bps=bit_rate_bps,
             duration_ns=int(_ticks_to_ns(np.array([duration_ticks], dtype=np.int64), time_base_num, time_base_den)[0]),
             encoder_tag=encoder_tag,
         )
+
+
+@attrs.define(frozen=True)
+class IndexedVideo:
+    """One video's frame index and metadata, with the source's ``moov`` box, header included, that they describe."""
+
+    frame_index: Mp4FrameIndex
+    metadata: Mp4Metadata
+    moov_bytes: bytes

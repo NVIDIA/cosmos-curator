@@ -79,6 +79,7 @@ def _metadata(**overrides: object) -> dict[str, Any]:
         "track_display_width": 0,
         "track_display_height": 0,
         "elst_bytes": None,
+        "ftyp_bytes": None,
         "avg_frame_rate_num": 30,
         "avg_frame_rate_den": 1,
         "bit_rate_bps": 1000,
@@ -194,8 +195,17 @@ def test_required_lookup_preserves_manifest_access_errors(
         Mp4IndexLookup.open_required(str(tmp_path / "manifest.lance"))
 
 
+def _warned(records: list[dict[str, Any]], text: str) -> bool:
+    """Whether a WARNING record contains *text*.
+
+    Asserted on loguru records rather than captured stderr: importing a module that reconfigures
+    loguru mid-session binds its stderr sink to whichever stream pytest had installed then.
+    """
+    return any(record["level"].name == "WARNING" and text in record["message"] for record in records)
+
+
 def test_required_lookup_normalizes_local_uris_and_reads_the_source_size(
-    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str]
+    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str], loguru_records: list[dict[str, Any]]
 ) -> None:
     """Required reads handle file URIs and validate the current source without opening its media."""
     video = tmp_path / "front camera.mp4"
@@ -208,7 +218,8 @@ def test_required_lookup_normalizes_local_uris_and_reads_the_source_size(
     video.write_bytes(bytes(INDEXED_SIZE_BYTES + 1))
     with pytest.raises(ValueError, match="stale"):
         lookup.require_index_for(str(video), storage_profile="default")
-    assert "the index is stale" in capfd.readouterr().err
+    capfd.readouterr()
+    assert _warned(loguru_records, "the index is stale")
 
 
 def test_required_lookup_propagates_a_missing_source(tmp_path: pathlib.Path) -> None:
@@ -239,6 +250,54 @@ def test_required_lookup_checks_s3_size_using_the_requested_profile(
             lookup.require_index_for(video, storage_profile="video-profile")
     factory.assert_called_once_with(video, profile_name="video-profile")
     client.stat.assert_called_once_with(S3Prefix(video))
+
+
+@pytest.mark.parametrize("fault", [None, "missing sidecar", "stale size"])
+def test_required_video_lookup_reads_the_moov_sidecar_of_a_current_record(
+    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str], loguru_records: list[dict[str, Any]], fault: str | None
+) -> None:
+    """The sidecar is read only for a record that still describes the source, and must exist."""
+    video = tmp_path / "front.mp4"
+    video.write_bytes(bytes(INDEXED_SIZE_BYTES + (fault == "stale size")))
+    sidecar = tmp_path / "moov" / "front.moov"
+    if fault != "missing sidecar":
+        sidecar.parent.mkdir()
+        sidecar.write_bytes(b"\x00\x00\x00\x0cmoovdata")
+    lookup = Mp4IndexLookup.open_required(
+        _write_manifest(tmp_path, [_manifest_row(str(video), moov_location=str(sidecar))])
+    )
+
+    if fault is None:
+        indexed = lookup.require_indexed_video_for(str(video), storage_profile="default")
+        assert indexed.moov_bytes == b"\x00\x00\x00\x0cmoovdata"
+        assert indexed.metadata.frame_count == len(indexed.frame_index) == 3
+        return
+    with pytest.raises(FileNotFoundError if fault == "missing sidecar" else ValueError):
+        lookup.require_indexed_video_for(str(video), storage_profile="default")
+    capfd.readouterr()
+    assert _warned(loguru_records, "the index is stale") == (fault == "stale size")
+
+
+def test_required_video_lookup_reads_an_s3_sidecar_with_the_requested_profile(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar is read through the same storage client factory and profile as the size check."""
+    video, moov_location = "s3://bucket/session/front.mp4", "s3://index-bucket/moov/front.moov"
+    lookup = Mp4IndexLookup.open_required(
+        _write_manifest(tmp_path, [_manifest_row(video, moov_location=moov_location)])
+    )
+    client = Mock(spec=S3Client)
+    client.stat.return_value.size_bytes = INDEXED_SIZE_BYTES
+    client.download_object_as_bytes.return_value = b"moov-bytes"
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(index_lookup, "get_storage_client", factory)
+
+    indexed = lookup.require_indexed_video_for(video, storage_profile="video-profile")
+
+    assert indexed.moov_bytes == b"moov-bytes"
+    assert [call.args for call in factory.call_args_list] == [(video,), (moov_location,)]
+    assert all(call.kwargs == {"profile_name": "video-profile"} for call in factory.call_args_list)
+    client.download_object_as_bytes.assert_called_once_with(S3Prefix(moov_location))
 
 
 def test_lookup_serves_the_frame_index_for_an_indexed_video(tmp_path: pathlib.Path) -> None:
@@ -409,7 +468,7 @@ def test_lookup_preserves_edit_list_and_constructs_both_pts_timelines(tmp_path: 
 
 @pytest.mark.parametrize("required", [False, True])
 def test_lookup_handles_unsupported_edits_at_the_caller_boundary(
-    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str], *, required: bool
+    tmp_path: pathlib.Path, capfd: pytest.CaptureFixture[str], loguru_records: list[dict[str, Any]], *, required: bool
 ) -> None:
     """Required inputs propagate the original error; optional inputs log and fall back."""
     video = str(tmp_path / "front.mp4")
@@ -421,4 +480,5 @@ def test_lookup_handles_unsupported_edits_at_the_caller_boundary(
             lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES, required=True)
     else:
         assert lookup.index_for(video, media_size_bytes=INDEXED_SIZE_BYTES) is None
-        assert "unusable; opening the video" in capfd.readouterr().err
+        capfd.readouterr()
+        assert _warned(loguru_records, "unusable; opening the video")

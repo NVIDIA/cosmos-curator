@@ -40,6 +40,11 @@ def pack_box(box_type: str, content: bytes) -> bytes:
     return struct.pack(">I", 8 + len(content)) + box_type.encode("ascii") + content
 
 
+def ftyp_box() -> bytes:
+    """Pack a well-formed ``ftyp``: major brand ``isom``, minor version, and compatible brands, as libav requires."""
+    return pack_box("ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomiso2mp41")
+
+
 def pack_full_box(box_type: str, version: int, content_after_flags: bytes) -> bytes:
     """Pack one ``FullBox`` (version byte + 3 reserved flag bytes prepended to *content_after_flags*)."""
     return pack_box(box_type, bytes([version]) + b"\x00\x00\x00" + content_after_flags)
@@ -367,7 +372,7 @@ def synthetic_moov(
 
 def synthetic_nonfragmented_mp4(moov_box: bytes, *, frame_count: int) -> bytes:
     """Wrap a synthetic moov in a file with payload bytes covering its sample ranges."""
-    prefix = pack_box("ftyp", b"isom") + moov_box
+    prefix = ftyp_box() + moov_box
     # synthetic_moov places one chunk at 5000, with sample sizes 1000, 1001, ... .
     media_end = 5000 + sum(range(1000, 1000 + frame_count))
     return prefix + pack_box("mdat", bytes(media_end - len(prefix) - 8))

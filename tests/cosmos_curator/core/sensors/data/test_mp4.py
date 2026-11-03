@@ -79,6 +79,7 @@ _METADATA_ROW = {
     "track_display_width": 0,
     "track_display_height": 0,
     "elst_bytes": None,
+    "ftyp_bytes": None,
     "avg_frame_rate_num": 30,
     "avg_frame_rate_den": 1,
     "bit_rate_bps": 1000,
@@ -269,7 +270,7 @@ def test_mp4_metadata_from_video_track_matches_the_real_box_fields() -> None:
     moov = bf.synthetic_moov(frame_count=3, keyframe_index=0, ctts_offset=None)
     video_track = parse_video_track(moov)
 
-    metadata = Mp4Metadata.from_video_track(video_track)
+    metadata = Mp4Metadata.from_video_track(video_track, ftyp_bytes=None)
 
     assert metadata.codec_name == "h264"
     assert metadata.time_base_num == 1
@@ -308,7 +309,9 @@ def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_d
     """Duration, rates, and decoder setup come from libav; fields it does not report are None."""
     probe = _video_probe([0, 40, 80, 120], [40, 40, 40, 40])
 
-    metadata = Mp4Metadata.from_video_probe(probe, track_id=3, encoder_tag="Lavc libx264", elst_bytes=b"elst")
+    metadata = Mp4Metadata.from_video_probe(
+        probe, track_id=3, encoder_tag="Lavc libx264", elst_bytes=b"elst", ftyp_bytes=b"ftyp"
+    )
 
     assert metadata.track_id == 3
     assert metadata.duration_ns == 160_000_000
@@ -317,7 +320,7 @@ def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_d
     assert (metadata.time_base_num, metadata.time_base_den) == (1, 1000)
     assert (metadata.frame_count, metadata.keyframe_count) == (4, 1)
     assert (metadata.codec_name, metadata.extradata, metadata.width, metadata.height) == ("h264", b"\x01\x42", 640, 480)
-    assert (metadata.encoder_tag, metadata.elst_bytes) == ("Lavc libx264", b"elst")
+    assert (metadata.encoder_tag, metadata.elst_bytes, metadata.ftyp_bytes) == ("Lavc libx264", b"elst", b"ftyp")
     assert metadata.avc_profile_idc is None
     assert metadata.track_matrix is None
     assert metadata.movie_creation_time is None
@@ -326,7 +329,7 @@ def test_mp4_metadata_from_video_probe_spans_decode_times_plus_the_last_packet_d
 def test_mp4_metadata_from_video_probe_spans_only_decode_times_without_packet_durations() -> None:
     """With no durations reported, the last sample adds nothing to the span."""
     metadata = Mp4Metadata.from_video_probe(
-        _video_probe([0, 40, 80], None), track_id=1, encoder_tag=None, elst_bytes=None
+        _video_probe([0, 40, 80], None), track_id=1, encoder_tag=None, elst_bytes=None, ftyp_bytes=None
     )
 
     assert metadata.duration_ns == 80_000_000
@@ -337,7 +340,7 @@ def test_mp4_metadata_from_video_track_tolerates_a_zero_timescale_with_duration_
     moov = bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None, timescale=0)
     video_track = parse_video_track(moov)
 
-    metadata = Mp4Metadata.from_video_track(video_track)
+    metadata = Mp4Metadata.from_video_track(video_track, ftyp_bytes=None)
 
     assert metadata.duration_ns == 0
     assert metadata.avg_frame_rate_num == 0
@@ -348,7 +351,7 @@ def test_mp4_metadata_from_video_track_maps_non_avc_fourcc_to_hevc() -> None:
     moov = bf.synthetic_moov(frame_count=1, keyframe_index=0, ctts_offset=None, fourcc="hev1")
     video_track = parse_video_track(moov)
 
-    metadata = Mp4Metadata.from_video_track(video_track)
+    metadata = Mp4Metadata.from_video_track(video_track, ftyp_bytes=None)
 
     assert metadata.codec_name == "hevc"
 
@@ -369,7 +372,7 @@ def test_mp4_frame_index_from_video_track_works_for_a_fragment_sourced_table() -
     video_track = parse_fragment_table(moov, moof_rows)
 
     frame_index = Mp4FrameIndex.from_video_track(video_track)
-    metadata = Mp4Metadata.from_video_track(video_track)
+    metadata = Mp4Metadata.from_video_track(video_track, ftyp_bytes=None)
 
     assert frame_index.dts_ticks.tolist() == [0, 1]
     assert frame_index.offset.tolist() == [1032, 1632]

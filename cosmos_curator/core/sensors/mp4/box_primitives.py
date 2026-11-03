@@ -26,6 +26,11 @@ EXTENDED_HEADER_BYTES = 16
 EXTENDED_SIZE_MARKER = 1
 TO_END_MARKER = 0
 
+#: Largest ``ftyp`` read in full. It holds a 4-byte major brand, a 4-byte minor version, and 4 bytes
+#: per compatible brand, so a real one is well under a kilobyte; a larger declared size is refused
+#: rather than allocated.
+MAX_FTYP_BYTES = 64 * 1024
+
 #: Every ``stsd`` video sample entry fourcc this package recognizes, mapped to the codec name a
 #: reader should report for it.
 VIDEO_FOURCC_CODEC_NAMES = {
@@ -57,6 +62,22 @@ class MalformedBoxHeaderError(UnindexableVideoError):
     read after the malformed one and publish a wrong-but-plausible :class:`~.moov_track.VideoTrack`
     with no signal anything was cut short.
     """
+
+
+class BoxTooLargeError(UnindexableVideoError):
+    """A box declares more bytes than this package reads for its type."""
+
+
+def require_ftyp_size(size: int, start: int) -> None:
+    """Raise unless the ``ftyp`` of *size* bytes at offset *start* is small enough to read in full.
+
+    Raises:
+        BoxTooLargeError: *size* exceeds :data:`MAX_FTYP_BYTES`.
+
+    """
+    if size > MAX_FTYP_BYTES:
+        msg = f"ftyp at offset {start} declares {size} bytes, more than the {MAX_FTYP_BYTES}-byte limit"
+        raise BoxTooLargeError(msg)
 
 
 def read_box_header(buf: bytes, offset: int, end: int) -> tuple[str, int, int]:

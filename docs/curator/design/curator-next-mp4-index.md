@@ -52,19 +52,20 @@ falls back to a single full listing.
 One row per video in `manifest.lance`
 ([`VIDEO_MANIFEST_SCHEMA`](../../../cosmos_curator/next/recipes/mp4_index/contracts.py)):
 
-The record schema version is 8. Version 7 lacks the selected MP4 `track_id`; version 6 also
-requires the `mvhd` and `tkhd` metadata fields that PyAV leaves null, and version 5 lacks the
-nullable EOF/SOF/MOE frame fields. Older manifests require rebuilding into a fresh output
-dataset. Moov/moof caches can be reused; old frame records must not assume track 0.
+The record schema version is 9. Version 8 lacks the metadata's `ftyp_bytes`; version 7 also lacks
+the selected MP4 `track_id`; version 6 also requires the `mvhd` and `tkhd` metadata fields that PyAV
+leaves null, and version 5 lacks the nullable EOF/SOF/MOE frame fields. Older manifests require
+rebuilding into a fresh output dataset; readers refuse them. Moov/moof caches can be reused; the
+rebuild reads each source's `ftyp` again, since no sidecar holds it.
 
 | Field | Nullable | Notes |
 | --- | --- | --- |
 | `video_id`, `media_location`, `media_size_bytes` | no | |
 | `source_session_id`, `camera_key` | no | |
 | `source_width`, `source_height`, `source_frame_rate`, `source_frame_count`, `source_duration_ns`, `source_video_codec` | no | Summary fields derived from the same metadata object, named to match `video_cut`. Queries can project these columns without loading frame arrays. |
-| `metadata` | no | Struct containing every `VIDEO_METADATA_SCHEMA` field, including extradata and edit-list bytes. |
+| `metadata` | no | Struct containing every `VIDEO_METADATA_SCHEMA` field, including extradata, edit-list bytes, and the source's `ftyp` box (`ftyp_bytes`, null when the source has no top-level `ftyp` ahead of `moov`). |
 | `frames` | no | Large list of non-null `FRAME_INDEX_SCHEMA` structs, in decode order. Composition offsets may be all null when absent from the source. EOF/SOF/MOE timestamps are nullable int64 nanoseconds. |
-| `moov_location` | no | Raw `moov` bytes, named by `video_id`. |
+| `moov_location` | no | Raw `moov` bytes, named by `video_id`. Decoding consumers read it to set up the decoder without reading the source's boxes. |
 | `moof_table_location` | yes | Raw `moof` bytes, one row per fragment; null for a nonfragmented video. |
 | `container_kind` | no | `"fragmented"`/`"nonfragmented"`, this video's own declared run shape. |
 | `record_schema_version`, `extraction_contract_id` | no | See "Reconciliation" below. |
@@ -73,7 +74,7 @@ dataset. Moov/moof caches can be reused; old frame records must not assume track
 video records as Lance fragments; the driver receives only fragment descriptors, counts, and
 failures, and appends each fragment atomically. Metadata, frame index, summaries, and provenance
 become visible under the same Lance commit. Uncommitted work can be recomputed from the raw-box
-caches without fetching the source again.
+caches, fetching only the source's leading `ftyp`.
 
 Extraction actors construct frame columns directly from NumPy arrays and return typed Arrow
 batches. No Python dictionary per frame or nested IPC schema-metadata blob is created. Publication
@@ -91,8 +92,12 @@ eliminate allocations for subsequent NumPy conversion or derived timestamp calcu
 
 `Mp4IndexLookup` owns manifest opening, source-location normalization, source-size checks, and
 record decoding. Consumers requiring indexed input use `open_required()` and
-`require_index_for()`; missing, ambiguous, stale, or invalid records raise. Optional consumers
-use `open()` and `index_for()` to retain their fallback behavior. Timestamp selection belongs
+`require_index_for()`; missing, ambiguous, stale, or invalid records raise. Consumers that decode
+use `require_indexed_video_for()`, which also reads the record's `moov` sidecar through the same
+storage profile and raises if it cannot. It returns the sensor library's `IndexedVideo`, the record
+`index_video()` builds from a source. Passing that `moov` to `StreamingCameraSensor` sets up the
+decoder without reading the source beyond packet byte ranges; multimodal splitting does so.
+Optional consumers use `open()` and `index_for()` to retain their fallback behavior. Timestamp selection belongs
 to the consumer: multimodal splitting selects EOF/SOF/MOE or explicit `pts_ns`/`edited_pts_ns`
 through `camera_alignment_fields`, while data-integrity checks select DTS for stored indexes.
 
@@ -114,9 +119,11 @@ Failures append to `errors.lance` (`ERROR_SCHEMA`): `video_id`, `media_location`
 PyAV is the reference indexer: the published frames and timestamps are libav's reading of the
 video, with as little reinterpretation as possible.
 [`box_probe.index_from_boxes`](../../../cosmos_curator/core/sensors/mp4/box_probe.py) lays one
-video's extracted boxes out as a file the size of its source: `moov` at offset 0, each `moof` at its
-source offset (a `trun` data offset may be relative to it), a `free` or `mdat` header spanning each
-gap, and zeros in place of media. libav takes each sample's decode time, composition offset, byte
+video's extracted boxes out as a file the size of its source: the source's `ftyp` at offset 0 and
+`moov` right after it (`moov` at offset 0 for a source without `ftyp`), each `moof` at its source
+offset (a `trun` data offset may be relative to it), a `free` or `mdat` header spanning each gap, and
+zeros in place of media. The `ftyp` is read from the source's head, from the range the `moov` fetch
+already holds when it is fresh; libav reads a file without one as QuickTime. libav takes each sample's decode time, composition offset, byte
 range, and duration from the boxes, so a full demux of that file reports the source's packets
 without reading the source. libav also derives a demuxed packet's key flag from its payload, so
 zero-filled media demuxes with no keyframes. Keyframes therefore come from libav's header index,

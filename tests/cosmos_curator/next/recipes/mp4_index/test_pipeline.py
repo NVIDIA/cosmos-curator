@@ -69,7 +69,7 @@ def _write_synthetic_fragmented_mp4(path: pathlib.Path) -> None:
     """Write a real, byte-accurate fragmented file -- fragment_table.py's own parser must accept it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     moov_box = bf.synthetic_fragmented_moov()
-    buf = bf.pack_box("ftyp", b"isom") + moov_box
+    buf = bf.ftyp_box() + moov_box
     for i in range(3):
         buf += bf.pack_moof(bf.real_traf(decode_time=i, data_offset=32, sample_size=100, is_keyframe=i == 0))
         buf += bf.pack_box("mdat", b"video-bytes" * 20)
@@ -489,7 +489,7 @@ def test_run_config_reuses_already_extracted_sidecars_via_the_caching_guard(
     moov_box = bf.synthetic_moov(frame_count=5, keyframe_index=0, ctts_offset=None)
     write_bytes_sidecar(moov_box, str(tmp_path / "output" / "moov" / f"{video_id}.moov"))
     # Corrupt the media file after its sidecars are pre-populated -- a real refetch would fail.
-    prefix = bf.pack_box("ftyp", b"isom")
+    prefix = bf.ftyp_box()
     media_path.write_bytes(prefix + bf.pack_box("mdat", bytes(media_path.stat().st_size - len(prefix) - 8)))
 
     summary = pipeline.run_config(cfg)

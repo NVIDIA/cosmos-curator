@@ -511,7 +511,7 @@ def _index_for(video_bytes: bytes) -> tuple[Mp4FrameIndex, Mp4Metadata]:
         return video_bytes[offset : offset + length]
 
     track = parse_video_track(get_moov_auto(len(video_bytes), _fetch))
-    return Mp4FrameIndex.from_video_track(track), Mp4Metadata.from_video_track(track)
+    return Mp4FrameIndex.from_video_track(track), Mp4Metadata.from_video_track(track, ftyp_bytes=None)
 
 
 class _StubLookup:

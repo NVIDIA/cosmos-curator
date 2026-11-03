@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Find a non-fragmented file's ``moov`` box and return its bytes, box header included."""
+"""Find a file's top-level ``moov`` and ``ftyp`` boxes and return their bytes, box header included."""
 
 import struct
+from collections.abc import Iterator
 
 from loguru import logger  # type: ignore[import-untyped]
 
@@ -25,17 +26,46 @@ from cosmos_curator.core.sensors.mp4.box_primitives import (
     STANDARD_HEADER_BYTES,
     BoxNotFoundError,
     read_box_header,
+    require_ftyp_size,
 )
 from cosmos_curator.core.sensors.mp4.byte_range import FetchRange
 
 #: size (4) + type (4) + optional 64-bit largesize (8) -- enough to read any box header.
 _HEADER_PROBE_BYTES = 16
 
+#: Fetched per top-level box while looking for ``ftyp``: its header plus a typical brand list, in one read.
+_FTYP_PROBE_BYTES = 256
+
 #: Fetched on the first attempt, head or tail alike.
 _DEFAULT_INITIAL_GUESS_BYTES = 8 * 1024 * 1024
 
 #: Multiplier applied to the guess size on the one bounded retry, head or tail alike.
 _DEFAULT_GUESS_RETRY_MULTIPLIER = 4
+
+
+def _walk_top_level(file_size: int, fetch_range: FetchRange, probe_bytes: int) -> Iterator[tuple[str, int, int, bytes]]:
+    """Yield ``(box_type, start, size, probe)`` per top-level box; *probe* is its first *probe_bytes* bytes."""
+    position = 0
+    while position < file_size:
+        probe = fetch_range(position, probe_bytes)
+        if len(probe) < STANDARD_HEADER_BYTES:
+            break
+        size32 = struct.unpack_from(">I", probe, 0)[0]
+        header_bytes_needed = EXTENDED_HEADER_BYTES if size32 == EXTENDED_SIZE_MARKER else STANDARD_HEADER_BYTES
+        if len(probe) < header_bytes_needed:
+            break
+        box_type, box_size, _ = read_box_header(probe, 0, file_size - position)
+        yield box_type, position, box_size, probe
+        if box_size <= 0:
+            break
+        position += box_size
+
+
+def _whole_box(fetch_range: FetchRange, start: int, size: int, probe: bytes) -> bytes:
+    """Return the *size*-byte box at *start*, fetching whatever *probe* lacks."""
+    if size <= len(probe):
+        return probe[:size]
+    return probe + fetch_range(start + len(probe), size - len(probe))
 
 
 def get_moov_full_walk(file_size: int, fetch_range: FetchRange) -> bytes:
@@ -45,25 +75,29 @@ def get_moov_full_walk(file_size: int, fetch_range: FetchRange) -> bytes:
         BoxNotFoundError: no top-level ``moov`` box in the file.
 
     """
-    position = 0
-    while position < file_size:
-        header = fetch_range(position, _HEADER_PROBE_BYTES)
-        if len(header) < STANDARD_HEADER_BYTES:
-            break
-        size32 = struct.unpack_from(">I", header, 0)[0]
-        header_bytes_needed = EXTENDED_HEADER_BYTES if size32 == EXTENDED_SIZE_MARKER else STANDARD_HEADER_BYTES
-        if len(header) < header_bytes_needed:
-            break
-        found_type, box_size, _ = read_box_header(header, 0, file_size - position)
-        if found_type == "moov":
-            if box_size <= len(header):
-                return header[:box_size]
-            return header + fetch_range(position + len(header), box_size - len(header))
-        if box_size <= 0:
-            break
-        position += box_size
-    msg = f"no top-level moov box found (walked to file offset {position} of {file_size})"
+    walked_to = 0
+    for box_type, start, size, probe in _walk_top_level(file_size, fetch_range, _HEADER_PROBE_BYTES):
+        if box_type == "moov":
+            return _whole_box(fetch_range, start, size, probe)
+        walked_to = start + max(size, 0)
+    msg = f"no top-level moov box found (walked to file offset {walked_to} of {file_size})"
     raise BoxNotFoundError(msg)
+
+
+def get_ftyp(file_size: int, fetch_range: FetchRange) -> bytes | None:
+    """Return the first top-level ``ftyp`` box ahead of ``moov``, header included, or ``None`` if there is none.
+
+    Raises:
+        BoxTooLargeError: that ``ftyp`` declares more than ``MAX_FTYP_BYTES``.
+
+    """
+    for box_type, start, size, probe in _walk_top_level(file_size, fetch_range, _FTYP_PROBE_BYTES):
+        if box_type == "ftyp":
+            require_ftyp_size(size, start)
+            return _whole_box(fetch_range, start, size, probe)
+        if box_type == "moov":
+            return None
+    return None
 
 
 def _trailing_bytes_are_well_formed_boxes(tail: bytes, offset: int, tail_start: int, file_size: int) -> bool:

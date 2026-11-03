@@ -30,16 +30,18 @@ that a decoder may discard. This difference cannot be detected from the index al
 from collections.abc import Iterable
 from typing import Literal, Self, overload
 
+import attrs
 import lance  # type: ignore[import-untyped]
 import pyarrow as pa
 from loguru import logger
 
-from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
+from cosmos_curator.core.sensors.data.mp4 import IndexedVideo, Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_lance_storage_options,
     get_storage_client,
     is_remote_path,
+    read_bytes,
 )
 from cosmos_curator.core.utils.storage_cli import get_lance_storage_options as get_cli_lance_storage_options
 from cosmos_curator.next.recipes.mp4_index.contracts import RECORD_SCHEMA_VERSION, read_video_record
@@ -50,12 +52,21 @@ from cosmos_curator.next.utils.uris import normalize_location
 
 #: The columns one lookup projects. ``media_size_bytes`` is compared against the
 #: object's current size before the row is used (see :meth:`Mp4IndexLookup.index_for`).
-_PROJECTION = ("media_location", "media_size_bytes", "metadata", "frames")
+_PROJECTION = ("media_location", "media_size_bytes", "metadata", "frames", "moov_location")
 
 #: Schemes :func:`normalize_location` can spell. An ``az://`` source is never in a
 #: manifest, and normalizing one resolves it as a relative local path, which would
 #: then be looked up as if it were a real key.
 _INDEXABLE_SCHEMES = ("s3://",)
+
+
+@attrs.define(frozen=True)
+class _IndexRecord:
+    """One video's frame index and metadata, with the location of its ``moov`` sidecar."""
+
+    frame_index: Mp4FrameIndex
+    metadata: Mp4Metadata
+    moov_location: str
 
 
 class Mp4IndexLookup:
@@ -119,6 +130,20 @@ class Mp4IndexLookup:
 
     def require_index_for(self, source: str, *, storage_profile: str) -> tuple[Mp4FrameIndex, Mp4Metadata]:
         """Read the source's current size and require a matching indexed record."""
+        record = self._require_index_record_for(source, storage_profile=storage_profile)
+        return record.frame_index, record.metadata
+
+    def require_indexed_video_for(self, source: str, *, storage_profile: str) -> IndexedVideo:
+        """Require a matching indexed record, as :meth:`require_index_for` does, and read its ``moov`` sidecar.
+
+        The sidecar is read with *storage_profile*; a missing or unreadable sidecar raises.
+        """
+        record = self._require_index_record_for(source, storage_profile=storage_profile)
+        client = get_storage_client(record.moov_location, profile_name=storage_profile)
+        return IndexedVideo(record.frame_index, record.metadata, read_bytes(record.moov_location, client))
+
+    def _require_index_record_for(self, source: str, *, storage_profile: str) -> _IndexRecord:
+        """Read the source's current size and require a matching indexed record."""
         location = normalize_location(source)
         if is_remote_path(location):
             client = get_storage_client(location, profile_name=storage_profile)
@@ -128,7 +153,7 @@ class Mp4IndexLookup:
             media_size = client.stat(S3Prefix(location)).size_bytes
         else:
             media_size = local_path(location).stat().st_size
-        return self.index_for(location, media_size_bytes=media_size, required=True)
+        return self._index_record_for(location, media_size_bytes=media_size, required=True)
 
     @overload
     def index_for(
@@ -158,6 +183,21 @@ class Mp4IndexLookup:
             *source* or its size does not match.
 
         """
+        record = self._index_record_for(source, media_size_bytes=media_size_bytes, required=required)
+        return None if record is None else (record.frame_index, record.metadata)
+
+    @overload
+    def _index_record_for(
+        self, source: str, *, media_size_bytes: int | None, required: Literal[True]
+    ) -> _IndexRecord: ...
+
+    @overload
+    def _index_record_for(
+        self, source: str, *, media_size_bytes: int | None, required: bool
+    ) -> _IndexRecord | None: ...
+
+    def _index_record_for(self, source: str, *, media_size_bytes: int | None, required: bool) -> _IndexRecord | None:
+        """Return *source*'s usable indexed record, as :meth:`index_for` describes, with its ``moov_location``."""
         key = _manifest_key(source)
         if key is None:
             if required:
@@ -229,8 +269,10 @@ def _manifest_key(source: str) -> str | None:
         return None
 
 
-def _unwrap(table: pa.Table) -> tuple[Mp4FrameIndex, Mp4Metadata]:
+def _unwrap(table: pa.Table) -> _IndexRecord:
     """Convert one manifest row into the sensor library's ``Mp4FrameIndex`` and ``Mp4Metadata``.
+
+    Also carries the row's ``moov_location``.
 
     The sensor library computes media and edited PTS; unsupported edits raise
     during frame-index construction.
@@ -243,7 +285,7 @@ def _unwrap(table: pa.Table) -> tuple[Mp4FrameIndex, Mp4Metadata]:
         time_base_den=metadata.time_base_den,
         elst_bytes=metadata.elst_bytes,
     )
-    return index, metadata
+    return _IndexRecord(index, metadata, table.column("moov_location")[0].as_py())
 
 
 def _reject_stale_schema(dataset: lance.LanceDataset, manifest_uri: str) -> None:

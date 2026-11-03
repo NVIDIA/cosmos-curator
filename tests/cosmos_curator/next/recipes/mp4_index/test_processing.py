@@ -107,7 +107,7 @@ def _write_synthetic_fragmented_mp4(
         ]
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    buf = bf.pack_box("ftyp", b"isom") + moov_box
+    buf = bf.ftyp_box() + moov_box
     written_rows: list[tuple[int, bytes]] = []
     for _, supplied_moof in rows:
         moof_box = supplied_moof
@@ -546,7 +546,7 @@ def test_ensure_moov_cache_hit_checks_existence_correctly_against_a_non_s3_locat
     fake_client = FakeStorageClient({moov_sidecar_location: b"pre-existing-moov-bytes"})
     monkeypatch.setattr(processing, "read_bytes_sidecar", lambda location, **_kwargs: fake_client.objects[location])
 
-    moov_bytes, served_from_cache = processing._ensure_moov(
+    ftyp_bytes, moov_bytes, served_from_cache = processing._ensure_moov(
         "unused-media-location",
         moov_sidecar_location,
         file_size=0,
@@ -557,6 +557,7 @@ def test_ensure_moov_cache_hit_checks_existence_correctly_against_a_non_s3_locat
     )
 
     assert moov_bytes == b"pre-existing-moov-bytes"
+    assert ftyp_bytes is None
     assert served_from_cache is True
 
 
@@ -1228,7 +1229,7 @@ def test_invalid_extension_columns_propagate(
         def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
             pytest.fail("Unexpected source refetch after an extension contract violation")
 
-        monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+        monkeypatch.setattr(processing.box_locate, "get_moov_auto", unexpected_source_read)
 
     class Extension:
         uuid_handlers = ()
@@ -1306,7 +1307,7 @@ def test_uuid_callback_bugs_propagate_without_cache_recovery(
     def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Unexpected source refetch after a callback bug")
 
-    monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+    monkeypatch.setattr(processing.box_locate, "get_moov_auto", unexpected_source_read)
     with pytest.raises(error_type) as caught:
         processing.process_one_video(row, config=config, extension_factory=Extension)
     assert caught.value is error
@@ -1352,16 +1353,16 @@ def test_extension_setup_refusal_does_not_refetch(
             raise error
 
     source_reads: list[str] = []
-    original_fetch_range = processing._make_fetch_range
+    original_get_moov_auto = processing.box_locate.get_moov_auto
 
-    def fetch_range(uri: str, transport_params: dict[str, Any] | None) -> processing.FetchRange:
-        source_reads.append(uri)
+    def get_moov_auto(file_size: int, fetch_range: processing.FetchRange, *, source_name: str) -> bytes:
+        source_reads.append(source_name)
         if cached or len(source_reads) > 1:
             msg = "source unavailable on unexpected refetch"
             raise FileNotFoundError(msg)
-        return original_fetch_range(uri, transport_params)
+        return original_get_moov_auto(file_size, fetch_range, source_name=source_name)
 
-    monkeypatch.setattr(processing, "_make_fetch_range", fetch_range)
+    monkeypatch.setattr(processing.box_locate, "get_moov_auto", get_moov_auto)
     result = processing.process_one_video(row, config=config, extension_factory=Extension)
 
     assert result["status"] == "failed"
@@ -1404,13 +1405,13 @@ def test_extension_parse_refusal_refetches_cached_boxes(
 
     instances: list[Extension] = []
     source_reads: list[str] = []
-    original_fetch_range = processing._make_fetch_range
+    original_get_moov_auto = processing.box_locate.get_moov_auto
 
-    def fetch_range(uri: str, transport_params: dict[str, Any] | None) -> processing.FetchRange:
-        source_reads.append(uri)
-        return original_fetch_range(uri, transport_params)
+    def get_moov_auto(file_size: int, fetch_range: processing.FetchRange, *, source_name: str) -> bytes:
+        source_reads.append(source_name)
+        return original_get_moov_auto(file_size, fetch_range, source_name=source_name)
 
-    monkeypatch.setattr(processing, "_make_fetch_range", fetch_range)
+    monkeypatch.setattr(processing.box_locate, "get_moov_auto", get_moov_auto)
     result = processing.process_one_video(row, config=config, extension_factory=Extension)
 
     assert result["status"] == "success"
@@ -1447,7 +1448,7 @@ def test_extension_bugs_propagate_without_cache_recovery(
     def unexpected_source_read(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Unexpected source refetch after an extension bug")
 
-    monkeypatch.setattr(processing, "_make_fetch_range", unexpected_source_read)
+    monkeypatch.setattr(processing.box_locate, "get_moov_auto", unexpected_source_read)
     with pytest.raises(error_type) as caught:
         processing.process_one_video(row, config=config, extension_factory=Extension)
     assert caught.value is error
