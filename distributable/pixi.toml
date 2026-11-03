@@ -96,8 +96,6 @@ nvidia-cuda-cccl = "==13.0.*"
 nvidia-cuda-crt = "==13.0.*"
 PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
-torch = "==2.13.0"
-torchvision = "==0.28.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/" }
 paddleocr = "==2.10.*"
 
@@ -110,7 +108,6 @@ cuda-nvrtc-static = "13.0.*"
 cuda-cupti = "13.0.*"
 cuda-cuobjdump = "13.0.*"
 cuda-nvdisasm = "13.0.*"
-triton = "==3.7.1"
 
 [feature.runtime.target.linux-aarch64.pypi-dependencies]
 nvidia-cublas = "*"
@@ -130,15 +127,22 @@ nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
 [feature.vllm.dependencies]
-transformers = ">=5.16.1,<5.20.0"
+transformers = ">=5.16.1,<5.21.0"
 
 [feature.vllm.pypi-dependencies]
-vllm = "==0.32.0"
+torch = "==2.14.0"
+torchvision = "==0.29.0"
+vllm = "==0.33.0"
 
 [feature.vllm-omni.dependencies]
 transformers = ">=5.16.1,<5.20.0"
 
+[feature.vllm-omni.target.linux-aarch64.dependencies]
+triton = "==3.7.1"
+
 [feature.vllm-omni.pypi-dependencies]
+torch = "==2.13.0"
+torchvision = "==0.28.0"
 vllm = "==0.32.0"
 vllm-omni = "==0.32.0"
 

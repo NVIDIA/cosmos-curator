@@ -212,9 +212,10 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert runtime_feature["channels"] == ["conda-forge", "nvidia"]
     assert runtime_feature["platforms"] == ["linux-64-cuda", "linux-aarch64-cuda"]
     assert "system-requirements" not in runtime_feature
-    for dependency_name in ("torch", "torchvision", "cvcuda-cu13", "PyNvVideoCodec"):
+    for dependency_name in ("cvcuda-cu13", "PyNvVideoCodec"):
         assert dependency_name in runtime_pypi_dependencies
-    for dependency_name in ("vllm", "transformers-cosmos3", "vllm-cosmos3"):
+    # Each vLLM feature pins the torch stack its own vLLM release requires.
+    for dependency_name in ("torch", "torchvision", "vllm", "transformers-cosmos3", "vllm-cosmos3"):
         assert dependency_name not in runtime_pypi_dependencies
     for dependency_name in ("av", "opencv-python-headless", "opencv-python", "opencv-contrib-python"):
         assert dependency_name not in runtime_pypi_dependencies
@@ -254,8 +255,8 @@ def test_vllm_and_omni_have_independent_pins() -> None:
         "vllm-omni",
     }
     assert "vllm-omni" not in features["runtime"]["pypi-dependencies"]
-    assert set(features["vllm"]["pypi-dependencies"]) == {"vllm"}
-    assert set(features["vllm-omni"]["pypi-dependencies"]) == {"vllm", "vllm-omni"}
+    assert set(features["vllm"]["pypi-dependencies"]) == {"torch", "torchvision", "vllm"}
+    assert set(features["vllm-omni"]["pypi-dependencies"]) == {"torch", "torchvision", "vllm", "vllm-omni"}
     for feature_name in ("vllm", "vllm-omni"):
         for constraint in features[feature_name]["pypi-dependencies"].values():
             assert constraint.startswith("==")

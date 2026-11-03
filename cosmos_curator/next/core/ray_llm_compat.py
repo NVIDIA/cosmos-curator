@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run Ray 2.59's multimodal preparation stage against vLLM 0.32.
+"""Run Ray 2.59's multimodal preparation stage against vLLM 0.32 and later.
 
 Ray Data LLM's ``PrepareMultimodalStage`` imports ``parse_chat_messages_async``
 from ``vllm.entrypoints.chat_utils`` on every batch. vLLM 0.32 moved that module,

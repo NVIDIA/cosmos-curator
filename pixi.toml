@@ -134,8 +134,8 @@ matplotlib = "*"
 mypy = "==2.1.0"
 openai = "*"
 pandas-stubs = "*"
-torch = "==2.13.0"
-torchvision = "==0.28.0"
+torch = "==2.14.0" # match the default environment's vLLM-pinned torch
+torchvision = "==0.29.0"
 twine = "==6.1.0"
 types-aiofiles = "*"
 types-boto3 = "*"
@@ -174,9 +174,7 @@ cuda-python = "==13.0.*"
 nvidia-cuda-cccl = "==13.0.*"
 nvidia-cuda-crt = "==13.0.*"
 PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
-timm = "*" # conda-forge package pulls in torchvision, which is behind
-torch = "==2.13.0"
-torchvision = "==0.28.0"
+timm = "*" # conda-forge package pulls in torchvision, which is behind; torch is pinned by vllm/vllm-omni
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
@@ -190,7 +188,6 @@ cuda-nvrtc-static = "13.0.*"
 cuda-cupti = "13.0.*"
 cuda-cuobjdump = "13.0.*"
 cuda-nvdisasm = "13.0.*"
-triton = "==3.7.1"
 
 [feature.runtime.target.linux-aarch64.pypi-dependencies]
 # Add available NVIDIA CUDA runtime wheels for aarch64 to match linux-64 installs.
@@ -212,14 +209,17 @@ nvidia-nvjitlink = "*"
 nvidia-nvshmem-cu13 = "*"
 nvidia-nvtx = "*"
 
-# Regular inference can upgrade vLLM independently of the Omni-compatible pair.
+# Regular inference can upgrade vLLM independently of the Omni-compatible pair, so each
+# feature pins the torch stack its vLLM release requires instead of the shared runtime feature.
 [feature.vllm.dependencies]
-transformers = ">=5.16.1,<5.20.0" # keep the conda solve within vLLM's supported range
+transformers = ">=5.16.1,<5.21.0" # keep the conda solve within vLLM's supported range
 
 # Ray 2.59.0's ray.data.llm multimodal stage imports vLLM's chat utilities from their
 # pre-0.32 path; cosmos_curator/next/core/ray_llm_compat.py bridges it until Ray catches up.
 [feature.vllm.pypi-dependencies]
-vllm = "==0.32.0" # not available on conda-forge
+torch = "==2.14.0" # vLLM 0.33.0 requires torch==2.14.0
+torchvision = "==0.29.0"
+vllm = "==0.33.0" # not available on conda-forge
 
 # Cosmos3 Generator Transfer runs in-process through vLLM-Omni's offline `Omni`
 # API. Keep it out of the shared runtime feature: its large, transfer-specific
@@ -228,7 +228,14 @@ vllm = "==0.32.0" # not available on conda-forge
 [feature.vllm-omni.dependencies]
 transformers = ">=5.16.1,<5.20.0" # keep the conda solve within Omni's supported range
 
+[feature.vllm-omni.target.linux-aarch64.dependencies]
+# conda-forge has no CUDA 13.0 build of triton 3.8, so torch 2.14 in the vllm feature takes
+# triton from PyPI; keep this pair's conda triton until Omni moves to torch 2.14.
+triton = "==3.7.1" # torch 2.13 requires triton==3.7.1
+
 [feature.vllm-omni.pypi-dependencies]
+torch = "==2.13.0" # vLLM 0.32.0 requires torch==2.13.0
+torchvision = "==0.28.0"
 vllm = "==0.32.0" # keep paired with the Omni release
 vllm-omni = "==0.32.0" # not available on conda-forge
 
@@ -265,7 +272,7 @@ transformers = ">=5.11.0,<6.0.0" # native Cosmos3 support requires recent Transf
 [feature.transformers.pypi-dependencies]
 # sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
 cuda-bindings = "==13.0.*"
-sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch==2.13.0
+sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch
 
 # SeedVR2 super-resolution dependencies.
 # SeedVR's own requirements.txt pins old versions (e.g. diffusers==0.29.1,
