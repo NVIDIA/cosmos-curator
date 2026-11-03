@@ -126,12 +126,35 @@ def test_ego_variants_require_exact_source_config(variant: str, tmp_path: Path) 
     }
     assert resolve_config_data(unresolved_config).context.ego is not None  # type: ignore[union-attr]
 
-    for forbidden in ("schema_name", "protobuf_mapping", "cadence_period_ns", "max_delta_ns"):
+    for forbidden in ("schema_name", "protobuf_mapping", "cadence_period_ns", "max_delta_ns", "pose_convention"):
         invalid = dict(unresolved_config)
         invalid["context"] = dict(unresolved_config["context"])  # type: ignore[arg-type]
         invalid["context"]["ego"] = dict(unresolved_config["context"]["ego"], **{forbidden: "override"})  # type: ignore[index]
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             resolve_config_data(invalid)
+
+
+@pytest.mark.parametrize("convention", [None, "unknown", "rfu_body_local_enu_v1"])
+def test_combined_context_requires_supported_pose_convention(convention: str | None, tmp_path: Path) -> None:
+    """Only the combined context requires an explicit qualified source convention."""
+    unresolved = _unresolved_config(str(tmp_path / "episodes.lance"))
+    ego = {"sensor_key": "ego", "topic": "/ego", "frame": "world"}
+    if convention is not None:
+        ego["pose_convention"] = convention
+    unresolved["context"] = {
+        "variant": "ego_trajectory_absolute_poses_with_relative_motion",
+        "camera_key": "front_wide",
+        "ego": ego,
+    }
+    if convention != "rfu_body_local_enu_v1":
+        with pytest.raises(ValidationError, match="pose_convention"):
+            resolve_config_data(unresolved)
+    else:
+        resolved = resolve_config_data(unresolved)
+        assert resolve_config_data(json.loads(resolved_config_to_json(resolved))) == resolved
+        schema = json.loads(config_schema_json())["$defs"]["RelativeEgoContextConfig"]
+        assert "pose_convention" in schema["required"]
+        assert schema["additionalProperties"] is False
 
 
 @pytest.mark.parametrize(

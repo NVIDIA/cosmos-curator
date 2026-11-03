@@ -4,12 +4,15 @@
 """Tests for compositional multimodal caption contracts."""
 
 from copy import deepcopy
+from dataclasses import replace
+from hashlib import sha256
 from typing import Any, get_args
 
 import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.recipes.multimodal_caption import contracts
 from cosmos_curator.next.recipes.multimodal_caption.config import ContextVariant, ModelVariant
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     ABSOLUTE_POSES_SERIALIZATION,
@@ -18,6 +21,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     EGO_CONTEXT_CADENCE_PERIOD_NS,
     EGO_CONTEXT_MAX_NEAREST_POSE_DELTA_NS,
     EGO_PROMPT_SENTINEL,
+    EGO_PROMPT_TEMPLATE,
     EGO_REQUIRED_TIMESTAMP_SOURCE,
     FIELD_SET_METADATA,
     SUMMARY_SERIALIZATION,
@@ -38,6 +42,7 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     staged_result_schema,
     validate_terminal_row,
 )
+from cosmos_curator.next.recipes.multimodal_caption.ego_context import POSE_CONVENTION
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     resolve_model_spec,
@@ -50,7 +55,12 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
 from cosmos_curator.next.recipes.video_caption.inference import caption_llm_preprocess
 
 _MODELS = ("qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super")
-_CONTEXTS = ("video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses")
+_CONTEXTS = (
+    "video_only",
+    "ego_trajectory_summary",
+    "ego_trajectory_absolute_poses",
+    "ego_trajectory_absolute_poses_with_relative_motion",
+)
 
 
 def _resolved_context(variant: str) -> tuple[CaptionContextDefinition, EgoContextIdentity | None, str]:
@@ -60,6 +70,7 @@ def _resolved_context(variant: str) -> tuple[CaptionContextDefinition, EgoContex
         sensor_key=None if variant == "video_only" else "ego",
         topic=None if variant == "video_only" else "/ego",
         frame=None if variant == "video_only" else "world",
+        pose_convention=POSE_CONVENTION if variant == "ego_trajectory_absolute_poses_with_relative_motion" else None,
     )
     return definition, ego, resolve_prompt_template(definition, mode="default", custom_template=None)
 
@@ -148,7 +159,15 @@ def test_context_capability_and_ego_source_invariants_are_exact() -> None:
         definition = resolve_context_definition(variant)
         assert definition.input_profile is CaptionInputProfile.EGO_TRAJECTORY
         with pytest.raises(ValueError, match="requires non-empty"):
-            resolve_ego_identity(definition, sensor_key=None, topic=None, frame=None)
+            resolve_ego_identity(
+                definition,
+                sensor_key=None,
+                topic=None,
+                frame=None,
+                pose_convention=POSE_CONVENTION
+                if variant == "ego_trajectory_absolute_poses_with_relative_motion"
+                else None,
+            )
 
     with pytest.raises(ValueError, match="configured together"):
         CaptionContextDefinition(
@@ -168,6 +187,15 @@ def test_context_defaults_and_custom_prompt_sentinel_rules_are_exact() -> None:
     assert resolve_prompt_template(video, mode="default", custom_template=None) == DEFAULT_PROMPT
     assert summary.default_prompt_template == absolute.default_prompt_template
     assert summary.default_prompt_template.count(EGO_PROMPT_SENTINEL) == 1
+    assert summary.default_prompt_template == EGO_PROMPT_TEMPLATE
+    assert (
+        sha256(EGO_PROMPT_TEMPLATE.encode()).hexdigest()
+        == "4a5b99b1e559a340e5ec42556a351da975dba7110836d9fbe0184a7fe2ead6b1"
+    )
+    assert (
+        sha256(DEFAULT_PROMPT.encode()).hexdigest()
+        == "f2dbb18c29633caf4770541d7eb244af7c0ccfa061fbca6247107cc4391cc33c"
+    )
 
     custom_video = "literal {unrelated} braces\n"
     assert resolve_prompt_template(video, mode="custom", custom_template=custom_video) == custom_video
@@ -179,6 +207,52 @@ def test_context_defaults_and_custom_prompt_sentinel_rules_are_exact() -> None:
         resolve_prompt_template(summary, mode="custom", custom_template="missing")
     with pytest.raises(ValueError, match="exactly 1"):
         resolve_prompt_template(summary, mode="custom", custom_template=EGO_PROMPT_SENTINEL * 2)
+
+
+def test_relative_policy_and_source_declaration_are_contract_identity() -> None:
+    """Derivation precision and source convention are identity without extending metadata."""
+    model, definition, ego, prompt, digest = _identity("ego_trajectory_absolute_poses_with_relative_motion")
+    assert ego is not None
+    contract = normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
+    assert contract["ego_context"]["pose_convention"] == POSE_CONVENTION
+    assert contract["ego_context"]["relative_motion_policy"] == {
+        "displacement_decimal_places": 3,
+        "heading_decimal_places": 1,
+        "min_horizontal_forward_norm": 1e-8,
+    }
+    assert digest != caption_contract_digest(
+        model, "front_wide", definition, replace(ego, pose_convention="different"), prompt, "default"
+    )
+    with pytest.raises(ValueError, match="requires pose_convention"):
+        resolve_ego_identity(definition, sensor_key="ego", topic="/ego", frame="world")
+    absolute = resolve_context_definition("ego_trajectory_absolute_poses")
+    with pytest.raises(ValueError, match="forbids pose_convention"):
+        resolve_ego_identity(absolute, sensor_key="ego", topic="/ego", frame="world", pose_convention=POSE_CONVENTION)
+    absolute_ego = resolve_ego_identity(absolute, sensor_key="ego", topic="/ego", frame="world")
+    combined_metadata = logical_result_fields(definition.variant, "default", model.key, ego=ego).field(1).type
+    absolute_metadata = logical_result_fields(absolute.variant, "default", model.key, ego=absolute_ego).field(1).type
+    assert combined_metadata == absolute_metadata
+    assert prompt.count(EGO_PROMPT_SENTINEL) == 1
+    assert result_field_names(definition.variant, "default", model.key) == (
+        "caption_ego_trajectory_absolute_poses_with_relative_motion_default_qwen3_8_27b_fp8_v1",
+        "caption_ego_trajectory_absolute_poses_with_relative_motion_default_qwen3_8_27b_fp8_v1_metadata",
+    )
+    assert sha256(prompt.encode()).hexdigest() == "8b949ac9be78b2660a6c41d7c528530827c25bce40a3f4e213f71b48dbe39fda"
+    custom = "literal {other}: {ego_trajectory_context}"
+    assert resolve_prompt_template(definition, mode="custom", custom_template=custom) == custom
+
+
+def test_fixed_relative_motion_precision_changes_contract_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The contract reads fixed precision without exposing a runtime policy override."""
+    model, definition, ego, prompt, digest = _identity("ego_trajectory_absolute_poses_with_relative_motion")
+    monkeypatch.setattr(
+        contracts,
+        "RELATIVE_MOTION_POLICY",
+        replace(contracts.RELATIVE_MOTION_POLICY, displacement_decimal_places=2),
+    )
+    contract = normalized_caption_contract(model, "front_wide", definition, ego, prompt, "default")
+    assert contract["ego_context"]["relative_motion_policy"]["displacement_decimal_places"] == 2
+    assert digest != caption_contract_digest(model, "front_wide", definition, ego, prompt, "default")
 
 
 def test_field_formula_and_digest_tagged_registration_are_exact() -> None:

@@ -5,7 +5,7 @@
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final, cast
@@ -16,8 +16,11 @@ from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.models.registry import RegisteredModel, resolve_registered_model
 from cosmos_curator.next.recipes.multimodal_caption.config import ContextVariant, ModelVariant
 from cosmos_curator.next.recipes.multimodal_caption.ego_context import (
+    POSE_CONVENTION,
+    RELATIVE_MOTION_POLICY,
     EgoContextBuilder,
     build_ego_trajectory_absolute_poses,
+    build_ego_trajectory_absolute_poses_with_relative_motion,
     build_ego_trajectory_summary,
 )
 from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION
@@ -47,6 +50,29 @@ EGO_PROMPT_TEMPLATE: Final = (
     "describe them in detail."
     "\n\nEgo trajectory context for this episode (duration is the full episode span; motion covers only the recorded "
     f"in-span poses):\n{EGO_PROMPT_SENTINEL}"
+)
+ABSOLUTE_POSES_WITH_RELATIVE_MOTION_PROMPT_TEMPLATE: Final = (
+    "The video depicts the view from a camera mounted on a car as it is driving. Pay special attention to the motion "
+    "of the cars, including the primary car whose point-of-view we observe in the video. Also note important factors "
+    "that would relate to driving safety like the relative positions of pedestrians, lane markers, road signs, traffic "
+    "signals, and any aggressive driving behavior of other vehicles. Also pay attention to interesting landmarks and "
+    "describe them in detail."
+    "\n\nEgo trajectory context for this episode. Duration covers the full episode. Summary motion metrics use only "
+    "poses recorded within it.\n"
+    "Absolute position_m and orientation_xyzw are the reported source pose. Relative motion is measured from the "
+    "origin: the pose of the first sample, which may be recorded just before the episode starts. All four origin "
+    "values are zero. forward_m and left_m are metres along fixed horizontal axes set by the origin's "
+    "attitude-derived forward heading; up_m is metres along local ENU up, without pitch or roll rotation. "
+    "These values describe displacement of the reported sensor output point, not a camera, axle, or vehicle centre, "
+    "and are not distance travelled. left_m is approximate and can be sensitive to small heading errors. "
+    "A negative forward_m means the point is behind the origin along the initial forward axis. "
+    "Reversing or position noise can cause this, so the sign alone does not establish that the vehicle reversed "
+    "or indicate its current direction of motion. heading_change_deg is the offset in reported body heading from "
+    "the origin, positive to the left, wrapped to [-180, 180) degrees; it is not accumulated turning and remains "
+    "defined when stationary if the horizontal heading projection is valid. Reported body heading approximates "
+    "vehicle heading and is not camera direction. The summary net_displacement_m uses the first and last recorded "
+    "poses within the episode. Its value may differ from the magnitude of the final relative displacement because "
+    f"their start and end poses can differ.\n{EGO_PROMPT_SENTINEL}"
 )
 EGO_SCHEMA_NAME: Final = "foxglove.PoseInFrame"
 EGO_DECODER_MAPPING_DIGEST: Final = "2d1b47c77fe8781997601044974049727d5882999461a3fa6b183cc3cc554cbc"
@@ -82,6 +108,15 @@ ABSOLUTE_POSES_SERIALIZATION: Final = {
             "requested_align_timestamp_ns",
         ],
     },
+}
+ABSOLUTE_POSES_WITH_RELATIVE_MOTION_SERIALIZATION: Final[dict[str, Any]] = deepcopy(ABSOLUTE_POSES_SERIALIZATION)
+ABSOLUTE_POSES_WITH_RELATIVE_MOTION_SERIALIZATION["samples"]["fields"].append("relative_motion")
+ABSOLUTE_POSES_WITH_RELATIVE_MOTION_SERIALIZATION["relative_motion"] = {
+    "fields": ["forward_m", "left_m", "up_m", "heading_change_deg"],
+    "origin": "first_qualification_request_selected_pose_including_predecessor",
+    "displacement": "reported_output_point_in_fixed_initial_horizontal_forward_left_and_ENU_up_axes",
+    "heading": "horizontal_body_forward_heading_offset_from_origin_left_positive_degrees",
+    "heading_wrap": "[-180,180)_after_rounding_not_accumulated",
 }
 
 
@@ -120,6 +155,7 @@ class EgoContextIdentity:
     representation_version: int = EGO_CONTEXT_REPRESENTATION_VERSION
     cadence_period_ns: int = EGO_CONTEXT_CADENCE_PERIOD_NS
     max_delta_ns: int = EGO_CONTEXT_MAX_NEAREST_POSE_DELTA_NS
+    pose_convention: str | None = None
 
 
 CONTEXT_DEFINITIONS: Final[Mapping[ContextVariant, CaptionContextDefinition]] = MappingProxyType(
@@ -144,6 +180,13 @@ CONTEXT_DEFINITIONS: Final[Mapping[ContextVariant, CaptionContextDefinition]] = 
             ego_builder=build_ego_trajectory_absolute_poses,
             ego_serialization_contract=ABSOLUTE_POSES_SERIALIZATION,
             default_prompt_template=EGO_PROMPT_TEMPLATE,
+        ),
+        "ego_trajectory_absolute_poses_with_relative_motion": CaptionContextDefinition(
+            variant="ego_trajectory_absolute_poses_with_relative_motion",
+            input_profile=CaptionInputProfile.EGO_TRAJECTORY,
+            ego_builder=build_ego_trajectory_absolute_poses_with_relative_motion,
+            ego_serialization_contract=ABSOLUTE_POSES_WITH_RELATIVE_MOTION_SERIALIZATION,
+            default_prompt_template=ABSOLUTE_POSES_WITH_RELATIVE_MOTION_PROMPT_TEMPLATE,
         ),
     }
 )
@@ -235,7 +278,7 @@ def caption_inference_bindings(model_key: str) -> CaptionInferenceBindings:
 
 
 def resolve_context_definition(variant: str) -> CaptionContextDefinition:
-    """Resolve one of the recipe's exact three context definitions."""
+    """Resolve one of the recipe's explicit context definitions."""
     definition = CONTEXT_DEFINITIONS.get(cast("ContextVariant", variant))
     if definition is None:
         msg = f"Unsupported caption context variant: {variant!r}. Supported: {sorted(CONTEXT_DEFINITIONS)}"
@@ -249,9 +292,17 @@ def resolve_ego_identity(
     sensor_key: str | None,
     topic: str | None,
     frame: str | None,
+    pose_convention: str | None = None,
 ) -> EgoContextIdentity | None:
     """Resolve configured Ego identity exactly for Ego-capable contexts."""
     values = (sensor_key, topic, frame)
+    if definition.variant == "ego_trajectory_absolute_poses_with_relative_motion":
+        if pose_convention != POSE_CONVENTION:
+            msg = f"{definition.variant} requires pose_convention={POSE_CONVENTION}"
+            raise ValueError(msg)
+    elif pose_convention is not None:
+        msg = f"{definition.variant} forbids pose_convention"
+        raise ValueError(msg)
     if definition.input_profile is CaptionInputProfile.CAMERA:
         if any(value is not None for value in values):
             msg = f"{definition.variant} forbids Ego source values"
@@ -260,7 +311,9 @@ def resolve_ego_identity(
     if any(not isinstance(value, str) or not value for value in values):
         msg = f"{definition.variant} requires non-empty sensor key, topic, and frame"
         raise ValueError(msg)
-    return EgoContextIdentity(sensor_key=str(sensor_key), topic=str(topic), frame=str(frame))
+    return EgoContextIdentity(
+        sensor_key=str(sensor_key), topic=str(topic), frame=str(frame), pose_convention=pose_convention
+    )
 
 
 def resolve_prompt_template(
@@ -553,6 +606,9 @@ def normalized_caption_contract(  # noqa: PLR0913 -- each value is independent c
             },
             "serialization": deepcopy(serialization),
         }
+        if definition.variant == "ego_trajectory_absolute_poses_with_relative_motion":
+            contract["ego_context"]["pose_convention"] = ego.pose_convention
+            contract["ego_context"]["relative_motion_policy"] = asdict(RELATIVE_MOTION_POLICY)
     return contract
 
 

@@ -28,6 +28,7 @@ from cosmos_curator.next.recipes.video_caption import inference
 from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
 from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
+from tests.cosmos_curator.next.recipes.multimodal_caption.test_ego_context import _mcap
 
 
 class _FakeEpisodeProcessor:
@@ -52,6 +53,93 @@ def _fake_inference(row: dict[str, Any]) -> dict[str, object]:
         "generated_token_count": 8,
         "__inference_error__": "",
     }
+
+
+class _FakeEgoProcessor:
+    """Preserve source and context identity while standing in for GPU generation."""
+
+    def __call__(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
+        return dataset.map(_fake_ego_inference)
+
+
+def _fake_ego_inference(row: dict[str, Any]) -> dict[str, object]:
+    assert row["context_digest"]
+    assert row["rendered_prompt"]
+    return {**row, **_fake_inference(row)}
+
+
+@pytest.mark.integration
+def test_combined_and_absolute_publication_and_completed_reuse(
+    tmp_path: Path,
+    camera_factory: Callable[..., dict[str, object]],
+    sensor_factory: Callable[..., dict[str, object]],
+    episode_factory: Callable[..., dict[str, object]],
+    curator_io_cluster: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actual context construction publishes independent fields and reuses each completed result."""
+    del curator_io_cluster
+    camera_path = tmp_path / "camera.mp4"
+    camera_path.write_bytes(b"synthetic video bytes; inference is mocked")
+    ego_bytes = _mcap(tmp_path, [(0, 0, 0.0), (500_000_000, 1, 2.0)])
+    ego_path = tmp_path / "ego.mcap"
+    ego_path.write_bytes(ego_bytes)
+    row = episode_factory(
+        0,
+        camera_media=[
+            camera_factory(
+                "front_wide",
+                "1",
+                location=str(camera_path),
+                size=camera_path.stat().st_size,
+                media_sha256=sha256(camera_path.read_bytes()).hexdigest(),
+            )
+        ],
+        sensor_media=[
+            sensor_factory(location=str(ego_path), size=len(ego_bytes), media_sha256=sha256(ego_bytes).hexdigest())
+        ],
+    )
+    uri = str(tmp_path / "episodes.lance")
+    lance.write_dataset(pa.Table.from_pylist([row], schema=EPISODE_SCHEMA), uri, data_storage_version="2.2")
+    monkeypatch.setattr(pipeline, "validate_model_directory", lambda path, **_kwargs: path)
+    monkeypatch.setattr(inference, "_build_llm_processor", lambda *_args, **_kwargs: _FakeEgoProcessor())
+    configs = []
+    names = []
+    digests = []
+    for variant in ("ego_trajectory_absolute_poses", "ego_trajectory_absolute_poses_with_relative_motion"):
+        ego = {"sensor_key": "ego", "topic": "/ego", "frame": "world"}
+        if variant == "ego_trajectory_absolute_poses_with_relative_motion":
+            ego["pose_convention"] = "rfu_body_local_enu_v1"
+        config = resolve_config_data(
+            {
+                "schema_version": 1,
+                "kind": "multimodal-caption",
+                "input": {"episodes_lance_uri": uri},
+                "context": {"variant": variant, "camera_key": "front_wide", "ego": ego},
+                "inference": {"prompt": {"mode": "default"}},
+                "execution": {"media_batch_size": 1, "inference_batch_size": 1},
+            }
+        )
+        summary = pipeline.run_config(config)
+        assert summary["published_fragments"] == 1
+        assert summary["terminal_counts"] == {"success": 1, "truncated": 0, "error": 0}
+        names.append((summary["caption_field"], summary["metadata_field"]))
+        digests.append(summary["caption_contract_digest"])
+        configs.append(config)
+    assert names[0] != names[1]
+    assert digests[0] != digests[1]
+    before = lance.dataset(uri)
+    expected = before.to_table().to_pylist()
+    for _caption, metadata in names:
+        assert expected[0][metadata]["context_digest"]
+    assert expected[0][names[0][1]]["context_digest"] != expected[0][names[1][1]]["context_digest"]
+    monkeypatch.setattr(pipeline, "run_inference_phase", lambda *_args, **_kwargs: pytest.fail("must reuse"))
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda *_args, **_kwargs: pytest.fail("must reuse"))
+    for config in configs:
+        assert pipeline.run_config(config)["published_fragments"] == 0
+    after = lance.dataset(uri)
+    assert after.version == before.version
+    assert after.to_table().to_pylist() == expected
 
 
 @pytest.mark.integration

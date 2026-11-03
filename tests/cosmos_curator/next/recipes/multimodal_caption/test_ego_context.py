@@ -4,6 +4,7 @@
 """Focused synthetic contract tests for deterministic Ego caption context."""
 
 import json
+import math
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -35,6 +36,7 @@ from cosmos_curator.next.recipes.multimodal_caption.ego_context import (
     EgoContextBuilder,
     EgoTrajectoryContextPolicy,
     build_ego_trajectory_absolute_poses,
+    build_ego_trajectory_absolute_poses_with_relative_motion,
     build_ego_trajectory_summary,
 )
 from cosmos_curator.next.recipes.multimodal_caption.ego_context_adapter import append_ego_context_batch
@@ -117,6 +119,142 @@ def _mcap(tmp_path: Path, samples: list[tuple[int, int, float]]) -> bytes:
         library="synthetic multimodal caption test",
     )
     return path.read_bytes()
+
+
+def _motion_mcap(
+    tmp_path: Path, positions: list[tuple[float, float, float]], quaternions: list[tuple[float, float, float, float]]
+) -> bytes:
+    messages = []
+    for index, (position, orientation) in enumerate(zip(positions, quaternions, strict=True)):
+        message = PoseInFrame(frame_id="ignored")
+        message.timestamp.nanos = index
+        message.pose.position.x, message.pose.position.y, message.pose.position.z = position
+        (
+            message.pose.orientation.x,
+            message.pose.orientation.y,
+            message.pose.orientation.z,
+            message.pose.orientation.w,
+        ) = orientation
+        messages.append(McapSample(log_time_ns=90 + index * 50, data=message.SerializeToString()))
+    path = tmp_path / "motion.mcap"
+    write_protobuf_mcap(
+        path, messages, topic=_TOPIC, schema_name=_SCHEMA_NAME, schema_data=_descriptor_set(), library="synthetic"
+    )
+    return path.read_bytes()
+
+
+def _motion_context(payload: bytes, count: int, *, combined: bool = True) -> tuple[bytes, str]:
+    builder = (
+        build_ego_trajectory_absolute_poses_with_relative_motion if combined else build_ego_trajectory_absolute_poses
+    )
+    return builder(
+        payload,
+        episode_start_ns=100,
+        exclusive_end_ns=100 + count * 50,
+        topic=_TOPIC,
+        schema_name=_SCHEMA_NAME,
+        protobuf_mapping=_MAPPING,
+        frame=_FRAME,
+        policy=EgoTrajectoryContextPolicy(representation_version=1, cadence_period_ns=50, max_delta_ns=20),
+    )
+
+
+def test_combined_halo_origin_preserves_absolute_payload_and_native_summary(tmp_path: Path) -> None:
+    """Removing only the additive blocks reproduces the complete incumbent bytes."""
+    payload = _mcap(tmp_path, [(90, 900, 9.0), (140, 1_400, 14.0), (190, 1_900, 20.0)])
+    context_bytes, digest = _motion_context(payload, 3)
+    context = json.loads(context_bytes)
+    motions = [sample.pop("relative_motion") for sample in context["samples"]]
+    assert motions == [
+        {"forward_m": 0.0, "left_m": 0.0, "up_m": 0.0, "heading_change_deg": 0.0},
+        {"forward_m": 0.0, "left_m": -5.0, "up_m": 0.0, "heading_change_deg": 0.0},
+        {"forward_m": 0.0, "left_m": -11.0, "up_m": 0.0, "heading_change_deg": 0.0},
+    ]
+    assert context["summary"] == {
+        "duration_ns": 150,
+        "recorded_pose_count": 2,
+        "path_length_m": 6.0,
+        "net_displacement_m": 6.0,
+    }
+    absolute_bytes, _ = _motion_context(payload, 3, combined=False)
+    stripped_bytes = json.dumps(context, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert stripped_bytes == absolute_bytes
+    assert digest == sha256(context_bytes).hexdigest()
+    assert b"-0.0" not in context_bytes
+
+
+def test_motion_uses_initial_horizontal_axes_and_wrapped_attitude_heading(tmp_path: Path) -> None:
+    """Turn offsets return toward zero; displacement can be negative; quaternion signs are immaterial."""
+    angles = [90.0, 120.0, 90.0, 270.0, 269.99]
+    quaternions = [(0.0, 0.0, math.sin(math.radians(a) / 2), math.cos(math.radians(a) / 2)) for a in angles]
+    quaternions[2] = tuple(-v for v in quaternions[2])
+    positions = [(10.0, 20.0, 30.0), (8.0, 19.0, 31.23456), (10.0, 20.0, 30.0), (11.0, 20.0, 30.0), (11.0, 20.0, 30.0)]
+    payload = _motion_mcap(tmp_path, positions, quaternions)
+    context_bytes, _ = _motion_context(payload, len(positions))
+    context = json.loads(context_bytes)
+    motions = [sample["relative_motion"] for sample in context["samples"]]
+    assert motions[1] == {"forward_m": 2.0, "left_m": 1.0, "up_m": 1.235, "heading_change_deg": 30.0}
+    assert motions[2] == motions[0]
+    assert motions[3] == {"forward_m": -1.0, "left_m": 0.0, "up_m": 0.0, "heading_change_deg": -180.0}
+    assert motions[4]["heading_change_deg"] == -180.0
+    assert context["samples"][2]["orientation_xyzw"] == list(quaternions[2])
+
+
+def test_tilt_and_standstill_heading_do_not_rotate_enu_up(tmp_path: Path) -> None:
+    """Pitch changes horizontal normalization, while heading at a fixed position comes from attitude."""
+    half_pitch = math.radians(60.0) / 2
+    payload = _motion_mcap(
+        tmp_path,
+        [(0.0, 0.0, 0.0), (1.0, 2.0, 3.0), (1.0, 2.0, 3.0)],
+        [
+            (math.sin(half_pitch), 0.0, 0.0, math.cos(half_pitch)),
+            (0.0, 0.0, 0.0, 1.0),
+            (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)),
+        ],
+    )
+    context_bytes, _ = _motion_context(payload, 3)
+    samples = json.loads(context_bytes)["samples"]
+    assert samples[1]["relative_motion"] == {"forward_m": 2.0, "left_m": -1.0, "up_m": 3.0, "heading_change_deg": 0.0}
+    assert samples[2]["relative_motion"] == {"forward_m": 2.0, "left_m": -1.0, "up_m": 3.0, "heading_change_deg": 90.0}
+
+
+@pytest.mark.parametrize(
+    ("bad_orientation", "expected_message"),
+    [
+        pytest.param(
+            (math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)),
+            "Relative motion requires a defined horizontal body-forward heading",
+            id="vertical",
+        ),
+        pytest.param((0.0, 0.0, 0.0, 0.0), "Failed to decode Ego trajectory (ValueError)", id="zero"),
+        pytest.param((math.nan, 0.0, 0.0, 1.0), "Failed to decode Ego trajectory (ValueError)", id="nan"),
+    ],
+)
+def test_combined_invalid_heading_is_safe_adapter_item_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_orientation: tuple[float, float, float, float],
+    expected_message: str,
+) -> None:
+    """Undefined projection or invalid source orientation fails only its episode, without source values."""
+    payload = _motion_mcap(tmp_path, [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)], [(0.0, 0.0, 0.0, 1.0), bad_orientation])
+    monkeypatch.setattr(ego_context_adapter, "read_and_validate_media", lambda *_args, **_kwargs: payload)
+    result = append_ego_context_batch(
+        _adapter_batch(start_ns=100, exclusive_end_ns=200),
+        storage_profile="default",
+        attempts=1,
+        schema_name=_SCHEMA_NAME,
+        protobuf_mapping=_MAPPING,
+        topic=_TOPIC,
+        frame=_FRAME,
+        policy=EgoTrajectoryContextPolicy(representation_version=1, cadence_period_ns=50, max_delta_ns=20),
+        prompt_template="{ego_trajectory_context}",
+        build_context=build_ego_trajectory_absolute_poses_with_relative_motion,
+    ).to_pylist()[0]
+    assert result["download_error_type"] == "ValueError"
+    assert result["download_error_message"] == expected_message
+    assert result["context_digest"] is None
+    assert result["rendered_prompt"] is None
 
 
 def test_context_bytes_pin_summary_grid_halo_and_digest(tmp_path: Path) -> None:

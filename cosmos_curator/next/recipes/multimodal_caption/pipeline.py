@@ -139,6 +139,7 @@ def _resolve_selected_context(
         sensor_key=None if ego_config is None else ego_config.sensor_key,
         topic=None if ego_config is None else ego_config.topic,
         frame=None if ego_config is None else ego_config.frame,
+        pose_convention=getattr(ego_config, "pose_convention", None),
     )
     prompt = config.inference.prompt
     prompt_template = resolve_prompt_template(

@@ -17,7 +17,7 @@ Each invocation selects a model, context, prompt, and result identity. Model and
 | Axis | Supported values | Owner |
 |---|---|---|
 | Model | `qwen3_8_27b_fp8`, `qwen3_8_27b`, `cosmos3_nano`, `cosmos3_super` | Recipe-owned model runtime |
-| Context | `video_only`, `ego_trajectory_summary`, `ego_trajectory_absolute_poses` | Context representation and default prompt |
+| Context | `video_only`, `ego_trajectory_summary`, `ego_trajectory_absolute_poses`, `ego_trajectory_absolute_poses_with_relative_motion` | Context representation and default prompt |
 | Prompt/result | Required `default` or `custom` prompt selection; `output.result_key` defaults to `default` | Caller |
 
 Prompt selection and result identity are per-invocation settings, so each model/context combination can publish
@@ -38,7 +38,7 @@ recipes share only private execution machinery.
 
 ## Context modes
 
-All three context modes caption the selected camera video. The two Ego modes additionally use deterministic,
+All four context modes caption the selected camera video. The three Ego modes additionally use deterministic,
 recipe-owned preprocessing to derive canonical trajectory context from the episode-level `egotrajectory` MCAP
 produced by `multimodal-split`. This gives the model information about the Ego vehicle's motion without requiring it
 to infer that context from video alone.
@@ -49,7 +49,7 @@ to infer that context from video alone.
 Elaborate on the visual and narrative elements of the video in detail.
 ```
 
-Both Ego modes use the same driving-oriented default prompt, followed by exactly one literal
+The summary and absolute-only modes use the same driving-oriented default prompt, followed by exactly one literal
 `{ego_trajectory_context}` sentinel:
 
 ```text
@@ -62,11 +62,15 @@ Ego trajectory context for this episode (duration is the full episode span; moti
 The adapter replaces that literal sentinel once with canonical JSON. It does not use Python format-string rendering,
 so unrelated braces remain unchanged.
 
-The two Ego representations share the same decoder, qualification, and numeric summary:
+The three Ego representations share the same decoder, qualification, and numeric summary:
 
 - `ego_trajectory_summary` serializes `frame`, `representation_version`, and `summary` only.
 - `ego_trajectory_absolute_poses` adds one `samples` item per qualification request. Each item contains
   `relative_time_ns`, `requested_align_timestamp_ns`, `position_m`, and `orientation_xyzw`.
+- `ego_trajectory_absolute_poses_with_relative_motion` retains those absolute samples and summary and adds a
+  `relative_motion` object to every sample, with `forward_m`, `left_m`, `up_m`, and `heading_change_deg`.
+  It has its own default prompt explaining the relative fields and the limitations below. Custom prompts remain
+  available with exactly one literal `{ego_trajectory_context}` sentinel.
 
 Summary metrics use every recorded pose whose MCAP `log_time` lies in the half-open episode span, in time order.
 `path_length_m` is the sum of the 3D Euclidean distances between consecutive in-span positions;
@@ -75,10 +79,67 @@ span contains one recorded pose. Path length is sensitive to recording rate and 
 than a trajectory-precision or quality measure. The summary describes the native decoded artifact; it does not infer
 missing poses, classify motion, or assume a vehicle-forward axis.
 
-Both Ego modes perform the same fixed-grid qualification. Summary mode omits the `samples` array; absolute mode
-serializes the nearest qualified pose for every request. In each absolute sample, `relative_time_ns` and
+All Ego modes perform the same fixed-grid qualification. Summary mode omits the `samples` array; pose modes
+serialize the nearest qualified pose for every request. In each absolute sample, `relative_time_ns` and
 `requested_align_timestamp_ns` describe the requested grid instant, not an observed source-pose timestamp. The
 associated position and orientation come from the nearest recorded pose within the inclusive 20 ms tolerance.
+
+### Absolute poses with relative motion
+
+The absolute poses with relative motion context requires `context.ego.pose_convention: rfu_body_local_enu_v1`.
+This declares that source quaternions rotate reported body axes (+X right,
++Y forward, +Z up; left is -X) into local east/north/up (ENU) coordinates.
+`context.ego.frame` and `EgoTrajectory.frame` label the world frame; they do
+not identify which body axis points forward. Neither a `PoseInFrame` message
+nor direction of travel alone establishes that convention. Declare it only
+for sources whose producer provenance establishes it; other sources need
+separate qualification. The recipe does not verify provenance or recover it
+from split media.
+
+The origin is the recorded pose selected for the first qualification request. It can be a qualified predecessor
+halo just before the episode, rather than the first recorded in-span observation. All four origin values are zero.
+Project its body-forward direction onto the horizontal ENU plane, normalize it, and use that fixed direction for
+`forward_m`. The horizontal direction 90 degrees to its left defines `left_m`; `up_m` follows ENU +Z.
+Pitch and roll do not rotate height into forward or lateral displacement. No particular ENU anchor location is required.
+Origin subtraction removes a common translation; independently exported tangent frames can still have different orientations.
+
+These are displacements of the producer-reported sensor output point, not a camera, axle, or vehicle centre.
+The context applies no calibration or output-point correction. Reported body heading approximates vehicle heading
+and does not describe camera direction. Lateral displacement is approximate and can be sensitive to small heading
+errors. A negative `forward_m` means the reported point is behind the origin along the initial forward axis.
+Reversing or position noise, including GNSS noise, can produce this, but the sign alone does not establish that
+the vehicle reversed or indicate its current direction of motion.
+Displacement is not distance travelled.
+
+`heading_change_deg` comes from each pose's attitude-derived horizontal forward direction, including at standstill.
+It is left-positive offset from the initial heading in `[-180, 180)`, not accumulated turning. A heading can return
+toward zero after a turn. Source quaternions are normalized only for derivation; copied absolute values remain exact.
+An undefined horizontal heading (projected unit-forward norm at most `1e-8`) produces a deterministic episode item
+error with a safe diagnostic. Invalid source values or non-finite derived values also fail that episode.
+
+Derived displacement uses Python float rounding to three decimal places and heading to one decimal place, with
+positive numeric zero and heading wrapping after rounding. Decimal precision, the minimum horizontal heading norm,
+and the effective convention are bound into the normalized caption contract and its digest.
+`representation_version` remains 1; the distinct
+context name provides independent fields, workspace, publication, and reuse identity. The metadata struct is unchanged.
+Removing `relative_motion` from each sample reproduces the absolute-only payload for the same input.
+
+Episode duration covers the full episode. Summary motion metrics use only recorded in-span poses;
+`net_displacement_m` uses the first and last of those poses. Relative displacement uses qualified grid poses,
+possibly starting at a predecessor. The final request in a 10-second episode is at 9.5 seconds. The summary
+`net_displacement_m` and the magnitude of the final relative displacement may differ because their start and end
+poses can differ. No velocity, acceleration, motion classification, video-frame alignment, or claim of improved
+caption quality is included.
+
+This context uses the following default prompt:
+
+```text
+The video depicts the view from a camera mounted on a car as it is driving. Pay special attention to the motion of the cars, including the primary car whose point-of-view we observe in the video. Also note important factors that would relate to driving safety like the relative positions of pedestrians, lane markers, road signs, traffic signals, and any aggressive driving behavior of other vehicles. Also pay attention to interesting landmarks and describe them in detail.
+
+Ego trajectory context for this episode. Duration covers the full episode. Summary motion metrics use only poses recorded within it.
+Absolute position_m and orientation_xyzw are the reported source pose. Relative motion is measured from the origin: the pose of the first sample, which may be recorded just before the episode starts. All four origin values are zero. forward_m and left_m are metres along fixed horizontal axes set by the origin's attitude-derived forward heading; up_m is metres along local ENU up, without pitch or roll rotation. These values describe displacement of the reported sensor output point, not a camera, axle, or vehicle centre, and are not distance travelled. left_m is approximate and can be sensitive to small heading errors. A negative forward_m means the point is behind the origin along the initial forward axis. Reversing or position noise can cause this, so the sign alone does not establish that the vehicle reversed or indicate its current direction of motion. heading_change_deg is the offset in reported body heading from the origin, positive to the left, wrapped to [-180, 180) degrees; it is not accumulated turning and remains defined when stationary if the horizontal heading projection is valid. Reported body heading approximates vehicle heading and is not camera direction. The summary net_displacement_m uses the first and last recorded poses within the episode. Its value may differ from the magnitude of the final relative displacement because their start and end poses can differ.
+{ego_trajectory_context}
+```
 
 ## Input and source binding
 
@@ -103,7 +164,7 @@ The selected MP4 is checked against its exact byte size and SHA-256. Its durable
  media_location, media_size_bytes, media_sha256)
 ```
 
-Both Ego modes extend that same pre-registration scan by reading the episode bounds, timestamp source, and
+All Ego modes extend that same pre-registration scan by reading the episode bounds, timestamp source, and
 `sensor_media` descriptors for every row. The scan resolves the configured `egotrajectory` descriptor and validates a
 positive episode duration within the maximum and `timestamp_source == "sensor"`; it does not fetch the referenced
 camera or Ego media bytes. The projector repeats both guards against the pinned attempt and carries the bounds into
@@ -117,13 +178,14 @@ conversion or fallback.
 
 ## Ego decoder and qualification contract
 
-The two Ego modes consume the complete split MCAP named by `context.ego.sensor_key`. The source is fixed to the
+The three Ego modes consume the complete split MCAP named by `context.ego.sensor_key`. The source is fixed to the
 `foxglove.PoseInFrame` schema and a recipe-owned protobuf mapping. The mapping decodes the embedded
 `PoseInFrame.timestamp` as `sensor_timestamp_ns` source provenance and derives `align_timestamp_ns` from MCAP
 `log_time`. MCAP log time controls span membership, predecessor selection, nearest-pose qualification, and summary
 calculation. The embedded timestamp is not an alignment coordinate and is not serialized or durably persisted in Ego
-context version 1. Both timestamp roles and the parsed mapping digest are contract identity. Callers configure only
-the sensor key, topic, and frame.
+context version 1. Both timestamp roles and the parsed mapping digest are contract identity. All Ego contexts configure
+the sensor key, topic, and frame; only the absolute poses with relative motion context additionally requires the
+pose-convention declaration.
 
 Captioning relies on the producer contract that Ego MCAP `log_time` and the episode clock share a session-local domain.
 `timestamp_source: sensor` identifies the recorded sensor timestamps as the source of the camera timelines rather than
@@ -142,8 +204,10 @@ Ego context version 1 requires:
 The request count is `ceil(duration_ns / 500_000_000)`. The recipe does not interpolate, pair camera frames with Ego
 poses, or claim frame-accurate synchronization between sampled video frames and serialized poses.
 
-`context.ego.frame` is a caller-supplied source-coordinate label serialized into the context payload. Version 1 does
-not inspect `PoseInFrame.frame_id`, transform coordinates, infer frame meaning, or verify a physical vehicle convention.
+`context.ego.frame` is a caller-supplied source-coordinate label serialized into the context payload, labeling the
+absolute values. The recipe does not inspect `PoseInFrame.frame_id` or infer physical axes from that label. Summary
+and absolute-only modes do not transform coordinates; the absolute poses with relative motion mode derives relative
+motion under the explicit convention above without changing absolute values.
 
 Invalid table identity or versions, missing or duplicate selected camera or Ego descriptors, non-sensor timestamps,
 and invalid or over-limit episode spans fail during the full-table preflight without registering result fields. After
@@ -194,6 +258,34 @@ execution:
 
 The generated full template shows `output.result_key: default` and `output.tag_camera_key: false` for discoverability
 even though that default-prompt configuration may omit them.
+
+A complete invocation for absolute poses with relative motion is:
+
+```yaml
+schema_version: 1
+kind: multimodal-caption
+input:
+  episodes_lance_uri: s3://example-bucket/curated/multimodal-split/episodes.lance
+context:
+  variant: ego_trajectory_absolute_poses_with_relative_motion
+  camera_key: front_wide
+  ego:
+    sensor_key: ego
+    topic: /vehicle/pose
+    frame: clip_local_enu
+    pose_convention: rfu_body_local_enu_v1
+model:
+  variant: cosmos3_nano
+inference:
+  prompt:
+    mode: default
+execution:
+  storage_profile: default
+```
+
+The existing summary and absolute-only configurations omit `pose_convention` and reject it as an extra field.
+The `video_only` configuration omits the entire `ego` block. The four contexts run in separate invocations and retain
+independent caption/metadata field pairs; there is no multi-context invocation or relative-only variant.
 
 A custom context-free prompt can use an opaque result identity such as `safety_focus`; that is an example result key,
 not a context variant or preset:

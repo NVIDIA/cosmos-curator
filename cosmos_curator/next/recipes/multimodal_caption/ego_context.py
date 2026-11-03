@@ -4,6 +4,7 @@
 """Deterministic episode-level EgoTrajectory caption context."""
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -15,6 +16,20 @@ from mcap.exceptions import McapError
 from cosmos_curator.core.sensors.alignment.ego_trajectory import align_ego_trajectory_nearest
 from cosmos_curator.core.sensors.sampling.policy import NearestTimestampPolicy
 from cosmos_curator.core.sensors.sensors.ego_trajectory_sensor import EgoTrajectorySensor
+
+
+@dataclass(frozen=True)
+class RelativeMotionPolicy:
+    """Effective numerical policy shared by derivation and result identity."""
+
+    displacement_decimal_places: int = 3
+    heading_decimal_places: int = 1
+    min_horizontal_forward_norm: float = 1e-8
+
+
+RELATIVE_MOTION_POLICY = RelativeMotionPolicy()
+POSE_CONVENTION = "rfu_body_local_enu_v1"
+_HALF_TURN_DEG = 180.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,63 @@ def build_ego_trajectory_summary(  # noqa: PLR0913 -- all decoder inputs are exp
     )
     del payload["samples"]
     return _serialize_context(payload)
+
+
+def build_ego_trajectory_absolute_poses_with_relative_motion(  # noqa: PLR0913 -- decoder and derivation identity
+    mcap_bytes: bytes,
+    *,
+    episode_start_ns: int,
+    exclusive_end_ns: int,
+    topic: str,
+    schema_name: str,
+    protobuf_mapping: Mapping[str, Any],
+    frame: str,
+    policy: EgoTrajectoryContextPolicy,
+) -> tuple[bytes, str]:
+    """Add output-point displacement and heading offset to the qualified absolute poses."""
+    payload = _build_ego_trajectory_payload(
+        mcap_bytes,
+        episode_start_ns=episode_start_ns,
+        exclusive_end_ns=exclusive_end_ns,
+        topic=topic,
+        schema_name=schema_name,
+        protobuf_mapping=protobuf_mapping,
+        frame=frame,
+        policy=policy,
+    )
+    samples = payload["samples"]
+    headings = [_horizontal_forward(sample["orientation_xyzw"]) for sample in samples]
+    forward_x, forward_y = headings[0]
+    origin_x, origin_y, origin_z = samples[0]["position_m"]
+    for sample, (heading_x, heading_y) in zip(samples, headings, strict=True):
+        x, y, z = sample["position_m"]
+        dx, dy = x - origin_x, y - origin_y
+        heading_deg = math.degrees(
+            math.atan2(forward_x * heading_y - forward_y * heading_x, forward_x * heading_x + forward_y * heading_y)
+        )
+        # Wrap after rounding too: values just below +180 can round to +180.
+        heading_deg = round(heading_deg, RELATIVE_MOTION_POLICY.heading_decimal_places) or 0.0
+        sample["relative_motion"] = {
+            "forward_m": round(dx * forward_x + dy * forward_y, RELATIVE_MOTION_POLICY.displacement_decimal_places)
+            or 0.0,
+            "left_m": round(-dx * forward_y + dy * forward_x, RELATIVE_MOTION_POLICY.displacement_decimal_places)
+            or 0.0,
+            "up_m": round(z - origin_z, RELATIVE_MOTION_POLICY.displacement_decimal_places) or 0.0,
+            "heading_change_deg": heading_deg - 360.0 if heading_deg >= _HALF_TURN_DEG else heading_deg,
+        }
+    return _serialize_context(payload)
+
+
+def _horizontal_forward(orientation_xyzw: list[float]) -> tuple[float, float]:
+    """Project quaternion-rotated body +Y into ENU's horizontal plane."""
+    norm = math.hypot(*orientation_xyzw)
+    x, y, z, w = (value / norm for value in orientation_xyzw)
+    forward_x, forward_y = 2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z)
+    horizontal_norm = math.hypot(forward_x, forward_y)
+    if horizontal_norm <= RELATIVE_MOTION_POLICY.min_horizontal_forward_norm:
+        msg = "Relative motion requires a defined horizontal body-forward heading"
+        raise ValueError(msg)
+    return forward_x / horizontal_norm, forward_y / horizontal_norm
 
 
 def _build_ego_trajectory_payload(  # noqa: PLR0913 -- all decoder inputs are explicit identity

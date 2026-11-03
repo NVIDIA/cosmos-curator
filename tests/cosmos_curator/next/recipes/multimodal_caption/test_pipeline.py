@@ -41,6 +41,8 @@ def _config(
     context: dict[str, object] = {"variant": variant, "camera_key": "front_wide"}
     if variant != "video_only":
         context["ego"] = {"sensor_key": "ego", "topic": "/ego", "frame": "world"}
+        if variant == "ego_trajectory_absolute_poses_with_relative_motion":
+            context["ego"]["pose_convention"] = "rfu_body_local_enu_v1"  # type: ignore[index]
     return resolve_config_data(
         {
             "schema_version": 1,
@@ -89,7 +91,10 @@ def test_recipe_owned_mapping_shape_and_digest_are_pinned() -> None:
     assert canonical_digest(mapping) == EGO_DECODER_MAPPING_DIGEST
 
 
-@pytest.mark.parametrize("variant", ["ego_trajectory_summary", "ego_trajectory_absolute_poses"])
+@pytest.mark.parametrize(
+    "variant",
+    ["ego_trajectory_summary", "ego_trajectory_absolute_poses", "ego_trajectory_absolute_poses_with_relative_motion"],
+)
 def test_resolved_prompt_is_bound_into_ego_adapter(variant: str, tmp_path: Path) -> None:
     """The adapter receives the single already resolved run template."""
     custom = "keep {unrelated} exactly: {ego_trajectory_context}"
@@ -404,7 +409,12 @@ def test_workspace_and_publication_identity_are_complete(tmp_path: Path) -> None
     assert "prompt_mode" not in manifest
 
 
-def test_run_composes_transaction_identity_and_context_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "variant", ["ego_trajectory_absolute_poses", "ego_trajectory_absolute_poses_with_relative_motion"]
+)
+def test_run_composes_transaction_identity_and_context_builder(
+    variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Selected context and result identity reach bindings without a pair table."""
 
     class BindingsCapturedError(Exception):
@@ -418,17 +428,18 @@ def test_run_composes_transaction_identity_and_context_builder(tmp_path: Path, m
 
     monkeypatch.setattr(pipeline, "CaptionRunBindings", capture_bindings)
     with pytest.raises(BindingsCapturedError):
-        pipeline.run_config(_config(tmp_path, "ego_trajectory_absolute_poses"))  # type: ignore[arg-type]
+        pipeline.run_config(_config(tmp_path, variant))  # type: ignore[arg-type]
 
     publication = captured["publication"]
     assert isinstance(publication, CaptionPublicationBindings)
     properties = dict(publication.transaction_properties)
     assert properties["kind"] == "multimodal-caption"
     assert properties["result_key"] == "default"
-    assert properties["context_variant"] == "ego_trajectory_absolute_poses"
+    assert properties["context_variant"] == variant
     assert properties["model_key"] == "qwen3_8_27b_fp8"
     assert len(properties["caption_contract_digest"]) == 64
     assert "prompt_mode" not in properties
     context_stage = captured["context_stage"]
     assert isinstance(context_stage, partial)
-    assert context_stage.keywords["build_context"].__name__ == "build_ego_trajectory_absolute_poses"
+    builder = context_stage.keywords["build_context"]
+    assert builder.__name__ == f"build_{variant}"

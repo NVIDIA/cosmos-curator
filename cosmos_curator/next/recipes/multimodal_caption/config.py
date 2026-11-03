@@ -22,7 +22,12 @@ _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 SchemaVersion = Literal[1]
 MultimodalCaptionKind = Literal["multimodal-caption"]
-ContextVariant = Literal["video_only", "ego_trajectory_summary", "ego_trajectory_absolute_poses"]
+ContextVariant = Literal[
+    "video_only",
+    "ego_trajectory_summary",
+    "ego_trajectory_absolute_poses",
+    "ego_trajectory_absolute_poses_with_relative_motion",
+]
 ModelVariant = Literal["qwen3_8_27b_fp8", "qwen3_8_27b", "cosmos3_nano", "cosmos3_super"]
 PromptMode = Literal["default", "custom"]
 
@@ -112,8 +117,21 @@ class EgoCaptionContextConfig(_CaptionContextBase):
     ego: EgoContextConfig
 
 
+class RelativeEgoContextConfig(EgoContextConfig):
+    """Operator assertion of the qualified body-to-local-ENU source convention."""
+
+    pose_convention: Literal["rfu_body_local_enu_v1"]
+
+
+class AbsolutePosesWithRelativeMotionCaptionContextConfig(_CaptionContextBase):
+    """Absolute poses and motion relative to the initial horizontal heading."""
+
+    variant: Literal["ego_trajectory_absolute_poses_with_relative_motion"]
+    ego: RelativeEgoContextConfig
+
+
 MultimodalCaptionContextConfig = Annotated[
-    VideoOnlyContextConfig | EgoCaptionContextConfig,
+    VideoOnlyContextConfig | EgoCaptionContextConfig | AbsolutePosesWithRelativeMotionCaptionContextConfig,
     Field(discriminator="variant"),
 ]
 
