@@ -40,6 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cosmos_curator.core.sensors.data_integrity.instruments import MAX_PERCENT, Thresholds
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.recipes.mp4_index.timestamp_field_selection import CameraAlignmentField
 from cosmos_curator.next.utils.uris import normalize_location
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
@@ -112,7 +113,8 @@ class DataIntegrityInputConfig(BaseModel):
         min_length=1,
         description=(
             "An mp4-index manifest.lance. Read each covered stream's timeline from the "
-            "manifest instead of opening the video; check the rest as usual. Sessions are "
+            "manifest instead of opening the video, using checks.camera_alignment_fields; "
+            "check the rest as usual. Sessions are "
             "still discovered by listing, so a partly indexed dataset is fine. A manifest named "
             "here that cannot be read fails the run rather than falling back to the videos: the "
             "two paths report different timestamp_source values, so a run that fell back would "
@@ -207,7 +209,34 @@ class DataIntegrityChecksConfig(BaseModel):
         ge=0,
         description="Timestamps per metric update; 0 feeds the whole array at once.",
     )
+    camera_alignment_fields: tuple[CameraAlignmentField, ...] = Field(
+        default=("eof_ns",),
+        min_length=1,
+        description=(
+            "Camera timestamp preference order; each stream is measured on the first one available to it, "
+            "and a stream with none of them is recorded as an error. An indexed stream reads only its "
+            "mp4-index record; any other stream takes eof_ns from a .timestamps.npy sidecar and pts_ns / "
+            "edited_pts_ns from its container. SOF/MOE require mp4-index. Add edited_pts_ns to measure "
+            "streams without sensor timestamps on container PTS."
+        ),
+        examples=[["eof_ns"], ["eof_ns", "edited_pts_ns"]],
+    )
     thresholds: ThresholdsConfig = Field(default_factory=ThresholdsConfig)
+
+    @field_validator("camera_alignment_fields", mode="before")
+    @classmethod
+    def _coerce_alignment_fields(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("camera_alignment_fields")
+    @classmethod
+    def _reject_repeated_alignment_fields(
+        cls, fields: tuple[CameraAlignmentField, ...]
+    ) -> tuple[CameraAlignmentField, ...]:
+        if len(set(fields)) != len(fields):
+            msg = f"camera_alignment_fields lists a field more than once: {list(fields)}"
+            raise ValueError(msg)
+        return fields
 
 
 class DataIntegrityOutputConfig(BaseModel):
@@ -369,6 +398,9 @@ _TEMPLATE_PREAMBLE = """\
 # `output.store_root` must be a local directory or an s3:// prefix; az:// is not supported.
 # It may be null only for `di`, which then prints its report without persisting anything;
 # a pipeline run requires it, since the store is the only thing such a run leaves behind.
+# `checks.camera_alignment_fields` defaults to [eof_ns]: a stream with no recorder EOF clock
+# (no .timestamps.npy sidecar, or an mp4-index row without eof_ns) is recorded as an error.
+# Use [eof_ns, edited_pts_ns] to measure such streams on container PTS instead.
 """
 
 

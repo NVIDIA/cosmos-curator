@@ -37,7 +37,7 @@ already-open sensor, packaging its output as a :class:`StreamResult`.
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO
 
@@ -61,7 +61,12 @@ from cosmos_curator.core.sensors.data_integrity.results import (
 )
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader, raise_if_interrupted
 from cosmos_curator.next.recipes.data_integrity.discovery import discover_streams
-from cosmos_curator.next.recipes.data_integrity.sources import error_code, http_status, run_checks
+from cosmos_curator.next.recipes.data_integrity.sources import (
+    DEFAULT_ALIGNMENT_FIELDS,
+    error_code,
+    http_status,
+    run_checks,
+)
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 
@@ -225,6 +230,7 @@ def run_one_stream(  # noqa: PLR0913
     raise_infrastructure_errors: bool = False,
     index_lookup: Mp4IndexLookup | None = None,
     stats: dict[str, float] | None = None,
+    alignment_fields: Sequence[str] = DEFAULT_ALIGNMENT_FIELDS,
 ) -> StreamResult:
     """Open a single stream and run the integrity metrics, capturing failures as ERROR.
 
@@ -263,6 +269,9 @@ def run_one_stream(  # noqa: PLR0913
             the stream could not be measured, so a caller can tell a stream that was
             never timed from one that was timed at zero. On a retry the final attempt's
             timings win, which is the attempt the result describes.
+        alignment_fields: camera timestamp fields in preference order; see
+            :func:`~.sources.run_checks`. A stream with none of them available is
+            recorded as an error.
 
     Returns:
         The stream's result, carrying ``error`` when it could not be measured.
@@ -295,6 +304,7 @@ def run_one_stream(  # noqa: PLR0913
                 stats=stats,
                 stream_wrapper=stream_wrapper,
                 index_lookup=index_lookup,
+                alignment_fields=alignment_fields,
             )
         # A session is a batch: one unreadable or malformed stream must not abandon the
         # ones behind it, and the set of exceptions PyAV, botocore, and smart_open can
@@ -385,6 +395,7 @@ def run_session(  # noqa: PLR0913
     make_stream_wrapper: Callable[[int, int, str], Callable[[BinaryIO], BinaryIO]] | None = None,
     index_lookup: Mp4IndexLookup | None = None,
     stats: dict[str, dict[str, float]] | None = None,
+    alignment_fields: Sequence[str] = DEFAULT_ALIGNMENT_FIELDS,
 ) -> SessionReport:
     """Discover and run integrity metrics over every stream in one session.
 
@@ -434,6 +445,8 @@ def run_session(  # noqa: PLR0913
             stream in the session. Streams it covers are measured from the index
             instead of being opened; the rest are unaffected, and discovery still
             lists the session either way.
+        alignment_fields: camera timestamp fields in preference order, applied to
+            every stream; see :func:`~.sources.run_checks`.
         stats: optional out-parameter collecting per-phase timings per stream, keyed by
             source. Only streams that were measured get an entry, so a caller can tell
             those apart from streams that errored. Written from worker threads when
@@ -503,6 +516,7 @@ def run_session(  # noqa: PLR0913
             cancel=cancel,
             index_lookup=index_lookup,
             stats=stream_stats,
+            alignment_fields=alignment_fields,
         )
         # Keyed on the verdict and not merely on the dict being non-empty: a stream that
         # failed partway through measurement already has the phases it got through, so

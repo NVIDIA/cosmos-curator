@@ -49,6 +49,10 @@ from cosmos_curator.next.recipes.data_integrity.session_runner import (
 
 HZ_100_PERIOD_NS = 10_000_000  # one sample every 10 ms at 100 Hz
 
+#: Sensor timeline when present, else container PTS: the opt-in for tests about sessions
+#: measured on the container clock, which the default ``("eof_ns",)`` refuses.
+_EOF_OR_PTS = ("eof_ns", "edited_pts_ns")
+
 
 class _FakeSensor:
     """Minimal stand-in satisfying the shared engine's IntegritySensor surface."""
@@ -379,7 +383,7 @@ def test_a_session_of_resampled_clips_is_not_graded_as_a_rig(
         with pathlib.Path(f"{tmp_path / name}.sensor_timestamps.npy").open("wb") as stream:
             np.save(stream, np.arange(30, dtype=np.int64), allow_pickle=False)
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
 
     assert {s.timestamp_source for s in report.streams} == {TimestampSource.CONTAINER_PTS}
     assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
@@ -393,7 +397,7 @@ def test_session_metrics_are_skipped_for_a_session_of_one_stream(
     """The common case for a single-camera clip, and it must not read as agreement."""
     (tmp_path / "only.mp4").write_bytes(h264_video())
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
 
     assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
     assert report.status is OverallStatus.PASS, "a skipped session metric is not a finding"
@@ -455,12 +459,37 @@ def test_a_session_without_sensor_timelines_is_skipped_rather_than_passed(
     for name in ("front.mp4", "rear.mp4"):
         (tmp_path / name).write_bytes(h264_video(frames=30))
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
 
     assert {s.status for s in report.streams} == {OverallStatus.PASS}, "the per-stream grain is unaffected"
     assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
     assert all("container PTS" in m.reason for m in report.metrics)
     assert report.status is OverallStatus.PASS, "a skipped session metric is not a finding"
+
+
+def test_by_default_a_camera_without_sensor_timestamps_is_an_error_and_the_rest_still_run(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    sensor_timeline: Callable[..., pathlib.Path],
+) -> None:
+    """The default clock is EOF, so a camera that cannot supply it fails alone.
+
+    Its sibling is still measured on its own sensor timeline: one camera missing the
+    requested clock is a finding about that camera, not a reason to abandon the session.
+    """
+    for name in ("front.mp4", "rear.mp4"):
+        (tmp_path / name).write_bytes(h264_video(frames=30))
+    sensor_timeline(tmp_path / "front.mp4", frames=30)
+
+    report = run_session(str(tmp_path), expected_hz=30.0)
+
+    by_name = {pathlib.Path(s.source).name: s for s in report.streams}
+    assert by_name["front.mp4"].status is OverallStatus.PASS
+    assert by_name["front.mp4"].timestamp_source is TimestampSource.SENSOR
+    assert by_name["rear.mp4"].status is OverallStatus.ERROR
+    assert by_name["rear.mp4"].error is not None
+    assert "no sensor-timestamp sidecar" in by_name["rear.mp4"].error
+    assert report.status is OverallStatus.ERROR
 
 
 def test_a_session_where_only_some_cameras_have_sensor_timelines_is_skipped_too(
@@ -473,7 +502,7 @@ def test_a_session_where_only_some_cameras_have_sensor_timelines_is_skipped_too(
         (tmp_path / name).write_bytes(h264_video(frames=30))
     sensor_timeline(tmp_path / "front.mp4", frames=30)
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
 
     assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
     assert all("disagree" in m.reason for m in report.metrics)

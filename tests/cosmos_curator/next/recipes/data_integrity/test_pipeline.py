@@ -88,6 +88,9 @@ def _config_data(dataset: pathlib.Path, store_root: pathlib.Path, **execution: A
             ]
         },
         "output": {"store_root": str(store_root)},
+        # Encoded clips carry no recorder clock, so these runs opt into container PTS
+        # rather than recording every readable stream as missing its EOF timestamps.
+        "checks": {"camera_alignment_fields": ["eof_ns", "edited_pts_ns"]},
         "execution": {"append_batch_size": 2, **execution},
     }
 

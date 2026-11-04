@@ -457,6 +457,7 @@ def _run(  # noqa: PLR0913 -- the resolved config plus the per-process concerns 
             endpoint_url=endpoint_url,
             stream_idx=args.stream_idx,
             index_lookup=index_lookup,
+            alignment_fields=config.checks.camera_alignment_fields,
             max_workers=config.execution.stream_concurrency,
             max_attempts=config.execution.stream_attempts,
             cancel=interrupted,

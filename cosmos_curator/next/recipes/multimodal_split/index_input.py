@@ -22,8 +22,8 @@ import numpy.typing as npt
 
 from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
 from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
-from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
 from cosmos_curator.core.sensors.utils.validation import require_1d, require_strictly_increasing
+from cosmos_curator.next.recipes.mp4_index.timestamp_field_selection import first_complete_alignment_field
 
 
 def indexed_timeline(
@@ -33,17 +33,14 @@ def indexed_timeline(
     if len(index) == 0:
         msg = "mp4-index record has no frames"
         raise ValueError(msg)
-    for field in alignment_fields:
-        alignment_field = VideoFrameAlignmentField(field)
-        timestamps = getattr(index, field)
-        if timestamps is None or (isinstance(timestamps, np.ma.MaskedArray) and np.any(timestamps.mask)):
-            continue
-        sensor = StreamingCameraSensor(metadata=metadata, frame_index=index, alignment_field=alignment_field)
-        timeline = sensor.timestamps_ns
-        validate_timeline(timeline, frame_count=len(index))
-        return timeline, field
-    msg = f"mp4-index record has no complete camera timestamp column from {list(alignment_fields)}"
-    raise ValueError(msg)
+    alignment_field = first_complete_alignment_field(index, alignment_fields)
+    if alignment_field is None:
+        msg = f"mp4-index record has no complete camera timestamp column from {list(alignment_fields)}"
+        raise ValueError(msg)
+    sensor = StreamingCameraSensor(metadata=metadata, frame_index=index, alignment_field=alignment_field)
+    timeline = sensor.timestamps_ns
+    validate_timeline(timeline, frame_count=len(index))
+    return timeline, alignment_field.value
 
 
 def validate_timeline(timeline: npt.NDArray[np.int64], *, frame_count: int) -> None:

@@ -27,18 +27,20 @@ Both entry points build on :func:`run_checks` through the concurrent session run
 (:mod:`.session_runner`): the ``di`` tool (:mod:`.session_cli`) and the Ray Data
 pipeline (:mod:`.pipeline`).
 
-Given an ``mp4-index`` manifest, a stream the manifest covers takes its timeline from
-the index instead of being opened
-(:mod:`cosmos_curator.next.recipes.mp4_index.index_lookup`). Every other stream is
-opened as usual, whether the manifest has no row for it or the row it has cannot be
-used.
+Which clock a stream is measured on follows ``checks.camera_alignment_fields``, an
+ordered preference shared with ``multimodal-split``
+(:mod:`cosmos_curator.next.recipes.mp4_index.timestamp_field_selection`). Given an ``mp4-index``
+manifest, a stream the manifest covers takes its timeline from the index instead of
+being opened (:mod:`cosmos_curator.next.recipes.mp4_index.index_lookup`). Every other
+stream is opened as usual, whether the manifest has no row for it or the row it has
+cannot be used.
 """
 
 import pathlib
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import BinaryIO, cast
+from typing import BinaryIO, cast, get_args
 
 import numpy as np
 import numpy.typing as npt
@@ -59,6 +61,15 @@ from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
 from cosmos_curator.core.utils.storage_cli import open_storage_source
 from cosmos_curator.next.recipes.data_integrity import storage_io
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
+from cosmos_curator.next.recipes.mp4_index.timestamp_field_selection import (
+    INDEX_ONLY_ALIGNMENT_FIELDS,
+    CameraAlignmentField,
+    first_complete_alignment_field,
+)
+
+#: The camera clock preference when a caller names none, matching the config default.
+DEFAULT_ALIGNMENT_FIELDS: tuple[CameraAlignmentField, ...] = ("eof_ns",)
+_CAMERA_ALIGNMENT_FIELDS: frozenset[str] = frozenset(get_args(CameraAlignmentField))
 
 
 def _as_data_source(stream: BinaryIO) -> DataSource:
@@ -304,8 +315,9 @@ def read_sensor_timestamps(
 
     Four outcomes, and the difference between them matters:
 
-    * absent -- ``None``, and the caller measures the container's PTS. The ordinary
-      case for any source whose recorder wrote no timeline.
+    * absent -- ``None``, and the caller tries the next configured clock (container
+      PTS if ``checks.camera_alignment_fields`` lists it, otherwise the stream is an
+      error). The ordinary case for any source whose recorder wrote no timeline.
     * present but disowned -- ``None`` as well, and logged. A timeline the tree itself
       says is a resampling grid is worth less than no timeline at all, because it
       would be believed; see :data:`_RESAMPLED_CLIP_MARKER_SUFFIXES`.
@@ -363,11 +375,11 @@ def read_sensor_timestamps(
         # Logged rather than recorded as the stream's error: nothing here is broken,
         # and the stored row says what it always says -- which clock this was measured
         # on. The line is what tells an operator why a tree full of timelines reports
-        # container PTS anyway.
+        # container PTS anyway, or errors when no container clock was allowed.
         logger.warning(
             f"{uri} is a resampling grid, not a recording's clock "
             f"({marker_uri} sits beside it); "
-            f"measuring container PTS instead"
+            f"ignoring it as a sensor timeline"
         )
         return None
     return sensor_timestamps_ns
@@ -401,27 +413,137 @@ def observed_size_bytes(
 
 def _indexed_sensor(
     source: str,
-    record: tuple[Mp4FrameIndex, Mp4Metadata] | None,
-    sensor_timestamps_ns: npt.NDArray[np.int64] | None,
+    record: tuple[Mp4FrameIndex, Mp4Metadata],
+    alignment_fields: Sequence[str],
 ) -> StreamingCameraSensor | None:
-    """Build a sensor over *record*, or return ``None`` so the caller opens the video.
+    """Build a sensor over *record* on the first complete field, or ``None`` to open the video.
 
-    External timelines retain the CameraSensor reader; their timestamp field is
-    not recorded, so they cannot be assigned to an EOF/SOF/MOE index field.
-    A row that cannot describe this stream is expected rather than exceptional -- a
-    sensor timeline counts displayable frames where the index counts samples -- so it
-    is logged at debug and answered by reading the media instead.
+    A row with none of *alignment_fields* is a finding about this stream, so it raises
+    rather than falling back to the media: the row is current, and opening the video
+    could not supply a sensor clock the index lacks. A row that cannot describe this
+    stream at all is expected rather than exceptional -- an index whose frame count
+    disagrees with its own metadata -- so it is logged at debug and answered by reading
+    the media instead, exactly as if the manifest had no row.
+
+    The chosen timeline is not required to ascend, unlike ``multimodal-split``'s use of
+    the same rule: a recorder clock that steps backwards is what the ordering metric is
+    here to report.
+
+    Raises:
+        ValueError: If the row populates none of *alignment_fields* for every frame.
+
     """
-    if record is None or sensor_timestamps_ns is not None:
-        return None
     index, metadata = record
-    try:
-        return StreamingCameraSensor(
-            metadata=metadata, frame_index=index, alignment_field=VideoFrameAlignmentField.DTS_NS
+    alignment_field = first_complete_alignment_field(index, alignment_fields)
+    if alignment_field is None:
+        msg = (
+            f"mp4-index record for {source} has no complete camera timestamp column from "
+            f"{list(alignment_fields)}; set checks.camera_alignment_fields to include one it has"
         )
+        raise ValueError(msg)
+    try:
+        return StreamingCameraSensor(metadata=metadata, frame_index=index, alignment_field=alignment_field)
     except IndexRecordUnusableError:
         logger.opt(exception=True).debug("mp4-index row for {} cannot answer; opening the video", source)
         return None
+
+
+def _validate_alignment_fields(alignment_fields: Sequence[str]) -> tuple[str, ...]:
+    """Return *alignment_fields* as a tuple, rejecting an empty list or an unknown field."""
+    fields = tuple(alignment_fields)
+    if not fields:
+        msg = "alignment_fields must name at least one camera timestamp field"
+        raise ValueError(msg)
+    unknown = [field for field in fields if field not in _CAMERA_ALIGNMENT_FIELDS]
+    if unknown:
+        msg = f"unknown camera alignment field(s) {unknown}; expected some of {sorted(_CAMERA_ALIGNMENT_FIELDS)}"
+        raise ValueError(msg)
+    return fields
+
+
+def _measure_media(  # noqa: PLR0913 -- the source, its clock preference, and the open/metric settings
+    source: str,
+    *,
+    alignment_fields: tuple[str, ...],
+    expected_hz: float | None,
+    thresholds: Thresholds,
+    stream_idx: int,
+    batch_size: int,
+    s3_profile_name: str | None,
+    azure_profile_name: str,
+    endpoint_url: str | None,
+    stats: dict[str, float] | None,
+    stream_wrapper: Callable[[BinaryIO], BinaryIO] | None,
+) -> tuple[list[CheckResult], VideoInfo, ResolvedConfig]:
+    """Measure a stream no index row answers for, on the first field its media can supply.
+
+    The same rules ``multimodal-split`` applies without an index: ``eof_ns`` is the
+    sensor timeline beside the video, ``edited_pts_ns`` and ``pts_ns`` are the
+    container's own presentation times (with and without the edit list), and SOF/MOE
+    exist only in an index. A sidecar is read only when ``eof_ns`` is consulted, and one
+    that is present but broken fails the stream rather than permitting the next field.
+
+    Raises:
+        ValueError: If the media can supply none of *alignment_fields*, or a sidecar sits
+            beside a non-zero ``stream_idx`` (see :func:`run_checks`).
+
+    """
+    for field in alignment_fields:
+        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None
+        if field == VideoFrameAlignmentField.EOF_NS.value:
+            sensor_timestamps_ns = read_sensor_timestamps(
+                source,
+                s3_profile_name=s3_profile_name,
+                azure_profile_name=azure_profile_name,
+                endpoint_url=endpoint_url,
+                stream_wrapper=stream_wrapper,
+            )
+            if sensor_timestamps_ns is None:
+                continue
+            if stream_idx != 0:
+                # The artifact is named for the file, not for a stream within it, so which
+                # stream it describes is simply not recorded. Refused rather than guessed:
+                # applying it to another stream would either silently put that stream on a
+                # clock measured elsewhere, or fail on a frame count that says nothing about
+                # the recording.
+                msg = (
+                    f"{source_sensor_timestamps_uri(source)} does not record which video stream it describes, "
+                    f"so it cannot be applied to stream_idx {stream_idx}; only stream 0 is defined"
+                )
+                raise ValueError(msg)
+        elif field in INDEX_ONLY_ALIGNMENT_FIELDS:
+            continue
+        with open_source(
+            source,
+            s3_profile_name=s3_profile_name,
+            azure_profile_name=azure_profile_name,
+            endpoint_url=endpoint_url,
+            stream_wrapper=stream_wrapper,
+        ) as src:
+            t0 = time.perf_counter()
+            sensor: CameraSensor | StreamingCameraSensor
+            if field == VideoFrameAlignmentField.PTS_NS.value:
+                sensor = StreamingCameraSensor(
+                    _as_data_source(src), stream_idx=stream_idx, alignment_field=VideoFrameAlignmentField.PTS_NS
+                )
+            else:
+                # eof_ns with its sidecar, or edited_pts_ns: the container's displayed PTS.
+                sensor = CameraSensor(
+                    _as_data_source(src),
+                    stream_idx=stream_idx,
+                    sensor_timestamps_ns=sensor_timestamps_ns,
+                )
+            if stats is not None:
+                stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
+            return run_metrics(
+                sensor, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats
+            )
+    msg = (
+        f"no sensor-timestamp sidecar or requested camera timestamps for {source} from "
+        f"{list(alignment_fields)}; add edited_pts_ns to checks.camera_alignment_fields to measure container PTS, "
+        f"and note SOF/MOE require input.mp4_index_uri"
+    )
+    raise ValueError(msg)
 
 
 def run_checks(  # noqa: PLR0913
@@ -437,6 +559,7 @@ def run_checks(  # noqa: PLR0913
     stats: dict[str, float] | None = None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
     index_lookup: Mp4IndexLookup | None = None,
+    alignment_fields: Sequence[str] = DEFAULT_ALIGNMENT_FIELDS,
 ) -> tuple[list[CheckResult], VideoInfo, ResolvedConfig]:
     """Open ``source``, build a sensor over it, and run every metric on it.
 
@@ -446,13 +569,12 @@ def run_checks(  # noqa: PLR0913
     to classify (``di`` records a per-stream ERROR; the pipeline additionally sorts
     unreachable from unreadable).
 
-    Also where a sensor timeline is preferred over the container's PTS, when the source
-    has one beside it (:func:`read_sensor_timestamps`). Done here rather than at either
-    entry point so both inherit it, and unconditionally rather than behind a flag: a
-    recorder's own timestamps are the better answer wherever they exist, and which clock
-    a stream was measured on is reported rather than chosen. The two exceptions are both
-    cases where the artifact's name stops saying whose clock it is: a non-zero
-    ``stream_idx``, and a timeline the tree marks as a resampling grid.
+    Also where the stream's clock is chosen, from *alignment_fields* in order, so both
+    entry points inherit one rule -- the one ``multimodal-split`` applies to cameras. A
+    stream with a current ``mp4-index`` row is measured from that row alone, and never
+    reads a sensor timeline beside the video; any other stream is opened (see
+    :func:`_measure_media`). A stream for which no listed field is available raises, so
+    it is recorded as an error rather than silently measured on another clock.
 
     Args:
         source: local path, ``s3://`` URI, or ``az://`` URI.
@@ -474,37 +596,21 @@ def run_checks(  # noqa: PLR0913
             otherwise the video is opened. Costs one metadata lookup per stream, to
             confirm the row still describes the bytes there. Consulted only for
             ``stream_idx`` 0, since a manifest row is keyed by file, not by track.
+        alignment_fields: camera timestamp fields in preference order (see
+            :data:`~cosmos_curator.next.recipes.mp4_index.timestamp_field_selection.CameraAlignmentField`).
 
     Returns:
         The tuple returned by ``run_metrics``.
 
     Raises:
-        ValueError: If ``stream_idx`` is not 0 and a sensor timeline sits beside
+        ValueError: If no field in ``alignment_fields`` is available for the stream,
+            if ``alignment_fields`` is empty or names an unknown field, or if
+            ``stream_idx`` is not 0 and ``eof_ns`` finds a sensor timeline beside
             ``source``; see :func:`read_sensor_timestamps` for why it cannot be
             attributed to a particular stream.
 
     """
-    # Before the video is opened, so a source whose timeline is unreachable fails
-    # without paying to decode it -- and so a corrupt timeline is reported as the
-    # stream's error rather than being overtaken by whatever the video says.
-    sensor_timestamps_ns = read_sensor_timestamps(
-        source,
-        s3_profile_name=s3_profile_name,
-        azure_profile_name=azure_profile_name,
-        endpoint_url=endpoint_url,
-        stream_wrapper=stream_wrapper,
-    )
-    if stream_idx != 0 and sensor_timestamps_ns is not None:
-        # The artifact is named for the file, not for a stream within it, so which
-        # stream it describes is simply not recorded. Refused rather than guessed:
-        # applying it to another stream would either silently put that stream on a
-        # clock measured elsewhere, or fail on a frame count that says nothing about
-        # the recording. A stream with no timeline beside it is unaffected.
-        msg = (
-            f"{source_sensor_timestamps_uri(source)} does not record which video stream it describes, "
-            f"so it cannot be applied to stream_idx {stream_idx}; only stream 0 is defined"
-        )
-        raise ValueError(msg)
+    fields = _validate_alignment_fields(alignment_fields)
     # A manifest row is keyed by file, not by track, so it only describes the stream
     # the indexer chose. Any other stream_idx is opened instead.
     if index_lookup is not None and stream_idx == 0:
@@ -518,26 +624,23 @@ def run_checks(  # noqa: PLR0913
                 endpoint_url=endpoint_url,
             ),
         )
-        indexed = _indexed_sensor(source, record, sensor_timestamps_ns)
+        indexed = None if record is None else _indexed_sensor(source, record, fields)
         if indexed is not None:
             if stats is not None:
                 stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
             return run_metrics(
                 indexed, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats
             )
-    with open_source(
+    return _measure_media(
         source,
+        alignment_fields=fields,
+        expected_hz=expected_hz,
+        thresholds=thresholds,
+        stream_idx=stream_idx,
+        batch_size=batch_size,
         s3_profile_name=s3_profile_name,
         azure_profile_name=azure_profile_name,
         endpoint_url=endpoint_url,
+        stats=stats,
         stream_wrapper=stream_wrapper,
-    ) as src:
-        t0 = time.perf_counter()
-        sensor = CameraSensor(
-            _as_data_source(src),
-            stream_idx=stream_idx,
-            sensor_timestamps_ns=sensor_timestamps_ns,
-        )
-        if stats is not None:
-            stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
-        return run_metrics(sensor, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats)
+    )

@@ -336,3 +336,35 @@ def test_the_template_payload_names_the_input_alternatives() -> None:
 
     assert payload["kind"] == config.KIND_NAME
     assert "input.sessions|input.session_list_uri|input.session_roots" in paths
+
+
+def test_streams_are_measured_on_the_recorders_eof_clock_by_default() -> None:
+    """The same default as ``multimodal-split``: a camera without EOF is an error until a run opts out."""
+    resolved = config.resolve_config_data(_config_data())
+
+    assert resolved.checks.camera_alignment_fields == ("eof_ns",)
+    assert config.config_template()["checks"]["camera_alignment_fields"] == ["eof_ns"]
+
+
+def test_a_clock_preference_is_kept_in_the_order_written() -> None:
+    """Order is the preference: the first field a stream can supply is the one it is measured on."""
+    resolved = config.resolve_config_data(
+        _config_data(checks={"camera_alignment_fields": ["eof_ns", "sof_ns", "edited_pts_ns"]})
+    )
+
+    assert resolved.checks.camera_alignment_fields == ("eof_ns", "sof_ns", "edited_pts_ns")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param([], id="empty"),
+        pytest.param(["dts_ns"], id="dts-is-not-a-timing-clock"),
+        pytest.param(["capture_ns"], id="unknown"),
+        pytest.param(["eof_ns", "eof_ns"], id="repeated"),
+    ],
+)
+def test_an_unusable_clock_preference_is_refused_at_load(fields: list[str]) -> None:
+    """Refused before a run starts, rather than as an error on every stream it measures."""
+    with pytest.raises(ValidationError, match="camera_alignment_fields"):
+        config.resolve_config_data(_config_data(checks={"camera_alignment_fields": fields}))

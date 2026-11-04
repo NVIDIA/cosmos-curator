@@ -98,8 +98,10 @@ storage profile and raises if it cannot. It returns the sensor library's `Indexe
 `index_video()` builds from a source. Passing that `moov` to `StreamingCameraSensor` sets up the
 decoder without reading the source beyond packet byte ranges; multimodal splitting does so.
 Optional consumers use `open()` and `index_for()` to retain their fallback behavior. Timestamp selection belongs
-to the consumer: multimodal splitting selects EOF/SOF/MOE or explicit `pts_ns`/`edited_pts_ns`
-through `camera_alignment_fields`, while data-integrity checks select DTS for stored indexes.
+to the consumer: multimodal splitting and data-integrity checks both select EOF/SOF/MOE or explicit
+`pts_ns`/`edited_pts_ns` through `camera_alignment_fields`, the first field a record fully populates
+(`mp4_index.timestamp_field_selection`). The two differ in what they then require: splitting rejects a timeline that
+does not strictly ascend, while data-integrity measures it and reports the ordering violation.
 
 The ordinary `mp4-index` recipe leaves EOF/SOF/MOE fields null. Extensions can supply timing
 columns within the fixed shared frame schema; recorder-specific requirements and sentinel

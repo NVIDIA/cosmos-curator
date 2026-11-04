@@ -22,17 +22,22 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pytest
 from loguru import logger
 
-from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, SESSION_INSTRUMENTS
+from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, NAME_ORDERING, SESSION_INSTRUMENTS
 from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
 from cosmos_curator.next.recipes.data_integrity import processing, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
 from cosmos_curator.next.recipes.mp4_index import processing as mp4_index_processing
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
-from cosmos_curator.next.recipes.mp4_index.contracts import CONTAINER_KIND_NONFRAGMENTED, make_video_id
+from cosmos_curator.next.recipes.mp4_index.contracts import (
+    CONTAINER_KIND_NONFRAGMENTED,
+    VIDEO_MANIFEST_SCHEMA,
+    make_video_id,
+)
 from cosmos_curator.next.utils.uris import normalize_location
 
 RUN_ID = "0" * 32
@@ -42,25 +47,34 @@ CREATED_AT = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.UTC)
 #: many measurement rows and how many evaluations it contributes.
 NUM_METRICS = len(INSTRUMENTS)
 
+#: Sensor timeline when present, else container PTS. These fixtures are encoded clips with
+#: no recorder clock, so the default ``("eof_ns",)`` would error every stream; tests about
+#: the default say so by passing ``alignment_fields=None``.
+_EOF_OR_PTS = ("eof_ns", "edited_pts_ns")
+
 
 def _config(
     session: pathlib.Path,
     *,
     thresholds: dict[str, Any] | None = None,
     mp4_index_uri: str | None = None,
+    alignment_fields: tuple[str, ...] | None = _EOF_OR_PTS,
     **execution: Any,  # noqa: ANN401
 ) -> ResolvedDataIntegrityConfig:
-    """Resolve a config covering one local session."""
+    """Resolve a config covering one local session; ``alignment_fields=None`` keeps the default."""
     session_input: dict[str, Any] = {"sessions": [str(session)]}
     if mp4_index_uri is not None:
         session_input["mp4_index_uri"] = mp4_index_uri
+    checks: dict[str, Any] = {"thresholds": thresholds or {}}
+    if alignment_fields is not None:
+        checks["camera_alignment_fields"] = list(alignment_fields)
     return ResolvedDataIntegrityConfig.model_validate(
         {
             "schema_version": 1,
             "kind": "data-integrity",
             "input": session_input,
             "output": {"store_root": str(session.parent / "di-store")},
-            "checks": {"thresholds": thresholds or {}},
+            "checks": checks,
             "execution": execution,
         }
     )
@@ -81,12 +95,19 @@ def _check(
     *,
     thresholds: dict[str, Any] | None = None,
     mp4_index_uri: str | None = None,
+    alignment_fields: tuple[str, ...] | None = _EOF_OR_PTS,
     **execution: Any,  # noqa: ANN401
 ) -> dict[str, object]:
     """Measure one session the way the Ray stage does."""
     return processing.check_session(
         {"session_path": str(session)},
-        config=_config(session, thresholds=thresholds, mp4_index_uri=mp4_index_uri, **execution),
+        config=_config(
+            session,
+            thresholds=thresholds,
+            mp4_index_uri=mp4_index_uri,
+            alignment_fields=alignment_fields,
+            **execution,
+        ),
         run_id=RUN_ID,
         created_at=CREATED_AT,
     )
@@ -133,6 +154,59 @@ def _manifest(session: pathlib.Path, *videos: pathlib.Path) -> str:
     uri = str(session.parent / "mp4-index" / "manifest.lance")
     lance.write_dataset(pa.concat_tables(tables), uri)
     return uri
+
+
+#: A recorder epoch, so a bound on this clock cannot be mistaken for container PTS near zero.
+_SENSOR_EPOCH_NS = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z
+_FRAME_PERIOD_NS = 33_333_333
+
+
+def _add_eof_to_manifest(manifest_uri: str, *, reorder: bool = False) -> dict[str, list[int]]:
+    """Fill ``eof_ns`` on every manifest row, as an index extension would, and return it per source.
+
+    Each frame's end-of-frame time follows its presentation rank, not its decode
+    position, so on a reordered stream the stored column is out of order and only a
+    reader that applies presentation order sees a clean clock.
+
+    ``reorder`` rewrites the composition offsets so decode samples 0, 1, 2 present as
+    1, 2, 0 -- the shape B-frames give a stream. Done on the row rather than with a
+    B-frame clip, because the checked-in one carries a single constant offset that its
+    edit list cancels, which leaves presentation order equal to decode order. The video
+    is never opened for an indexed stream, so the row is all that has to say it.
+    """
+    rows = lance.dataset(manifest_uri).to_table().to_pylist()
+    eof_by_source: dict[str, list[int]] = {}
+    for row in rows:
+        frames = row["frames"]
+        if reorder:
+            ticks_per_frame = frames[1]["dts_ticks"] - frames[0]["dts_ticks"]
+            ranks = [2, 0, 1, *range(3, len(frames))]
+            for sample, (frame, rank) in enumerate(zip(frames, ranks, strict=True)):
+                frame["composition_offset_ticks"] = (rank - sample + 2) * ticks_per_frame
+        pts_ticks = np.array(
+            [frame["dts_ticks"] + (frame["composition_offset_ticks"] or 0) for frame in frames], dtype=np.int64
+        )
+        presentation_rank = np.argsort(np.argsort(pts_ticks, kind="stable"), kind="stable")
+        for frame, rank in zip(frames, presentation_rank, strict=True):
+            frame["eof_ns"] = _SENSOR_EPOCH_NS + int(rank) * _FRAME_PERIOD_NS
+        eof_by_source[str(row["media_location"])] = [frame["eof_ns"] for frame in frames]
+    lance.write_dataset(pa.Table.from_pylist(rows, schema=VIDEO_MANIFEST_SCHEMA), manifest_uri, mode="overwrite")
+    return eof_by_source
+
+
+def _stream_rows(record: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Return each stream row, keyed by its source."""
+    return {str(row["source"]): row for row in _rows(record)[store_schema.STREAM_DATASET]}
+
+
+def _ordering_status(record: dict[str, object], source: str) -> object:
+    """Return the stored ordering verdict for *source*."""
+    stream_id = _stream_rows(record)[source]["stream_id"]
+    return next(
+        row["check_status"]
+        for row in _rows(record)[store_schema.EVALUATION_DATASET]
+        if row["stream_id"] == stream_id and row["metric_name"] == NAME_ORDERING
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -215,17 +289,78 @@ def test_a_covered_stream_is_measured_from_the_index_and_an_uncovered_one_from_i
 ) -> None:
     """A stream the manifest covers is measured from it; the rest are opened as usual.
 
-    The clock each row records is what makes the difference visible in the store.
+    Plain mp4-index output has no EOF column, so with container PTS allowed both
+    streams land on it -- one read from the row, one from the video.
     """
     (session / "side.mp4").write_bytes(h264_video())
 
     record = _check(session, mp4_index_uri=_manifest(session, session / "front.mp4"))
 
     assert _timestamp_sources(record) == {
-        str(session / "front.mp4"): "container_dts",
+        str(session / "front.mp4"): "container_pts",
         str(session / "side.mp4"): "container_pts",
         str(session / "rear.mp4"): None,  # unreadable, so measured on no clock at all
     }
+
+
+def test_an_indexed_eof_clock_is_what_the_stored_row_measures(session: pathlib.Path) -> None:
+    """End to end from a real manifest with ``eof_ns`` to the stream row, under the default config.
+
+    A sidecar with other times sits beside the video, so the bounds prove the clock
+    came from the index rather than from the deprecated sidecar.
+    """
+    front = session / "front.mp4"
+    with pathlib.Path(f"{front}.timestamps.npy").open("wb") as stream:
+        np.save(stream, np.arange(30, dtype=np.int64) * 7, allow_pickle=False)
+    manifest_uri = _manifest(session, front)
+    eof_ns = _add_eof_to_manifest(manifest_uri)[normalize_location(str(front))]
+
+    record = _check(session, mp4_index_uri=manifest_uri, alignment_fields=None)
+
+    row = _stream_rows(record)[str(front)]
+    assert row["error"] is None
+    assert row["timestamp_source"] == "sensor"
+    assert row["num_samples"] == len(eof_ns)
+    assert row["start_ns"] == _SENSOR_EPOCH_NS
+    assert row["end_ns"] == max(eof_ns)
+    assert _ordering_status(record, str(front)) == CheckStatus.PASS.value
+
+
+def test_an_indexed_eof_clock_on_a_reordered_stream_is_read_in_presentation_order(session: pathlib.Path) -> None:
+    """B-frames store samples out of display order, and the EOF column with them.
+
+    Read in decode order, this clock would step backwards and fail ordering; read in
+    presentation order, as the frames are shown, it is the clean clock it describes.
+    """
+    clip = session / "front.mp4"
+    manifest_uri = _manifest(session, clip)
+    eof_ns = _add_eof_to_manifest(manifest_uri, reorder=True)[normalize_location(str(clip))]
+    assert np.any(np.diff(eof_ns) < 0), "the fixture must store EOF out of order, or this proves nothing"
+
+    record = _check(session, mp4_index_uri=manifest_uri, alignment_fields=None)
+
+    row = _stream_rows(record)[str(clip)]
+    assert row["timestamp_source"] == "sensor"
+    assert row["start_ns"] == _SENSOR_EPOCH_NS
+    assert row["end_ns"] == max(eof_ns)
+    assert _ordering_status(record, str(clip)) == CheckStatus.PASS.value
+
+
+def test_by_default_a_stream_without_a_sensor_clock_is_recorded_as_an_error(
+    session: pathlib.Path,
+    h264_video: Callable[..., bytes],
+) -> None:
+    """The default asks for EOF; neither a plain index row nor a bare video has one.
+
+    Each becomes that stream's error row, and the session is still measured and written.
+    """
+    (session / "side.mp4").write_bytes(h264_video())
+
+    record = _check(session, mp4_index_uri=_manifest(session, session / "front.mp4"), alignment_fields=None)
+
+    errors = {str(row["source"]): row["error"] for row in _rows(record)[store_schema.STREAM_DATASET]}
+    assert "no complete camera timestamp column" in str(errors[str(session / "front.mp4")])
+    assert "no sensor-timestamp sidecar" in str(errors[str(session / "side.mp4")])
 
 
 def test_a_stale_index_row_reads_the_video_it_describes_rather_than_trusting_it(

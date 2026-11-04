@@ -84,6 +84,9 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #: ``stream.lance.timestamp_source`` also gained ``"container_dts"``, for a stream read
 #: from an ``mp4-index`` manifest instead of from the media. ``session.lance`` keeps its
 #: three values: a ``"container_dts"`` stream counts as ``"container_pts"`` there.
+#: Current writers no longer emit it -- an indexed stream is measured on the clock
+#: ``checks.camera_alignment_fields`` selects, which is ``"sensor"`` for EOF/SOF/MOE and
+#: ``"container_pts"`` for PTS -- but readers still accept it for rows already stored.
 STORE_SCHEMA_VERSION = 3
 
 STREAM_DATASET = "stream.lance"

@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cosmos_curator.core.utils.storage.s3_validation import validate_configured_s3_location
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.recipes.mp4_index.timestamp_field_selection import CameraAlignmentField
 
 _MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 _NS_PER_SECOND = 1_000_000_000
@@ -63,7 +64,6 @@ MultimodalSplitVideoEncoder = Literal["libopenh264"]
 # Widened as each kind lands. A config naming a kind the recipe cannot process
 # yet is refused at load, rather than discovering it after a listing pass.
 MultimodalSplitSensorType = Literal["camera", "egotrajectory", "gps", "imu"]
-CameraAlignmentField = Literal["eof_ns", "moe_ns", "sof_ns", "pts_ns", "edited_pts_ns"]
 
 #: How a sensor's samples are placed on the clip's grid.
 #:

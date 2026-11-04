@@ -420,6 +420,7 @@ def check_session(
                 max_attempts=config.execution.stream_attempts,
                 raise_infrastructure_errors=True,
                 index_lookup=index_lookup,
+                alignment_fields=config.checks.camera_alignment_fields,
             )
         except InfrastructureError as exc:
             # Counted, not recorded: see InfrastructureError for why a row here would
