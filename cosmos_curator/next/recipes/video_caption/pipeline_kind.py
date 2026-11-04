@@ -53,16 +53,11 @@ def _prepare_run(config: Path, *, set_overrides: list[str]) -> PreparedPipelineR
     resolved = resolve_config(config, overrides=set_overrides)
 
     def run() -> PipelineRunOutput:
+        from cosmos_curator.next.enrichment.execution import summary_message  # noqa: PLC0415
         from cosmos_curator.next.recipes.video_caption.pipeline import run_config  # noqa: PLC0415
 
         summary = run_config(resolved)
-        return PipelineRunOutput(
-            json_payload=summary,
-            message=(
-                f"video-caption: {summary['published_fragments']} fragment(s) published, "
-                f"{summary['skipped_complete_fragments']} complete fragment(s) skipped"
-            ),
-        )
+        return PipelineRunOutput(json_payload=summary, message=summary_message("video-caption", summary))
 
     return run
 

@@ -32,9 +32,10 @@ Tensor parallelism defaults to 1 and remains configurable through `execution.ten
 placement and batching. Configuration values are validated, but the recipe does not check whether the selected model
 and execution settings fit available GPU memory.
 
-The recipe uses the current `video-caption` complete-MP4 inference, checkpoint, staging, and fragment-atomic Lance
-publication engine. `video-caption` keeps its clip schema, fields, literal contract digests, prompt, and runtime; the
-recipes share only private execution machinery.
+The recipe shares `video-caption`'s complete-MP4 media fetch and Ray Data LLM plan. Its checkpoint, staging, and
+fragment-atomic Lance publication use the deprecated two-phase engine in `legacy/caption_fragment_recovery`, which
+`video-caption` used before adopting shared enrichment. `video-caption` keeps its clip schema, fields, literal contract
+digests, prompt, and runtime; the recipes share only private execution machinery.
 
 ## Context modes
 

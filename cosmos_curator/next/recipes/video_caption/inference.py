@@ -1,54 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Phase A: checkpoint-filtered media fetch, Ray Data LLM, and durable Parquet."""
+"""Caption complete MP4s with Ray Data LLM: exact media fetch, vLLM, and terminal rows.
+
+``caption_rows`` is the processing plan between a recipe's read and its durable
+write. Video-caption runs it inside shared enrichment's checkpoint scope;
+multimodal-caption's two-phase runner reuses it. A ``CaptionRequest`` names each
+row's media, the identity carried into terminal rows, and how to build them.
+"""
 
 import base64
 import copy
 import time
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import unquote, urlsplit
 
-import lance
 import pyarrow as pa
-import pyarrow.fs as pafs
 import ray
 from botocore.exceptions import BotoCoreError, ClientError
 from loguru import logger
-from ray.data.block import BlockMetadata
-from ray.data.context import DataContext
-from ray.data.datasource import Datasource, ReadTask
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
-from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInferenceBindings,
-    CaptionInputBindings,
-    CaptionRunBindings,
-)
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     VIDEO_NUM_FRAMES,
-    CaptionModelSpec,
+    CaptionInferenceBindings,
     resolved_max_output_tokens,
     resolved_sampling_params,
 )
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
-from cosmos_curator.next.recipes.video_caption.workspace import (
-    CaptionWorkspace,
-    record_phase_a_completion,
-)
-from cosmos_curator.next.utils.arrow_utils import filesystem_path
 from cosmos_curator.next.utils.storage import download_bytes
 
-_ROW_ADDRESS_FRAGMENT_SHIFT = 32
-_ROW_ADDRESS_OFFSET_MASK = (1 << _ROW_ADDRESS_FRAGMENT_SHIFT) - 1
 _ITEM_S3_ERROR_CODES = frozenset({"404", "NoSuchKey", "NoSuchObject", "NotFound", "InvalidObjectState"})
 _RETRYABLE_S3_ERROR_CODES = frozenset(
     {
@@ -73,127 +60,118 @@ _CHAT_TEMPLATE_MEMORY_BYTES = 16 * _BYTES_PER_GIB
 _MEDIA_FETCH_RESOURCES = {environment.CURATOR_IO_RESOURCE_NAME: 1.0}
 
 
-@dataclass(frozen=True)
-class CaptionExecutionConfig:
-    """Inference-only settings shared by complete-MP4 caption recipes."""
-
-    storage_profile: str
-    inference_concurrency: int | Literal["auto"]
-    inference_batch_size: int
-    max_concurrent_batches: int
-    tensor_parallel_size: int
-    pipeline_parallel_size: int
-    media_concurrency: int | Literal["auto"]
-    media_batch_size: int
-    media_cpus: float
-    media_attempts: int
-    lance_read_batch_size: int
-    parquet_rows_per_file: int
-    max_model_len: int | None = None
+TerminalRowBuilder = Callable[..., dict[str, Any]]
 
 
-MAPPED_INPUT_SCHEMA = pa.schema(
-    [
-        pa.field("fragment_id", pa.int64(), nullable=False),
-        pa.field("row_offset", pa.int64(), nullable=False),
-        pa.field("clip_id", pa.string(), nullable=False),
-        pa.field("clip_uri", pa.large_string(), nullable=False),
-        pa.field("clip_size_bytes", pa.int64(), nullable=False),
-    ]
-)
+class ContextStage(Protocol):
+    """Post-fetch context enrichment used by the shared caption plan."""
+
+    def __call__(
+        self,
+        batch: pa.Table,
+        *,
+        storage_profile: str,
+        attempts: int,
+    ) -> pa.Table:
+        """Append transient prompt context and declared small result values."""
+        ...
 
 
-@dataclass(frozen=True)
-class _CaptionFragmentRead:
-    """Picklable driver-side metadata for one pinned Lance fragment."""
+class CaptionExecution(Protocol):
+    """Media and inference settings the caption plan reads, excluded from caption identity.
 
-    fragment_id: int
-    num_rows: int
-    input_files: tuple[str, ...]
-    schema: pa.Schema
-
-
-class _CaptionLanceDatasource(Datasource):
-    """Read selected fragments without putting live ``LanceFragment`` objects in Ray tasks.
-
-    ``LanceFragment.__reduce__`` reopens its dataset without storage options. Ray's
-    built-in Lance datasource captures explicitly supplied fragments in each read
-    task, so pickling an S3 fragment can lose its configured credentials before the
-    task even starts. This datasource plans from inert metadata and has each worker
-    reopen the pinned dataset with the original storage options and fragment IDs.
+    Recipes pass their resolved execution config; ``max_model_len`` is the one
+    setting that, when set, also enters the caption contract.
     """
 
-    def __init__(  # noqa: PLR0913 -- serialized datasource connection inputs are independently meaningful
-        self,
-        *,
-        uri: str,
-        version: int,
-        fragments: tuple[_CaptionFragmentRead, ...],
-        storage_options: dict[str, str] | None,
-        batch_size: int,
-        source_columns: tuple[str, ...],
-        skip_null_column: str | None = None,
-    ) -> None:
-        super().__init__()  # type: ignore[no-untyped-call]  # Ray's public Datasource constructor lacks typing.
-        self._uri = uri
-        self._version = version
-        self._fragments = fragments
-        self._storage_options = dict(storage_options) if storage_options is not None else None
-        self._batch_size = batch_size
-        self._source_columns = source_columns
-        self._skip_null_column = skip_null_column
+    @property
+    def storage_profile(self) -> str:
+        """Name the storage credentials for media reads."""
+        ...
 
     @property
-    def num_rows(self) -> int:
-        """Return the pre-checkpoint-filter work ceiling without scanning rows."""
-        return sum(fragment.num_rows for fragment in self._fragments)
+    def inference_concurrency(self) -> int | Literal["auto"]:
+        """Cap vLLM replicas, or let Ray scale them with work and live GPUs."""
+        ...
 
-    def estimate_inmemory_data_size(self) -> int | None:
-        """Let Ray choose memory targets because Lance file size is not an Arrow size estimate."""
-        return None
+    @property
+    def inference_batch_size(self) -> int:
+        """Rows per exact vLLM batch."""
+        ...
 
-    def get_read_tasks(
-        self,
-        parallelism: int,
-        per_task_row_limit: int | None = None,
-        data_context: DataContext | None = None,
-    ) -> list[ReadTask]:
-        """Build tasks containing only fragment IDs and serializable connection data."""
-        del data_context
-        if parallelism < 1:
-            msg = f"Caption Lance read parallelism must be positive, got {parallelism}"
-            raise ValueError(msg)
-        task_count = min(parallelism, len(self._fragments))
-        tasks = []
-        for task_index in range(task_count):
-            start = task_index * len(self._fragments) // task_count
-            stop = (task_index + 1) * len(self._fragments) // task_count
-            fragments = self._fragments[start:stop]
-            fragment_ids = tuple(fragment.fragment_id for fragment in fragments)
-            metadata = BlockMetadata(
-                num_rows=None if self._skip_null_column else sum(fragment.num_rows for fragment in fragments),
-                size_bytes=None,
-                input_files=tuple(path for fragment in fragments for path in fragment.input_files),
-                exec_stats=None,
-            )
-            tasks.append(
-                ReadTask(
-                    partial(
-                        _read_caption_fragments,
-                        uri=self._uri,
-                        version=self._version,
-                        fragment_ids=fragment_ids,
-                        storage_options=self._storage_options,
-                        batch_size=self._batch_size,
-                        source_columns=self._source_columns,
-                        skip_null_column=self._skip_null_column,
-                    ),
-                    metadata,
-                    schema=fragments[0].schema,
-                    per_task_row_limit=per_task_row_limit,
-                )
-            )
-        return tasks
+    @property
+    def max_concurrent_batches(self) -> int:
+        """Concurrent batch calls per vLLM replica."""
+        ...
+
+    @property
+    def tensor_parallel_size(self) -> int:
+        """GPUs per replica across tensor parallelism."""
+        ...
+
+    @property
+    def pipeline_parallel_size(self) -> int:
+        """GPUs per replica across pipeline parallelism."""
+        ...
+
+    @property
+    def max_model_len(self) -> int | None:
+        """Longest request the engine accepts, or vLLM's default."""
+        ...
+
+    @property
+    def lance_read_batch_size(self) -> int:
+        """Rows per media-fetch task, which recipes also use as their Lance scanner batch size."""
+        ...
+
+    @property
+    def media_concurrency(self) -> int | Literal["auto"]:
+        """Cap concurrent media-fetch tasks, or let Ray scale them within IO slots."""
+        ...
+
+    @property
+    def media_batch_size(self) -> int:
+        """Rows per media-fetch call."""
+        ...
+
+    @property
+    def media_cpus(self) -> float:
+        """CPUs reserved by each media-fetch task."""
+        ...
+
+    @property
+    def media_attempts(self) -> int:
+        """Attempts for transient media storage failures."""
+        ...
+
+
+@dataclass(frozen=True)
+class MediaColumns:
+    """Input columns naming each row's complete media object and the bytes it must have."""
+
+    uri: str
+    size: str
+    sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class CaptionRequest:
+    """One recipe's caption media, request, and terminal rows, independent of its reads and writes.
+
+    Input rows carry ``fragment_id``, ``row_offset``, the ``identity_columns``
+    that reach ``build_terminal_row``, and the ``media`` columns. An optional
+    ``context_stage`` renders a per-row prompt and may add the declared
+    ``carried_result_columns``. Terminal rows use ``result_schema``.
+    """
+
+    media: MediaColumns
+    identity_columns: tuple[str, ...]
+    prompt_template: str
+    build_terminal_row: TerminalRowBuilder
+    result_schema: pa.Schema
+    inference: CaptionInferenceBindings = field(default_factory=CaptionInferenceBindings)
+    context_stage: ContextStage | None = None
+    carried_result_columns: tuple[str, ...] = ()
 
 
 class _ExactVLLMBatchProcessor:
@@ -249,62 +227,17 @@ class _ExactVLLMBatchProcessor:
 
 
 class SharedMediaError(RuntimeError):
-    """A credentials or storage-availability failure that must stop Phase A."""
+    """A credentials or storage-availability failure that must stop processing."""
 
 
 class ItemMediaError(RuntimeError):
     """A deterministic failure scoped to one media item."""
 
 
-def result_schema(spec: CaptionModelSpec) -> pa.Schema:
-    """Return the explicit Parquet recovery schema."""
-    return pa.schema(
-        [
-            pa.field("fragment_id", pa.int64(), nullable=False),
-            pa.field("row_offset", pa.int64(), nullable=False),
-            pa.field("clip_id", pa.string(), nullable=False),
-            spec.caption_field,
-            spec.metadata_field,
-        ]
-    )
-
-
-def decompose_row_addresses(batch: pa.Table) -> pa.Table:
-    """Turn Lance's global row address into physical fragment and local offset."""
-    required = {"_rowaddr", "clip_id", "clip_uri", "clip_size_bytes"}
-    missing = sorted(required - set(batch.schema.names))
-    if missing:
-        msg = f"Lance caption read is missing required column(s): {', '.join(missing)}"
-        raise ValueError(msg)
-    rows = []
-    for row in batch.select(["_rowaddr", "clip_id", "clip_uri", "clip_size_bytes"]).to_pylist():
-        row_address = int(row["_rowaddr"])
-        rows.append(
-            {
-                "fragment_id": row_address >> _ROW_ADDRESS_FRAGMENT_SHIFT,
-                "row_offset": row_address & _ROW_ADDRESS_OFFSET_MASK,
-                "clip_id": row["clip_id"],
-                "clip_uri": row["clip_uri"],
-                "clip_size_bytes": row["clip_size_bytes"],
-            }
-        )
-    return pa.Table.from_pylist(rows, schema=MAPPED_INPUT_SCHEMA)
-
-
-def _repartition_caption_inputs_for_fetch(
-    dataset: ray.data.Dataset,
-    *,
-    rows_per_block: int,
-) -> ray.data.Dataset:
-    """Expose enough lightweight input blocks for media fetches to scale cluster-wide."""
-    logger.info("Repartitioning caption inputs into strict {}-row blocks before media fetch", rows_per_block)
-    return dataset.repartition(target_num_rows_per_block=rows_per_block, strict=True)
-
-
 def fetch_media_batch(
     batch: pa.Table,
     *,
-    input_bindings: CaptionInputBindings,
+    media: MediaColumns,
     storage_profile: str,
     attempts: int,
 ) -> pa.Table:
@@ -312,22 +245,20 @@ def fetch_media_batch(
     rows = []
     fetched_schema = pa.schema(
         [
-            *input_bindings.mapped_schema,
+            *batch.schema,
             pa.field("video_data_url", pa.large_string()),
             pa.field("download_error_type", pa.string()),
             pa.field("download_error_message", pa.large_string()),
         ]
     )
-    for row in batch.cast(input_bindings.mapped_schema).to_pylist():
+    for row in batch.to_pylist():
         try:
-            expected_sha256 = (
-                None if input_bindings.media_sha256_column is None else str(row[input_bindings.media_sha256_column])
-            )
+            expected_sha256 = None if media.sha256 is None else str(row[media.sha256])
             payload = read_and_validate_media(
-                str(row[input_bindings.media_uri_column]),
+                str(row[media.uri]),
                 storage_profile=storage_profile,
                 attempts=attempts,
-                expected_size=int(row[input_bindings.media_size_column]),
+                expected_size=int(row[media.size]),
                 expected_sha256=expected_sha256,
             )
         except ItemMediaError as exc:
@@ -420,10 +351,10 @@ def caption_llm_postprocess(
 def canonicalize_llm_batch(
     batch: pa.Table,
     *,
-    bindings: CaptionRunBindings,
+    request: CaptionRequest,
 ) -> pa.Table:
-    """Convert Ray LLM success/error shapes into the exact terminal schema."""
-    max_output_tokens = resolved_max_output_tokens(bindings.inference)
+    """Convert Ray LLM success/error shapes into the request's exact terminal schema."""
+    max_output_tokens = resolved_max_output_tokens(request.inference)
     rows = []
     for raw in batch.to_pylist():
         error_message = str(raw.get("__inference_error__") or "")
@@ -433,7 +364,7 @@ def canonicalize_llm_batch(
                 prefix, separator, _ = error_message.partition(":")
                 error_type = prefix if separator and prefix else "InferenceError"
             rows.append(
-                bindings.result.build_terminal_row(
+                request.build_terminal_row(
                     raw,
                     caption=None,
                     status="error",
@@ -452,7 +383,7 @@ def canonicalize_llm_batch(
         generated_tokens = _optional_int(raw.get("generated_token_count"))
         status = "truncated" if generated_tokens is not None and generated_tokens >= max_output_tokens else "success"
         rows.append(
-            bindings.result.build_terminal_row(
+            request.build_terminal_row(
                 raw,
                 caption=caption_text,
                 status=status,
@@ -462,225 +393,93 @@ def canonicalize_llm_batch(
                 error_message=None,
             )
         )
-    return pa.Table.from_pylist(rows, schema=bindings.result.staged_schema)
+    return pa.Table.from_pylist(rows, schema=request.result_schema)
 
 
-def caption_lance_datasource(  # noqa: PLR0913 -- datasource identity and schema inputs are independently meaningful
-    dataset: lance.LanceDataset,
-    attempt: CaptionAttempt,
-    *,
-    storage_options: dict[str, str] | None,
-    batch_size: int,
-    source_columns: tuple[str, ...],
-    source_schema: pa.Schema,
-    skip_null_column: str | None = None,
-) -> _CaptionLanceDatasource:
-    """Snapshot selected-fragment metadata while keeping live handles on the driver."""
-    fragments = []
-    for fragment_id in attempt.pending_fragment_ids:
-        fragment = dataset.get_fragment(fragment_id)
-        if fragment is None:
-            msg = f"Pending fragment {fragment_id} disappeared from attempt version {attempt.version}"
-            raise ValueError(msg)
-        fragments.append(
-            _CaptionFragmentRead(
-                fragment_id=fragment_id,
-                num_rows=int(fragment.count_rows()),
-                input_files=tuple(
-                    str(data_file.path)
-                    for data_file in fragment.data_files()  # type: ignore[no-untyped-call]  # Missing in Lance stubs.
-                ),
-                schema=source_schema,
-            )
-        )
-    return _CaptionLanceDatasource(
-        uri=dataset.uri,
-        version=attempt.version,
-        fragments=tuple(fragments),
-        storage_options=storage_options,
-        batch_size=batch_size,
-        source_columns=source_columns,
-        skip_null_column=skip_null_column,
-    )
-
-
-def _read_caption_fragments(  # noqa: PLR0913 -- serialized read-task inputs are independently meaningful
-    *,
-    uri: str,
-    version: int,
-    fragment_ids: tuple[int, ...],
-    storage_options: dict[str, str] | None,
-    batch_size: int,
-    source_columns: tuple[str, ...],
-    skip_null_column: str | None = None,
-) -> Iterator[pa.Table]:
-    """Reopen a pinned Lance snapshot with credentials and stream selected fragments."""
-    dataset = lance.dataset(uri, version=version, storage_options=storage_options)
-    fragments = []
-    for fragment_id in fragment_ids:
-        fragment = dataset.get_fragment(fragment_id)
-        if fragment is None:
-            msg = f"Pending fragment {fragment_id} disappeared from attempt version {version}"
-            raise ValueError(msg)
-        fragments.append(fragment)
-    scanner = dataset.scanner(
-        columns=list(source_columns),
-        fragments=fragments,
-        with_row_address=True,
-        batch_size=batch_size,
-    )
-    for batch in scanner.to_reader():
-        table = pa.Table.from_batches([batch])
-        if skip_null_column is not None:
-            table = table.filter(table[skip_null_column].is_valid())
-        if table.num_rows:
-            yield table
-
-
-def run_inference_phase(  # noqa: PLR0913 -- explicit phase boundary inputs are independently meaningful
-    dataset: lance.LanceDataset,
-    attempt: CaptionAttempt,
-    config: CaptionExecutionConfig,
-    bindings: CaptionRunBindings,
+def caption_rows(
+    rows: ray.data.Dataset,
+    request: CaptionRequest,
+    execution: CaptionExecution,
     model_dir: Path,
-    workspace: CaptionWorkspace,
     *,
-    storage_options: dict[str, str] | None,
-) -> None:
-    """Execute one checkpointed read-to-Parquet plan for the attempt's pending fragments."""
-    if not attempt.pending_fragment_ids:
-        return
-    caption_source = caption_lance_datasource(
-        dataset,
-        attempt,
-        storage_options=storage_options,
-        batch_size=config.lance_read_batch_size,
-        source_columns=bindings.input.source_columns,
-        source_schema=bindings.input.source_schema,
-        skip_null_column=bindings.input.row_id_column if bindings.input.skip_null_ids else None,
-    )
+    max_rows: int,
+) -> ray.data.Dataset:
+    """Fetch each row's media, caption it with vLLM, and return terminal rows in ``request.result_schema``.
 
-    with installed_checkpoint(
-        id_column=bindings.input.row_id_column,
-        checkpoint_path=workspace.checkpoints_uri,
-        filesystem=workspace.filesystem,
-    ):
-        source = ray.data.read_datasource(
-            caption_source,
-            override_num_blocks=len(attempt.pending_fragment_ids),
-        )
-        mapped = source.map_batches(
-            bindings.input.project_batch,
+    Each media-fetch task takes ``execution.lance_read_batch_size`` rows.
+    ``max_rows`` bounds the replica pool by the work rather than by a snapshot of
+    cluster GPUs. Deterministic per-item media failures become terminal error
+    rows; shared storage, multimodal preparation, and inference failures raise.
+    """
+    media_compute = (
+        None if execution.media_concurrency == "auto" else ray.data.TaskPoolStrategy(size=execution.media_concurrency)
+    )
+    # Ray merges each read task's scanner batches into one block and sizes read tasks from the
+    # CPUs present when the plan starts. Fixed blocks keep fetch tasks the same size regardless,
+    # including the rows a resume leaves after checkpoint filtering.
+    rows = rows.repartition(target_num_rows_per_block=execution.lance_read_batch_size, strict=True)
+    # Ray accepts fn_kwargs for keyword-only batch UDFs; its public stub does not model that callable shape.
+    fetched = rows.map_batches(
+        fetch_media_batch,  # type: ignore[arg-type]
+        batch_format="pyarrow",
+        batch_size=execution.media_batch_size,
+        fn_kwargs={
+            "media": request.media,
+            "storage_profile": execution.storage_profile,
+            "attempts": execution.media_attempts,
+        },
+        num_cpus=execution.media_cpus,
+        resources=_MEDIA_FETCH_RESOURCES,
+        compute=media_compute,
+    )
+    if request.context_stage is not None:
+        fetched = fetched.map_batches(
+            request.context_stage,  # type: ignore[arg-type]
             batch_format="pyarrow",
-            batch_size=None,
-            zero_copy_batch=True,
-        )
-        fetch_inputs = _repartition_caption_inputs_for_fetch(
-            mapped,
-            rows_per_block=config.lance_read_batch_size,
-        )
-        # Ray accepts fn_kwargs for a keyword-only batch UDF; its public stub does not model that callable shape.
-        media_compute = (
-            None if config.media_concurrency == "auto" else ray.data.TaskPoolStrategy(size=config.media_concurrency)
-        )
-        fetched = fetch_inputs.map_batches(
-            fetch_media_batch,  # type: ignore[arg-type]
-            batch_format="pyarrow",
-            batch_size=config.media_batch_size,
-            fn_kwargs={
-                "input_bindings": bindings.input,
-                "storage_profile": config.storage_profile,
-                "attempts": config.media_attempts,
-            },
-            num_cpus=config.media_cpus,
+            batch_size=execution.media_batch_size,
+            fn_kwargs={"storage_profile": execution.storage_profile, "attempts": execution.media_attempts},
+            num_cpus=execution.media_cpus,
             resources=_MEDIA_FETCH_RESOURCES,
             compute=media_compute,
         )
-        context_enriched = fetched
-        if bindings.context_stage is not None:
-            context_enriched = fetched.map_batches(
-                bindings.context_stage,  # type: ignore[arg-type]
-                batch_format="pyarrow",
-                batch_size=config.media_batch_size,
-                fn_kwargs={"storage_profile": config.storage_profile, "attempts": config.media_attempts},
-                num_cpus=config.media_cpus,
-                resources=_MEDIA_FETCH_RESOURCES,
-                compute=media_compute,
-            )
-        inference_worker_ceiling = _resolve_inference_worker_ceiling(config, caption_source.num_rows)
-        gpus_per_replica = config.tensor_parallel_size * config.pipeline_parallel_size
-        available_gpus = float(ray.available_resources().get("GPU", 0.0))  # type: ignore[no-untyped-call]
-        initial_inference_workers = _resolve_initial_inference_workers(
-            available_gpus=available_gpus,
-            gpus_per_replica=gpus_per_replica,
-            worker_ceiling=inference_worker_ceiling,
-        )
-        logger.info(
-            "Caption inference actor pool will eagerly request {} replica(s) and can scale to {}, after observing {} "
-            "currently available GPU(s); each replica requests {} GPU(s) (TP={}, PP={})",
-            initial_inference_workers,
-            inference_worker_ceiling,
-            available_gpus,
-            gpus_per_replica,
-            config.tensor_parallel_size,
-            config.pipeline_parallel_size,
-        )
-        processor = _build_llm_processor(
-            config,
-            model_dir,
-            bindings.input.staged_binding_columns,
-            inference_bindings=bindings.inference,
-            prompt_template=bindings.prompt_template,
-            carried_result_columns=bindings.result.carried_result_columns,
-            initial_inference_workers=initial_inference_workers,
-            inference_worker_ceiling=inference_worker_ceiling,
-        )
-        inferred = processor(context_enriched)
-        terminal = inferred.map_batches(
-            canonicalize_llm_batch,
-            batch_format="pyarrow",
-            batch_size=config.inference_batch_size,
-            fn_kwargs={"bindings": bindings},
-            zero_copy_batch=True,
-        )
-        checkpoint_groups = terminal.repartition(
-            target_num_rows_per_block=config.parquet_rows_per_file,
-            strict=True,
-        )
-        checkpoint_groups.write_parquet(
-            workspace.results_uri,
-            filesystem=workspace.filesystem,
-            max_rows_per_file=config.parquet_rows_per_file,
-        )
-    try:
-        record_phase_a_completion(workspace, attempt, bindings.result.digest)
-    except Exception as exc:  # noqa: BLE001 -- this marker is only a restart optimization
-        logger.warning(
-            "Phase A results are durable, but writing completion marker {} failed; a restart will let Ray reload "
-            "checkpoints instead: {!r}",
-            workspace.phase_a_completion_uri,
-            exc,
-        )
-    else:
-        logger.info(
-            "Recorded Phase A completion for {} pending fragment(s) at {}",
-            len(attempt.pending_fragment_ids),
-            workspace.phase_a_completion_uri,
-        )
-
-
-def staged_result_files(workspace: CaptionWorkspace) -> tuple[str, ...]:
-    """Return all durable Parquet result paths in stable order."""
-    return tuple(
-        sorted(
-            path
-            for path in _files(workspace.filesystem, filesystem_path(workspace.results_uri), recursive=True)
-            if path.endswith(".parquet")
-        )
+    inference_worker_ceiling = _resolve_inference_worker_ceiling(execution, max_rows)
+    gpus_per_replica = execution.tensor_parallel_size * execution.pipeline_parallel_size
+    available_gpus = float(ray.available_resources().get("GPU", 0.0))  # type: ignore[no-untyped-call]
+    initial_inference_workers = _resolve_initial_inference_workers(
+        available_gpus=available_gpus,
+        gpus_per_replica=gpus_per_replica,
+        worker_ceiling=inference_worker_ceiling,
+    )
+    logger.info(
+        "Caption inference actor pool will eagerly request {} replica(s) and can scale to {}, after observing {} "
+        "currently available GPU(s); each replica requests {} GPU(s) (TP={}, PP={})",
+        initial_inference_workers,
+        inference_worker_ceiling,
+        available_gpus,
+        gpus_per_replica,
+        execution.tensor_parallel_size,
+        execution.pipeline_parallel_size,
+    )
+    processor = _build_llm_processor(
+        execution,
+        model_dir,
+        request.identity_columns,
+        inference_bindings=request.inference,
+        prompt_template=request.prompt_template,
+        carried_result_columns=request.carried_result_columns,
+        initial_inference_workers=initial_inference_workers,
+        inference_worker_ceiling=inference_worker_ceiling,
+    )
+    return processor(fetched).map_batches(
+        canonicalize_llm_batch,  # type: ignore[arg-type]
+        batch_format="pyarrow",
+        batch_size=execution.inference_batch_size,
+        fn_kwargs={"request": request},
+        zero_copy_batch=True,
     )
 
 
-def _resolve_inference_worker_ceiling(config: CaptionExecutionConfig, num_input_rows: int) -> int:
+def _resolve_inference_worker_ceiling(config: CaptionExecution, num_input_rows: int) -> int:
     """Bound the actor pool by pending work, never by a snapshot of cluster GPUs."""
     if num_input_rows < 1:
         msg = f"Caption inference requires at least one input row, got {num_input_rows}"
@@ -707,7 +506,7 @@ def _resolve_initial_inference_workers(
 
 
 def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to independent Ray settings
-    config: CaptionExecutionConfig,
+    config: CaptionExecution,
     model_dir: Path,
     staged_binding_columns: tuple[str, ...],
     *,
@@ -716,7 +515,7 @@ def _build_llm_processor(  # noqa: PLR0913 -- construction inputs map to indepen
     carried_result_columns: tuple[str, ...] = (),
     initial_inference_workers: int,
     inference_worker_ceiling: int,
-) -> Any:  # noqa: ANN401
+) -> Callable[[ray.data.Dataset], ray.data.Dataset]:
     """Build Ray 2.58's vLLM processor against the pre-staged local directory."""
     from ray.data.llm import (  # noqa: PLC0415 -- keep CLI/config import layers light
         ChatTemplateStageConfig,
@@ -887,8 +686,3 @@ def _optional_int(value: object) -> int | None:
         msg = f"Ray LLM token counts must be integers or null, got {type(value).__name__}"
         raise TypeError(msg)
     return value
-
-
-def _files(filesystem: pafs.FileSystem, root: str, *, recursive: bool) -> list[str]:
-    infos = filesystem.get_file_info(pafs.FileSelector(root, recursive=recursive, allow_not_found=True))
-    return [info.path for info in infos if info.type == pafs.FileType.File]

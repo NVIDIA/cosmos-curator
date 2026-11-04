@@ -41,7 +41,9 @@ components are the canonical reference. Migrate other recipes and older recovery
 the [extensions it lacks](../../docs/curator/design/curator-next-checkpoint-recovery.md#expansion-across-curator-next)
 first: row-level selection (embeddings, robot-action-caption) and several field sets in one commit
 (multimodal-embedding) each need an explicit extension, not a force-fit. `lance_fragment_recovery` is deprecated; its
-producers (mp4-index, multimodal-split, robot-action-split) migrate to shared append publication explicitly.
+producers (mp4-index, multimodal-split, robot-action-split) migrate to shared append publication explicitly. Likewise,
+`legacy/caption_fragment_recovery`, video-caption's former two-phase engine, is deprecated; multimodal-caption and
+multimodal-embedding migrate to shared enrichment explicitly.
 
 ## Recipe Contracts
 

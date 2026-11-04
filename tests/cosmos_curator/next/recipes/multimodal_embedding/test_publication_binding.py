@@ -23,6 +23,17 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import (
+    CaptionInputBindings,
+    CaptionPublicationBindings,
+    CaptionResultBindings,
+    CaptionRunBindings,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import FragmentCaptionState, classify_fragment
+from cosmos_curator.next.legacy.caption_fragment_recovery.publication import (
+    commit_prepared_update,
+    prepare_fragment_update,
+)
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     CameraEmbeddingPlan,
     EmbeddingRunPlan,
@@ -35,14 +46,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     validate_terminal_row,
 )
 from cosmos_curator.next.recipes.multimodal_embedding.publication import publication_bindings
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInputBindings,
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
-)
-from cosmos_curator.next.recipes.video_caption.lance_state import FragmentCaptionState, classify_fragment
-from cosmos_curator.next.recipes.video_caption.publication import commit_prepared_update, prepare_fragment_update
 from cosmos_curator.next.utils.identity import canonical_digest
 
 

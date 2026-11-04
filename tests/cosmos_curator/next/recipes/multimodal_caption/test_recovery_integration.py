@@ -14,6 +14,8 @@ import pyarrow.parquet as pq
 import pytest
 import ray
 
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import CaptionWorkspace, staged_result_files
 from cosmos_curator.next.recipes.multimodal_caption import pipeline
 from cosmos_curator.next.recipes.multimodal_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
@@ -25,9 +27,6 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
 )
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
 from cosmos_curator.next.recipes.video_caption import inference
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
 from tests.cosmos_curator.next.recipes.multimodal_caption.test_ego_context import _mcap
 
 

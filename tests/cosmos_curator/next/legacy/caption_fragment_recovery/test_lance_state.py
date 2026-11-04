@@ -11,9 +11,8 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
-from cosmos_curator.next.recipes.video_caption.lance_state import (
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
     CaptionAttempt,
     FragmentCaptionState,
     ResultFieldMismatchError,
@@ -22,8 +21,8 @@ from cosmos_curator.next.recipes.video_caption.lance_state import (
     classify_fragment,
     ensure_caption_fields,
     leaf_field_ids,
-    validate_caption_input,
 )
+from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
 
 
 def _registered(
@@ -62,7 +61,7 @@ def _commit_terminal_rows(
         }
         for index in range(rows)
     ]
-    schema = pa.schema([pa.field("clip_id", pa.string(), nullable=False), spec.caption_field, spec.metadata_field])
+    schema = pa.schema([pa.field("clip_id", pa.string(), nullable=False), *spec.fields])
     table = pa.Table.from_pylist(values, schema=schema)
     metadata, field_ids = fragment.update_columns(
         pa.RecordBatchReader.from_batches(schema, table.to_batches()),
@@ -102,7 +101,7 @@ def test_partial_or_conflicting_field_sets_fail(
 ) -> None:
     """A field set cannot be partial or reuse owned names with different types."""
     partial_uri, partial = clip_dataset_factory()
-    partial.add_columns(pa.schema([caption_spec.caption_field]))
+    partial.add_columns(pa.schema([caption_spec.fields.field(caption_spec.caption_field_name)]))
     with pytest.raises(ValueError, match="partially present") as caught:
         ensure_caption_fields(partial_uri, storage_options=None, bindings=caption_bindings, attempts=1)
     assert not isinstance(caught.value, ResultFieldMismatchError)
@@ -115,7 +114,7 @@ def test_partial_or_conflicting_field_sets_fail(
         pa.schema(
             [
                 pa.field(caption_spec.caption_field_name, pa.string()),
-                caption_spec.metadata_field,
+                caption_spec.fields.field(caption_spec.metadata_field_name),
             ]
         )
     )
@@ -284,44 +283,3 @@ def test_fragment_with_stale_contract_digest_fails(
 
     with pytest.raises(ValueError, match="contract_digest"):
         classify_fragment(fragment, bindings=caption_bindings)
-
-
-def test_input_validation_rejects_duplicate_clip_ids(
-    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
-) -> None:
-    """Publication keys must be globally unique before caption registration."""
-    uri, dataset = clip_dataset_factory(clip_ids=["duplicate", "duplicate"])
-
-    with pytest.raises(ValueError, match="globally unique"):
-        validate_caption_input(dataset, uri=uri)
-
-
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("clip_size_bytes", 1, None),
-        ("clip_id", None, "non-null and globally unique clip_id"),
-        ("clip_uri", None, "non-null URIs"),
-        ("clip_size_bytes", None, "positive byte sizes"),
-        ("clip_size_bytes", 0, "positive byte sizes"),
-        ("clip_size_bytes", -1, "positive byte sizes"),
-    ],
-)
-def test_input_validation_checks_appended_clip_values(
-    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
-    clip_row_factory: Callable[..., dict[str, object]],
-    field: str,
-    value: int | None,
-    message: str | None,
-) -> None:
-    """New spans must have usable clips; their readiness depends on values, not publication history."""
-    uri, dataset = clip_dataset_factory()
-    row = clip_row_factory(2)
-    row[field] = value
-    lance.write_dataset(pa.Table.from_pylist([row], schema=dataset.schema), uri, mode="append")
-    latest = lance.dataset(uri)
-    if message is None:
-        validate_caption_input(latest, uri=uri)
-    else:
-        with pytest.raises(ValueError, match=message):
-            validate_caption_input(latest, uri=uri)

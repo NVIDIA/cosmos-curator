@@ -17,15 +17,24 @@ import pytest
 
 from cosmos_curator.next.enrichment import execution, inputs
 from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
-from cosmos_curator.next.recipes.video_caption.contracts import caption_contract_digest, resolve_model_spec
-from cosmos_curator.next.recipes.video_caption.lance_state import ensure_caption_fields, validate_caption_input
+from cosmos_curator.next.recipes.video_caption.bindings import resolve_bindings as resolve_caption_bindings
+from cosmos_curator.next.recipes.video_caption.config import resolve_config_data as resolve_caption_config
 from cosmos_curator.next.recipes.video_cut.contracts import SPAN_SCHEMA
 from cosmos_curator.next.recipes.video_transcode import pipeline
 from cosmos_curator.next.recipes.video_transcode.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
-from cosmos_curator.next.recipes.video_transcode.contracts import make_clip_id
+from cosmos_curator.next.recipes.video_transcode.contracts import (
+    make_clip_id,
+    validate_clip_readiness,
+    validate_clip_table,
+)
 from tests.cosmos_curator.next.enrichment.helpers import prepare_results, publish_attempt, publish_results
-from tests.cosmos_curator.next.recipes.video_caption.helpers import caption_run_bindings
+
+
+def _ready_for_caption(dataset: lance.LanceDataset) -> None:
+    """Apply the clip checks captioning and embedding run before selecting work."""
+    validate_clip_table(dataset, uri=dataset.uri)
+    validate_clip_readiness(dataset)
 
 
 def _append_span(dataset: lance.LanceDataset) -> lance.LanceDataset:
@@ -37,19 +46,21 @@ def _append_span(dataset: lance.LanceDataset) -> lance.LanceDataset:
 
 
 def test_publication_feeds_caption(
-    enrichment_input: inputs.EnrichmentInput, dataset: lance.LanceDataset, results: pa.Table
+    config: ResolvedVideoTranscodeConfig, enrichment_input: inputs.EnrichmentInput, results: pa.Table
 ) -> None:
     """Caption accepts published clip values without a recipe-specific receipt."""
     published = publish_results(results, enrichment_input)
-    validate_caption_input(published, uri=dataset.uri)
-    spec = resolve_model_spec("qwen3_8_27b_fp8")
-    captioned = ensure_caption_fields(
-        dataset.uri,
-        storage_options=None,
-        bindings=caption_run_bindings(spec, caption_contract_digest(spec)),
-        attempts=1,
+    caption_config = resolve_caption_config(
+        {
+            "schema_version": 1,
+            "kind": "video-caption",
+            "input": {"media_root": config.input.media_root, "clips_lance_uri": published.uri},
+            "model": {"variant": "qwen3_8_27b_fp8"},
+        }
     )
-    assert inputs.open_enrichment_input(enrichment_input.bindings).dataset.version == captioned.version
+    captioned = inputs.open_enrichment_input(resolve_caption_bindings(caption_config))
+    assert captioned.dataset.version == published.version + 1
+    assert inputs.open_enrichment_input(enrichment_input.bindings).dataset.version == captioned.dataset.version
 
 
 def test_next_run_fills_only_appended_fragments(
@@ -71,7 +82,7 @@ def test_next_run_fills_only_appended_fragments(
     published = publish_results(pa.Table.from_pylist([row], schema=results.schema), current)
     assert inputs.pending_fragment_ids(published, enrichment_input.bindings) == ()
     assert [fragment.metadata.to_json() for fragment in published.get_fragments()[:2]] == files
-    validate_caption_input(published, uri=published.uri)
+    _ready_for_caption(published)
 
 
 def test_caption_readiness_survives_pruned_transcode_history(
@@ -83,7 +94,7 @@ def test_caption_readiness_survives_pruned_transcode_history(
     latest = lance.dataset(published.uri)
     latest.cleanup_old_versions(older_than=timedelta(seconds=0))
     assert [version["version"] for version in latest.versions()] == [latest.version]
-    validate_caption_input(latest, uri=latest.uri)
+    _ready_for_caption(latest)
 
 
 @pytest.mark.parametrize("corruption", ["wrong-contract", "wrong-uri"])
@@ -150,7 +161,7 @@ def test_resumed_selection_leaves_appended_spans_unready_for_caption(
     current = lance.dataset(enrichment_input.dataset.uri)
     assert summary["remaining_rows"] == 1
     with pytest.raises(ValueError, match="non-null and globally unique clip_id"):
-        validate_caption_input(current, uri=current.uri)
+        _ready_for_caption(current)
 
 
 def test_empty_input_needs_no_ray_or_completion_commit(
@@ -169,7 +180,7 @@ def test_empty_input_needs_no_ray_or_completion_commit(
     assert result["selected_fragments"] == result["remaining_fragments"] == 0
     assert result["clips_lance_version"] == empty.version
     assert pipeline.run_config(config)["clips_lance_version"] == result["clips_lance_version"]
-    validate_caption_input(empty, uri=empty.uri)
+    _ready_for_caption(empty)
     assert not Path(config.output.staging_root_uri).exists()
 
 
@@ -220,7 +231,7 @@ def test_outcome_rows_are_skipped_across_fragment_batches(
     assert latest.to_table(columns=SPAN_SCHEMA.names).equals(pa.Table.from_pylist(source_rows, schema=SPAN_SCHEMA))
     assert latest.to_table(filter="span_id IS NULL", columns=["clip_id"])["clip_id"].null_count == 3
     assert reconcile_and_select_attempt(inputs.open_enrichment_input(bindings)).selected == ()
-    validate_caption_input(latest, uri=latest.uri)
+    _ready_for_caption(latest)
 
 
 @pytest.mark.parametrize("status", ["empty", "error"])
@@ -252,7 +263,7 @@ def test_appending_outcomes_needs_no_transcode_work_and_keeps_caption_ready(
     monkeypatch.setattr(pipeline, "start_ray", Mock(side_effect=AssertionError("Ray must not start")))
     assert pipeline.run_config(config)["selected_fragments"] == 0
     before = lance.dataset(dataset.uri)
-    validate_caption_input(before, uri=before.uri)
+    _ready_for_caption(before)
     source |= {"source_id": "later-source", "source_uri": "s3://test-bucket/later.mp4"}
     appended = lance.write_dataset(
         pa.Table.from_pylist([source], schema=before.schema),
@@ -264,5 +275,5 @@ def test_appending_outcomes_needs_no_transcode_work_and_keeps_caption_ready(
     assert summary["selected_fragments"] == 0
     assert summary["clips_lance_version"] == appended.version
     latest = lance.dataset(dataset.uri)
-    validate_caption_input(latest, uri=latest.uri)
+    _ready_for_caption(latest)
     assert latest.count_rows() == before.count_rows() + 1

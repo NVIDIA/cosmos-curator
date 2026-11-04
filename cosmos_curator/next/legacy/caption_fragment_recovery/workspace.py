@@ -8,6 +8,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 from uuid import uuid4
 
 import pyarrow.fs as pafs
@@ -15,9 +16,12 @@ from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
 from cosmos_curator.core.utils.storage.storage_utils import get_storage_client
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import CaptionAttempt
 from cosmos_curator.next.utils.arrow_utils import arrow_filesystem, filesystem_path
 
+# Persisted in the multimodal recipes' workspace manifests; bump to isolate incompatible staged results.
+CHECKPOINT_ADAPTER_VERSION: Final = 1
+WORKSPACE_SCHEMA_VERSION: Final = 1
 _PRECONDITION_FAILED = 412
 _PHASE_A_COMPLETION_SCHEMA_VERSION = 1
 
@@ -140,6 +144,16 @@ def record_phase_a_completion(
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     with workspace.filesystem.open_output_stream(filesystem_path(workspace.phase_a_completion_uri)) as output:
         output.write(encoded)
+
+
+def staged_result_files(workspace: CaptionWorkspace) -> tuple[str, ...]:
+    """Return all durable Parquet result paths in stable order."""
+    infos = workspace.filesystem.get_file_info(
+        pafs.FileSelector(filesystem_path(workspace.results_uri), recursive=True, allow_not_found=True)
+    )
+    return tuple(
+        sorted(info.path for info in infos if info.type == pafs.FileType.File and info.path.endswith(".parquet"))
+    )
 
 
 def cleanup_workspace(workspace: CaptionWorkspace, *, storage_profile: str) -> None:

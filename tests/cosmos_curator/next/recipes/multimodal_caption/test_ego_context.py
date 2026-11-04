@@ -19,6 +19,12 @@ from google.protobuf.descriptor import FileDescriptor
 from cosmos_curator.core.sensors.data.egotrajectory_data import EgoTrajectory
 from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sensors.ego_trajectory_sensor import EgoTrajectorySensor
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import (
+    CaptionPublicationBindings,
+    CaptionResultBindings,
+    CaptionRunBindings,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.inference import caption_request
 from cosmos_curator.next.recipes.multimodal_caption import ego_context, ego_context_adapter, pipeline
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     EGO_CONTEXT_MAX_NEAREST_POSE_DELTA_NS,
@@ -40,11 +46,6 @@ from cosmos_curator.next.recipes.multimodal_caption.ego_context import (
     build_ego_trajectory_summary,
 )
 from cosmos_curator.next.recipes.multimodal_caption.ego_context_adapter import append_ego_context_batch
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
-)
 from cosmos_curator.next.recipes.video_caption.inference import (
     ItemMediaError,
     SharedMediaError,
@@ -785,7 +786,7 @@ def test_ego_context_composes_through_shared_engine_and_canonicalization(tmp_pat
         ],
         schema=input_bindings.mapped_schema,
     )
-    fetched = fetch_media_batch(mapped, input_bindings=input_bindings, storage_profile="default", attempts=1)
+    fetched = fetch_media_batch(mapped, media=input_bindings.media, storage_profile="default", attempts=1)
     contextual = context_stage(fetched, storage_profile="default", attempts=1)
     engine_row = contextual.to_pylist()[0]
     context_digest = engine_row["context_digest"]
@@ -809,7 +810,7 @@ def test_ego_context_composes_through_shared_engine_and_canonicalization(tmp_pat
     assert postprocessed["context_digest"] == context_digest
     assert "rendered_prompt" not in postprocessed
     assert "video_data_url" not in postprocessed
-    terminal = canonicalize_llm_batch(pa.Table.from_pylist([postprocessed]), bindings=bindings)
+    terminal = canonicalize_llm_batch(pa.Table.from_pylist([postprocessed]), request=caption_request(bindings))
     assert terminal.schema.equals(result_bindings.staged_schema, check_metadata=True)
     terminal_row = terminal.to_pylist()[0]
     assert terminal_row["timestamp_source"] == "sensor"

@@ -30,6 +30,20 @@ from cosmos_curator.next.core.ray_runtime import (
     curator_io_resources,
     ensure_ray_initialized,
 )
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
+    CaptionAttempt,
+    capture_attempt,
+    ensure_caption_fields,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import (
+    CHECKPOINT_ADAPTER_VERSION,
+    WORKSPACE_SCHEMA_VERSION,
+    cleanup_workspace,
+    ensure_workspace,
+    phase_a_completion_covers,
+    resolve_workspace,
+    workspace_manifest_exists,
+)
 from cosmos_curator.next.recipes.multimodal_embedding.config import (
     ResolvedMultimodalEmbeddingConfig,
     resolve_config,
@@ -50,19 +64,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.inference import (
 from cosmos_curator.next.recipes.multimodal_embedding.publication import (
     camera_bindings,
     publish_atomic_staged_results,
-)
-from cosmos_curator.next.recipes.video_caption.contracts import CHECKPOINT_ADAPTER_VERSION, WORKSPACE_SCHEMA_VERSION
-from cosmos_curator.next.recipes.video_caption.lance_state import (
-    CaptionAttempt,
-    capture_attempt,
-    ensure_caption_fields,
-)
-from cosmos_curator.next.recipes.video_caption.workspace import (
-    cleanup_workspace,
-    ensure_workspace,
-    phase_a_completion_covers,
-    resolve_workspace,
-    workspace_manifest_exists,
 )
 from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 from cosmos_curator.next.utils.identity import canonical_digest

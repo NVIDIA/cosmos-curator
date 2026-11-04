@@ -42,6 +42,29 @@ import ray
 from lance.fragment import FragmentMetadata, LanceFragment
 from ray.data.expressions import col
 
+from cosmos_curator.next.legacy.caption_fragment_recovery import publication as fragment_publication
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import (
+    CaptionInputBindings,
+    CaptionPublicationBindings,
+    CaptionResultBindings,
+    CaptionRunBindings,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
+    CaptionAttempt,
+    FragmentCaptionState,
+    classify_fragment,
+    fragment_fingerprint,
+    fragment_metadata_json,
+    leaf_field_ids,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.publication import (
+    AttemptFragmentGuard,
+    PreparedFragmentPublication,
+    PreparedFragmentUpdate,
+    PublicationError,
+    PublicationSummary,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import CaptionWorkspace, staged_result_files
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     CameraEmbeddingPlan,
     EmbeddingRunPlan,
@@ -65,30 +88,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.episode_input import (
 from cosmos_curator.next.recipes.multimodal_embedding.inference import camera_staged_schema
 from cosmos_curator.next.recipes.multimodal_split.lance_sink import validate_episode_table
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
-from cosmos_curator.next.recipes.video_caption import publication as fragment_publication
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInputBindings,
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
-)
-from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
-from cosmos_curator.next.recipes.video_caption.lance_state import (
-    CaptionAttempt,
-    FragmentCaptionState,
-    classify_fragment,
-    fragment_fingerprint,
-    fragment_metadata_json,
-    leaf_field_ids,
-)
-from cosmos_curator.next.recipes.video_caption.publication import (
-    AttemptFragmentGuard,
-    PreparedFragmentPublication,
-    PreparedFragmentUpdate,
-    PublicationError,
-    PublicationSummary,
-)
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
 from cosmos_curator.next.utils.identity import canonical_digest
 
 _ATOMIC_PUBLICATION_KEY = "cosmos_curator.atomic_publication"

@@ -3,7 +3,7 @@
 
 """Embedding plan wiring inside the shared checkpoint scope, without starting Ray or loading a model."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from ray.data import ActorPoolStrategy
@@ -23,7 +23,7 @@ def test_plan_reads_clip_ids_and_reserves_io_before_inference(
     spec: ModelSpec,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The plan reads clip IDs, URIs, and sizes; downloads hold IO slots; GPU actors stay loaded between bursts."""
+    """The plan reads clip IDs, URIs, and sizes; fixed-size downloads hold IO slots; GPU actors stay loaded."""
     context = DataContext.get_current()
     monkeypatch.setattr(context, "checkpoint_config", None)
     plan = Mock()
@@ -43,6 +43,11 @@ def test_plan_reads_clip_ids_and_reserves_io_before_inference(
 
     (datasource,) = datasources
     assert datasource._schema.names == ["clip_id", "clip_uri", "clip_size_bytes", "fragment_id", "row_offset"]
+    fixed_blocks, download = plan.mock_calls[:2]
+    assert fixed_blocks == call.repartition(
+        target_num_rows_per_block=config.execution.lance_read_batch_size, strict=True
+    )
+    assert download.args == (processing.download_clip,)
     args, kwargs = plan.map.call_args
     assert args == (processing.download_clip,)
     assert kwargs["resources"] == {"curator_io": 1.0}

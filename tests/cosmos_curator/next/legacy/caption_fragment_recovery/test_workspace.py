@@ -9,15 +9,10 @@ from pathlib import Path
 import pyarrow.fs as pafs
 import pytest
 
-from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_caption.contracts import (
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import CaptionAttempt
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import (
     CHECKPOINT_ADAPTER_VERSION,
     WORKSPACE_SCHEMA_VERSION,
-    CaptionModelSpec,
-    normalized_caption_contract,
-)
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
-from cosmos_curator.next.recipes.video_caption.workspace import (
     CaptionWorkspace,
     arrow_filesystem,
     cleanup_workspace,
@@ -28,6 +23,8 @@ from cosmos_curator.next.recipes.video_caption.workspace import (
     resolve_workspace,
     workspace_manifest_exists,
 )
+from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config_data
+from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, normalized_caption_contract
 
 
 def _config(media_root: Path, staging_root: Path | str) -> ResolvedVideoCaptionConfig:

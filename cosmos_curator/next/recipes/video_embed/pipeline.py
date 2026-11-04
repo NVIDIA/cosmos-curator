@@ -57,7 +57,12 @@ def embed_clips(processing: ProcessingScope, config: ResolvedVideoEmbedConfig, s
     """Stream downloaded clips through GPU preprocessing and inference to durable results."""
     execution = config.execution
     model_dir = str(validate_model_directory(spec))
-    clips = processing.read(READ_COLUMNS)
+    # Ray merges each read task's scanner batches into one block and sizes read tasks from the
+    # CPUs present when the plan starts. Fixed blocks keep download tasks the same size regardless,
+    # including the clips a resume leaves after checkpoint filtering.
+    clips = processing.read(READ_COLUMNS).repartition(
+        target_num_rows_per_block=execution.lance_read_batch_size, strict=True
+    )
     # Keep loaded actors while their pool has work in flight between download bursts.
     clips.context.autoscaling_config.actor_pool_util_downscaling_threshold = 0.0
     downloaded = clips.map(

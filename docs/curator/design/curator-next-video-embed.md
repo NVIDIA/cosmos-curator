@@ -8,7 +8,7 @@ embedding can run independently and publish disjoint columns concurrently.
 video-cut -> video-transcode --+--> video-caption
                               +--> video-embed
 
-pending Lance clips -> checkpoint filter
+pending Lance clips -> checkpoint filter -> fixed-size blocks
   -> CPU download tasks -> GPU decode / sample / pinned processor / embedding actors
   -> strict repartition -> checkpointed Arrow IPC
   -> group by original fragment -> prepare column files on workers
@@ -148,8 +148,10 @@ triggered Ray OOM kills. Ray's output backpressure alone did not bound worker he
 there is no download actor pool or actor-autoscaling workaround. Ray Core enforces each node's IO slots, including
 on late workers; Ray Data still regulates queued output and may submit tasks that wait for those slots.
 
-Lance scanner batches are sized by `lance_read_batch_size`; the shared reader balances fragment row ranges across Ray's
-requested read tasks, without a separate input repartition. Download tasks reserve 0.25 CPUs; each inference actor
+The shared reader balances fragment row ranges across Ray's read tasks. Ray merges each read task's output into one
+block and sizes read tasks from the CPUs present when the plan starts. A strict repartition after the read therefore
+gives every download task `lance_read_batch_size` clips (default 128), independent of read parallelism, including the
+clips a resume leaves after checkpoint filtering. Download tasks reserve 0.25 CPUs; each inference actor
 reserves one CPU and one GPU. The plan retains Ray's default target block size. Model pools use Ray's default scale-up
 threshold and task prefetching, executing one call per actor at a time. This inference plan sets the utilization downscaling threshold
 to `0.0` for the inference pool: one idle GPU alongside a busy GPU no longer triggers model retirement. Fully idle pools

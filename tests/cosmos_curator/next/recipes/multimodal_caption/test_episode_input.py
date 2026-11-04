@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionInputBindings
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_caption import episode_input
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
@@ -45,7 +46,6 @@ from cosmos_curator.next.recipes.multimodal_caption.episode_input import (
 )
 from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION, make_episode_id
 from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionInputBindings
 from cosmos_curator.next.recipes.video_caption.inference import fetch_media_batch
 
 
@@ -176,7 +176,7 @@ def test_media_fetch_checks_selected_size_and_sha256(tmp_path: Path) -> None:
 
     fetched = fetch_media_batch(
         source,
-        input_bindings=input_bindings,
+        media=input_bindings.media,
         storage_profile="default",
         attempts=1,
     ).to_pylist()[0]
@@ -185,7 +185,7 @@ def test_media_fetch_checks_selected_size_and_sha256(tmp_path: Path) -> None:
     row["media_sha256"] = "0" * 64
     mismatch = fetch_media_batch(
         pa.Table.from_pylist([row], schema=EPISODE_MAPPED_INPUT_SCHEMA),
-        input_bindings=input_bindings,
+        media=input_bindings.media,
         storage_profile="default",
         attempts=1,
     ).to_pylist()[0]

@@ -25,6 +25,28 @@ from cosmos_curator.next.core.ray_runtime import (
     curator_io_resources,
     ensure_ray_initialized,
 )
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import (
+    CaptionInputBindings,
+    CaptionPublicationBindings,
+    CaptionResultBindings,
+    CaptionRunBindings,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.inference import CaptionExecutionConfig, run_inference_phase
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
+    ResultFieldMismatchError,
+    capture_attempt,
+    ensure_caption_fields,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.publication import publish_staged_results
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import (
+    CHECKPOINT_ADAPTER_VERSION,
+    WORKSPACE_SCHEMA_VERSION,
+    cleanup_workspace,
+    ensure_workspace,
+    phase_a_completion_covers,
+    resolve_workspace,
+    workspace_manifest_exists,
+)
 from cosmos_curator.next.recipes.multimodal_caption.config import ResolvedMultimodalCaptionConfig, resolve_config
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     EGO_DECODER_MAPPING_DIGEST,
@@ -64,28 +86,7 @@ from cosmos_curator.next.recipes.multimodal_caption.episode_input import (
 )
 from cosmos_curator.next.recipes.multimodal_split.lance_sink import validate_episode_table
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
-from cosmos_curator.next.recipes.video_caption.bindings import (
-    CaptionInputBindings,
-    CaptionPublicationBindings,
-    CaptionResultBindings,
-    CaptionRunBindings,
-    ContextStage,
-)
-from cosmos_curator.next.recipes.video_caption.contracts import CHECKPOINT_ADAPTER_VERSION, WORKSPACE_SCHEMA_VERSION
-from cosmos_curator.next.recipes.video_caption.inference import CaptionExecutionConfig, run_inference_phase
-from cosmos_curator.next.recipes.video_caption.lance_state import (
-    ResultFieldMismatchError,
-    capture_attempt,
-    ensure_caption_fields,
-)
-from cosmos_curator.next.recipes.video_caption.publication import publish_staged_results
-from cosmos_curator.next.recipes.video_caption.workspace import (
-    cleanup_workspace,
-    ensure_workspace,
-    phase_a_completion_covers,
-    resolve_workspace,
-    workspace_manifest_exists,
-)
+from cosmos_curator.next.recipes.video_caption.inference import ContextStage
 from cosmos_curator.next.utils.arrow_utils import s3_compatibility_env_vars
 from cosmos_curator.next.utils.identity import canonical_digest
 

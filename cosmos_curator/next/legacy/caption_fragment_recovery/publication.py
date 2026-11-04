@@ -21,9 +21,8 @@ from lance.fragment import FragmentMetadata, LanceFragment
 from loguru import logger
 from ray.data.expressions import col
 
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_caption.inference import staged_result_files
-from cosmos_curator.next.recipes.video_caption.lance_state import (
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
     CaptionAttempt,
     FragmentCaptionState,
     classify_fragment,
@@ -32,7 +31,7 @@ from cosmos_curator.next.recipes.video_caption.lance_state import (
     leaf_field_ids,
     protected_binding_fingerprint,
 )
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import CaptionWorkspace, staged_result_files
 
 _BYTES_PER_GIB = 1024**3
 _PUBLICATION_PREPARE_MEMORY_BYTES = 8 * _BYTES_PER_GIB

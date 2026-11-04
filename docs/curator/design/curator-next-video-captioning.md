@@ -1,27 +1,32 @@
 # Curator Next: Video Captioning
 
-## Summary
-
 `video-caption` enriches the canonical clip table produced by Curator Next
-[`video-transcode`](curator-next-video-transcode.md). It reads complete clip MP4s, generates one caption per clip with Qwen3.8
-through Ray Data LLM and vLLM, and fills a versioned caption field set on the existing Lance rows.
+[`video-transcode`](curator-next-video-transcode.md). It reads complete clip MP4s, generates one caption per clip with
+Qwen3.8 through Ray Data LLM and vLLM, and fills a versioned caption field set on the existing Lance rows.
 
-The design separates expensive inference from canonical publication:
+```text
+video-cut -> video-transcode --+--> video-caption
+                              +--> video-embed
 
-1. **Phase A: checkpointed inference** runs one streaming Ray Data plan and writes terminal caption rows to durable
-   Parquet. Ray checkpoints completed `clip_id` values at the file-sink boundary so a restart skips media fetch and
-   inference for completed work.
-2. **Phase B: fragment publication** validates the staged rows, prepares Lance column files on Ray workers, and commits
-   one complete physical fragment at a time from the driver.
+pending Lance clips -> checkpoint filter -> fixed-size blocks
+  -> CPU media-fetch tasks -> multimodal preparation, chat template, tokenization
+  -> exact-batch vLLM actors -> terminal caption rows
+  -> strict repartition -> checkpointed Arrow IPC
+  -> group by original fragment -> prepare column files on workers
+  -> ONE Lance Update containing every selected fragment
+```
 
-These phases address different recovery units. Ray's checkpoints prevent repeated row-level GPU work, while Lance
-transactions make fragment-level progress canonical. Parquet connects the two: it is durable recovery data until the
-corresponding fragments are verified in Lance.
+The implementation lives in `cosmos_curator.next.recipes.video_caption`. Checkpoint reuse, atomic enrichment, commit
+reconciliation, and cleanup follow the [shared checkpoint and recovery contract](curator-next-checkpoint-recovery.md),
+also used by video-transcode and video-embed. Captioning supplies clip identity, its model and result contract, clip
+readiness, and terminal-result validation, which its `bindings.py` declares to the shared contract; media fetch and
+vLLM inference remain recipe-owned.
 
 ## Context and Responsibilities
 
 `video-cut` owns span rows and fragment creation. `video-transcode` owns clip media and its metadata. Captioning owns
-only its selected caption and metadata fields. It does not discover sources, split videos, rewrite media, append rows, or change row order.
+only its selected caption and metadata fields. It does not discover sources, split videos, rewrite media, append rows,
+or change row order.
 
 Empty/error source outcomes from video-cut have null span and clip IDs. Captioning skips these rows during reading,
 completion checks, and publication coverage, preserving their physical offsets and leaving caption fields null.
@@ -35,100 +40,23 @@ The design relies on these properties of the upstream table:
 - Transcoding publishes all clip metadata in one commit while preserving the cut fragment layout.
 - Nullable enrichment fields may be added without changing the upstream-owned fields.
 
-Captioning validates the current clip schema, globally unique non-null IDs, non-null media URIs, and positive byte sizes
-on every real span. It shares the readiness validator with embedding and includes uniqueness in the same aggregate query.
-It requires no transcode publication receipt, so history pruning and later empty/error source outcomes do not block
-ready clips. Newly appended spans without clip metadata must finish transcoding before captioning starts.
+Input readiness comes from data. Shared validation requires the canonical clip schema and globally unique `clip_id`
+values; captioning adds the readiness validator it shares with embedding, which requires a non-null `clip_id`, a
+non-null `clip_uri`, and a positive `clip_size_bytes` on every real span. No transcode publication receipt is required,
+so history pruning and later empty/error source outcomes do not block ready clips. These checks cover the entire
+pinned snapshot: newly appended spans without clip metadata must finish transcoding before captioning starts.
 
-One logical writer owns a given caption field set. Enrichment writers
-for disjoint field sets may run concurrently when they follow the fragment-reconciliation protocol described below.
-Multiple writers for the same field set are outside the consistency model.
-
-## Design Invariants
-
-The implementation preserves the following invariants across normal execution, task replay, process failure, and Ray
-head loss:
-
-1. **Lance is canonical.** Downstream readers never need the staging workspace.
-2. **Publication is fragment-atomic.** A fragment contains either all pending values or a complete, valid caption field
-   set; mixed state is rejected.
-3. **Durable inference is reusable.** Once a result shard and its checkpoint are committed, a restart does not fetch or
-   infer those clips again.
-4. **Staged rows cannot silently rebind.** Phase B proves that staged `clip_id` values still describe the selected
-   physical fragment before publishing them.
-5. **Concurrent disjoint changes are preserved.** A stale same-fragment descriptor is rebuilt from Parquet against the
-   latest fragment rather than attached to a newer read version.
-6. **An attempt is finite.** Work is selected from one pinned Lance snapshot. Rows appended later wait for a subsequent
-   attempt.
-7. **Result identity is independent of execution tuning.** Cluster size, batching, worker placement, and retry timing do
-   not change the caption contract.
-
-## State and Authority
-
-Several durable objects participate in recovery, but they are not equally authoritative:
-
-| State | Role | Authority and lifetime |
-| --- | --- | --- |
-| Lance clip table | Published clip metadata and caption fields | Canonical and long-lived. A fragment commit survives later failures. |
-| Result Parquet | Terminal caption rows produced by Phase A | Authoritative recovery input until all selected fragments are canonical. |
-| Ray checkpoint files | Committed `clip_id` values for result shards | An index over safely written Parquet. Used to filter work, not as caption data. |
-| `workspace.json` | Contract and schema compatibility manifest | Protects a workspace from reuse by an incompatible caption contract. |
-| `phase-a-complete.json` | Fragment-level completion fast path | An optimization only. Its absence never invalidates Parquet or checkpoints. |
-
-The workspace is scoped by caption field and contract digest rather than by run or Lance version. That choice allows a
-new attempt to reuse completed clips from an earlier attempt while still selecting newly appended fragments from the
-latest table.
-
-## Attempts and End-to-End Flow
-
-Each invocation captures the latest table as `V_attempt` after registering or validating the selected caption fields.
-Every fragment in that snapshot is classified as one of two valid states:
-
-- **pending:** both caption-owned fields are null on every clip row;
-- **complete:** every clip row is terminal and matches the selected contract digest.
-
-A fragment with mixed pending and terminal rows, a partial field set, stale contract metadata, or invalid terminal
-values fails before new work begins.
-
-The execution flow is:
-
-```text
-Driver
-  validate input and caption fields
-        |
-        v
-  capture finite Lance snapshot V_attempt
-        |
-        +-- complete fragments ------------------------------+
-        |                                                     |
-        v                                                     |
-  pending fragments                                           |
-        |                                                     |
-        v                                                     |
-  Phase A: install Ray CheckpointConfig                       |
-        |                                                     |
-        v                                                     |
-Ray Data                                                      |
-  pinned Lance read -> CheckpointFilter -> fetch -> vLLM -> result Parquet
-        |                                                     |
-        v                                                     |
-Driver                                                        |
-  clear CheckpointConfig -> Phase B publication <-------------+
-        |
-        v
-  verify every selected fragment at latest Lance -> clean workspace
-```
-
-If no fragment is pending, the invocation skips model setup and Ray inference. It still verifies the selected canonical
-state and validates any pre-existing workspace before cleanup.
+One logical writer owns a given caption field set. Writers for disjoint field sets, including embedding and other
+caption variants, may publish concurrently under the shared contract. Multiple writers for the same field set are
+outside the consistency model.
 
 ## Caption Result Contract
 
 ### Field ownership and registration
 
-The recipe adds the caption and metadata fields together in one Lance schema transaction. Both top-level fields are
-nullable so existing rows and any future producer appends begin pending. Their Arrow metadata records the owner and
-field set:
+The recipe declares the caption and metadata fields with the shared `owned_fields`, and shared registration adds them
+together in one Lance schema transaction. Both top-level fields are nullable so existing rows and any future producer
+appends begin pending. Their Arrow metadata records the owner and field set:
 
 ```text
 cosmos_curator.owner = video-caption
@@ -137,7 +65,6 @@ cosmos_curator.field_set = <caption-field-name>
 
 An existing field set must match its expected names, Arrow types, nullability, and ownership metadata exactly. A
 result-defining change receives a new versioned field name instead of changing the meaning of an existing `_v1` field.
-Schema registration retries disjoint schema races, but a partial or conflicting caption field set fails.
 
 The FP8 field set is representative:
 
@@ -171,7 +98,9 @@ A non-pending row has exactly one terminal state:
 | `error` | Null | Non-null type and message | A deterministic per-clip media failure exhausted its retries. |
 
 Every terminal metadata value records the schema version, contract digest, model ID and revision, prompt, and available
-token counts. The metadata struct is null only while the row is pending.
+token counts. The metadata struct is null only while the row is pending. Every physical fragment in the pinned table
+must be wholly pending or wholly terminal under the requested contract; mixed fragments and terminal values with a
+different digest are rejected before selection.
 
 ### Contract identity
 
@@ -182,12 +111,15 @@ containing every result-defining value:
 - model ID, immutable revision, and precision;
 - prompt, message order, and chat-template arguments;
 - sampling and output-token settings;
-- video preprocessing settings; and
+- video preprocessing settings;
+- a set `execution.max_model_len`, which can end generation early; and
 - terminal-state and failure semantics.
 
-Data-URL encoding, block sizes, concurrency, retry counts, and worker placement are execution details and are excluded
-from the digest. Sampling is intentionally stochastic, so the first compatible result durably committed to Parquet is
-authoritative; retries are not expected to reproduce identical text bit-for-bit.
+The normalized contract is the spec's `result_contract`, so the shared publication's `contract_digest` provenance is the
+same digest that terminal metadata records. Data-URL encoding, block sizes, concurrency, retry counts, and worker
+placement are execution details and are excluded from the digest. Sampling is intentionally stochastic, so the first
+compatible result durably checkpointed is authoritative; retries are not expected to reproduce identical text
+bit-for-bit.
 
 ### Current v1 contract
 
@@ -212,108 +144,61 @@ Supported variants resolve their model IDs and immutable revisions from
 | `qwen3_8_27b_fp8` | `Qwen/Qwen3.8-27B-FP8` | FP8 | `caption_qwen3_8_27b_fp8_v1` |
 | `qwen3_8_27b` | `Qwen/Qwen3.8-27B` | BF16 | `caption_qwen3_8_27b_v1` |
 
-## Recovery Workspace
+## Checkpoints and Publication
 
-The default workspace layout is:
+New work selects all pending caption fragments unless `execution.max_fragments` bounds it. Every selected fragment
+becomes visible in one Lance `Update`, so nothing is visible until the selection publishes; set `max_fragments` to
+publish smaller selections sooner, and rerun while `remaining_fragments` is nonzero. Saved selections follow the
+[shared recovery rules](curator-next-checkpoint-recovery.md#recovery-workspaces-and-receipts), and fragment counts
+follow the [shared run summary definitions](curator-next-checkpoint-recovery.md#run-summaries).
 
-```text
-<staging-root>/<caption-field>/<caption-contract-digest>/
-  workspace.json
-  phase-a-complete.json
-  results/
-  checkpoints/
-```
+Ray filters checkpointed `clip_id` values at the read, before media fetch or inference. Staged results hold
+`fragment_id`, `row_offset`, `clip_id`, the caption, and its metadata; media never enters durable result files. The
+shared writer validates every terminal row before Ray checkpoints its ID, and publication repeats the check.
+`execution.rows_per_checkpoint` sets the strict repartition and checkpoint shard boundary, defaulting to 1,000 rows.
 
-`workspace.json` is created atomically before the first inference attempt. It records normalized media and Lance URIs,
-the output schemas, pinned model identity and runtime path, the normalized caption contract, and workspace/checkpoint
-schema versions. It deliberately records neither `V_attempt` nor fixed work membership.
+The workspace is `<output.staging_root_uri>/<contract-namespace>/`. Captioning contributes its pinned model, field
+schemas, and result contract to the
+[shared compatibility manifest](curator-next-checkpoint-recovery.md#enrichment-recovery-identity), so each variant and
+each set `max_model_len` uses its own contract namespace. A valid processing-completion marker lets a publication retry
+skip model validation and inference.
 
-An existing manifest must match exactly before any staged data is reused or removed. Because a compatible workspace may
-contain rows produced by several attempts, physical locations stored in Parquet are treated as hints. Phase B validates
-them against the current fragment instead of assuming that an old `(fragment_id, row_offset)` is still valid.
+Publication follows the
+[shared publication and concurrency rules](curator-next-checkpoint-recovery.md#canonical-publication-and-concurrent-writers),
+and the [shared failure boundaries](curator-next-checkpoint-recovery.md#failure-and-recovery-boundaries) cover
+interrupted processing, ambiguous commit responses, and cleanup; publication retries reuse staged captions without
+inference.
 
-### Ray Data checkpoint protocol
+Earlier versions published one fragment per commit from a separate Parquet workspace under
+`<staging-root>/<caption-field>/<contract-digest>/`. The caption fields and contract digests are unchanged, so tables
+captioned that way are already complete: their values validate, and only fragments still pending are selected. An
+unfinished workspace from that implementation is not resumed; delete it, and rerun to caption its fragments again.
 
-Phase A installs a job-level `CheckpointConfig` with `clip_id` as its identity column, `checkpoints/` as its durable
-path, and checkpoint deletion on success disabled. Ray places `CheckpointFilter` directly after the datasource read.
-When the workspace uses GCS through its S3/XML endpoint, driver and worker
-filesystem construction follow the endpoint-scoped compatibility policy in
-[Ray Data: S3-compatible object storage (GCS)](ray-data.md#s3-compatible-object-storage-gcs).
+## Media and Inference
 
-For each compact output shard, Ray's file-sink protocol performs this durability handshake:
+The plan reads `clip_id`, `clip_uri`, `clip_size_bytes`, and the row addresses through the shared Lance reader, which
+balances fragment row ranges across Ray's read tasks. Ray merges each read task's output into one block and sizes read
+tasks from the CPUs present when the plan starts. A strict repartition after the read therefore gives every media-fetch
+task `execution.lance_read_batch_size` clips, independent of the fragment count and read parallelism, including the
+clips a resume leaves after checkpoint filtering. Fetch tasks download the exact
+`clip_uri`, validate its byte length against `clip_size_bytes`, and encode the MP4 as a data URL that can cross the
+Ray object store. The top-level data URL is removed once it has been moved into the OpenAI message, and multimodal
+preparation replaces that message with decoded inputs. Large media values therefore do not travel through
+tokenization, inference output, or staged results.
 
-1. write a pending checkpoint containing the shard's `clip_id` values;
-2. write the corresponding result Parquet file;
-3. mark the checkpoint committed only after the result write succeeds.
+The plan uses Ray Data LLM's public processor surface and built-in multimodal preparation. Immediately before vLLM, a
+strict repartition creates exact `inference_batch_size` blocks. This compensates for the ordinary `map_batches`
+rebundler, which may pass a 33-row multimodal block as 32 rows followed by a recurring one-row engine call. Only the
+final global block may be smaller.
 
-On recovery, Ray removes outputs associated with pending checkpoints, reads compact committed ID files, and filters
-those IDs before media access. Any shard whose checkpoint remains pending may be replayed, but each replay unit is
-bounded to one compact shard. A committed shard skips both download and inference. Curator does not duplicate this
-protocol by scanning result Parquet or collecting checkpoint IDs on the driver.
+The vLLM actor pool has a work-sized upper bound, the selection's row count from `ProcessingScope.selected_rows`,
+rather than a GPU count captured at startup. Each replica requests `tensor_parallel_size * pipeline_parallel_size`
+GPUs; the default TP=1, PP=1 topology places one replica per live GPU. Currently available GPUs seed the initial actor
+count so model loading begins in parallel, while Ray's eager actor autoscaling lets GPUs on later-joining managed Slurm
+nodes join without changing the plan.
 
-After the complete Ray write succeeds, `phase-a-complete.json` records the attempt version, contract digest, and pending
-fragment IDs. If a later attempt's pending set is covered by that marker, the recipe enters Phase B without loading the
-model. If the marker is absent or does not cover the new attempt, the normal Ray plan runs and `CheckpointFilter`
-removes already completed clips.
-
-The job-level checkpoint configuration is always cleared before Phase B. This keeps Ray's checkpoint injection scoped
-to the inference sink and prevents publication's own Ray Data reads from participating in the Phase A protocol.
-
-The workspace is removed only after every fragment selected from `V_attempt` is canonical at the latest Lance version.
-A cleanup failure does not invalidate committed captions; Lance remains authoritative and cleanup can be retried.
-
-## Phase A: Checkpointed Inference
-
-Phase A is one streaming execution over all fragments that were pending at `V_attempt`:
-
-```text
-pinned Lance read
-  -> Ray CheckpointFilter
-  -> physical row-address mapping
-  -> strict lightweight blocks
-  -> MP4 fetch and byte validation
-  -> multimodal preparation
-  -> chat template and tokenization
-  -> vLLM
-  -> terminal rows
-  -> compact checkpoint/result shards
-```
-
-### Pinned Lance input
-
-A recipe-local Ray datasource plans from inert fragment metadata. Read tasks contain only the Lance URI, pinned version,
-fragment IDs, resolved storage options, and batch size; workers reopen Lance with those values. Live `LanceFragment`
-objects are never serialized into tasks because their pickle path reopens the dataset without the configured storage
-options, which can lose S3 credentials before execution begins.
-
-The read projects only `clip_id`, `clip_uri`, `clip_size_bytes`, and Lance's physical row address. Checkpoint filtering
-happens before the row address is decomposed into `fragment_id` and fragment-local `row_offset`, and before any media is
-downloaded.
-
-Lance fragments determine the number of source read tasks, but they do not cap later parallelism. A strict streaming
-repartition of the lightweight rows fans a few large fragments out into fetch-sized work as an elastic cluster grows.
-
-### Media and inference
-
-Fetch tasks download the exact `clip_uri`, validate its byte length against `clip_size_bytes`, and encode the MP4 as a
-data URL that can cross the Ray object store. The top-level data URL is removed once it has been moved into the OpenAI
-message, and multimodal preparation replaces that message with decoded inputs. Large media values therefore do not
-travel through tokenization, inference output, or Parquet.
-
-The implementation uses Ray Data LLM's public processor surface and built-in multimodal preparation. Multimodal or
-inference failures stop Phase A instead of being published as bad-media rows: the upstream splitter already transcoded
-and probed each clip, so a later decode or engine failure indicates a runtime or contract problem. Deterministic
-per-clip download failures become terminal `error` rows; credentials, storage availability, model loading, and other
-shared failures stop the phase.
-
-The vLLM actor pool has a work-sized upper bound rather than a GPU count captured at startup. Each replica requests
-`tensor_parallel_size * pipeline_parallel_size` GPUs. The default TP=1, PP=1 topology places one replica per live GPU.
-Currently available GPUs seed the initial actor count so model loading begins in parallel, while Ray's eager actor
-autoscaling allows GPUs on later-joining managed Slurm nodes to be claimed without changing the plan.
-
-Immediately before vLLM, a strict repartition creates exact `inference_batch_size` blocks. This compensates for the
-ordinary `map_batches` rebundler, which may pass a 33-row multimodal block as 32 rows followed by a recurring one-row
-engine call. Only the final global block may be smaller.
+Multimodal-caption's two-phase runner reuses this media-fetch and inference plan through `inference.caption_rows`,
+supplying its own media columns, prompt context, and terminal rows.
 
 ### Backpressure and reference tuning
 
@@ -321,131 +206,35 @@ The reference settings are execution choices, not result-contract inputs:
 
 | Boundary | Default | Rationale |
 | --- | --- | --- |
-| Lance/read fan-out | 256 rows per strict block | Exposes media work beyond the number of input fragments. |
+| Media-fetch block | 256 rows | `lance_read_batch_size`, the scanner batch and fetch-task size; fixed blocks spread fetches across the cluster whatever the read parallelism. |
 | Media fetch | 4 clips, 0.25 CPU, one `curator_io` slot | Bounds simultaneous downloads and active encoded MP4s per node. |
 | Multimodal preparation | 24 GiB scheduling reservation per actor | Covers measured batch-32 heap peaks without host overcommit. |
 | Chat-template stage | 16 GiB scheduling reservation per actor | Bounds CPU actor growth on large nodes. |
 | vLLM | Batch 32, 8 concurrent batch calls | Matches the benchmarked legacy Ray Data captioning baseline. |
 | vLLM context length | Unset, the model's own maximum | `execution.max_model_len` caps prompt plus generated tokens per request. vLLM refuses to start unless one request of that length fits in the KV cache, so lowering it lets the model load on GPUs with less memory beyond the weights; a clip over the limit fails the run. A set limit is part of the caption contract and digest; null leaves both unchanged. |
-| Result/checkpoint shard | 4,096 rows | Amortizes object listing and validation while bounding replay work. |
+| Checkpoint group | 1,000 rows | The shared default; bounds the in-flight results that replay after an interruption. |
 
 Memory values are Ray scheduling reservations rather than eager allocations. Media fetch uses the per-node
 `curator_io` resource advertised by managed Ray; the default 16 slots bound concurrent fetch tasks independently on
-each node. Explicit concurrency limits remain available for diagnostics or deliberate resource sharing, while `auto`
-lets CPU and GPU pools follow live resources.
+each node. Fetches are plain tasks, as in [video-embed](curator-next-video-embed.md#failure-and-concurrency-boundaries),
+not a download actor pool. Ray Data may submit fetch tasks that then wait for slots, counting each against its CPU
+and object-store budgets. That can slow later stages' scale-up but does not affect GPU or heap-memory reservations.
+Explicit concurrency limits remain available for diagnostics or deliberate resource sharing, while `auto` lets CPU and
+GPU pools follow live resources.
 
-### Durable output
+## Failure and Concurrency Boundaries
 
-After inference, the pipeline keeps only physical identity, caption values, metadata, and token counts. Terminal rows
-are strictly repartitioned into compact groups before `write_parquet`, aligning result files with Ray's checkpoint
-units. Each row contains:
+Deterministic per-clip download failures, such as a missing or archived object or a byte-length mismatch, become
+terminal `error` rows and are not retried by an ordinary rerun. Credentials, access denials, storage availability,
+model loading, multimodal preparation, and inference failures stop processing: the upstream transcoder already probed
+each clip, so a later decode or engine failure indicates a runtime or contract problem rather than bad media. Failed
+processing leaves checkpointed results and the workspace for the next invocation.
 
-```text
-fragment_id: int64
-row_offset: int64
-clip_id: string
-<caption field>
-<caption metadata field>
-```
+Each attempt covers the clip snapshot selected at its start; appended fragments wait for a later selection. Row
+mutation, deletion, compaction, and multiple writers for one caption field set are unsupported and fail closed when
+detectable.
 
-The complete Phase A plan finishes before publication begins, so the model remains loaded for the inference workload
-and no Lance transaction can be affected by a still-installed checkpoint configuration.
-
-## Phase B: Fragment-Atomic Publication
-
-Phase B turns durable Parquet into canonical Lance columns without sending caption rows through the driver:
-
-```text
-Ray workers
-  validate Parquet footers
-    -> read staged rows
-    -> hash-group by fragment_id
-    -> validate one complete fragment group
-    -> prepare uncommitted Lance column files
-    -> return compact descriptor + fingerprints
-
-Driver
-  stream descriptors with prefetch disabled
-    -> reopen latest Lance
-    -> reconcile fragment state
-    -> commit one fragment transaction
-    -> verify all selected fragments
-```
-
-Each Ray group is sorted by `row_offset` and checked against the current fragment. Validation proves that:
-
-- the fragment was pending in `V_attempt`;
-- offsets cover every clip row exactly, allowing gaps only for source outcomes with null clip IDs;
-- ordered `clip_id` values match the eligible rows in the current fragment;
-- every row has the selected field set and contract digest;
-- every row is a valid terminal value; and
-- both fields cast exactly to their registered Arrow types.
-
-The worker calls `LanceFragment.update_columns(..., left_on="clip_id", right_on="clip_id")` with an explicitly typed
-Arrow reader. It returns only a compact descriptor containing the source version and fragment fingerprint, updated
-fragment metadata, modified leaf field IDs, and row count. Uncommitted column files created by task replay are not
-visible to readers and are harmless.
-
-Before each commit, the driver reopens the latest table and follows this reconciliation state machine:
-
-| Latest target state | Action |
-| --- | --- |
-| Terminal and value-for-value equivalent to staging | Treat the fragment as already committed. |
-| Pending with the same physical fingerprint used by the worker | Commit the prepared descriptor. |
-| Pending with only disjoint schema or enrichment changes | Discard the descriptor and ask a Ray task to rebuild it from the same Parquet rows against latest. |
-| Mixed, conflicting, rewritten, deleted, or differently terminal | Fail without changing the fragment. |
-
-Restaging is conservative by design. Lance may reject two same-fragment updates even when their fields are disjoint,
-and attaching old fragment metadata to a newer read version can discard the winning writer's file bindings. Rebuilding
-only the caption column files preserves the other enrichment without repeating inference.
-
-Each transaction updates exactly one fragment and every leaf under the two caption-owned fields. Transaction properties
-record the source version, fragment ID, field name, and contract digest. Updates to other fragments and split appends may
-rebase independently.
-
-An ambiguous commit response is resolved by reopening latest and applying the same state machine. Exact staged data is
-accepted as committed; a still-pending target is retried or restaged; conflicting state fails. This makes an uncertain
-client response a reconciliation event rather than a reason to repeat inference.
-
-## Concurrency and Consistency Model
-
-The pinned `V_attempt` separates selection from concurrent appends. A fragment appended by a future producer after that
-snapshot is not part of the active attempt and remains pending for the next invocation. Earlier selected fragments can
-still be published while an independent producer appends other fragments. Transcode itself publishes a complete snapshot
-and does not append after completion.
-
-Disjoint enrichment writers can proceed concurrently when they preserve the fragment ID, row count, ordered
-`clip_id` values, and all split- and caption-owned physical bindings. A same-fragment race causes restaging from Parquet
-against latest. No GPU work is repeated.
-
-The following changes are intentionally outside the current protocol:
-
-- multiple active writers for one caption field set;
-- row mutation, deletion, or reordering;
-- fragment compaction or remapping while an attempt is staged; and
-- another enrichment implementation that attaches stale descriptors without equivalent reconciliation.
-
-These cases fail closed when detectable rather than risking a caption-to-media mismatch.
-
-## Failure and Recovery
-
-| Last durable event | Behavior on the next invocation |
-| --- | --- |
-| Before or during Phase A | Capture a new `V_attempt`; reuse compatible checkpoints and process unfinished or newly selected clips. |
-| Result file written but checkpoint still pending | Ray removes the pending output and replays that compact shard. |
-| Phase A complete | Reuse Parquet and enter Phase B without model setup when the completion marker covers the attempt. |
-| Prepared update not known committed | Reopen latest and reconcile; restage from Parquet when the change is disjoint. |
-| Some fragments committed | Skip canonical fragments and publish only fragments that remain pending. |
-| A producer appended after `V_attempt` | Leave the new fragment pending until the next attempt. |
-| Canonical verification succeeded but cleanup failed | Keep the Lance result; retry workspace cleanup later. |
-
-Deterministic per-clip media failures are terminal data and are not retried by an ordinary rerun. Shared failures stop
-the phase so broken credentials, storage, model setup, or inference infrastructure cannot be mistaken for a large set
-of bad clips. Checkpoints, result Parquet, and already committed fragments remain available after such a failure.
-
-## Configuration and Runtime Assumptions
-
-The recipe uses strict, versioned YAML or JSON. A minimal configuration is:
+## Configuration and Validation
 
 ```yaml
 schema_version: 1
@@ -456,19 +245,27 @@ input:
 
 model:
   variant: qwen3_8_27b_fp8
-
-output: {}
-
-execution:
-  storage_profile: default
 ```
 
-`clips_lance_uri` defaults to `<media_root>/lance`, and `staging_root_uri` defaults to
+`input.clips_lance_uri` defaults to `<media_root>/lance`, and `output.staging_root_uri` defaults to
 `<media_root>/staging/video-caption`. The staging location is visible to every Ray worker and survives Ray head loss.
+`cosmos-curator pipeline template video-caption` shows execution defaults. Run on managed Ray through the usual entry:
+
+```bash
+cosmos-curator slurm ray submit CLUSTER_CONFIG -- pixi run --as-is run-pipeline RECIPE_CONFIG
+```
 
 Model weights are pinned by variant and pre-staged under the standard `/config/models` mount on every inference node.
-The runtime validates `config.json` and model weight files but does not download weights. This keeps model acquisition
-outside the recovery protocol and ensures every actor resolves the same local path.
+The runtime validates `config.json` and model weight files but does not download weights.
+
+CPU unit tests cover the contract digest, field set, terminal states, media failure classification, processor
+construction, plan wiring, and clip readiness. The shared enrichment conformance suite runs against caption's clip
+fixtures, covering coverage rejection, concurrent writers, ambiguous publication, and recovery. A CPU integration test
+runs the shared fresh-cluster scenario with a vLLM stand-in: the native Ray plan resumes across fresh local clusters
+with one `curator_io` slot, previously checkpointed clips are neither fetched nor inferred again, a clip whose media
+disappears still records a terminal error, and the recipe's `run_config` publishes the result. These checks do not
+constitute managed Slurm worker-churn or head-loss qualification, and GPU throughput of the shared-enrichment plan has
+not been re-measured.
 
 ## Known Boundaries
 
@@ -479,23 +276,16 @@ The v1 design does not:
 - download models at pipeline runtime;
 - replace an existing caption contract in place;
 - coordinate multiple writers for the same field set;
-- support row mutation, fragment compaction, or fragment remapping during recovery; or
+- support row mutation, fragment compaction, or fragment remapping during recovery;
+- select individually ready fragments from a growing clip table; or
 - promise bitwise-identical stochastic output across retries or hardware.
 
 ## Implementation Map
 
 | Module | Responsibility |
 | --- | --- |
-| `pipeline.py` | Clip binding construction, attempt orchestration, phase boundaries, Ray setup, verification, and cleanup. |
-| `bindings.py` | Private recipe-owned row, result, and publication bindings for the shared two-phase engine. |
-| `config.py` | Strict config validation and derived storage locations. |
+| `bindings.py` | The shared enrichment spec: clip input, owned caption fields, result contract, and validators. |
+| `config.py` | Strict config validation, derived storage locations, and execution tuning. |
 | `contracts.py` | Model resolution, field schemas, normalized contract digest, and terminal-value rules. |
-| `lance_state.py` | Field registration, input validation, attempt capture, and physical-fragment identity. |
-| `workspace.py` | Contract-scoped manifest, completion marker, filesystem resolution, and cleanup. |
-| `inference.py` | Lance datasource adapter, Ray checkpoint configuration, media fetch, Ray Data LLM, and Parquet sink. |
-| `publication.py` | Distributed staged-row validation, descriptor preparation, reconciliation, and Lance commits. |
-
-Unit tests exercise contract and publication logic without launching Ray jobs. Environment-marked integration tests run
-the real Ray checkpoint/recovery path and distributed publication boundary on provisioned infrastructure. The
-publication suite covers corrupt or incomplete staging, partial progress, ambiguous responses, disjoint same-fragment
-races, stale-descriptor restaging, split-owned rewrites, and appends after `V_attempt`.
+| `inference.py` | The shared caption plan: media fetch, Ray Data LLM processor, and terminal rows. |
+| `pipeline.py` | Ray setup, the checkpointed processing plan, and the `run_enrichment` entry point. |

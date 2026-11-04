@@ -6,9 +6,9 @@ index until publication is verified lets a fresh driver or Ray cluster finish th
 work.
 
 The shared implementation covers two kinds of publication. **Enrichment** fills a recipe's owned columns on existing
-Lance rows, one whole fragment at a time; `video-transcode` and `video-embed` use it. **Append** adds a producer's rows
-to a Lance table it owns; `video-cut` uses it. [The shared model](#the-shared-model) describes what both kinds share:
-assumptions, run sequence, workspaces, failure handling, and summaries. [Enrichment
+Lance rows, one whole fragment at a time; `video-transcode`, `video-embed`, and `video-caption` use it. **Append** adds
+a producer's rows to a Lance table it owns; `video-cut` uses it. [The shared model](#the-shared-model) describes what
+both kinds share: assumptions, run sequence, workspaces, failure handling, and summaries. [Enrichment
 publication](#enrichment-publication) and [append publication](#append-publication) each describe only what their kind
 adds, including an adoption example. Other recipes migrate explicitly; see
 [Expansion across Curator Next](#expansion-across-curator-next).
@@ -248,9 +248,11 @@ The spec derives `result_schema` for canonical processing results: the non-null 
 `row_offset` fields in `ROW_ADDRESS_FIELDS`, the non-null ID field, and the owned output fields.
 `ProcessingScope.read(columns)` returns the selection's logical IDs, the named input columns, and the original row
 addresses; it reads only declared `input_fields`, so recovery protects every value the plan reads. The recipe keeps the
-ID and row addresses through to `write`. `validate_batch` receives the ID and output columns, whether it is checking
-existing fragments or staged results. Transcode requires successful clips; embedding also accepts declared terminal
-media errors.
+ID and row addresses through to `write`. `ProcessingScope.selected_rows` counts the selection's physical rows, an
+upper bound on the work that checkpoint filtering and null IDs only lower; video-caption bounds its vLLM replica pool by
+it rather than by a startup snapshot of cluster resources. `validate_batch` receives the ID and output columns, whether
+it is checking existing fragments or staged results. Transcode requires successful clips; embedding and captioning also
+accept declared terminal media errors.
 
 `run_enrichment` opens the input with `open_enrichment_input(bindings)`, which returns an `EnrichmentInput`: the pinned
 dataset, its bindings, and its validation fingerprint. Shared validation requires globally unique work IDs across
@@ -267,7 +269,9 @@ The shared Lance reader splits or combines fragment row ranges into the requeste
 by the number of selected rows. It preserves the pinned version and physical row addresses, and workers resolve
 credentials from the storage profile. `execution.lance_read_batch_size` sets the rows per scanner batch. Read
 parallelism is independent of publication fragments and checkpoint groups, and does not rely on Ray splitting
-whole-fragment tasks.
+whole-fragment tasks. Ray merges each read task's scanner batches into one block and, without `override_num_blocks`,
+sizes read tasks from the CPUs present when the plan starts. Video-embed and video-caption therefore repartition after
+the read so each media download task gets a fixed number of rows.
 
 ```mermaid
 flowchart TD
@@ -365,7 +369,8 @@ on the size of the entire selected run's checkpoint index.
 ### Adopting enrichment publication
 
 Use `video_embed` as the example for independent row processing and terminal media errors; use `video_transcode` for
-source grouping and payload writes that must finish before checkpointing. Both follow this sequence, sketched here for
+source grouping and payload writes that must finish before checkpointing. `video_caption` adds a model actor pool sized
+by the selection. Both follow this sequence, sketched here for
 an item-scoring recipe: the item schema, `validate_items`, `validate_scores`, and the Ray Data plan are recipe-owned.
 Put `resolve_bindings` in the recipe's `bindings.py` and base its `execution` config on `EnrichmentExecutionConfig`.
 
@@ -701,7 +706,12 @@ extensions.
 
 Check these before migrating a recipe. Embeddings and robot-action-caption select rows within fragments and checkpoint
 on row addresses, and multimodal-embedding publishes per-camera field sets in one commit; each needs an extension first.
-Video-caption's whole-fragment, `clip_id`-checkpointed enrichment is the closest fit. Mp4-index, multimodal-split, and
+Video-caption has adopted shared enrichment. Multimodal-caption and multimodal-embedding still use the deprecated
+two-phase engine that video-caption owned before its migration,
+[`caption_fragment_recovery`](../../../cosmos_curator/next/legacy/caption_fragment_recovery/__init__.py), which stages
+Parquet. Multimodal-caption also publishes through it, one fragment per commit, while multimodal-embedding uses its own
+atomic publisher. Multimodal-caption's whole-fragment, `episode_id`-checkpointed enrichment is the closest fit; the
+engine retires once both migrate. Mp4-index, multimodal-split, and
 robot-action-split still append through the deprecated
 [`lance_fragment_recovery`](../../../cosmos_curator/next/utils/lance_fragment_recovery.py), which retires once they
 migrate to append publication. They append rows in bounded fragments as work completes and treat row presence in the
@@ -743,7 +753,8 @@ item, then resumes on a fresh cluster after a disjoint column write and executio
 step to run exactly once per ID. Finally, it runs the recipe's own `run_config`, which must reprocess nothing, publish
 once, and remove the workspace. The
 [transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py),
-[embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py), and cut
+[embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py),
+[caption](../../../tests/cosmos_curator/next/recipes/video_caption/test_ray_pipeline.py), and cut
 ([fixed-stride](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_recovery.py),
 [TransNetV2](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_transnetv2.py)) tests show the stand-ins.
 

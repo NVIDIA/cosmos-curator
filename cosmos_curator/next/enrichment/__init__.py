@@ -10,7 +10,8 @@ Recipes use this API, imported from its defining modules:
   ``EnrichmentBindings`` binds the spec to one invocation's table, staging root, and
   execution settings
 - ``execution``: ``run_enrichment``, whose ``process`` callback receives a ``ProcessingScope``
-  that reads the selection and writes canonical rows in its ``result_schema``, and ``summary_message``
+  that reads the selection, bounds work-sized pools by its ``selected_rows``, and writes
+  canonical rows in its ``result_schema``, and ``summary_message``
 - ``config``: ``EnrichmentExecutionConfig``, the base of a recipe's ``execution`` settings
 - ``cosmos_curator.next.core.lance_datasource``: ``ROW_ADDRESS_FIELDS``, for recipe work schemas
   that carry row addresses

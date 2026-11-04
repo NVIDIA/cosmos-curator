@@ -12,8 +12,7 @@ import lance
 import pyarrow as pa
 from lance.fragment import FragmentMetadata, LanceFragment
 
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_transcode.contracts import validate_clip_readiness, validate_clip_table
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
 from cosmos_curator.next.utils.identity import canonical_digest
 
 
@@ -78,12 +77,6 @@ def ensure_caption_fields(
         return latest
     msg = f"Could not atomically register caption field set {bindings.result.caption_field_name!r} on {uri}"
     raise RuntimeError(msg) from last_error
-
-
-def validate_caption_input(dataset: lance.LanceDataset, *, uri: str) -> None:
-    """Require the canonical clip schema and ready media with globally unique IDs."""
-    validate_clip_table(dataset, uri=uri)
-    validate_clip_readiness(dataset)
 
 
 def capture_attempt(

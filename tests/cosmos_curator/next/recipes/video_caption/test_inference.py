@@ -1,96 +1,57 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for checkpoint, media, and terminal inference adapters."""
+"""Tests for the shared caption plan: media fetch, vLLM processor construction, and terminal rows."""
 
 import base64
-from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-import lance
 import pyarrow as pa
-import pyarrow.fs as pafs
-import pyarrow.parquet as pq
 import pytest
-import ray
-import ray.cloudpickle as ray_cloudpickle
 import ray.data.llm as ray_data_llm
 from botocore.exceptions import ClientError
-from lance.fragment import LanceFragment
 from ray.llm._internal.batch.stages import prepare_multimodal_stage
 
 from cosmos_curator.next.core import ray_llm_compat
+from cosmos_curator.next.core.lance_datasource import ROW_ADDRESS_FIELDS
 from cosmos_curator.next.recipes.video_caption import inference
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings, CaptionRunBindings
 from cosmos_curator.next.recipes.video_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     MAX_OUTPUT_TOKENS,
+    CaptionInferenceBindings,
     CaptionModelSpec,
     resolved_sampling_params,
 )
 from cosmos_curator.next.recipes.video_caption.inference import (
-    MAPPED_INPUT_SCHEMA,
+    CaptionRequest,
+    MediaColumns,
     SharedMediaError,
     canonicalize_llm_batch,
     caption_llm_postprocess,
     caption_llm_preprocess,
-    decompose_row_addresses,
     fetch_media_batch,
-    result_schema,
-    run_inference_phase,
-    staged_result_files,
 )
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace, phase_a_completion_covers
 from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
-from tests.cosmos_curator.next.conftest import CURATOR_IO_RESOURCE, CURATOR_IO_SLOTS
-from tests.cosmos_curator.next.recipes.video_caption.helpers import append_clip_fragment, write_clip_fragment
 
-
-class _FakeCaptionProcessor:
-    """Small CPU stand-in that preserves Ray LLM's postprocessed row shape."""
-
-    def __init__(self, expected_ids: set[str]) -> None:
-        self._expected_ids = expected_ids
-
-    def __call__(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
-        return dataset.map(_fake_inference, fn_kwargs={"expected_ids": self._expected_ids})
-
-
-def _fake_inference(row: dict[str, Any], *, expected_ids: set[str]) -> dict[str, object]:
-    clip_id = str(row["clip_id"])
-    if clip_id not in expected_ids or row.get("download_error_type") is not None:
-        msg = f"Checkpoint filter leaked unexpected clip {clip_id!r} into media/inference"
-        raise AssertionError(msg)
-    return {
-        "fragment_id": row["fragment_id"],
-        "row_offset": row["row_offset"],
-        "clip_id": clip_id,
-        "caption_text": f"caption for {clip_id}",
-        "prompt_token_count": 4,
-        "generated_token_count": 8,
-        "__inference_error__": "",
-    }
+_CLIP_MEDIA = MediaColumns(uri="clip_uri", size="clip_size_bytes")
+# Rows as the shared enrichment reader yields them for READ_COLUMNS.
+_WORK_SCHEMA = pa.schema(
+    [
+        CLIP_SCHEMA.field("clip_id"),
+        CLIP_SCHEMA.field("clip_uri"),
+        CLIP_SCHEMA.field("clip_size_bytes"),
+        *ROW_ADDRESS_FIELDS,
+    ]
+)
 
 
 def _annotate_batch_size(batch: pa.Table) -> pa.Table:
     """Expose the batch size seen by a test stage on every output row."""
     return batch.append_column("observed_batch_size", pa.array([batch.num_rows] * batch.num_rows, type=pa.int64()))
-
-
-def _workspace(tmp_path: Path) -> CaptionWorkspace:
-    root = tmp_path / "workspace"
-    return CaptionWorkspace(
-        root_uri=str(root),
-        manifest_uri=str(root / "workspace.json"),
-        results_uri=str(root / "results"),
-        checkpoints_uri=str(root / "checkpoints"),
-        filesystem=pafs.LocalFileSystem(),
-    )
 
 
 def _s3_client_error(code: str, status: int) -> ClientError:
@@ -103,114 +64,7 @@ def _s3_client_error(code: str, status: int) -> ClientError:
     )
 
 
-def test_row_addresses_decompose_into_fragment_and_local_offset() -> None:
-    """Lance row addresses preserve physical fragment and local row identity."""
-    table = pa.table(
-        {
-            "_rowaddr": pa.array([(7 << 32) | 19], type=pa.uint64()),
-            "clip_id": ["clip"],
-            "clip_uri": ["relative/clip.mp4"],
-            "clip_size_bytes": pa.array([4], type=pa.int64()),
-        }
-    )
-
-    mapped = decompose_row_addresses(table)
-
-    assert mapped.schema == MAPPED_INPUT_SCHEMA
-    assert mapped.to_pylist() == [
-        {
-            "fragment_id": 7,
-            "row_offset": 19,
-            "clip_id": "clip",
-            "clip_uri": "relative/clip.mp4",
-            "clip_size_bytes": 4,
-        }
-    ]
-
-
-def test_caption_lance_read_task_reopens_with_storage_options_without_pickling_fragments(
-    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
-    clip_row_factory: Callable[..., dict[str, object]],
-    monkeypatch: pytest.MonkeyPatch,
-    caption_bindings: CaptionRunBindings,
-) -> None:
-    """Ray tasks carry credentials and fragment IDs, never storage-blind fragment handles."""
-    uri, dataset = clip_dataset_factory(rows=[clip_row_factory(0)])
-    attempt = CaptionAttempt(version=int(dataset.version), pending_fragment_ids=(0,), complete_fragment_ids=())
-    storage_options = {
-        "aws_access_key_id": "id",
-        "aws_secret_access_key": "secret",
-        "aws_session_token": "token",
-        "aws_endpoint": "https://s3.example.test",
-    }
-    datasource = inference.caption_lance_datasource(
-        dataset,
-        attempt,
-        storage_options=storage_options,
-        batch_size=17,
-        source_columns=caption_bindings.input.source_columns,
-        source_schema=caption_bindings.input.source_schema,
-    )
-    read_task = datasource.get_read_tasks(parallelism=1)[0]
-
-    def reject_fragment_pickle(_fragment: LanceFragment) -> object:
-        msg = "a live LanceFragment crossed the Ray serialization boundary"
-        raise AssertionError(msg)
-
-    monkeypatch.setattr(LanceFragment, "__reduce__", reject_fragment_pickle)
-    calls: list[tuple[str, int, dict[str, str] | None]] = []
-    fragment_token = object()
-    table = pa.table(
-        {
-            "clip_id": ["clip-0"],
-            "clip_uri": ["s3://bucket/clip-0.mp4"],
-            "clip_size_bytes": pa.array([1], type=pa.int64()),
-            "_rowaddr": pa.array([0], type=pa.uint64()),
-        }
-    )
-
-    class FakeDataset:
-        def get_fragment(self, fragment_id: int) -> object | None:
-            assert fragment_id == 0
-            return fragment_token
-
-        def scanner(self, **kwargs: object) -> object:
-            assert kwargs == {
-                "columns": ["clip_id", "clip_uri", "clip_size_bytes"],
-                "fragments": [fragment_token],
-                "with_row_address": True,
-                "batch_size": 17,
-            }
-
-            class FakeScanner:
-                def to_reader(self) -> pa.RecordBatchReader:
-                    return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
-
-            return FakeScanner()
-
-    def reopen_dataset(
-        reopened_uri: str,
-        *,
-        version: int,
-        storage_options: dict[str, str] | None,
-    ) -> FakeDataset:
-        calls.append((reopened_uri, version, storage_options))
-        return FakeDataset()
-
-    monkeypatch.setattr(inference.lance, "dataset", reopen_dataset)
-
-    restored_task = ray_cloudpickle.loads(ray_cloudpickle.dumps(read_task))
-    output = list(restored_task())
-
-    assert calls == [(uri, attempt.version, storage_options)]
-    assert len(output) == 1
-    assert output[0].equals(table)
-
-
-def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(
-    tmp_path: Path,
-    caption_bindings: CaptionRunBindings,
-) -> None:
+def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(tmp_path: Path) -> None:
     """Media bytes are length-checked and embedded in an MP4 data URL."""
     payload = b"\x00\x00\x00\x18ftypmp42"
     clip = tmp_path / "clip.mp4"
@@ -225,12 +79,12 @@ def test_media_fetch_uses_exact_bytes_and_cross_node_data_url(
                 "clip_size_bytes": len(payload),
             }
         ],
-        schema=MAPPED_INPUT_SCHEMA,
+        schema=_WORK_SCHEMA,
     )
 
     fetched = fetch_media_batch(
         source,
-        input_bindings=caption_bindings.input,
+        media=_CLIP_MEDIA,
         storage_profile="default",
         attempts=2,
     ).to_pylist()[0]
@@ -253,7 +107,6 @@ def test_item_media_failures_become_rows(
     uri: str,
     size: int,
     message: str,
-    caption_bindings: CaptionRunBindings,
 ) -> None:
     """Deterministic missing, malformed, and unsupported media become item errors."""
     if uri == "existing":
@@ -262,12 +115,12 @@ def test_item_media_failures_become_rows(
         uri = str(path)
     source = pa.Table.from_pylist(
         [{"fragment_id": 0, "row_offset": 0, "clip_id": "clip", "clip_uri": uri, "clip_size_bytes": size}],
-        schema=MAPPED_INPUT_SCHEMA,
+        schema=_WORK_SCHEMA,
     )
 
     fetched = fetch_media_batch(
         source,
-        input_bindings=caption_bindings.input,
+        media=_CLIP_MEDIA,
         storage_profile="default",
         attempts=1,
     ).to_pylist()[0]
@@ -277,14 +130,11 @@ def test_item_media_failures_become_rows(
     assert message in fetched["download_error_message"]
 
 
-def test_shared_media_failure_stops_the_batch(
-    monkeypatch: pytest.MonkeyPatch,
-    caption_bindings: CaptionRunBindings,
-) -> None:
-    """Repeated shared filesystem failures fail Phase A instead of becoming rows."""
+def test_shared_media_failure_stops_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated shared filesystem failures stop processing instead of becoming rows."""
     source = pa.Table.from_pylist(
         [{"fragment_id": 0, "row_offset": 0, "clip_id": "clip", "clip_uri": "/clip", "clip_size_bytes": 1}],
-        schema=MAPPED_INPUT_SCHEMA,
+        schema=_WORK_SCHEMA,
     )
     attempts = 0
 
@@ -301,7 +151,7 @@ def test_shared_media_failure_stops_the_batch(
     with pytest.raises(SharedMediaError, match="after 3 attempt"):
         fetch_media_batch(
             source,
-            input_bindings=caption_bindings.input,
+            media=_CLIP_MEDIA,
             storage_profile="default",
             attempts=3,
         )
@@ -418,7 +268,7 @@ def test_preprocess_prefers_exact_rendered_prompt_without_formatting() -> None:
 
 def test_download_error_preserves_identity_through_terminal_adapter(
     caption_spec: CaptionModelSpec,
-    caption_bindings: CaptionRunBindings,
+    caption_request: CaptionRequest,
 ) -> None:
     """Download failure normalization retains physical identity in the terminal row."""
     source = {
@@ -436,7 +286,7 @@ def test_download_error_preserves_identity_through_terminal_adapter(
     )
     terminal = canonicalize_llm_batch(
         pa.Table.from_pylist([preprocessed]),
-        bindings=caption_bindings,
+        request=caption_request,
     ).to_pylist()[0]
 
     assert (terminal["fragment_id"], terminal["row_offset"], terminal["clip_id"]) == (2, 3, "clip")
@@ -899,24 +749,6 @@ def test_exact_vllm_batch_processor_inserts_strict_repartition() -> None:
     assert kwargs == {"batch_size": 32, "batch_format": "pyarrow", "zero_copy_batch": True}
 
 
-def test_caption_input_repartition_fans_fragment_blocks_out_to_fetch_tasks() -> None:
-    """The media boundary requests strict small blocks without executing a Ray job."""
-
-    class _DatasetPlan:
-        def __init__(self) -> None:
-            self.call: tuple[int, bool] | None = None
-
-        def repartition(self, *, target_num_rows_per_block: int, strict: bool) -> "_DatasetPlan":
-            self.call = (target_num_rows_per_block, strict)
-            return self
-
-    source = _DatasetPlan()
-    result = inference._repartition_caption_inputs_for_fetch(source, rows_per_block=128)  # type: ignore[arg-type]
-
-    assert result is source
-    assert source.call == (128, True)
-
-
 @pytest.mark.parametrize(
     ("configured", "num_input_rows", "expected"),
     [("auto", 12, 12), (3, 12, 3), (20, 12, 12)],
@@ -1016,7 +848,7 @@ def test_postprocess_carries_only_declared_small_context_values() -> None:
 
 def test_canonicalization_emits_success_truncated_and_error_rows(
     caption_spec: CaptionModelSpec,
-    caption_bindings: CaptionRunBindings,
+    caption_request: CaptionRequest,
 ) -> None:
     """Ray LLM shapes normalize into all three canonical terminal states."""
     raw = pa.Table.from_pylist(
@@ -1051,18 +883,21 @@ def test_canonicalization_emits_success_truncated_and_error_rows(
         ]
     )
 
-    terminal = canonicalize_llm_batch(raw, bindings=caption_bindings)
+    terminal = canonicalize_llm_batch(raw, request=caption_request)
     rows = terminal.to_pylist()
 
-    assert terminal.schema.equals(result_schema(caption_spec), check_metadata=True)
+    assert terminal.schema.equals(caption_request.result_schema, check_metadata=True)
     assert [row[caption_spec.metadata_field_name]["status"] for row in rows] == ["success", "truncated", "error"]
     assert rows[2][caption_spec.caption_field_name] is None
     assert rows[2][caption_spec.metadata_field_name]["error_type"] == "ItemMediaError"
 
 
-def test_canonicalization_uses_the_model_bound_output_limit(caption_bindings: CaptionRunBindings) -> None:
+def test_canonicalization_uses_the_model_bound_output_limit(
+    caption_spec: CaptionModelSpec,
+    caption_request: CaptionRequest,
+) -> None:
     """Terminal state follows the model binding's request limit, not a module default."""
-    bindings = replace(caption_bindings, inference=CaptionInferenceBindings(sampling_params={"max_tokens": 5}))
+    request = replace(caption_request, inference=CaptionInferenceBindings(sampling_params={"max_tokens": 5}))
     raw = pa.Table.from_pylist(
         [
             {
@@ -1078,111 +913,6 @@ def test_canonicalization_uses_the_model_bound_output_limit(caption_bindings: Ca
         ]
     )
 
-    terminal = canonicalize_llm_batch(raw, bindings=bindings).to_pylist()[0]
+    terminal = canonicalize_llm_batch(raw, request=request).to_pylist()[0]
 
-    assert terminal[caption_bindings.result.metadata_field_name]["status"] == "truncated"
-
-
-@pytest.mark.integration
-def test_checkpointed_phase_a_reuses_results_against_a_newer_input_superset(
-    tmp_path: Path,
-    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
-    clip_row_factory: Callable[..., dict[str, object]],
-    caption_spec: CaptionModelSpec,
-    caption_digest: str,
-    caption_bindings: CaptionRunBindings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Committed clip IDs skip media and inference after a post-attempt split append."""
-    old_paths = [tmp_path / "clip-0.mp4", tmp_path / "clip-1.mp4"]
-    rows = []
-    for index, path in enumerate(old_paths):
-        payload = f"video-{index}".encode()
-        path.write_bytes(payload)
-        row = clip_row_factory(index)
-        row["clip_uri"] = str(path)
-        row["clip_size_bytes"] = len(payload)
-        rows.append(row)
-    uri, _ = clip_dataset_factory(rows=rows, rows_per_fragment=1)
-    dataset = ensure_caption_fields(uri, storage_options=None, bindings=caption_bindings, attempts=3)
-    attempt = capture_attempt(dataset, bindings=caption_bindings)
-    config = resolve_config_data(
-        {
-            "schema_version": 1,
-            "kind": "video-caption",
-            "input": {"media_root": str(tmp_path), "clips_lance_uri": uri},
-            "model": {"variant": "qwen3_8_27b_fp8"},
-            "output": {"staging_root_uri": str(tmp_path / "staging")},
-            "execution": {
-                "media_batch_size": 1,
-                "parquet_rows_per_file": 2,
-            },
-        }
-    )
-    workspace = _workspace(tmp_path)
-
-    ray.shutdown()
-    # The shared cluster's own slot count, not a literal: ``curator_io_cluster``
-    # restarts any cluster whose count differs, so a copy here would silently
-    # trigger a mid-session restart the moment the fixture's constant moved.
-    ray.init(num_cpus=4, resources={CURATOR_IO_RESOURCE: CURATOR_IO_SLOTS}, include_dashboard=False)
-    try:
-        monkeypatch.setattr(
-            inference,
-            "_build_llm_processor",
-            lambda *_args, **_kwargs: _FakeCaptionProcessor({"clip-0", "clip-1"}),
-        )
-        run_inference_phase(
-            dataset,
-            attempt,
-            config.execution,
-            caption_bindings,
-            caption_spec.runtime_model_dir,
-            workspace,
-            storage_options=None,
-        )
-        assert phase_a_completion_covers(workspace, attempt, caption_digest) is True
-        assert len(staged_result_files(workspace)) == 1
-        assert len(list(Path(workspace.checkpoints_uri).glob("*.parquet"))) == 1
-
-        for path in old_paths:
-            path.unlink()
-        new_payload = b"new-video"
-        new_path = tmp_path / "clip-99.mp4"
-        new_path.write_bytes(new_payload)
-        appended_row = clip_row_factory(99)
-        appended_row["clip_uri"] = str(new_path)
-        appended_row["clip_size_bytes"] = len(new_payload)
-        candidate = write_clip_fragment(
-            pa.Table.from_pylist([appended_row], schema=CLIP_SCHEMA),
-            uri=uri,
-            storage_profile="default",
-        )
-        assert candidate is not None
-        append_clip_fragment(candidate, uri=uri, storage_profile="default", attempts=3)
-        latest = lance.dataset(uri)
-        superset_attempt = capture_attempt(latest, bindings=caption_bindings)
-        assert phase_a_completion_covers(workspace, superset_attempt, caption_digest) is False
-        monkeypatch.setattr(
-            inference,
-            "_build_llm_processor",
-            lambda *_args, **_kwargs: _FakeCaptionProcessor({"clip-99"}),
-        )
-
-        run_inference_phase(
-            latest,
-            superset_attempt,
-            config.execution,
-            caption_bindings,
-            caption_spec.runtime_model_dir,
-            workspace,
-            storage_options=None,
-        )
-        assert phase_a_completion_covers(workspace, superset_attempt, caption_digest) is True
-    finally:
-        ray.data.DataContext.get_current().checkpoint_config = None
-        ray.shutdown()
-
-    result_tables = [pq.read_table(path, filesystem=workspace.filesystem) for path in staged_result_files(workspace)]
-    staged = pa.concat_tables(result_tables)
-    assert sorted(staged["clip_id"].to_pylist()) == ["clip-0", "clip-1", "clip-99"]
+    assert terminal[caption_spec.metadata_field_name]["status"] == "truncated"

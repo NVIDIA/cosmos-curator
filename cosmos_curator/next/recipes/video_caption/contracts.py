@@ -4,7 +4,8 @@
 """Pinned model identities, Arrow fields, and caption-result semantics."""
 
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Final
@@ -12,14 +13,14 @@ from typing import Any, Final
 import pyarrow as pa
 
 from cosmos_curator.core.utils import environment
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings
+from cosmos_curator.next.enrichment.contracts import owned_fields
 from cosmos_curator.next.recipes.video_caption.config import ModelVariant
 from cosmos_curator.next.utils.identity import canonical_digest
 
 CAPTION_SCHEMA_VERSION: Final = 1
-CHECKPOINT_ADAPTER_VERSION: Final = 1
-WORKSPACE_SCHEMA_VERSION: Final = 1
 DEFAULT_PROMPT: Final = "Elaborate on the visual and narrative elements of the video in detail."
+# Clip columns processing reads besides clip_id and row addresses.
+READ_COLUMNS: Final = ("clip_uri", "clip_size_bytes")
 MAX_OUTPUT_TOKENS: Final = 2_048
 SAMPLING_PARAMS: Final[dict[str, float | int]] = {
     "temperature": 0.7,
@@ -35,8 +36,24 @@ VIDEO_FPS: Final = 2
 VIDEO_DO_SAMPLE_FRAMES: Final = False
 TERMINAL_STATUSES: Final = frozenset({"success", "truncated", "error"})
 _MODEL_WEIGHT_SUFFIXES: Final = frozenset({".bin", ".pt", ".safetensors"})
-OWNER_METADATA: Final = b"cosmos_curator.owner"
-FIELD_SET_METADATA: Final = b"cosmos_curator.field_set"
+
+
+@dataclass(frozen=True)
+class CaptionInferenceBindings:
+    """Model-specific settings consumed by the shared Ray vLLM processor.
+
+    Public recipes select one of these static bindings. They are deliberately
+    not user configuration: per-run execution sizing belongs in the recipe's
+    execution config and model behavior belongs in the result contract.
+    """
+
+    assistant_prefill: str | None = None
+    chat_template_kwargs: Mapping[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+    video_fps: int | float = 2
+    prepare_model_config_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    request_mm_processor_kwargs: Mapping[str, Any] = field(default_factory=lambda: {"do_sample_frames": False})
+    sampling_params: Mapping[str, float | int] | None = None
+    engine_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
 
 def resolved_sampling_params(inference: CaptionInferenceBindings) -> dict[str, float | int]:
@@ -70,55 +87,33 @@ class CaptionModelSpec:
         return environment.CONTAINER_PATHS_MODEL_WEIGHT_CACHE_DIR / self.model_id
 
     @property
-    def caption_field(self) -> pa.Field:
-        """Return the owned nullable caption field."""
-        return pa.field(
-            self.caption_field_name,
-            pa.large_string(),
-            nullable=True,
-            metadata=_ownership_metadata(self.caption_field_name),
-        )
-
-    @property
-    def metadata_field(self) -> pa.Field:
-        """Return the owned nullable terminal-metadata struct."""
-        return pa.field(
-            self.metadata_field_name,
-            pa.struct(
-                [
-                    pa.field("caption_schema_version", pa.int32(), nullable=False),
-                    pa.field("contract_digest", pa.string(), nullable=False),
-                    pa.field("status", pa.string(), nullable=False),
-                    pa.field("model_id", pa.string(), nullable=False),
-                    pa.field("model_revision", pa.string(), nullable=False),
-                    pa.field("prompt", pa.large_string(), nullable=False),
-                    pa.field("prompt_token_count", pa.int64()),
-                    pa.field("generated_token_count", pa.int64()),
-                    pa.field("error_type", pa.string()),
-                    pa.field("error_message", pa.large_string()),
-                ]
-            ),
-            nullable=True,
-            metadata=_ownership_metadata(self.caption_field_name),
-        )
-
-    @property
     def fields(self) -> pa.Schema:
-        """Return the two fields registered in one schema transaction."""
-        return pa.schema([self.caption_field, self.metadata_field])
+        """Return the owned caption and terminal-metadata fields, registered in one schema transaction."""
+        metadata = pa.struct(
+            [
+                pa.field("caption_schema_version", pa.int32(), nullable=False),
+                pa.field("contract_digest", pa.string(), nullable=False),
+                pa.field("status", pa.string(), nullable=False),
+                pa.field("model_id", pa.string(), nullable=False),
+                pa.field("model_revision", pa.string(), nullable=False),
+                pa.field("prompt", pa.large_string(), nullable=False),
+                pa.field("prompt_token_count", pa.int64()),
+                pa.field("generated_token_count", pa.int64()),
+                pa.field("error_type", pa.string()),
+                pa.field("error_message", pa.large_string()),
+            ]
+        )
+        return owned_fields(
+            pa.schema([(self.caption_field_name, pa.large_string()), (self.metadata_field_name, metadata)]),
+            owner="video-caption",
+            field_set=self.caption_field_name,
+        )
 
 
 _VARIANT_FIELDS: Final[dict[ModelVariant, tuple[str, str]]] = {
     "qwen3_8_27b_fp8": ("caption_qwen3_8_27b_fp8_v1", "caption_qwen3_8_27b_fp8_v1_metadata"),
     "qwen3_8_27b": ("caption_qwen3_8_27b_v1", "caption_qwen3_8_27b_v1_metadata"),
 }
-
-
-def _ownership_metadata(field_set: str) -> dict[bytes, bytes]:
-    return {
-        OWNER_METADATA: b"video-caption",
-        FIELD_SET_METADATA: field_set.encode("utf-8"),
-    }
 
 
 def resolve_model_spec(variant: ModelVariant) -> CaptionModelSpec:
@@ -361,6 +356,13 @@ def validate_terminal_row(
         spec=spec,
         digest=digest,
     )
+
+
+def validate_terminal_batch(batch: pa.RecordBatch, *, spec: CaptionModelSpec, digest: str) -> None:
+    """Validate every caption in the publisher's bounded batches against the selected contract."""
+    captions = batch.column(spec.caption_field_name).to_pylist()
+    for caption, metadata in zip(captions, batch.column(spec.metadata_field_name).to_pylist(), strict=True):
+        validate_terminal_value(caption, metadata, spec=spec, digest=digest)
 
 
 def _validate_token_counts(metadata: dict[str, Any]) -> None:

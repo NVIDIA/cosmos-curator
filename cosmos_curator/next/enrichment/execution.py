@@ -68,10 +68,23 @@ class ProcessingScope:
         """Return the schema of rows the plan passes to ``write``; build results in it on workers."""
         return self._writer.result_schema
 
+    @property
+    def selected_rows(self) -> int:
+        """Count the selected fragments' physical rows, an upper bound on the rows ``read`` yields.
+
+        Checkpoint filtering and null IDs only lower it. Bound work-sized resources,
+        such as model replicas, by it rather than by a snapshot of cluster resources.
+        """
+        return self._attempt.counts()["selected_rows"]
+
     def read(self, columns: Sequence[str], *, override_num_blocks: int | None = None) -> ray.data.Dataset:
         """Read the IDs, named input columns, and row addresses, with checkpoint filtering before expensive work.
 
         The columns must be declared input fields; see ``EnrichmentSpec.read_schema``.
+        Ray merges a read task's scanner batches into one block up to its target block
+        size and, unless ``override_num_blocks`` is set, sizes read tasks from the CPUs
+        present when the plan starts. Repartition before per-row work that needs a
+        fixed number of rows per task, such as media downloads.
         """
         return cast(
             "ray.data.Dataset",

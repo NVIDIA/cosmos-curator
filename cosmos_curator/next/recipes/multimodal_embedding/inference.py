@@ -35,6 +35,8 @@ from cosmos_curator.core.utils import environment
 from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv, ray_data_gpu_runtime_env
 from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
 from cosmos_curator.next.core.ray_checkpoints import installed_checkpoint
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import CaptionAttempt
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import CaptionWorkspace, record_phase_a_completion
 from cosmos_curator.next.recipes.multimodal_embedding.config import ResolvedMultimodalEmbeddingConfig
 from cosmos_curator.next.recipes.multimodal_embedding.contracts import (
     EmbeddingTerminalResult,
@@ -63,8 +65,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.video_media import (
     decode_selected_frames,
     inspect_video,
 )
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace, record_phase_a_completion
 from cosmos_curator.next.utils.media_reader import MediaObjectError, MediaObjectReader
 
 _READY: Final = "ready"

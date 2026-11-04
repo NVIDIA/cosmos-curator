@@ -1,329 +1,209 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for video-caption orchestration and its no-work fast path."""
+"""Caption plan wiring, clip readiness, and publication, without starting Ray or loading a model."""
 
-from collections.abc import Callable
+from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock, call
 
 import lance
 import pyarrow as pa
-import pyarrow.fs as pafs
+import pyarrow.compute as pc
 import pytest
+from ray.data.context import DataContext
 
-from cosmos_curator.next.recipes.video_caption import pipeline
-from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig, resolve_config_data
-from cosmos_curator.next.recipes.video_caption.inference import CaptionExecutionConfig
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt
-from cosmos_curator.next.recipes.video_caption.publication import PublicationSummary
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
-
-
-def _config(tmp_path: Path) -> ResolvedVideoCaptionConfig:
-    return resolve_config_data(
-        {
-            "schema_version": 1,
-            "kind": "video-caption",
-            "input": {
-                "media_root": str(tmp_path / "media"),
-                "clips_lance_uri": str(tmp_path / "clips.lance"),
-            },
-            "model": {"variant": "qwen3_8_27b_fp8"},
-            "output": {"staging_root_uri": str(tmp_path / "staging")},
-        }
-    )
+from cosmos_curator.next.core import recovery_bindings
+from cosmos_curator.next.enrichment import execution, inputs
+from cosmos_curator.next.enrichment.attempts import reconcile_and_select_attempt
+from cosmos_curator.next.enrichment.execution import checkpointed_processing
+from cosmos_curator.next.recipes.video_caption import inference, pipeline
+from cosmos_curator.next.recipes.video_caption.bindings import resolve_bindings
+from cosmos_curator.next.recipes.video_caption.config import ResolvedVideoCaptionConfig
+from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec
+from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
+from tests.cosmos_curator.next.enrichment.helpers import prepare_results
+from tests.cosmos_curator.next.recipes.video_caption.conftest import clip_rows, write_clips
 
 
-def _workspace(tmp_path: Path) -> CaptionWorkspace:
-    root = tmp_path / "workspace"
-    return CaptionWorkspace(
-        root_uri=str(root),
-        manifest_uri=str(root / "workspace.json"),
-        results_uri=str(root / "results"),
-        checkpoints_uri=str(root / "checkpoints"),
-        filesystem=pafs.LocalFileSystem(),
-    )
-
-
-def _common_mocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, attempt: CaptionAttempt) -> list[str]:
-    events: list[str] = []
-    dataset = SimpleNamespace(version=attempt.version)
-    monkeypatch.setattr(pipeline, "get_lance_storage_options", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "ensure_caption_fields", lambda *_args, **_kwargs: dataset)
-    monkeypatch.setattr(pipeline, "validate_caption_input", lambda *_args, **_kwargs: events.append("validate"))
-    monkeypatch.setattr(pipeline, "capture_attempt", lambda *_args, **_kwargs: attempt)
-    monkeypatch.setattr(pipeline, "resolve_workspace", lambda *_args, **_kwargs: _workspace(tmp_path))
-    monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(pipeline.lance, "dataset", lambda *_args, **_kwargs: SimpleNamespace(version=12))
-    return events
-
-
-def test_registration_rejects_unready_transcode_input(
-    tmp_path: Path,
-    clip_dataset_factory: Callable[..., tuple[str, lance.LanceDataset]],
-    clip_row_factory: Callable[..., dict[str, object]],
-) -> None:
-    """Caption startup rejects appended spans with incomplete clip metadata."""
-    uri, dataset = clip_dataset_factory()
-    row = clip_row_factory(2) | {"clip_uri": None}
-    lance.write_dataset(pa.Table.from_pylist([row], schema=dataset.schema), uri, mode="append")
-    config = _config(tmp_path)
-    config = config.model_copy(update={"input": config.input.model_copy(update={"clips_lance_uri": uri})})
-
-    with pytest.raises(ValueError, match="non-null URIs and positive byte sizes"):
-        pipeline.run_config(config)
-
-
-def test_pending_attempt_runs_one_inference_phase_then_publication(
-    tmp_path: Path,
+def test_plan_reserves_io_for_fetches_and_bounds_replicas_by_the_selection(
+    config: ResolvedVideoCaptionConfig,
+    enrichment_input: inputs.EnrichmentInput,
+    caption_spec: CaptionModelSpec,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pending work validates model/workspace, runs one Phase A, then publishes."""
-    attempt = CaptionAttempt(version=3, pending_fragment_ids=(0, 1), complete_fragment_ids=(2,))
-    events = _common_mocks(monkeypatch, tmp_path, attempt)
-    config = _config(tmp_path)
-    ray_init_calls: list[dict[str, object]] = []
-    manifests: list[dict[str, object]] = []
-    inference_configs: list[CaptionExecutionConfig] = []
+    """The plan reads clip IDs, URIs, and sizes; fixed-size fetches hold IO slots; the vLLM pool follows the work."""
+    monkeypatch.setattr(DataContext.get_current(), "checkpoint_config", None)
+    plan = Mock()
+    for method in ("map", "map_batches", "repartition"):
+        getattr(plan, method).return_value = plan
+    datasources = []
 
-    def validate_model_directory(*_args: object) -> Path:
-        events.append("model")
-        return tmp_path
+    def read(datasource: object, **_kwargs: object) -> Mock:
+        datasources.append(datasource)
+        return plan
 
-    monkeypatch.setattr(pipeline, "validate_model_directory", validate_model_directory)
+    built: list[dict[str, Any]] = []
 
-    def ensure_workspace(*_args: object, manifest: dict[str, object], **_kwargs: object) -> None:
-        manifests.append(manifest)
-        events.append("workspace")
+    def build_processor(*args: object, **kwargs: object) -> Mock:
+        built.append({"args": args, **kwargs})
+        return Mock(return_value=plan)
 
-    monkeypatch.setattr(pipeline, "ensure_workspace", ensure_workspace)
+    eager = Mock()
+    monkeypatch.setattr(execution.ray.data, "read_datasource", read)
+    monkeypatch.setattr(pipeline, "validate_model_directory", Mock(return_value=Path("/unused-model")))
+    monkeypatch.setattr(pipeline, "configure_ray_data_eager_actor_autoscaling", eager)
+    monkeypatch.setattr(inference.ray, "available_resources", lambda: {"GPU": 2.0})
+    monkeypatch.setattr(inference, "_build_llm_processor", build_processor)
+    with checkpointed_processing(reconcile_and_select_attempt(enrichment_input)) as scope:
+        pipeline.caption_clips(scope, config, caption_spec)
+
+    eager.assert_called_once_with()
+    (datasource,) = datasources
+    assert datasource._schema.names == ["clip_id", "clip_uri", "clip_size_bytes", "fragment_id", "row_offset"]
+    fixed_blocks, first_fetch = plan.mock_calls[:2]
+    assert fixed_blocks == call.repartition(
+        target_num_rows_per_block=config.execution.lance_read_batch_size, strict=True
+    )
+    assert first_fetch.args == (inference.fetch_media_batch,)
+    (fetch_args, fetch), (canonical_args, canonical), _stage = plan.map_batches.call_args_list
+    assert fetch_args == (inference.fetch_media_batch,)
+    assert fetch["resources"] == {"curator_io": 1.0}
+    assert fetch["fn_kwargs"]["media"] == inference.MediaColumns(uri="clip_uri", size="clip_size_bytes")
+    assert canonical_args == (inference.canonicalize_llm_batch,)
+    request = canonical["fn_kwargs"]["request"]
+    assert request.identity_columns == ("clip_id",)
+    assert request.result_schema.equals(enrichment_input.bindings.spec.result_schema, check_metadata=True)
+    (processor,) = built
+    assert processor["args"][1:] == (Path("/unused-model"), ("clip_id",))
+    # Four selected clips bound the pool; two live GPUs seed it.
+    assert (processor["initial_inference_workers"], processor["inference_worker_ceiling"]) == (2, 4)
+
+
+def test_ray_workers_reach_media_clips_and_staging(
+    config: ResolvedVideoCaptionConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each location is configured on its own, so workers get settings for every one they open."""
+    locations: list[tuple[str, ...]] = []
+
+    def classify(*urls: str, storage_profile: str) -> dict[str, str]:
+        assert storage_profile == config.execution.storage_profile
+        locations.append(urls)
+        return {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"}
+
+    initialized: list[dict[str, object]] = []
+    monkeypatch.setattr(recovery_bindings, "s3_compatibility_env_vars", classify)
+    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **kwargs: initialized.append(kwargs))
     monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
-    monkeypatch.setattr(
-        pipeline,
-        "s3_compatibility_env_vars",
-        lambda *_args, **_kwargs: {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"},
-    )
+    monkeypatch.setattr(pipeline, "configure_ray_data_progress", Mock())
+    monkeypatch.setattr(pipeline, "configure_ray_data_stability", Mock())
 
-    def initialize_ray(**kwargs: object) -> None:
-        ray_init_calls.append(kwargs)
-        events.append("ray")
+    pipeline.start_ray(resolve_bindings(config), config)
 
-    monkeypatch.setattr(pipeline, "ensure_ray_initialized", initialize_ray)
-    monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda **_kwargs: events.append("progress"))
-    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda **_kwargs: events.append("stability"))
-    monkeypatch.setattr(
-        pipeline,
-        "configure_ray_data_eager_actor_autoscaling",
-        lambda: events.append("autoscaling"),
-    )
-
-    def run_inference_phase(
-        _dataset: object,
-        _attempt: object,
-        inference_config: CaptionExecutionConfig,
-        *_args: object,
-        **_kwargs: object,
-    ) -> None:
-        inference_configs.append(inference_config)
-        events.append("inference")
-
-    monkeypatch.setattr(pipeline, "run_inference_phase", run_inference_phase)
-
-    def publish(*_args: object, **_kwargs: object) -> PublicationSummary:
-        events.append("publish")
-        return PublicationSummary(published_fragments=2, already_committed_fragments=0)
-
-    monkeypatch.setattr(pipeline, "publish_staged_results", publish)
-    monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: events.append("cleanup"))
-
-    summary = pipeline.run_config(config)
-
-    assert events == [
-        "validate",
-        "workspace",
-        "model",
-        "ray",
-        "progress",
-        "stability",
-        "autoscaling",
-        "inference",
-        "publish",
-        "cleanup",
+    assert locations == [
+        (config.input.clips_lance_uri, config.output.staging_root_uri, config.input.media_root),
     ]
-    assert summary["attempt_version"] == 3
-    assert summary["pending_fragments"] == 2
-    assert summary["published_fragments"] == 2
-    assert summary["skipped_complete_fragments"] == 1
-    assert summary["clips_lance_version"] == 12
-    assert summary["cleanup_complete"] is True
-    assert ray_init_calls == [
+    assert initialized == [
         {
             "local_resources": {"curator_io": 16.0},
             "runtime_env_vars": {"AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required"},
         }
     ]
-    assert manifests[0]["media_root"] == config.input.media_root
-    assert manifests[0]["clips_lance_uri"] == config.input.clips_lance_uri
-    assert inference_configs == [
-        CaptionExecutionConfig(
-            storage_profile=config.execution.storage_profile,
-            inference_concurrency=config.execution.inference_concurrency,
-            inference_batch_size=config.execution.inference_batch_size,
-            max_concurrent_batches=config.execution.max_concurrent_batches,
-            tensor_parallel_size=config.execution.tensor_parallel_size,
-            pipeline_parallel_size=config.execution.pipeline_parallel_size,
-            media_concurrency=config.execution.media_concurrency,
-            media_batch_size=config.execution.media_batch_size,
-            media_cpus=config.execution.media_cpus,
-            media_attempts=config.execution.media_attempts,
-            lance_read_batch_size=config.execution.lance_read_batch_size,
-            parquet_rows_per_file=config.execution.parquet_rows_per_file,
-        )
+
+
+def test_duplicate_clip_ids_are_rejected_before_any_work(config: ResolvedVideoCaptionConfig) -> None:
+    """Checkpoints key on clip IDs, so a duplicate would silently skip a clip."""
+    rows = clip_rows(config, count=2)
+    rows[1]["clip_id"] = rows[0]["clip_id"]
+    lance.write_dataset(
+        pa.Table.from_pylist(rows, schema=CLIP_SCHEMA), config.input.clips_lance_uri, data_storage_version="2.2"
+    )
+
+    with pytest.raises(ValueError, match="globally unique"):
+        pipeline.run_config(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("clip_size_bytes", 1, None),
+        ("clip_id", None, "non-null clip_id"),
+        ("clip_uri", None, "non-null URIs"),
+        ("clip_size_bytes", None, "positive byte sizes"),
+        ("clip_size_bytes", 0, "positive byte sizes"),
+        ("clip_size_bytes", -1, "positive byte sizes"),
+    ],
+)
+def test_appended_spans_need_ready_clips(
+    config: ResolvedVideoCaptionConfig, field: str, value: int | None, message: str | None
+) -> None:
+    """New spans must have usable clips; readiness depends on current values, not publication history."""
+    dataset = write_clips(config)
+    row = clip_rows(config, count=1)[0] | {"span_id": "appended-span", "clip_id": "appended-clip", field: value}
+    lance.write_dataset(
+        pa.Table.from_pylist([row], schema=dataset.schema), dataset.uri, mode="append", data_storage_version="2.2"
+    )
+    bindings = resolve_bindings(config)
+    if message is None:
+        inputs.open_enrichment_input(bindings)
+    else:
+        with pytest.raises(ValueError, match=message):
+            inputs.open_enrichment_input(bindings)
+
+
+def test_run_publishes_captions_and_reports_the_clip_table(
+    config: ResolvedVideoCaptionConfig,
+    results: pa.Table,
+    caption_spec: CaptionModelSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal captions, truncations, and media errors become visible together in the clip table."""
+    monkeypatch.setattr(pipeline, "start_ray", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline, "caption_clips", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(execution, "prepare_enrichment_fragments", partial(prepare_results, results))
+
+    summary = pipeline.run_config(config)
+
+    published = lance.dataset(config.input.clips_lance_uri)
+    assert (summary["clips_lance_uri"], summary["clips_lance_version"]) == (
+        config.input.clips_lance_uri,
+        published.version,
+    )
+    assert (summary["selected_rows"], summary["field_set"]) == (4, caption_spec.caption_field_name)
+    statuses = [
+        metadata["status"]
+        for metadata in published.to_table(columns=[caption_spec.metadata_field_name]).column(0).to_pylist()
     ]
+    assert sorted(statuses) == ["error", "success", "success", "truncated"]
 
 
-def test_storage_compatibility_is_selected_from_every_worker_visible_location(
-    tmp_path: Path,
+def test_captions_from_per_fragment_publication_remain_complete(
+    config: ResolvedVideoCaptionConfig,
+    enrichment_input: inputs.EnrichmentInput,
+    results: pa.Table,
+    caption_spec: CaptionModelSpec,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ray workers are started with the settings every location they open requires.
-
-    The media root, the clip table, and the staging root are each configurable on
-    their own, so a selection made from the staging root alone would leave a
-    worker reading media or scanning the table under the SDK default.
-    """
-    attempt = CaptionAttempt(version=9, pending_fragment_ids=(0,), complete_fragment_ids=())
-    config = _config(tmp_path)
-    workspace = _workspace(tmp_path)
-    compatibility_calls: list[tuple[tuple[str, ...], str]] = []
-    _common_mocks(monkeypatch, tmp_path, attempt)
-    monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
-
-    def classify_endpoints(*locations: str, storage_profile: str) -> dict[str, str]:
-        compatibility_calls.append((locations, storage_profile))
-        return {}
-
-    monkeypatch.setattr(pipeline, "s3_compatibility_env_vars", classify_endpoints)
-    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **_kwargs: None)
-    monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda **_kwargs: None)
-    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        pipeline,
-        "publish_staged_results",
-        lambda *_args, **_kwargs: PublicationSummary(published_fragments=1, already_committed_fragments=0),
-    )
-    monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: None)
-
-    pipeline.run_config(config)
-
-    assert compatibility_calls == [
-        (
-            (config.input.media_root, config.input.clips_lance_uri, workspace.root_uri),
-            config.execution.storage_profile,
+    """Fields and digests are unchanged, so tables captioned one fragment at a time need no new work."""
+    dataset = enrichment_input.dataset
+    for fragment in dataset.get_fragments():
+        values = results.filter(pc.equal(results["fragment_id"], fragment.fragment_id))
+        update = values.select(["clip_id", *caption_spec.fields.names]).cast(
+            pa.schema([CLIP_SCHEMA.field("clip_id"), *caption_spec.fields])
         )
-    ]
+        current = lance.dataset(dataset.uri)
+        metadata, modified = current.get_fragment(fragment.fragment_id).update_columns(
+            update, left_on="clip_id", right_on="clip_id"
+        )
+        lance.LanceDataset.commit(
+            dataset.uri,
+            lance.LanceOperation.Update(updated_fragments=[metadata], fields_modified=modified),
+            read_version=current.version,
+        )
+    monkeypatch.setattr(pipeline, "start_ray", Mock(side_effect=AssertionError("Ray must not start")))
 
+    summary = pipeline.run_config(config)
 
-def test_complete_attempt_skips_model_and_ray_and_validates_existing_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A complete attempt skips model/Ray work but validates reusable staging."""
-    attempt = CaptionAttempt(version=8, pending_fragment_ids=(), complete_fragment_ids=(0, 1))
-    events = _common_mocks(monkeypatch, tmp_path, attempt)
-    monkeypatch.setattr(pipeline, "workspace_manifest_exists", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: events.append("workspace"))
-    monkeypatch.setattr(
-        pipeline,
-        "validate_model_directory",
-        lambda *_args: pytest.fail("complete attempts must not require model files"),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "ensure_ray_initialized",
-        lambda **_kwargs: pytest.fail("complete attempts must not initialize Ray"),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "publish_staged_results",
-        lambda *_args, **_kwargs: PublicationSummary(published_fragments=0, already_committed_fragments=0),
-    )
-    monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: events.append("cleanup"))
-
-    summary = pipeline.run_config(_config(tmp_path))
-
-    assert events == ["validate", "workspace", "cleanup"]
-    assert summary["pending_fragments"] == 0
-    assert summary["skipped_complete_fragments"] == 2
-
-
-def test_recovered_phase_a_skips_model_but_initializes_ray_for_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A completed Phase A marker skips inference while Ray prepares publication."""
-    attempt = CaptionAttempt(version=9, pending_fragment_ids=(0,), complete_fragment_ids=())
-    events = _common_mocks(monkeypatch, tmp_path, attempt)
-    monkeypatch.setattr(pipeline, "phase_a_completion_covers", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: events.append("workspace"))
-    monkeypatch.setattr(
-        pipeline,
-        "validate_model_directory",
-        lambda *_args: pytest.fail("complete Phase A must not require model files"),
-    )
-    monkeypatch.setattr(pipeline, "curator_io_resources", lambda: {"curator_io": 16.0})
-    monkeypatch.setattr(pipeline, "ensure_ray_initialized", lambda **_kwargs: events.append("ray"))
-    monkeypatch.setattr(pipeline, "configure_ray_data_progress", lambda **_kwargs: events.append("progress"))
-    monkeypatch.setattr(pipeline, "configure_ray_data_stability", lambda **_kwargs: events.append("stability"))
-    monkeypatch.setattr(
-        pipeline,
-        "configure_ray_data_eager_actor_autoscaling",
-        lambda: pytest.fail("publication must not enable eager inference actor autoscaling"),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "run_inference_phase",
-        lambda *_args, **_kwargs: pytest.fail("complete Phase A must not run inference"),
-    )
-
-    def publish(*_args: object, **_kwargs: object) -> PublicationSummary:
-        events.append("publish")
-        return PublicationSummary(published_fragments=1, already_committed_fragments=0)
-
-    monkeypatch.setattr(pipeline, "publish_staged_results", publish)
-    monkeypatch.setattr(pipeline, "cleanup_workspace", lambda *_args, **_kwargs: events.append("cleanup"))
-
-    summary = pipeline.run_config(_config(tmp_path))
-
-    assert events == ["validate", "workspace", "ray", "progress", "stability", "publish", "cleanup"]
-    assert summary["published_fragments"] == 1
-
-
-def test_cleanup_failure_does_not_invalidate_canonical_commits(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cleanup is best effort after Lance has been canonically verified."""
-    attempt = CaptionAttempt(version=5, pending_fragment_ids=(), complete_fragment_ids=())
-    _common_mocks(monkeypatch, tmp_path, attempt)
-    monkeypatch.setattr(pipeline, "workspace_manifest_exists", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "ensure_workspace", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        pipeline,
-        "publish_staged_results",
-        lambda *_args, **_kwargs: PublicationSummary(published_fragments=0, already_committed_fragments=0),
-    )
-
-    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
-        msg = "temporary object-store outage"
-        raise OSError(msg)
-
-    monkeypatch.setattr(pipeline, "cleanup_workspace", fail_cleanup)
-
-    summary = pipeline.run_config(_config(tmp_path))
-
-    assert summary["clips_lance_version"] == 12
-    assert summary["cleanup_complete"] is False
+    assert (summary["selected_fragments"], summary["remaining_fragments"]) == (0, 0)
+    assert summary["clips_lance_version"] == lance.dataset(dataset.uri).version

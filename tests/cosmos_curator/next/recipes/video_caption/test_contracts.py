@@ -9,17 +9,17 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.enrichment.contracts import FIELD_SET_METADATA, OWNER_METADATA
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
-    FIELD_SET_METADATA,
     MAX_OUTPUT_TOKENS,
-    OWNER_METADATA,
     CaptionModelSpec,
     caption_contract_digest,
     normalized_caption_contract,
     resolve_model_spec,
     terminal_metadata,
     validate_model_directory,
+    validate_terminal_batch,
     validate_terminal_value,
 )
 
@@ -228,6 +228,36 @@ def test_invalid_terminal_states_are_rejected(
 
     with pytest.raises((TypeError, ValueError), match=match):
         validate_terminal_value(caption, metadata, spec=caption_spec, digest=caption_digest)
+
+
+def test_batch_validation_rejects_any_non_terminal_row(caption_spec: CaptionModelSpec, caption_digest: str) -> None:
+    """Shared publication validates Arrow batches; one pending or stale row rejects the batch."""
+    metadata = terminal_metadata(
+        caption_spec,
+        caption_digest,
+        status="success",
+        prompt_token_count=1,
+        generated_token_count=2,
+        error_type=None,
+        error_message=None,
+    )
+    schema = pa.schema([pa.field("clip_id", pa.string()), *caption_spec.fields])
+    rows = [
+        {"clip_id": "a", caption_spec.caption_field_name: "caption", caption_spec.metadata_field_name: metadata},
+        {"clip_id": "b", caption_spec.caption_field_name: "caption", caption_spec.metadata_field_name: metadata},
+    ]
+    validate_terminal_batch(pa.RecordBatch.from_pylist(rows, schema=schema), spec=caption_spec, digest=caption_digest)
+
+    rows[1][caption_spec.metadata_field_name] = None
+    with pytest.raises(ValueError, match="must not be null"):
+        validate_terminal_batch(
+            pa.RecordBatch.from_pylist(rows, schema=schema), spec=caption_spec, digest=caption_digest
+        )
+    rows[1][caption_spec.metadata_field_name] = metadata | {"contract_digest": "0" * 64}
+    with pytest.raises(ValueError, match="contract_digest"):
+        validate_terminal_batch(
+            pa.RecordBatch.from_pylist(rows, schema=schema), spec=caption_spec, digest=caption_digest
+        )
 
 
 def test_model_directory_must_contain_config_and_weights(

@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cosmos_curator.next.core.config import apply_dotted_overrides
+from cosmos_curator.next.enrichment.config import EnrichmentExecutionConfig
 from cosmos_curator.next.utils.uris import normalize_location
 
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
@@ -77,7 +78,7 @@ class VideoCaptionModelConfig(BaseModel):
 
 
 class VideoCaptionOutputConfig(BaseModel):
-    """Durable inference workspace, derived from the media root by default."""
+    """Durable recovery workspace, derived from the media root by default."""
 
     model_config = _MODEL_CONFIG
 
@@ -89,12 +90,9 @@ class VideoCaptionOutputConfig(BaseModel):
         return _normalize_location(location, label="output.staging_root_uri")
 
 
-class VideoCaptionExecutionConfig(BaseModel):
-    """Execution-only tuning excluded from caption identity."""
+class VideoCaptionExecutionConfig(EnrichmentExecutionConfig):
+    """Execution-only tuning excluded from caption identity, except a set ``max_model_len``."""
 
-    model_config = _MODEL_CONFIG
-
-    storage_profile: str = Field(default="default", min_length=1)
     inference_concurrency: int | Literal["auto"] = Field(
         default="auto",
         description="Maximum vLLM replicas, or auto to let Ray scale with pending work and live GPU resources.",
@@ -135,15 +133,8 @@ class VideoCaptionExecutionConfig(BaseModel):
     lance_read_batch_size: int = Field(
         default=256,
         ge=1,
-        description="Rows per Lance scan batch and strict pre-fetch block, exposing media work across the cluster.",
+        description="Clip rows per Lance scanner batch and per media-fetch task.",
     )
-    parquet_rows_per_file: int = Field(
-        default=4_096,
-        ge=1,
-        description="Rows per durable result/checkpoint group.",
-    )
-    commit_attempts: int = Field(default=5, ge=1)
-    progress: bool = False
 
     @field_validator("inference_concurrency")
     @classmethod
@@ -212,6 +203,7 @@ _TEMPLATE_PREAMBLE = """\
 # clips_lance_uri and staging_root_uri are derived from input.media_root when omitted.
 # Model weights must already exist under /config/models on every inference worker.
 # inference_concurrency=auto lets Ray place one TP=1 replica on each live GPU.
+# Each run publishes its whole selection in one commit; set execution.max_fragments to publish sooner.
 """
 
 

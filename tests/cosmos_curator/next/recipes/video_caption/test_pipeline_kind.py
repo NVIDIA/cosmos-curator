@@ -51,15 +51,12 @@ def test_prepared_run_dispatches_resolved_config(tmp_path: Path, monkeypatch: py
 
     def run_config(config: ResolvedVideoCaptionConfig) -> dict[str, object]:
         seen.append(config)
-        return {
-            "published_fragments": 3,
-            "skipped_complete_fragments": 4,
-        }
+        return {"selected_rows": 3, "input_rows": 7, "remaining_fragments": 1}
 
     monkeypatch.setattr(pipeline, "run_config", run_config)
 
     output = VIDEO_CAPTION_KIND.prepare_run(config_path, set_overrides=[])()
 
     assert seen[0].kind == "video-caption"
-    assert output.json_payload["published_fragments"] == 3
-    assert output.message == "video-caption: 3 fragment(s) published, 4 complete fragment(s) skipped"
+    assert output.json_payload["selected_rows"] == 3
+    assert output.message == "video-caption: published results for 3 of 7 input row(s); 1 fragment(s) pending"

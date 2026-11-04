@@ -56,8 +56,9 @@ class ModelConfig(_Config):
 class ExecutionConfig(EnrichmentExecutionConfig):
     """Resource and durability tuning, excluded from embedding identity."""
 
-    # Smaller scanner batches spread clip downloads across more Ray tasks.
-    lance_read_batch_size: int = Field(default=128, ge=1, description="Clip rows per Lance scanner batch.")
+    lance_read_batch_size: int = Field(
+        default=128, ge=1, description="Clip rows per Lance scanner batch and per download task."
+    )
     media_attempts: int = Field(default=3, ge=1)
     inference_concurrency: Concurrency = "auto"
     inference_batch_size: int = Field(default=16, ge=1)

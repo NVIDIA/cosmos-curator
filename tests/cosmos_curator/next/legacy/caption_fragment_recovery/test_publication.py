@@ -12,20 +12,28 @@ import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import pytest
 
-from cosmos_curator.next.recipes.video_caption import publication
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
-from cosmos_curator.next.recipes.video_caption.inference import caption_lance_datasource, result_schema
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
-from cosmos_curator.next.recipes.video_caption.publication import (
+from cosmos_curator.next.legacy.caption_fragment_recovery import publication
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
+from cosmos_curator.next.legacy.caption_fragment_recovery.inference import caption_lance_datasource
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
+    CaptionAttempt,
+    capture_attempt,
+    ensure_caption_fields,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.publication import (
     PreparedFragmentPublication,
     PreparedFragmentUpdate,
     PublicationError,
     publish_staged_results,
 )
-from cosmos_curator.next.recipes.video_caption.workspace import CaptionWorkspace
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import CaptionWorkspace
+from cosmos_curator.next.recipes.video_caption.contracts import CaptionModelSpec, terminal_metadata
 from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA
-from tests.cosmos_curator.next.recipes.video_caption.helpers import append_clip_fragment, write_clip_fragment
+from tests.cosmos_curator.next.legacy.caption_fragment_recovery.helpers import (
+    append_clip_fragment,
+    result_schema,
+    write_clip_fragment,
+)
 
 _DISTRIBUTED_PUBLICATION_DATASET = publication._prepared_publication_dataset
 

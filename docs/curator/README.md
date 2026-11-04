@@ -44,7 +44,7 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 - [Curator Next Video Transcode](design/curator-next-video-transcode.md) - checkpointed CPU transcoding and atomic clip
   metadata publication.
 - [Curator Next Video Captioning](design/curator-next-video-captioning.md) - checkpointed Qwen3.8 inference and
-  fragment-atomic Lance enrichment.
+  atomic publication across all selected clip fragments.
 - [Curator Next Video Embedding](design/curator-next-video-embed.md) - model-card Cosmos-Embed1 inference and atomic
   publication across all clip fragments.
 - [Curator Next Incremental Curation](design/curator-next-incremental-curation.md) - a canonical Lance clip table that

@@ -278,6 +278,20 @@ def test_processing_scope_owns_checkpoint_and_sink(
     assert attempt.processing_complete() is not fail_write
 
 
+def test_processing_scope_bounds_work_by_the_selection(
+    enrichment_input: inputs.EnrichmentInput, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row bound recipes size model pools by covers the frozen selection, not the whole input."""
+    tuned = enrichment_input.bindings.execution.model_copy(update={"max_fragments": 1})
+    attempt = reconcile_and_select_attempt(
+        inputs.open_enrichment_input(attrs.evolve(enrichment_input.bindings, execution=tuned))
+    )
+    monkeypatch.setattr(DataContext.get_current(), "checkpoint_config", None)
+    with execution.checkpointed_processing(attempt) as processing:
+        assert processing.selected_rows == 1
+    assert enrichment_input.dataset.count_rows() == 2
+
+
 def test_processing_validates_results_before_ray_checkpoints_them(
     enrichment_input: inputs.EnrichmentInput, results: pa.Table, monkeypatch: pytest.MonkeyPatch
 ) -> None:

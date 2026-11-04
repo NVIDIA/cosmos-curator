@@ -33,6 +33,20 @@ import ray
 from cosmos_curator.core.sensors.sampling.grid import make_ts_grid
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.core.utils import environment
+from cosmos_curator.next.legacy.caption_fragment_recovery import publication
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionRunBindings
+from cosmos_curator.next.legacy.caption_fragment_recovery.lance_state import (
+    CaptionAttempt,
+    capture_attempt,
+    ensure_caption_fields,
+)
+from cosmos_curator.next.legacy.caption_fragment_recovery.workspace import (
+    CaptionWorkspace,
+    ensure_workspace,
+    phase_a_completion_covers,
+    record_phase_a_completion,
+    resolve_workspace,
+)
 from cosmos_curator.next.recipes.multimodal_embedding import inference, pipeline
 from cosmos_curator.next.recipes.multimodal_embedding import publication as embedding_publication
 from cosmos_curator.next.recipes.multimodal_embedding.config import (
@@ -58,16 +72,6 @@ from cosmos_curator.next.recipes.multimodal_embedding.episode_input import (
     project_camera_work,
 )
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA, EpisodeFacts, build_episode_record
-from cosmos_curator.next.recipes.video_caption import publication
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionRunBindings
-from cosmos_curator.next.recipes.video_caption.lance_state import CaptionAttempt, capture_attempt, ensure_caption_fields
-from cosmos_curator.next.recipes.video_caption.workspace import (
-    CaptionWorkspace,
-    ensure_workspace,
-    phase_a_completion_covers,
-    record_phase_a_completion,
-    resolve_workspace,
-)
 from cosmos_curator.next.utils.identity import canonical_digest
 from tests.cosmos_curator.next.recipes.multimodal_embedding.test_inference import (
     _CPUEmbeddingActor,

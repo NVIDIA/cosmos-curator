@@ -1,13 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared caption bindings and competing table writes for recipe tests."""
+"""Clip-shaped two-phase bindings and competing table writes for the engine's tests.
+
+The multimodal recipes are the engine's production users; these tests exercise it
+with video-caption's clip table and caption contract, which the engine served
+before video-caption moved to shared enrichment.
+"""
 
 from functools import partial
 
 import pyarrow as pa
 
-from cosmos_curator.next.recipes.video_caption.bindings import (
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import (
     CaptionInputBindings,
     CaptionPublicationBindings,
     CaptionResultBindings,
@@ -20,17 +25,58 @@ from cosmos_curator.next.recipes.video_caption.contracts import (
     validate_terminal_row,
     validate_terminal_value,
 )
-from cosmos_curator.next.recipes.video_caption.inference import (
-    MAPPED_INPUT_SCHEMA,
-    decompose_row_addresses,
-    result_schema,
-)
 from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_SCHEMA, validate_clip_table
 from cosmos_curator.next.utils import lance_fragment_recovery
 
+_ROW_ADDRESS_FRAGMENT_SHIFT = 32
+_ROW_ADDRESS_OFFSET_MASK = (1 << _ROW_ADDRESS_FRAGMENT_SHIFT) - 1
+MAPPED_INPUT_SCHEMA = pa.schema(
+    [
+        pa.field("fragment_id", pa.int64(), nullable=False),
+        pa.field("row_offset", pa.int64(), nullable=False),
+        pa.field("clip_id", pa.string(), nullable=False),
+        pa.field("clip_uri", pa.large_string(), nullable=False),
+        pa.field("clip_size_bytes", pa.int64(), nullable=False),
+    ]
+)
+
+
+def result_schema(spec: CaptionModelSpec) -> pa.Schema:
+    """Return the staged clip result schema."""
+    return pa.schema(
+        [
+            pa.field("fragment_id", pa.int64(), nullable=False),
+            pa.field("row_offset", pa.int64(), nullable=False),
+            pa.field("clip_id", pa.string(), nullable=False),
+            *spec.fields,
+        ]
+    )
+
+
+def decompose_row_addresses(batch: pa.Table) -> pa.Table:
+    """Turn Lance's global row address into physical fragment and local offset."""
+    required = {"_rowaddr", "clip_id", "clip_uri", "clip_size_bytes"}
+    missing = sorted(required - set(batch.schema.names))
+    if missing:
+        msg = f"Lance caption read is missing required column(s): {', '.join(missing)}"
+        raise ValueError(msg)
+    rows = []
+    for row in batch.select(["_rowaddr", "clip_id", "clip_uri", "clip_size_bytes"]).to_pylist():
+        row_address = int(row["_rowaddr"])
+        rows.append(
+            {
+                "fragment_id": row_address >> _ROW_ADDRESS_FRAGMENT_SHIFT,
+                "row_offset": row_address & _ROW_ADDRESS_OFFSET_MASK,
+                "clip_id": row["clip_id"],
+                "clip_uri": row["clip_uri"],
+                "clip_size_bytes": row["clip_size_bytes"],
+            }
+        )
+    return pa.Table.from_pylist(rows, schema=MAPPED_INPUT_SCHEMA)
+
 
 def caption_run_bindings(spec: CaptionModelSpec, digest: str) -> CaptionRunBindings:
-    """Build clip bindings for caption tests and upstream compatibility tests."""
+    """Build clip bindings for the engine's tests."""
     return CaptionRunBindings(
         input=CaptionInputBindings(
             source_columns=("clip_id", "clip_uri", "clip_size_bytes"),

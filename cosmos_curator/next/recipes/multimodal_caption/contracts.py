@@ -26,10 +26,10 @@ from cosmos_curator.next.recipes.multimodal_caption.ego_context import (
 from cosmos_curator.next.recipes.multimodal_split.identities import MEDIA_CONTRACT_VERSION
 from cosmos_curator.next.recipes.multimodal_split.records import RECORD_SCHEMA_VERSION
 from cosmos_curator.next.recipes.result_keys import is_valid_result_key
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionInferenceBindings
 from cosmos_curator.next.recipes.video_caption.contracts import (
     DEFAULT_PROMPT,
     VIDEO_NUM_FRAMES,
+    CaptionInferenceBindings,
     resolved_max_output_tokens,
     resolved_sampling_params,
 )

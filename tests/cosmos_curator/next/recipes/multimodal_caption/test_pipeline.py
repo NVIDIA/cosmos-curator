@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 from cosmos_curator.core.sensors.types.types import TimestampSource
+from cosmos_curator.next.legacy.caption_fragment_recovery.bindings import CaptionPublicationBindings
 from cosmos_curator.next.recipes.multimodal_caption import pipeline
 from cosmos_curator.next.recipes.multimodal_caption.config import resolve_config_data
 from cosmos_curator.next.recipes.multimodal_caption.contracts import (
@@ -26,7 +27,6 @@ from cosmos_curator.next.recipes.multimodal_caption.contracts import (
     result_fields,
 )
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA
-from cosmos_curator.next.recipes.video_caption.bindings import CaptionPublicationBindings
 from cosmos_curator.next.recipes.video_caption.inference import caption_llm_preprocess
 from cosmos_curator.next.utils.identity import canonical_digest
 

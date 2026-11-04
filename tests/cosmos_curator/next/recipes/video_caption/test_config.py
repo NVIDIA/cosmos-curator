@@ -39,7 +39,9 @@ def test_defaults_derive_contract_paths_for_s3() -> None:
     assert config.execution.media_concurrency == "auto"
     assert config.execution.inference_batch_size == 32
     assert config.execution.max_concurrent_batches == 8
-    assert config.execution.parquet_rows_per_file == 4_096
+    assert config.execution.lance_read_batch_size == 256
+    assert config.execution.rows_per_checkpoint == 1_000
+    assert config.execution.max_fragments is None
 
 
 def test_defaults_derive_absolute_local_paths(tmp_path: Path) -> None:
@@ -63,6 +65,8 @@ def test_defaults_derive_absolute_local_paths(tmp_path: Path) -> None:
         {"execution": {"media_concurrency": 0}},
         {"execution": {"max_model_len": 1}},
         {"execution": {"max_model_len": "32768"}},
+        {"execution": {"parquet_rows_per_file": 4_096}},
+        {"execution": {"max_fragments": 0}},
         {"input": {"media_root": "https://example.com/clips"}},
     ],
 )

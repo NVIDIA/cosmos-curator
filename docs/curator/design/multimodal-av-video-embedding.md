@@ -137,9 +137,10 @@ validate exact row coverage and prepare fragment updates. The driver collects on
 and commits all pending fragment results in one Lance Update. On a backend meeting the storage requirements below,
 readers see the selected new results together in one atomic table version.
 Atomic publication is the recipe's only publication path; there is no mode setting. The embedding recipe's
-`publication.py` owns its transaction, receipt, and recovery logic, reusing shared fragment preparation and guards. Registering nullable result fields
-may be a separate setup commit; it does not publish any embeddings. Caption recipes retain their existing per-fragment
-publication entry point.
+`publication.py` owns its transaction, receipt, and recovery logic, reusing fragment preparation and guards from the
+deprecated two-phase engine in `legacy/caption_fragment_recovery`. Registering nullable result fields may be a separate
+setup commit; it does not publish any embeddings. Multimodal-caption retains that engine's per-fragment publication
+entry point.
 
 ### Storage requirements and qualification
 
