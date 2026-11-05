@@ -131,10 +131,8 @@ def _episode(index: int) -> dict[str, object]:
             "media_location": f"/output/{index}.mp4",
             "media_size_bytes": 10,
             "media_sha256": str(index + 1) * 64,
-            "timeline_location": f"/output/{index}.timestamps.npy",
-            "timeline_sha256": "a" * 64,
-            "sensor_timestamps_location": f"/output/{index}.sensor.npy",
-            "sensor_timestamps_sha256": "b" * 64,
+            "mp4_index_uri": f"/output/{index}.index.lance",
+            "index_sha256": "a" * 64,
         }
     ]
     return build_episode_record(facts, cameras, [])

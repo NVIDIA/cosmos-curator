@@ -24,6 +24,8 @@ sensors:
     uri_pattern: '*/egotrajectory.mcap'
     required: true
     topic: /egotrajectory
+# Writes episodes.lance and a one-row .mp4.index.lance manifest per generated camera MP4.
+# Output timing lives in the index; use a fresh path for previous sidecar-based datasets.
 output:
   path: /data/curated/full-rig
 clip:

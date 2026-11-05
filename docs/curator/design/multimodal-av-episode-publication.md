@@ -3,7 +3,7 @@
 ## Purpose
 
 `multimodal-split` publishes one canonical Lance row for each complete synchronized multimodal episode. Camera MP4s,
-their timing sidecars, and planned non-camera sensor MCAPs remain external payloads, while the row records their
+their MP4 indexes, and planned non-camera sensor MCAPs remain external payloads, while the row records their
 locations, sizes, and strong hashes. This gives downstream captioning and sensor-alignment recipes a stable episode
 identity without requiring them to traverse source sessions or infer whether the planned artifact set is complete.
 
@@ -137,8 +137,8 @@ The output root has one fixed layout:
   sessions/<source_session_id>/<split_clip_id>/
     clip.json
     <camera_key>.mp4
-    <camera_key>.mp4.timestamps.npy
-    <camera_key>.mp4.sensor_timestamps.npy
+    <camera_key>.mp4.moov
+    <camera_key>.mp4.index.lance/
     <sensor_key>.mcap
   errors/
 ```
@@ -151,8 +151,27 @@ inputs and are not another durable table.
 `clip.json` records each camera's selected clock in `camera_alignment_fields`;
 null identifies an unlabeled legacy timestamp sidecar.
 
-Each MP4 is written after its two timing sidecars and is the per-camera artifact commit point. The episode row becomes
-visible only after every planned camera and every planned non-camera sensor has produced a complete receipt.
+Each re-encoded MP4 is indexed from its own bytes. Its MP4 and decoder `moov` payload are published with
+conditional writes before `<camera>.mp4.index.lance` is atomically created with its complete single row.
+Overlapping attempts verify the winning receipt instead of appending rows. That committed index row is the
+per-camera completion receipt. The episode row becomes
+visible only after every planned camera has a complete index and every planned non-camera sensor has a complete
+receipt. Staging an episode verifies index bindings, media size, decoder-header availability, and the alignment grid.
+
+Each camera has a one-row manifest, avoiding a shared index-table commit bottleneck. Its schema extends
+`VIDEO_MANIFEST_SCHEMA` with non-null `alignment_timestamps_ns` and
+`source_timestamps_ns` arrays, both in output presentation order, plus `media_sha256`, `moov_sha256`, and
+`split_contract_digest`. Frame byte offsets, decode order, metadata, and `moov` describe the generated MP4, never
+the source recording. The original source timestamps may repeat; the alignment grid must strictly increase.
+The manifest's `source_session_id` retains the original source session ID.
+Its `video_id` identifies the individual output MP4.
+`index_sha256` hashes the complete single-row index using an uncompressed Arrow IPC stream with the output schema.
+
+A restart validates and reuses completed receipts without re-encoding. An attempt interrupted before index commit
+can replay media/header writes and index publication. Existing payloads must be byte-identical; conflicts fail
+without overwriting them. Already-published episodes and their payloads remain immutable by contract.
+Empty index tables left by the previous bootstrap/append writer are rejected with a fresh-output-directory error;
+new publication never commits an empty table.
 
 ## Episode record
 
@@ -186,10 +205,8 @@ Every list item and every child of the `camera_media` struct is non-nullable:
 | `media_location` | `large_string not null` | Materialized camera MP4 |
 | `media_size_bytes` | `int64 not null` | Exact MP4 byte count |
 | `media_sha256` | `string not null` | SHA-256 of MP4 bytes |
-| `timeline_location` | `large_string not null` | Regular-grid timestamp sidecar |
-| `timeline_sha256` | `string not null` | SHA-256 of grid-sidecar bytes |
-| `sensor_timestamps_location` | `large_string not null` | Selected source sensor-timestamp sidecar |
-| `sensor_timestamps_sha256` | `string not null` | SHA-256 of sensor-timestamp sidecar bytes |
+| `mp4_index_uri` | `large_string not null` | Output MP4 index manifest; select the row by media location |
+| `index_sha256` | `string not null` | Hash of the index record, including both episode clocks and payload hashes |
 
 Every list item and every child of the `sensor_media` struct is likewise non-nullable. It carries no grid or
 sensor-timestamp sidecars, whichever way its clip was produced. A copied sensor was never put on the episode's grid, so
@@ -292,7 +309,7 @@ resolved `source_media_location` remains explicit in the row and in pre-write co
 ```text
 {
   "kind": "multimodal-av-episode-materialization",
-  "materialization_digest_version": 3,
+  "materialization_digest_version": 4,
   "episode_id": <episode_id>,
   "split_clip_id": <split_clip_id>,
   "split_contract_digest": <split contract digest>,
@@ -302,8 +319,7 @@ resolved `source_media_location` remains explicit in the row and in pre-write co
     {
       "camera_key": <key>,
       "media_sha256": <MP4 hash>,
-      "timeline_sha256": <grid-sidecar hash>,
-      "sensor_timestamps_sha256": <sensor-timestamp-sidecar hash>
+      "index_sha256": <output index record hash>
     },
     ... sorted by camera_key
   ],
@@ -327,31 +343,30 @@ The per-artifact hashes and the composite digest serve different scopes. Each `*
 artifact, allowing a consumer to validate only the files it reads. `materialization_digest` is a derived manifest
 fingerprint over those stored hashes and the episode, split, and grid facts above; it is not an additional checksum of
 the bytes. It gives a consumer one compact binding to the complete published artifact set and changes whenever any
-published MP4, timeline, sensor-timestamp sidecar, or non-camera sensor MCAP changes.
+published MP4, index record, or non-camera sensor MCAP changes.
 
 Canonical row presence alone does not prove that external objects remain intact. Byte verification requires reading
-the selected artifacts and comparing their stored hashes. Publication and reconciliation do not reread or rehash
+the selected artifacts and comparing their stored hashes. Routine reads, staging, and reconciliation do not rehash
 already-canonical media, so this contract enables detection, not automatic repair: a normal retry will not repair a
 damaged already-canonical artifact. Repair requires an explicit verification-and-repair workflow.
 
 ### Episode clock and grid
 
-Record schema version 2 publishes half-open intervals `[start_ns, exclusive_end_ns)` with
+Record schema version 3 publishes half-open intervals `[start_ns, exclusive_end_ns)` with
 `timestamp_source="sensor"` for recorded EOF/SOF/MOE. Each camera's ordered
 `camera_alignment_fields` chooses the first complete indexed column for the whole video,
 defaulting to `[eof_ns]`. Selecting `pts_ns` or `edited_pts_ns` on any camera marks the
 whole episode `"container_pts"`. The former uses container PTS before playback edits;
-the latter applies supported edit-list shifts. Media contract version 3 names the
-selected-source sidecar `<camera>.mp4.sensor_timestamps.npy`.
+the latter applies supported edit-list shifts. Media contract version 4 replaces both output timestamp
+sidecars with indexed episode timing. Legacy recorder sidecars are still supported as input.
 
 Split contract version 6 includes the ordered preferences. It replaces the former
 `allow_pts_fallback` setting and rejects reconciliation with outputs from earlier
 split contracts; use a fresh output root.
 
 There is no in-place migration from the previous record or media contract. An existing
-`episodes.lance` table written under record schema version 1 and media contract version 2 fails
-schema validation, and surviving rows also conflict during reconciliation because their contract
-versions and timestamp-source value differ. Run this version against a fresh output root.
+`episodes.lance` table written under an older record schema fails schema validation, and older media
+contracts also conflict during reconciliation. Run this version against a fresh output root.
 
 ```text
 step_ns = 1_000_000_000.0 / sampling_fps
@@ -363,7 +378,11 @@ row_count = len(grid)
 
 The delivered `make_ts_grid` half-open grid is authoritative for row count. Offsets are independently rounded from the
 origin; they are neither floored nor built by accumulating a rounded period. The regular grid is stored in each
-camera's timeline sidecar, while the corresponding selected sensor timestamps are stored in its sensor-timestamp sidecar.
+camera's output index as `alignment_timestamps_ns`, while the corresponding selected source timestamps are
+stored as `source_timestamps_ns`. Read them together with indexed pixels through
+`multimodal_split.output_index.open_episode_camera(episode, camera_key)`; the context must remain open while
+iterating the returned `StreamingCameraData.frames()`. Caption and embedding consumers continue to read MP4
+pixels directly; neither requires NPY files.
 
 Together, `source_id` and `timestamp_source` record the provenance of the selected session-local episode clock. A
 non-camera enrichment must either rely on a producer contract that places its timestamps in that domain or record the
@@ -389,7 +408,7 @@ For each planned logical episode:
 2. An existing episode must match the record/media versions, split contract, sampling rate, timestamp source, and exact
    sorted camera and non-camera sensor source mappings. A match emits one `already_canonical` accounting record and
    touches no artifact path.
-3. An incompatible match fails before a manifest, sidecar, MP4, or sensor MCAP is rewritten.
+3. An incompatible match fails before a manifest, MP4, or sensor MCAP is rewritten.
 
 Reconciliation also assumes a configured `input.mp4_index_uri` refers to immutable indexed records.
 Reconciliation assumes resolved source artifacts—and each camera's input sensor-timestamp sidecar derived from its
@@ -398,7 +417,7 @@ session location, and therefore a new source identity.
 
 Each non-reconciled sensor emits exactly one current-run outcome per planned span. Both successes and failures carry the
 complete shared episode facts and expected row count. Successes additionally carry all artifact descriptors that apply
-to that sensor kind; a non-camera sensor has no grid or selection sidecars, so those descriptors are null for it. Durable
+to that sensor kind; a non-camera sensor has no MP4 index, so those descriptors are null for it. Durable
 error JSON supplies detailed failure category and message but does not veto a later successful current-run outcome.
 
 Assembly groups small outcomes by `split_clip_id`, compares the complete shared facts once, and requires exactly one
@@ -497,7 +516,8 @@ canonical row.
 ## Implementation ownership
 
 `multimodal_split.plan` owns synchronized span facts and pre-write reconciliation decisions. `split` retains the
-sensor-per-task processing and camera sidecar-first/MP4-last writes while emitting complete terminal receipts.
+sensor-per-task processing while emitting complete terminal receipts. `output_index` owns output MP4 indexing,
+conditional payload publication, index receipts, and downstream frame/timestamp reads.
 `records` owns the episode schema, construction invariants, and exact camera resolver. `publication` owns
 engine-neutral complete-artifact-set assembly and fragment staging; the `pipeline` driver owns bounded Ray batching,
 serial commits, and accounting. `lance_sink` is a thin episode-schema binding over the shared Curator Next fragment

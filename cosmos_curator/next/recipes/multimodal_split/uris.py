@@ -20,7 +20,6 @@ anything: a URI is a name, and resolving one to bytes is storage's job.
 """
 
 _TIMESTAMPS_SIDECAR_SUFFIX = ".timestamps.npy"
-_SENSOR_TIMESTAMPS_SUFFIX = ".sensor_timestamps.npy"
 SESSIONS_PREFIX = "sessions"
 
 
@@ -37,8 +36,7 @@ def slashed(location: str) -> str:
 def timestamps_sidecar_uri(media_uri: str) -> str:
     """Return the ``.timestamps.npy`` sidecar beside *media_uri*.
 
-    The filename does not identify its clock: a source camera uses it for sensor
-    timestamps, while a clip produced by this recipe uses it for its alignment grid.
+    Legacy recorder input only; generated episodes use output MP4 indexes.
     """
     return f"{media_uri}{_TIMESTAMPS_SIDECAR_SUFFIX}"
 
@@ -59,11 +57,6 @@ def clip_media_uri(clip_dir: str, sensor_key: str, suffix: str = ".mp4") -> str:
     MP4 and a trajectory's is an MCAP, and both sit under the same clip id.
     """
     return f"{clip_dir}/{sensor_key}{suffix}"
-
-
-def sensor_timestamps_uri(clip_media_location: str) -> str:
-    """Return the selected sensor-timestamps artifact beside a clip's media."""
-    return f"{clip_media_location}{_SENSOR_TIMESTAMPS_SUFFIX}"
 
 
 def clip_dir_uri(output_path: str, session_id: str, clip_id: str) -> str:

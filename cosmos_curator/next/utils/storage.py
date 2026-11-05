@@ -316,9 +316,9 @@ def _write_local_if_absent(path: Path, data: bytes) -> bool:
     # that are not there - surfacing as an errno from the read-back rather than
     # as the name that is occupied. ``is_file`` follows symlinks, so a link to a
     # real file is still an existing object.
-    if path.is_file():
-        return False
     if path.exists() or path.is_symlink():
+        if path.is_file():
+            return False
         msg = f"cannot create {path} exactly once: the path exists and is not a regular file"
         raise ValueError(msg)
 

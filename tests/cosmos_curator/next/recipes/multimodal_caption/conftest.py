@@ -30,10 +30,8 @@ def camera(
         "media_location": location or f"/output/{key}.mp4",
         "media_size_bytes": size,
         "media_sha256": marker * 64 if media_sha256 is None else media_sha256,
-        "timeline_location": f"/output/{key}.mp4.timestamps.npy",
-        "timeline_sha256": "a" * 64,
-        "sensor_timestamps_location": f"/output/{key}.mp4.sensor_timestamps.npy",
-        "sensor_timestamps_sha256": "b" * 64,
+        "mp4_index_uri": f"/output/{key}.mp4.index.lance",
+        "index_sha256": "a" * 64,
     }
 
 

@@ -41,7 +41,7 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
 from cosmos_curator.next.recipes.multimodal_split.identities import make_split_contract_digest
 from cosmos_curator.next.recipes.multimodal_split.split import split_session
 
-from .conftest import DEVICE_ORIGIN_NS
+from .conftest import DEVICE_ORIGIN_NS, selected_source_timestamps
 
 
 @pytest.fixture
@@ -170,7 +170,7 @@ def test_selected_camera_clock_drives_planning_decoding_and_provenance(
     for outcome in outcomes:
         with av.open(outcome["media_location"]) as container:
             assert len(list(container.decode(video=0))) == 60
-        selected = np.load(outcome["sensor_timestamps_location"])
+        selected = np.asarray(selected_source_timestamps(outcome))
         assert selected[0] == outcome["start_ns"]
         clip_manifest = json.loads((Path(outcome["media_location"]).parent / "clip.json").read_text())
         assert clip_manifest["camera_alignment_fields"] == {"front": field}
@@ -199,7 +199,7 @@ def test_camera_clock_fallback_skips_an_unavailable_column_for_the_entire_video(
     assert planned["timeline_ns"] == times
     outcomes = split_session(planned, config=config)
     assert all(outcome["status"] == "success" for outcome in outcomes)
-    assert np.load(outcomes[0]["sensor_timestamps_location"]).tolist() == times[:30]
+    assert selected_source_timestamps(outcomes[0]) == times[:30]
 
 
 def test_invalid_preferred_camera_clock_does_not_fall_back(
@@ -252,7 +252,7 @@ def test_indexed_windows_continue_after_a_partial_encode_failure(
     outcomes = split_session(planned, config=config)
 
     assert [outcome["status"] for outcome in outcomes] == ["failure", "success"]
-    assert np.load(outcomes[1]["sensor_timestamps_location"]).tolist() == times[30:]
+    assert selected_source_timestamps(outcomes[1]) == times[30:]
     decoder.assert_called_once()
     assert encode_calls == 2
 

@@ -46,8 +46,6 @@ from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.gps_sensor import GpsSensor
 from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor, stream_camera_windows
 from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
-from cosmos_curator.core.sensors.utils.validation import require_nondecreasing
 from cosmos_curator.core.sensors.utils.video import iter_video_frames
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
@@ -60,7 +58,15 @@ from cosmos_curator.next.recipes.multimodal_split.config import (
 from cosmos_curator.next.recipes.multimodal_split.cpu_video_encode import encode_frames_to_path
 from cosmos_curator.next.recipes.multimodal_split.gps_streams import GpsClipWriter
 from cosmos_curator.next.recipes.multimodal_split.grids import sampling_grid_ns, sampling_spec
+from cosmos_curator.next.recipes.multimodal_split.identities import make_split_contract_digest
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import McapSpanWriter, SpanCut
+from cosmos_curator.next.recipes.multimodal_split.output_index import (
+    find_output_index,
+    index_descriptor,
+    output_index_uri,
+    publish_output_index,
+    validate_output_index,
+)
 from cosmos_curator.next.recipes.multimodal_split.reports import failure, write_sensor_errors
 from cosmos_curator.next.recipes.multimodal_split.storage import (
     open_sensor_source,
@@ -68,8 +74,6 @@ from cosmos_curator.next.recipes.multimodal_split.storage import (
 from cosmos_curator.next.recipes.multimodal_split.uris import (
     clip_dir_uri,
     clip_media_uri,
-    sensor_timestamps_uri,
-    timestamps_sidecar_uri,
 )
 from cosmos_curator.next.utils.storage import write_media
 
@@ -105,10 +109,8 @@ SENSOR_OUTCOME_SCHEMA = pa.schema(
         pa.field("media_location", pa.large_string()),
         pa.field("media_size_bytes", pa.int64()),
         pa.field("media_sha256", pa.string()),
-        pa.field("timeline_location", pa.large_string()),
-        pa.field("timeline_sha256", pa.string()),
-        pa.field("sensor_timestamps_location", pa.large_string()),
-        pa.field("sensor_timestamps_sha256", pa.string()),
+        pa.field("mp4_index_uri", pa.large_string()),
+        pa.field("index_sha256", pa.string()),
     ]
 )
 
@@ -320,10 +322,8 @@ def _write_aligned_clip(  # noqa: PLR0913 -- every argument names a different pa
         "media_sha256": hashlib.sha256(payload).hexdigest(),
         # Placed on the episode's grid rather than resampled from a stream, so
         # there is no separate timeline to record: the grid is the episode's.
-        "timeline_location": None,
-        "timeline_sha256": None,
-        "sensor_timestamps_location": None,
-        "sensor_timestamps_sha256": None,
+        "mp4_index_uri": None,
+        "index_sha256": None,
     }, None
 
 
@@ -429,10 +429,8 @@ def _write_mcap_clip(  # noqa: PLR0913 -- every argument names a different part 
         "media_sha256": hashlib.sha256(payload).hexdigest(),
         # A trajectory is not resampled, so there is no grid it was put onto and
         # no per-row record of which sample served which row.
-        "timeline_location": None,
-        "timeline_sha256": None,
-        "sensor_timestamps_location": None,
-        "sensor_timestamps_sha256": None,
+        "mp4_index_uri": None,
+        "index_sha256": None,
     }
     return clip, None
 
@@ -478,23 +476,17 @@ def _sensor_outcome(
             "media_location": None,
             "media_size_bytes": None,
             "media_sha256": None,
-            "timeline_location": None,
-            "timeline_sha256": None,
-            "sensor_timestamps_location": None,
-            "sensor_timestamps_sha256": None,
+            "mp4_index_uri": None,
+            "index_sha256": None,
         }
     else:
-        # The sidecars are a camera's. A trajectory is copied rather than
-        # resampled, so it has no grid to record and no per-row account of which
-        # sample served which row, and those fields stay null for it.
+        # Only cameras carry output indexes; MCAPs are self-contained.
         success_fields = {
             "media_location": str(clip["clip_location"]),
             "media_size_bytes": int(clip["clip_bytes"]),
             "media_sha256": str(clip["media_sha256"]),
-            "timeline_location": _optional_str(clip["timeline_location"]),
-            "timeline_sha256": _optional_str(clip["timeline_sha256"]),
-            "sensor_timestamps_location": _optional_str(clip["sensor_timestamps_location"]),
-            "sensor_timestamps_sha256": _optional_str(clip["sensor_timestamps_sha256"]),
+            "mp4_index_uri": _optional_str(clip["mp4_index_uri"]),
+            "index_sha256": _optional_str(clip["index_sha256"]),
         }
     return {
         "status": "success" if clip is not None else "failure",
@@ -543,6 +535,28 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
             msg = "camera window timestamps disagree with the planned clip grid"
             raise ValueError(msg)  # noqa: TRY301 -- a mismatched window cannot be published
         row_count = len(timeline_ns)
+        uri = output_index_uri(destination)
+        existing = find_output_index(destination, uri=uri, storage_profile=storage_profile)
+        if existing is not None:
+            row = existing.to_pylist()[0]
+            if (
+                row["split_contract_digest"] != make_split_contract_digest(config)
+                or row["alignment_timestamps_ns"] != timeline_ns.tolist()
+                or row["source_timestamps_ns"] != window.sensor_timestamps_ns.tolist()
+            ):
+                msg = f"Output index conflicts with the current split contract: {destination}"
+                raise ValueError(msg)  # noqa: TRY301 -- incompatible output is this clip's failure
+            try:
+                validate_output_index(existing, uri=uri, storage_profile=storage_profile)
+            except (FileNotFoundError, ValueError, OSError):
+                pass  # Replay incomplete payload publication using the same planned window.
+            else:
+                return {
+                    "clip_id": clip_id,
+                    "clip_location": destination,
+                    "clip_bytes": row["media_size_bytes"],
+                    **index_descriptor(existing, uri=uri),
+                }, None
         with tempfile.TemporaryDirectory() as staging:
             local = Path(staging) / f"{clip_id}.mp4"
             written = encode_frames_to_path(
@@ -557,21 +571,17 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
             if written != row_count:
                 msg = f"encoded {written} frames for a clip whose grid has {row_count}"
                 raise ValueError(msg)  # noqa: TRY301 -- reported as this clip's failure, like any other
-            video = local.read_bytes()
-            # Sidecars first, media last. A consumer walking the tree looks for
-            # the MP4, so publishing it before its timeline and sensor timestamps
-            # would leave a window where a clip exists and cannot say when its
-            # frames happened -- and a failure between the two writes would
-            # leave that state permanently, under a stable clip id. Written this
-            # way the MP4 is the commit point: sidecars without media are
-            # invisible, media without sidecars cannot happen.
-            timeline_location, timeline_sha256 = _write_clip_timeline(destination, timeline_ns, storage_profile)
-            sensor_timestamps_location, sensor_timestamps_sha256 = _write_clip_sensor_timestamps(
-                destination, window.sensor_timestamps_ns, storage_profile
+            descriptor = publish_output_index(
+                local,
+                destination=destination,
+                uri=output_index_uri(destination),
+                session_id=session_id,
+                camera_key=sensor_key,
+                alignment_timestamps_ns=timeline_ns,
+                source_timestamps_ns=window.sensor_timestamps_ns,
+                split_contract_digest=make_split_contract_digest(config),
+                storage_profile=storage_profile,
             )
-            write_media(destination, video, storage_profile=storage_profile)
-            clip_bytes = len(video)
-            media_sha256 = hashlib.sha256(video).hexdigest()
     except _StreamEndedError:
         # A decoder failure ends the shared pass. The encoder removes its partial file.
         raise
@@ -592,63 +602,10 @@ def _process_one_clip(  # noqa: PLR0913 -- every argument names a different part
         "clip_location": destination,
         # Measured from the bytes that were written rather than derived from the
         # bitrate, so a run's reported total cannot drift from what is on disk.
-        "clip_bytes": clip_bytes,
-        "media_sha256": media_sha256,
-        "timeline_location": timeline_location,
-        "timeline_sha256": timeline_sha256,
-        "sensor_timestamps_location": sensor_timestamps_location,
-        "sensor_timestamps_sha256": sensor_timestamps_sha256,
+        "clip_bytes": descriptor["media_size_bytes"],
+        **descriptor,
     }
     return clip, None
-
-
-def _write_clip_sensor_timestamps(
-    destination: str, sensor_timestamps_ns: npt.NDArray[np.int64], storage_profile: str
-) -> tuple[str, str]:
-    """Write, for each of the clip's frames, when the camera actually saw it.
-
-    The timeline beside this says where the clip's frames sit: the grid it was
-    resampled onto, evenly spaced by construction. The session was not, and
-    once the clip is written that difference is unrecoverable -- a later stage
-    splitting this clip again would build on an idealized clock with no way back
-    to the instants a camera observed.
-
-    Per camera, because twelve views of one moment are served by twelve
-    different sensor samples. Non-decreasing rather than ascending, because one
-    sensor sample serves several frames wherever the grid asks for more than the
-    sensor produced, which is what a missed exposure looks like.
-    """
-    sensor_timestamps = np.asarray(sensor_timestamps_ns, dtype=np.int64)
-    require_nondecreasing("sensor_timestamps_ns", sensor_timestamps)
-    buffer = io.BytesIO()
-    np.save(buffer, sensor_timestamps, allow_pickle=False)
-    location = sensor_timestamps_uri(destination)
-    payload = buffer.getvalue()
-    write_media(location, payload, storage_profile=storage_profile)
-    return location, hashlib.sha256(payload).hexdigest()
-
-
-def _write_clip_timeline(destination: str, timeline_ns: npt.NDArray[np.int64], storage_profile: str) -> tuple[str, str]:
-    """Write the clip's alignment timeline beside its media.
-
-    A clip is read the same way a session is, and an MP4 starts at zero however it
-    was cut, so without this a later stage cannot say when a clip's frames
-    happened -- the problem this stage solved for its input, handed straight on.
-    Written to the same name the recorder's converter uses, so the next stage
-    reads a clip exactly as this one read a session.
-
-    The grid rather than the frames that served it: row k of the clip is at
-    reference k, which is what the clip resampled onto. Which source observation
-    supplied the pixels is provenance and travels on the diagnostics row, where
-    it may repeat -- one source frame can serve several rows, and a timeline with
-    duplicates is not a timeline.
-    """
-    buffer = io.BytesIO()
-    write_timestamps_ns(timeline_ns.astype(np.int64), buffer)
-    location = timestamps_sidecar_uri(destination)
-    payload = buffer.getvalue()
-    write_media(location, payload, storage_profile=storage_profile)
-    return location, hashlib.sha256(payload).hexdigest()
 
 
 def _decode_window(window: StreamingCameraData) -> Iterator[npt.NDArray[np.uint8]]:

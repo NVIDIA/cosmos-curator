@@ -711,10 +711,8 @@ def test_a_run_publishes_an_episode_carrying_a_gridded_sensor(
             "media_sha256",
         }
         sidecars = {
-            "timeline_location",
-            "timeline_sha256",
-            "sensor_timestamps_location",
-            "sensor_timestamps_sha256",
+            "mp4_index_uri",
+            "index_sha256",
         }
         assert sidecars.isdisjoint(gps)
         assert sidecars <= set(episode["camera_media"][0])

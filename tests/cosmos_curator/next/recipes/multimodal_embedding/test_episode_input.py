@@ -67,10 +67,8 @@ def _episode() -> dict[str, object]:
                 "media_location": "/output/front_wide.mp4",
                 "media_size_bytes": 11,
                 "media_sha256": "a" * 64,
-                "timeline_location": "/output/front_wide.mp4.timestamps.npy",
-                "timeline_sha256": "b" * 64,
-                "sensor_timestamps_location": "/output/front_wide.mp4.sensor_timestamps.npy",
-                "sensor_timestamps_sha256": "c" * 64,
+                "mp4_index_uri": "/output/front_wide.mp4.index.lance",
+                "index_sha256": "b" * 64,
             }
         ],
         [],

@@ -142,23 +142,21 @@ def test_episode_and_materialization_digest_fixtures(
         {
             "camera_key": "front",
             "media_sha256": "1" * 64,
-            "timeline_sha256": "2" * 64,
-            "sensor_timestamps_sha256": "3" * 64,
+            "index_sha256": "2" * 64,
         },
         {
             "camera_key": "left",
             "media_sha256": "4" * 64,
-            "timeline_sha256": "5" * 64,
-            "sensor_timestamps_sha256": "6" * 64,
+            "index_sha256": "5" * 64,
         },
     ]
 
     assert source_id == "e0f6ba3e1fd54cf7adc3e4491d1caca4e5337e9f86cbc2c5f0bf0175abd081d5"
     assert episode_id == "7bc8dd600c888cd42eb331f95b841438d9cc2db59e5468609956e61543d3c490"
-    assert split_clip_id == "e2d8eef2b261db0f41f75affa52c7d7bb77b812057705a8209d63c306ceda282"
+    assert split_clip_id == "1f03756437498fbb1aa8043900ce985b94c4f893c5bdb1311a32616a967a69ac"
     # The output and input roots are excluded, but the fixture config retains
     # its actual temporary path only in those excluded fields.
-    assert split_digest == "f4ed4de65c93cccd0e5e5a87ab204fde21b0d6979ce20edeb6179dc134692229"
+    assert split_digest == "4bea84899829d885bc44a323c413473b37f895033254b8a95d7bc2868a989c18"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -168,7 +166,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "ab5b53deaa21b765b4e6728abc7f048c081919d7bccb9a07484a713770bd02a1"
+        == "95674b3778da43be931eb014422ca626195754a83d27e1dcd21b470216e61557"
     )
 
 
@@ -247,8 +245,7 @@ def test_a_trajectory_changes_the_materialization_digest() -> None:
         {
             "camera_key": "front",
             "media_sha256": "1" * 64,
-            "timeline_sha256": "2" * 64,
-            "sensor_timestamps_sha256": "3" * 64,
+            "index_sha256": "2" * 64,
         }
     ]
     common = {

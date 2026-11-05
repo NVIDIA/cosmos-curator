@@ -627,3 +627,20 @@ def test_write_if_absent_raises_when_conflicts_outlast_the_bounded_retries(monke
     with pytest.raises(ClientError, match="ConditionalRequestConflict"):
         storage.write_if_absent("s3://bucket/run/workspace.json", b"payload")
     assert len(client.s3.calls) == 2
+
+
+def test_write_if_absent_accepts_a_file_created_between_presence_checks(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent regular-file winner must not be mistaken for a directory or broken symlink."""
+    target = tmp_path / "output.mp4"
+    exists = pathlib.Path.exists
+
+    def another_writer_wins(path: pathlib.Path) -> bool:
+        if path == target and not exists(path):
+            path.write_bytes(b"winner")
+        return exists(path)
+
+    monkeypatch.setattr(pathlib.Path, "exists", another_writer_wins)
+    assert storage.write_if_absent(str(target), b"loser") is False
+    assert target.read_bytes() == b"winner"

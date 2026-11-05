@@ -44,10 +44,8 @@ def _camera(key: str, marker: str) -> dict[str, object]:
         "media_location": f"/output/{key}.mp4",
         "media_size_bytes": 100,
         "media_sha256": marker * 64,
-        "timeline_location": f"/output/{key}.mp4.timestamps.npy",
-        "timeline_sha256": "a" * 64,
-        "sensor_timestamps_location": f"/output/{key}.mp4.sensor_timestamps.npy",
-        "sensor_timestamps_sha256": "b" * 64,
+        "mp4_index_uri": f"/output/{key}.mp4.index.lance",
+        "index_sha256": "a" * 64,
     }
 
 

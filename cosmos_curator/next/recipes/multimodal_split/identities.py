@@ -27,16 +27,12 @@ from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimod
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns
 from cosmos_curator.next.utils.identity import canonical_digest
 
-# Bump when the meaning of written media changes in a way the settings do not
-# express, so corrected clips re-key instead of overwriting the old ones.
-#
-# 2: the identity stopped covering settings and became geometry alone. The
-# digest inputs changed, so a version left at 1 would name two different
-# identity schemes -- ids from either would be version 1 and indistinguishable.
-# 3: the selected source sensor-timestamp sidecar was renamed from
-# ``.observations.npy`` to ``.sensor_timestamps.npy``.
-MEDIA_CONTRACT_VERSION = 3
+# Bump when output media semantics or layout change, so incompatible artifacts get new clip IDs.
+MEDIA_CONTRACT_VERSION = 4
+
+# Bump when logical episode identity rules change, so incompatible identities stay distinct.
 EPISODE_IDENTITY_VERSION = 1
+
 # 5: clip.whole_session joined the contract, because it decides whether a span
 # is tiled by duration_s or is the whole session -- an entirely different clip
 # for the same source, not a corrected rendering of the one duration_s already
@@ -59,11 +55,9 @@ EPISODE_IDENTITY_VERSION = 1
 # already published needs a new output path, not a rerun into the old one.
 # 6: ordered camera timestamp preferences replace the PTS fallback switch.
 SPLIT_CONTRACT_DIGEST_VERSION = 6
-# 2: non-camera sensor artifacts joined the digest. An episode published under
-# version 1 was its cameras and nothing else, so it cannot be compared byte for
-# byte against one that also carries a trajectory.
-# 3: camera artifact identity now uses the canonical sensor-timestamp field.
-MATERIALIZATION_DIGEST_VERSION = 3
+
+# Bump when materialization digest inputs or rules change, so incompatible fingerprints stay distinct.
+MATERIALIZATION_DIGEST_VERSION = 4
 
 
 def make_source_id(session_uri: str) -> str:
@@ -222,8 +216,7 @@ def make_materialization_digest(  # noqa: PLR0913 -- every input is a normative 
                 {
                     "camera_key": str(camera["camera_key"]),
                     "media_sha256": str(camera["media_sha256"]),
-                    "timeline_sha256": str(camera["timeline_sha256"]),
-                    "sensor_timestamps_sha256": str(camera["sensor_timestamps_sha256"]),
+                    "index_sha256": str(camera["index_sha256"]),
                 }
                 for camera in sorted(camera_media, key=lambda camera: str(camera["camera_key"]))
             ],

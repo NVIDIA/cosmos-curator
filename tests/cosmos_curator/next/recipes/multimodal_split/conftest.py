@@ -27,6 +27,7 @@ from mcap.writer import Writer as McapWriter
 
 from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
+from cosmos_curator.next.recipes.multimodal_split.output_index import find_output_index
 from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
 from cosmos_curator.next.recipes.multimodal_split.split import split_session
 
@@ -538,3 +539,17 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         )
 
     return build
+
+
+def output_index_record(clip: dict[str, Any]) -> dict[str, Any]:
+    """Read one committed output index by its camera descriptor."""
+    table = find_output_index(
+        clip.get("clip_location", clip.get("media_location")), uri=clip["mp4_index_uri"], storage_profile="default"
+    )
+    assert table is not None
+    return table.to_pylist()[0]
+
+
+def selected_source_timestamps(clip: dict[str, Any]) -> list[int]:
+    """Read original source provenance in output presentation order."""
+    return output_index_record(clip)["source_timestamps_ns"]

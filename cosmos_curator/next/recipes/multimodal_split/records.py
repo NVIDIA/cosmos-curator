@@ -27,7 +27,7 @@ from cosmos_curator.next.recipes.multimodal_split.identities import (
     make_materialization_digest,
 )
 
-RECORD_SCHEMA_VERSION = 2
+RECORD_SCHEMA_VERSION = 3
 
 CAMERA_MEDIA_STRUCT = pa.struct(
     [
@@ -36,20 +36,12 @@ CAMERA_MEDIA_STRUCT = pa.struct(
         pa.field("media_location", pa.large_string(), nullable=False),
         pa.field("media_size_bytes", pa.int64(), nullable=False),
         pa.field("media_sha256", pa.string(), nullable=False),
-        pa.field("timeline_location", pa.large_string(), nullable=False),
-        pa.field("timeline_sha256", pa.string(), nullable=False),
-        pa.field("sensor_timestamps_location", pa.large_string(), nullable=False),
-        pa.field("sensor_timestamps_sha256", pa.string(), nullable=False),
+        pa.field("mp4_index_uri", pa.large_string(), nullable=False),
+        pa.field("index_sha256", pa.string(), nullable=False),
     ]
 )
 
-# A sensor whose clip is one file and nothing else. A camera's clip carries two
-# sidecars because it was resampled onto the episode's grid and the record of
-# which frame served which row is otherwise unrecoverable; a trajectory is copied
-# at its own rate, so there is no grid to record and no selection to account for.
-# Kept separate from ``CAMERA_MEDIA_STRUCT`` rather than widening it with fields
-# that would be null for every row: a reader asking "what is in this clip" gets
-# two lists whose shapes mean what they say.
+# Cameras carry indexed MP4s; other sensors carry self-contained MCAP files.
 SENSOR_MEDIA_STRUCT = pa.struct(
     [
         pa.field("sensor_key", pa.string(), nullable=False),

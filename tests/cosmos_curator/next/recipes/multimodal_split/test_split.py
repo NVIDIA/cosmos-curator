@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import av
+import lance
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -34,8 +35,9 @@ from mcap.reader import make_reader as mcap_make_reader
 
 from cosmos_curator.core.sensors.sensors import camera_sensor
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
-from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns, write_timestamps_ns
+from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.media.spans import Span
+from cosmos_curator.next.recipes.multimodal_split import output_index
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.gps_streams import (
@@ -43,7 +45,9 @@ from cosmos_curator.next.recipes.multimodal_split.gps_streams import (
     _describe_mismatch,
 )
 from cosmos_curator.next.recipes.multimodal_split.grids import clip_duration_ns, plan_clip_spans, sampling_grid_ns
+from cosmos_curator.next.recipes.multimodal_split.lance_sink import open_or_create_episode_table
 from cosmos_curator.next.recipes.multimodal_split.plan import MCAP_PLAN, PLANNING_RESULT_SCHEMA, span_planner
+from cosmos_curator.next.recipes.multimodal_split.publication import assemble_episode_group, stage_episode_batch
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri, sensor_error_uri
 from cosmos_curator.next.recipes.multimodal_split.split import (
     SENSOR_OUTCOME_SCHEMA,
@@ -52,7 +56,13 @@ from cosmos_curator.next.recipes.multimodal_split.split import (
     split_mcap_session,
 )
 
-from .conftest import DEVICE_ORIGIN_NS, gps_source_fixes, split_all
+from .conftest import (
+    DEVICE_ORIGIN_NS,
+    gps_source_fixes,
+    output_index_record,
+    selected_source_timestamps,
+    split_all,
+)
 
 _S = 1_000_000_000
 _SOURCE_FPS = 30
@@ -106,7 +116,7 @@ def test_the_last_clip_is_served_from_real_frames(
     last = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[-1]
 
     assert last["start_ns"] == DEVICE_ORIGIN_NS + 2 * _S
-    assert len(_sensor_timestamps(last)) == 30
+    assert len(selected_source_timestamps(last)) == 30
     assert len(_decoded_means(Path(last["clip_location"]))) == 30
 
 
@@ -142,16 +152,6 @@ def test_an_end_before_the_start_is_rejected() -> None:
     """A camera reporting an empty or reversed range is a defect, not an empty result."""
     with pytest.raises(ValueError, match="end_ns"):
         plan_clip_spans(start_ns=_EPOCH, end_ns=_EPOCH - _S, duration_ns=10 * _S)
-
-
-def _sensor_timestamps(clip: dict[str, Any]) -> list[int]:
-    """Read the source sensor timestamp that served each of a clip's frames.
-
-    Beside the clip rather than on its row: the array is one entry per frame and
-    every downstream block would carry it for no reader.
-    """
-    media = Path(str(clip["clip_location"]))
-    return [int(value) for value in np.load(media.with_name(f"{media.name}{'.sensor_timestamps.npy'}"))]
 
 
 def _errors(config: ResolvedMultimodalSplitConfig, session_id: str = "session-000") -> list[dict[str, Any]]:
@@ -198,7 +198,7 @@ def test_a_session_yields_one_playable_clip_per_full_span(
     assert len(clips) == 3
     assert not _errors(config)
     for clip in clips:
-        assert len(_sensor_timestamps(clip)) == 30
+        assert len(selected_source_timestamps(clip)) == 30
         assert len(_decoded_means(Path(clip["clip_location"]))) == 30
 
 
@@ -219,7 +219,7 @@ def test_whole_session_encodes_the_full_recording_despite_a_short_clip_duration(
     clip = clips[0]
     assert clip["start_ns"] == DEVICE_ORIGIN_NS
     assert clip["exclusive_end_ns"] == DEVICE_ORIGIN_NS + 3 * _S
-    assert len(_sensor_timestamps(clip)) == 90
+    assert len(selected_source_timestamps(clip)) == 90
     assert len(_decoded_means(Path(clip["clip_location"]))) == 90
 
 
@@ -241,7 +241,7 @@ def test_one_source_frame_may_serve_several_grid_timestamps(
 
     clip = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[0]
 
-    sensor_timestamps = _sensor_timestamps(clip)
+    sensor_timestamps = selected_source_timestamps(clip)
     assert len(sensor_timestamps) == 30
     assert len(set(sensor_timestamps)) < 30
     # Source frames sit 100 ms apart, so a one-second clip draws on about ten.
@@ -337,7 +337,7 @@ def test_a_descriptor_carries_what_publication_will_need(
     assert clip["sensor_key"] == "front"
     assert clip["exclusive_end_ns"] - clip["start_ns"] == 1_000_000_000
     # One observation per frame of the clip's own grid: a second of 30 fps.
-    assert len(_sensor_timestamps(clip)) == 30
+    assert len(selected_source_timestamps(clip)) == 30
     assert clip["clip_id"]
 
 
@@ -376,7 +376,7 @@ def test_the_configured_output_rate_reaches_the_written_clip(
 
     clip = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)[0]
 
-    assert len(_sensor_timestamps(clip)) == 60
+    assert len(selected_source_timestamps(clip)) == 60
     path = Path(clip["clip_location"])
     assert len(_decoded_means(path)) == 60
     with av.open(str(path)) as container:
@@ -430,7 +430,7 @@ def test_a_fractional_duration_lands_on_exact_nanosecond_boundaries(
     assert [clip["start_ns"] for clip in clips] == [
         DEVICE_ORIGIN_NS + offset for offset in (0, 700_000_000, 1_400_000_000, 2_100_000_000)
     ]
-    assert all(len(_sensor_timestamps(clip)) == 21 for clip in clips)
+    assert all(len(selected_source_timestamps(clip)) == 21 for clip in clips)
 
 
 def test_a_short_encode_fails_the_clip_instead_of_publishing_it(
@@ -573,18 +573,12 @@ def test_a_clip_is_stamped_in_the_sensor_clock_not_the_container_clock(
     assert [clip["exclusive_end_ns"] for clip in clips] == [start + _S for start in expected]
 
 
-def test_a_clip_is_written_with_a_timeline_beside_it(
+def test_a_clip_index_records_its_alignment_timeline(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A clip needs the same thing its source needed: when its frames happened.
-
-    An MP4 starts at zero however it was cut, so a clip cannot say where it sits
-    on the recorder's clock, and a later stage would be back to inferring it. The
-    sidecar is the same convention the recording itself arrives with, so the next
-    stage reads a clip exactly as this stage read a session.
-    """
+    """Each output index carries the episode grid rather than zero-based container time."""
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     config = make_config(root, tmp_path / "media")
@@ -593,11 +587,9 @@ def test_a_clip_is_written_with_a_timeline_beside_it(
 
     for clip in clips:
         media = Path(clip["clip_location"])
-        beside = media.with_name(f"{media.name}.timestamps.npy")
-        assert beside.exists()
-        with beside.open("rb") as stream:
-            timeline = read_timestamps_ns(stream)
-        assert len(timeline) == len(_sensor_timestamps(clip))
+        assert not media.with_name(f"{media.name}.timestamps.npy").exists()
+        timeline = output_index_record(clip)["alignment_timestamps_ns"]
+        assert len(timeline) == len(selected_source_timestamps(clip))
         assert int(timeline[0]) == clip["start_ns"]
         assert int(timeline[-1]) < clip["exclusive_end_ns"]
 
@@ -770,10 +762,9 @@ def test_a_clip_records_each_frames_sensor_timestamp(
     clips = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)
 
     for clip in clips:
-        media = Path(clip["clip_location"])
-        observed = np.load(media.with_name(f"{media.name}.sensor_timestamps.npy"))
+        observed = np.asarray(selected_source_timestamps(clip), dtype=np.int64)
         assert observed.dtype == np.int64
-        assert len(observed) == len(_sensor_timestamps(clip))
+        assert len(observed) == len(selected_source_timestamps(clip))
         assert all(left <= right for left, right in itertools.pairwise(observed))
 
 
@@ -810,20 +801,7 @@ def test_a_rerun_over_the_same_output_rewrites_identical_bytes(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """The ordering holds a clip together within a generation; this is why there is only one.
-
-    Sidecars are written before the media, so a failure between them leaves a
-    clip invisible rather than unreadable. Running again over a finished clip
-    replaces the sidecars before the MP4, which would mix two generations if a
-    rerun could produce different bytes -- old media beside new sensor timestamps,
-    and no error, because the MP4 exists and the clip looks published.
-
-    It cannot, because the same clip id means the same content by construction:
-    the id covers the source, the span, the rates, the encoder, the camera map
-    and the tolerance. So the second pass overwrites every artifact with what
-    was already there. Mixing generations needs the source to change under a
-    stable id, which breaks the identity contract before it reaches the writes.
-    """
+    """A completed output receipt is reused without changing any artifact bytes."""
     root = tmp_path / "recordings"
     make_session(root, "session-000")
     media = tmp_path / "media"
@@ -842,33 +820,27 @@ def test_a_rerun_over_the_same_output_rewrites_identical_bytes(
     assert after == before, "a rerun rewrote an artifact with different bytes"
 
 
-def test_a_clip_is_never_published_without_its_sidecars(
+def test_a_clip_is_never_published_without_its_moov(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The media is written last, so a failure cannot leave a clip that cannot place itself.
-
-    A consumer walking the output looks for the MP4. Publishing it before its
-    timeline and sensor timestamps would leave a window where a clip exists and
-    cannot say when its frames happened -- and a failure between the writes
-    would leave that permanently, under an id a rerun addresses again.
-    """
+    """A failed decoder-header write cannot produce a successful camera receipt."""
     root = tmp_path / "recordings"
     make_session(root, "session-000")
     media = tmp_path / "media"
     config = make_config(root, media)
 
-    real_write = split_module.write_media
+    real_write = output_index.write_if_absent
 
-    def fail_on_sensor_timestamps(location: str, data: bytes, *, storage_profile: str) -> None:
-        if location.endswith(".sensor_timestamps.npy"):
+    def fail_on_moov(location: str, data: bytes, *, storage_profile: str) -> bool:
+        if location.endswith(".moov"):
             msg = "storage went away"
             raise OSError(msg)
-        real_write(location, data, storage_profile=storage_profile)
+        return real_write(location, data, storage_profile=storage_profile)
 
-    monkeypatch.setattr(split_module, "write_media", fail_on_sensor_timestamps)
+    monkeypatch.setattr(output_index, "write_if_absent", fail_on_moov)
 
     clips = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)
 
@@ -922,15 +894,15 @@ def test_one_sensors_failure_leaves_the_other_sensors_clips_and_report_alone(
     media = tmp_path / "media"
     config = make_config(root, media, cameras=_TWO_CAMERAS)
 
-    real_write = split_module.write_media
+    real_write = output_index.write_if_absent
 
-    def fail_the_left_camera(location: str, data: bytes, *, storage_profile: str) -> None:
+    def fail_the_left_camera(location: str, data: bytes, *, storage_profile: str) -> bool:
         if "left.mp4" in location:
             msg = "storage went away"
             raise OSError(msg)
-        real_write(location, data, storage_profile=storage_profile)
+        return real_write(location, data, storage_profile=storage_profile)
 
-    monkeypatch.setattr(split_module, "write_media", fail_the_left_camera)
+    monkeypatch.setattr(output_index, "write_if_absent", fail_the_left_camera)
 
     clips = split_all(item, config=config)
 
@@ -1057,7 +1029,7 @@ def test_a_failed_clip_does_not_shift_the_frames_of_the_clips_after_it(
     # have held had it never failed.
     assert [clip["clip_id"] for clip in written] == [clip["clip_id"] for clip in reference][1:]
     for clip, expected in zip(written, reference[1:], strict=True):
-        assert _sensor_timestamps(clip) == _sensor_timestamps(expected)
+        assert selected_source_timestamps(clip) == selected_source_timestamps(expected)
 
 
 def test_a_failure_that_ends_the_pass_early_reports_the_spans_after_it(
@@ -1170,7 +1142,7 @@ def test_non_contiguous_clips_share_one_decode_pass(
 
     assert [outcome["status"] for outcome in outcomes] == ["success", "success"]
     for outcome, expected in zip(outcomes, [reference[0], reference[2]], strict=True):
-        assert np.load(outcome["sensor_timestamps_location"]).tolist() == _sensor_timestamps(expected)
+        assert selected_source_timestamps(outcome) == selected_source_timestamps(expected)
         assert _decoded_means(Path(outcome["media_location"])) == _decoded_means(Path(expected["clip_location"]))
     decoder.assert_called_once()
 
@@ -1244,7 +1216,7 @@ def test_two_failures_in_a_row_leave_the_next_clip_where_it_belongs(
     written = split_all(item, config=config)
 
     assert [clip["clip_id"] for clip in written] == [reference[2]["clip_id"]]
-    assert _sensor_timestamps(written[0]) == _sensor_timestamps(reference[2])
+    assert selected_source_timestamps(written[0]) == selected_source_timestamps(reference[2])
     assert len(_errors(config)) == 2
 
 
@@ -1286,8 +1258,7 @@ def test_an_mcap_clip_is_written_per_span_and_catalogued(
         assert decoded
     # Copied rather than resampled, so there is no grid and no per-row account of
     # which sample served which row -- the two artifacts a camera clip carries.
-    assert all(outcome["timeline_location"] is None for outcome in outcomes)
-    assert all(outcome["sensor_timestamps_location"] is None for outcome in outcomes)
+    assert all(outcome["mp4_index_uri"] is None for outcome in outcomes)
 
 
 def test_an_imu_clip_is_written_per_span_and_catalogued(
@@ -1322,8 +1293,7 @@ def test_an_imu_clip_is_written_per_span_and_catalogued(
         with media.open("rb") as stream:
             decoded = list(mcap_make_reader(stream).iter_messages())
         assert decoded
-    assert all(outcome["timeline_location"] is None for outcome in outcomes)
-    assert all(outcome["sensor_timestamps_location"] is None for outcome in outcomes)
+    assert all(outcome["mp4_index_uri"] is None for outcome in outcomes)
 
 
 def test_an_interior_mcap_clip_carries_a_pose_at_or_before_its_start(
@@ -1640,7 +1610,7 @@ def test_an_mcap_block_round_trips_through_the_terminal_schema(
     assert outcomes.schema == SENSOR_OUTCOME_SCHEMA
     rows = outcomes.to_pylist()
     assert [row["status"] for row in rows] == ["success"] * 3
-    assert all(row["timeline_location"] is None for row in rows)
+    assert all(row["mp4_index_uri"] is None for row in rows)
     assert all(row["sensor_type"] == "egotrajectory" for row in rows)
 
 
@@ -2040,3 +2010,112 @@ def test_a_source_whose_clocks_agree_is_not_refused(
     )
 
     assert [outcome["status"] for outcome in _gps_clips(session, config)] == ["success"] * 3
+
+
+def test_output_index_preserves_repeated_source_frames(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+) -> None:
+    """An output index addresses encoded bytes and keeps both episode clocks."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", frames=15, fps=15, step=12)
+    config = make_config(root, tmp_path / "media", output_fps=30)
+    item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
+    clips = split_all(item, config=config)
+    assert len(clips) == 1
+    clip = clips[0]
+    assert not list(Path(config.output.path).rglob("*.npy"))
+    index = lance.dataset(clip["mp4_index_uri"]).to_table().to_pylist()[0]
+    assert index["media_location"] == str(Path(clip["clip_location"]))
+    assert index["metadata"]["frame_count"] == 30
+    assert len(index["alignment_timestamps_ns"]) == 30
+    assert index["alignment_timestamps_ns"][0] == DEVICE_ORIGIN_NS
+    assert len(set(index["source_timestamps_ns"])) == 15
+    assert index["source_timestamps_ns"] == sorted(index["source_timestamps_ns"])
+    assert all(frame["offset"] + frame["size"] <= clip["clip_bytes"] for frame in index["frames"])
+    episode = assemble_episode_group(pa.Table.from_pylist(clips, schema=SENSOR_OUTCOME_SCHEMA)).to_pylist()[0]
+    with output_index.open_episode_camera(episode, "front") as window:
+        frames = [(align, source, float(pixels.mean())) for align, source, pixels in window.frames()]
+    assert [align for align, _, _ in frames] == index["alignment_timestamps_ns"]
+    assert [source for _, source, _ in frames] == index["source_timestamps_ns"]
+    assert [mean for _, _, mean in frames] == _decoded_means(Path(clip["clip_location"]))
+    source_times = np.load(root / "session-000/camera/front.mp4.timestamps.npy")
+    expected_positions = np.abs(source_times[:, None] - np.asarray(index["alignment_timestamps_ns"])).argmin(axis=0)
+    assert [source for _, source, _ in frames] == source_times[expected_positions].tolist()
+    source_means = np.asarray(_decoded_means(root / "session-000/camera/front.mp4"))
+    np.testing.assert_allclose([mean for _, _, mean in frames], source_means[expected_positions], atol=3)
+
+
+@pytest.mark.parametrize("boundary", ["moov", "media", "index_create", "receipt"])
+def test_output_index_publication_resumes_after_interruption(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """Retry incomplete receipts; reuse committed receipts without encoding again."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", frames=30)
+    config = make_config(root, tmp_path / "media")
+    item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
+    with monkeypatch.context() as patch:
+        if boundary in ("moov", "media"):
+            original = output_index.write_if_absent
+
+            def interrupt_payload(location: str, data: bytes, *, storage_profile: str) -> bool:
+                result = original(location, data, storage_profile=storage_profile)
+                if location.endswith(".moov" if boundary == "moov" else ".mp4"):
+                    msg = "interrupted after payload write"
+                    raise OSError(msg)
+                return result
+
+            patch.setattr(output_index, "write_if_absent", interrupt_payload)
+        else:
+            module = output_index if boundary == "index_create" else split_module
+            name = "write_fragments" if boundary == "index_create" else "publish_output_index"
+            original_index = getattr(module, name)
+
+            def interrupt_index(*args: object, **kwargs: object) -> None:
+                original_index(*args, **kwargs)
+                msg = "interrupted during index publication"
+                raise OSError(msg)
+
+            patch.setattr(module, name, interrupt_index)
+        assert split_all(item, config=config) == []
+
+    if boundary == "receipt":
+        monkeypatch.setattr(split_module, "encode_frames_to_path", Mock(side_effect=AssertionError("encoded twice")))
+    clips = split_all(item, config=config)
+    assert len(clips) == 1
+    assert lance.dataset(clips[0]["mp4_index_uri"]).count_rows() == 1
+    episode = assemble_episode_group(pa.Table.from_pylist(clips, schema=SENSOR_OUTCOME_SCHEMA)).to_pylist()[0]
+    with output_index.open_episode_camera(episode, "front") as window:
+        assert len(list(window.frames())) == 30
+    assert not list(Path(config.output.path).rglob("*.npy"))
+
+
+@pytest.mark.parametrize("missing", ["index", "moov"])
+def test_episode_publication_requires_a_complete_output_index(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    missing: str,
+) -> None:
+    """A successful camera outcome cannot publish a missing index or decoder header."""
+    root = tmp_path / "recordings"
+    make_session(root, "session-000", frames=30)
+    config = make_config(root, tmp_path / "media")
+    clips = split_all({"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config)
+    assembled = assemble_episode_group(pa.Table.from_pylist(clips, schema=SENSOR_OUTCOME_SCHEMA))
+    if missing == "moov":
+        Path(output_index_record(clips[0])["moov_location"]).unlink()
+    else:
+        clips[0]["mp4_index_uri"] = str(tmp_path / "missing-index.lance")
+        assembled = assemble_episode_group(pa.Table.from_pylist(clips, schema=SENSOR_OUTCOME_SCHEMA))
+    uri = config.output.episodes_lance_uri
+    open_or_create_episode_table(uri=uri, storage_profile="default")
+    with pytest.raises((ValueError, FileNotFoundError)):
+        stage_episode_batch(assembled, uri=uri, storage_profile="default")
+    assert lance.dataset(uri).count_rows() == 0

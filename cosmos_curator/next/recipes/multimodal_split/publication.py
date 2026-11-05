@@ -23,6 +23,7 @@ import pyarrow as pa
 from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.recipes.multimodal_split.config import SENSOR_TYPE_CAMERA
 from cosmos_curator.next.recipes.multimodal_split.lance_sink import write_episode_fragment
+from cosmos_curator.next.recipes.multimodal_split.output_index import require_episode_index
 from cosmos_curator.next.recipes.multimodal_split.records import EPISODE_SCHEMA, EpisodeFacts, build_episode_record
 
 _COMPLETE = "complete"
@@ -78,7 +79,7 @@ def assemble_episode_group(outcomes: pa.Table) -> pa.Table:  # noqa: C901 -- one
 
     # Split by what the outcome is, not by which stage produced it. Both stages
     # write the same terminal schema, and the rows differ in which artifacts they
-    # carry: a camera clip has sidecars, a copied sensor clip is one file.
+    # carry: a camera clip has an MP4 index, a copied sensor clip is one file.
     camera_rows = [row for row in rows if _is_camera(row)]
     sensor_rows = [row for row in rows if not _is_camera(row)]
 
@@ -113,10 +114,8 @@ def assemble_episode_group(outcomes: pa.Table) -> pa.Table:  # noqa: C901 -- one
             "media_sha256",
         ) + (
             (
-                "timeline_location",
-                "timeline_sha256",
-                "sensor_timestamps_location",
-                "sensor_timestamps_sha256",
+                "mp4_index_uri",
+                "index_sha256",
             )
             if is_camera
             else ()
@@ -260,6 +259,9 @@ def stage_episode_batch(batch: pa.Table, *, uri: str, storage_profile: str) -> p
         msg = f"Episode publication received assembly states {sorted(statuses)}"
         raise ValueError(msg)
     episodes = batch.select(EPISODE_SCHEMA.names).cast(EPISODE_SCHEMA)
+    for episode in episodes.to_pylist():
+        for camera in episode["camera_media"]:
+            require_episode_index(episode, camera["camera_key"], storage_profile=storage_profile)
     candidate = write_episode_fragment(episodes, uri=uri, storage_profile=storage_profile)
     if candidate is None:
         msg = "Episode publication received an empty complete block"

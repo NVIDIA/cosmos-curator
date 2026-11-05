@@ -60,10 +60,8 @@ def _record(episode_id: str) -> dict[str, object]:
         "media_location": f"/output/{episode_id}/front.mp4",
         "media_size_bytes": 100,
         "media_sha256": episode_id * 64,
-        "timeline_location": f"/output/{episode_id}/front.mp4.timestamps.npy",
-        "timeline_sha256": "1" * 64,
-        "sensor_timestamps_location": f"/output/{episode_id}/front.mp4.sensor_timestamps.npy",
-        "sensor_timestamps_sha256": "2" * 64,
+        "mp4_index_uri": f"/output/{episode_id}/front.mp4.index.lance",
+        "index_sha256": "1" * 64,
     }
     return build_episode_record(_facts(episode_id), [camera])
 

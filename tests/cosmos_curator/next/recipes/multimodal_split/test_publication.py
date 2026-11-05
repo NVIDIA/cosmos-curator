@@ -41,8 +41,8 @@ def _outcome(
 
     return {
         "status": status,
-        "record_schema_version": 2,
-        "media_contract_version": 3,
+        "record_schema_version": 3,
+        "media_contract_version": 4,
         "episode_id": "episode",
         "split_clip_id": "split",
         "source_id": "source",
@@ -64,10 +64,8 @@ def _outcome(
         "media_sha256": marker * 64 if success else None,
         # A cut sensor has no grid to record and no per-row selection to account
         # for, so its sidecar descriptors are null where a camera's are set.
-        "timeline_location": sidecar(f"/output/{camera_key}.mp4.timestamps.npy"),
-        "timeline_sha256": sidecar("a" * 64),
-        "sensor_timestamps_location": sidecar(f"/output/{camera_key}.mp4.sensor_timestamps.npy"),
-        "sensor_timestamps_sha256": sidecar("b" * 64),
+        "mp4_index_uri": sidecar(f"/output/{camera_key}.mp4.index.lance"),
+        "index_sha256": sidecar("a" * 64),
     }
 
 

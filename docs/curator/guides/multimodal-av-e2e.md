@@ -10,6 +10,20 @@ This guide captions three representative selections: a front view with the defau
 view, and a rear view with Ego context. The embedding example selects the front and side views together; use `all`
 to include the rear view too. Each camera is embedded independently.
 
+Split outputs contain `episodes.lance` and per-camera MP4, `moov`, and `.mp4.index.lance` payloads.
+They produce no timestamp NPY files. Camera descriptors point to the output index, which records both the
+regular alignment grid and selected source-frame timestamps, including repeats. Use a fresh output root for
+this format (record schema 3, media contract 4); previous sidecar-based episode datasets are incompatible.
+For downstream frame/timestamp reads:
+
+```python
+from cosmos_curator.next.recipes.multimodal_split.output_index import open_episode_camera
+
+with open_episode_camera(episode_row, "front_wide") as window:
+    for alignment_ns, source_ns, pixels in window.frames():
+        ...
+```
+
 ## Prepare recordings and configs
 
 Start with [the split example](../../../examples/multimodal-multicamera-split.yaml). Its three-camera map is
