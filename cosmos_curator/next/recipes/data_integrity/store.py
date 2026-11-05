@@ -348,6 +348,7 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
     session_path: str,
     num_streams: int,
     num_unreadable: int,
+    num_unreachable: int = 0,
     timestamp_source: SessionTimestampSource | None = None,
     error: str | None = None,
 ) -> dict[str, object]:
@@ -361,6 +362,11 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
     ``timestamp_source`` defaults to null for the same reason: a session with no
     contributing streams was measured on no clock at all. Callers holding streams
     should pass :func:`session_clock` over them rather than deriving it again.
+
+    ``num_unreachable`` counts streams the run found but could not reach (see
+    :class:`~.session_runner.InfrastructureError`), which have no row anywhere else.
+    It defaults to 0 for callers that record every stream they find, unreachable or
+    not, as a row of its own.
     """
     return {
         "session_id": session_id,
@@ -370,6 +376,7 @@ def session_row(  # noqa: PLR0913 -- one argument per fact the row records
         "locator_namespace": identity.locator_namespace(session_path),
         "num_streams": num_streams,
         "num_unreadable": num_unreadable,
+        "num_unreachable": num_unreachable,
         "timestamp_source": None if timestamp_source is None else timestamp_source.value,
         "error": error,
     }
@@ -865,9 +872,12 @@ def _latest_per_key(rows: list[dict[str, object]], key: tuple[str, ...]) -> list
     return list(seen.values())
 
 
-#: ``stream.lance``'s dedup key, named because :func:`session_rollup` resolves a read
-#: of that dataset itself rather than reading it a second time.
+#: ``stream.lance``'s dedup key.
 _STREAM_KEY: tuple[str, ...] = ("stream_id",)
+
+#: ``session_evaluation.lance``'s dedup key, named because :func:`session_rollup`
+#: resolves that dataset's history itself, per session row.
+_SESSION_EVALUATION_KEY: tuple[str, ...] = ("session_id", "metric_name", "policy_id")
 
 
 def _read(  # noqa: PLR0913 -- a read is its dataset, its key, and how to resolve it
@@ -1115,7 +1125,7 @@ def read_session_evaluations(  # noqa: PLR0913 -- read options plus credentials,
     return _read(
         root,
         join(root, store_schema.SESSION_EVALUATION_DATASET),
-        key=("session_id", "metric_name", "policy_id"),
+        key=_SESSION_EVALUATION_KEY,
         latest=latest,
         include_incomplete=include_incomplete,
         completed=completed,
@@ -1194,50 +1204,29 @@ def _stream_statuses(streams: list[dict[str, object]], evaluations: list[dict[st
     return per_stream
 
 
-def _measured_per_session(streams: list[dict[str, object]]) -> Mapping[object, int]:
-    """Count the distinct streams each session has ever held a row for.
-
-    Fed the whole ``stream.lance`` history rather than the newest row per key, because
-    coverage asks whether a session was ever measured through, which is not the
-    question a reader resolving current state asks. A ``stream_id`` is keyed on source
-    and selector alone (see :func:`stream_key`), so one file measured under two
-    sessions in two runs has a row under each, but only the later row survives the
-    newest-per-key pass -- counting there would strand the earlier session below its
-    ``num_streams`` forever, on nothing worse than a re-run at a different scope.
-    """
-    seen: set[tuple[object, object]] = set()
-    measured: collections.Counter[object] = collections.Counter()
-    for row in streams:
-        session_id = row["session_id"]
-        if session_id is None:
-            continue
-        pair = (session_id, row["stream_id"])
-        if pair in seen:
-            continue
-        seen.add(pair)
-        measured[session_id] += 1
-    return measured
-
-
 def _session_statuses(
     sessions: list[dict[str, object]],
     evaluations: list[dict[str, object]],
-    measured: Mapping[object, int],
 ) -> list[dict[str, object]]:
     """Reduce each stored session and its own verdicts to one status, sorted by path.
 
-    ``measured`` counts the distinct streams each ``session_id`` has ever held a row
-    for (see :func:`_measured_per_session`). A session holding fewer of them than its
-    ``num_streams`` was not measured through: some stream it was found to contain has
-    no row, because the run could not reach it (see
-    :class:`~.session_runner.InfrastructureError`) or never finished. That is ``ERROR``
-    on the same grounds an errored stream is -- nothing was measured, so there is
-    nothing to call a pass, and no re-judge can complete it. Counting rows rather than
-    reading a stored shortfall keeps it true across runs: a stream one run could not
-    reach and a later one could is measured, and the session completes without either
-    run having to say so.
+    ``sessions`` is the newest row per session, and coverage is read off that row
+    alone. A row with ``num_unreachable`` above zero was written by a run that could
+    not reach some stream the session holds (see
+    :class:`~.session_runner.InfrastructureError`), so the session-grain verdicts it
+    wrote were judged over fewer streams than the session has. That is ``ERROR`` on
+    the same grounds an errored stream is -- the session was not measured through, so
+    there is nothing to call a pass, and no re-judge can complete it.
 
-    A row carrying an ``error`` counts as covered here, and the session still errors --
+    Coverage is deliberately *not* pieced together across runs. A cross-sensor verdict
+    describes the streams it was computed from, so streams one run reached cannot
+    complete a verdict another run judged without them: that is how a partial re-run
+    used to replace a failing session check with a passing one while the stream that
+    failed it still counted from history. A session completes when a single run
+    measures it through, which writes a newer row with nothing unreachable.
+
+    A stream that was reached but could not be read is not part of this count: it has
+    a row carrying an ``error``, and the session still errors --
     through :func:`_stream_statuses`, which grades that row directly and whose ``ERROR``
     outranks anything this pass returns. The two passes ask different questions, so
     neither has to restate the other's rule.
@@ -1246,24 +1235,49 @@ def _session_statuses(
     :meth:`~cosmos_curator.core.sensors.data_integrity.results.SessionReport.status`
     on an empty session, and for the same reason rather than by coincidence.
 
-    No missing-*verdict* rule, unlike :func:`_stream_statuses`, and the two are worth
-    keeping apart: a session row is written whether or not its writer had
-    session-grain verdicts to offer, so their absence says nothing either way, while
-    a missing stream row is a claim about coverage.
+    Verdicts are read only from the run that wrote the newest row: ``evaluations`` is
+    every stored session verdict, and only those whose ``measurement_run_id`` is that
+    row's ``run_id`` count, newest per metric and policy. Pairing the newest row with
+    whichever verdicts happen to be newest would let a complete run's row vouch for a
+    partial run's verdicts, as when the complete run was judged under a different
+    policy than the one asked for. A re-judge keeps ``measurement_run_id`` pointing at
+    the run that measured, so its verdicts still pair with that run's row.
+
+    A session some run *has* judged under the policy asked for, but not the run that
+    wrote its newest row, is ``ERROR``: the verdicts it has describe a different
+    measurement, and borrowing them is exactly the pairing above. A session with no
+    verdicts at all under that policy keeps the old reading -- a session row may be
+    written without verdicts when its writer had none to offer (see
+    :func:`write_run`), and that absence says nothing either way, whereas a missing
+    stream row is a claim about coverage.
     """
-    failed: set[object] = {row["session_id"] for row in evaluations if row["check_status"] == CheckStatus.FAIL.value}
+    by_session: dict[object, list[dict[str, object]]] = collections.defaultdict(list)
+    for evaluation in evaluations:
+        by_session[evaluation["session_id"]].append(evaluation)
     per_session: list[dict[str, object]] = []
     for row in sorted(sessions, key=lambda item: str(item["session_path"])):
         found = cast("int", row["num_streams"])
+        verdicts = _latest_per_key(
+            [
+                evaluation
+                for evaluation in by_session.get(row["session_id"], [])
+                if evaluation["measurement_run_id"] == row["run_id"]
+            ],
+            _SESSION_EVALUATION_KEY,
+        )
         if row["error"] is not None:
             # Never listed, so never measured: the session-level twin of an errored
             # stream, and beyond a re-judge's reach for the same reason.
             status = OverallStatus.ERROR
-        elif found == 0 or measured.get(row["session_id"], 0) < found:
-            # Not measured through: the session held nothing, or it held a stream the
-            # store has no row for. Both are the claim ERROR already makes.
+        elif found == 0 or cast("int", row["num_unreachable"]) > 0:
+            # Not measured through: the session held nothing, or the run that wrote
+            # this row could not reach some of what it held. Both are the claim ERROR
+            # already makes.
             status = OverallStatus.ERROR
-        elif row["session_id"] in failed:
+        elif not verdicts and by_session.get(row["session_id"]):
+            # Judged, but only by runs other than the one that measured it last.
+            status = OverallStatus.ERROR
+        elif any(verdict["check_status"] == CheckStatus.FAIL.value for verdict in verdicts):
             status = OverallStatus.FAIL
         else:
             status = OverallStatus.PASS
@@ -1307,12 +1321,11 @@ def session_rollup(
     has no session-grain verdicts when its caller had none to offer, which says nothing
     either way, whereas a stream is always measured against every metric.
 
-    A session is also ``ERROR`` when the store holds fewer stream rows than it was
-    found to contain, so a run that could not reach some of a session's streams cannot
-    leave the store calling that session ``PASS``. Coverage is counted over the whole
-    committed history rather than the newest row per stream, so re-measuring one file
-    under a different session does not strand the session that measured it first. See
-    :func:`_session_statuses` and :func:`_measured_per_session`.
+    A session is also ``ERROR`` when its newest row records streams that run could not
+    reach, so a run that measured only part of a session cannot leave the store calling
+    it ``PASS`` -- including after an earlier run measured the whole session and failed
+    it. Coverage belongs to the run that judged the session, not to the store's history;
+    see :func:`_session_statuses`.
 
     Args:
         root: the store root.
@@ -1322,32 +1335,37 @@ def session_rollup(
         s3_profile_name: AWS profile for an ``s3://`` store.
         endpoint_url: S3 endpoint override.
 
+    Raises:
+        ValueError: if the store's session rows predate store schema 4 and so carry no
+            ``num_unreachable``; such a store needs a fresh root.
+
     """
     # One ledger read shared by every pass below, so they cannot disagree about which
     # runs are committed even if one lands mid-write.
     finished = completed_runs(root, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
-    # stream.lance is read once and resolved twice, because the two passes below want
-    # different views of it: verdicts want the newest row per stream, coverage wants
-    # every row a session ever had. _read drops uncommitted rows *before* its
-    # newest-per-key pass, so resolving the history here is exactly what a second read
-    # at `latest=True` would have returned -- for one read of the dataset rather than two.
-    stream_history = read_streams(
-        root, latest=False, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
-    )
-    streams = _latest_per_key(stream_history, _STREAM_KEY)
+    streams = read_streams(root, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
     evaluations = read_evaluations(root, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
     sessions = read_sessions(root, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url)
+    if sessions and "num_unreachable" not in sessions[0]:
+        # A session row from before store schema 4, which had no coverage column; see
+        # store_schema.STORE_SCHEMA_VERSION. Refused rather than read as zero, since a
+        # missing count would let a partial session roll up as measured through.
+        msg = (
+            f"store at {root} holds session.lance rows without num_unreachable (store schema 3 or earlier); "
+            f"session rollups need schema {store_schema.STORE_SCHEMA_VERSION}, so re-measure into a fresh store root"
+        )
+        raise ValueError(msg)
+    # Every committed verdict, not the newest per key: which ones count depends on the
+    # session row they are paired with, so _session_statuses resolves them per row.
     session_evaluations = read_session_evaluations(
-        root, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
+        root, latest=False, completed=finished, s3_profile_name=s3_profile_name, endpoint_url=endpoint_url
     )
     if policy is not None:
         evaluations = [row for row in evaluations if row["policy_id"] == policy]
         session_evaluations = [row for row in session_evaluations if row["policy_id"] == policy]
 
     per_stream = _stream_statuses(streams, evaluations)
-    # Counted off the unresolved rows read above: stream.lance carries session_id for
-    # exactly this, so no paths are re-hashed either.
-    per_session = _session_statuses(sessions, session_evaluations, _measured_per_session(stream_history))
+    per_session = _session_statuses(sessions, session_evaluations)
     counts = _status_counts(per_stream)
     session_counts = _status_counts(per_session)
 

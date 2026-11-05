@@ -111,6 +111,7 @@ one metric's schema needs no number here, because Lance records that table's own
 | 1 | the original per-stream tables | — | — |
 | 2 | added the three session-grain tables | yes | yes |
 | 3 | added `timestamp_source` to `stream.lance` and to `session.lance` | yes | **no** |
+| 4 | added `num_unreachable` to `session.lance` | **no**, for session rollups | **no** |
 
 Version 2 was additive: a dataset that was never written reads as no rows, so nothing had to change. Version 3 is
 not. Appends go through `lance.write_dataset(..., mode="append")`, which requires the incoming schema to match the
@@ -118,6 +119,11 @@ dataset's, so a root written at version 1 or 2 rejects new `stream.lance` or `se
 one. That is a deliberate choice rather than an oversight: migration machinery for a store whose only readers are the
 store's entry points and the rollup would cost more than re-measuring, and re-measuring is cheap because the sources have not
 changed.
+
+Version 4 is not additive either, and it reaches reads as well as writes. A root written at version 3 or earlier
+rejects new `session.lance` rows for the same reason, and `session_rollup` refuses it: coverage is read from
+`num_unreachable`, which an older session row does not have, so the rollup raises a `ValueError` naming the column and
+asking for a fresh root rather than guessing. Existing v3 session stores need a fresh root.
 
 Version 3 also spans the timestamp-source terminology transition without a version bump: historical rows may contain
 `timestamp_source="capture"`, while current writers emit `"sensor"`. Library readers normalize the historical value to
@@ -418,6 +424,7 @@ One row per session per run. Dedup on `session_id` by `(created_at DESC, run_id 
 | `locator_namespace` | `string` | no | `local` \| `s3` \| `az` |
 | `num_streams` | `int64` | no | how many streams the run found under it |
 | `num_unreadable` | `int64` | no | how many of those could not be opened |
+| `num_unreachable` | `int64` | no | how many of those this run could not reach, and so left without a row (schema v4) |
 | `timestamp_source` | `string` | yes | `sensor` \| `container_pts` \| `mixed` — the clock rolled up across the session's streams; `null` when none contributed |
 | `error` | `string` | yes | if set, the session itself could not be listed and has no streams and no measurements |
 
@@ -437,19 +444,29 @@ camera's row. `di-reevaluate` reads it back to phrase the same reason the origin
 stale path in a thousand-path manifest gets a row saying so, rather than costing the run every measurement already
 taken.
 
-There is deliberately **no `num_unreachable` column**. A stream that could not be *reached* — an expired token, a
-403 — gets no row anywhere, for the reason in [the pipeline doc](data-integrity-pipeline.md): a failure the
-environment manufactured must not be persisted as a finding about the data. So `num_streams` counts what the run
-*found*, and a session with unreachable streams has more of them than it has rows in `stream.lance`.
+A stream that could not be *reached* — an expired token, a 403 — gets no row anywhere, for the reason in
+[the pipeline doc](data-integrity-pipeline.md): a failure the environment manufactured must not be persisted as a
+finding about the data. So `num_streams` counts what the run *found*, and `num_unreachable` counts how many of those
+it could not reach. That is a fact about the run, which is why it lives on the run's session row and on no stream row.
 
-That difference is the record of the gap, and `session_rollup` reads it: a session holding fewer stream rows than
-`num_streams` rolls up `ERROR`, on the same grounds an errored stream does — nothing was measured there, so there is
-nothing to call a pass. Counting rows rather than storing a shortfall is what keeps the answer true over time: a
-stream one run could not reach and a later one could is measured, and the session completes without either run
-having to revise a column. A stored `num_unreachable` would pin that session at `ERROR` for good, which is the
-concrete form of the reason not to have it — an unreachable stream is a fact about the run, not about the session,
-and the same session re-run with working credentials has a different number. The run says so too: the pipeline
-raises `IncompleteRunError` after committing, and its message carries the count.
+`session_rollup` reads coverage off the newest session row alone: a row with `num_unreachable` above zero rolls up
+`ERROR`, on the same grounds an errored stream does — the session was not measured through, so there is nothing to
+call a pass. The session-grain verdicts that run wrote are kept, and its `run_id` ties them to the row saying they
+were judged over fewer streams than the session holds.
+
+The session-grain verdicts the rollup reads are paired with that newest row: only verdicts whose
+`measurement_run_id` is the row's `run_id` count, newest per metric and policy. So a complete run's row cannot vouch
+for a partial run's verdicts — say, when the complete run was judged under a different policy than the one asked
+for. A session some run judged under the requested policy, but not the run that wrote its newest row, rolls up
+`ERROR`; one with no verdicts at all under it keeps reading as no claim.
+
+Coverage is deliberately not pieced together across runs. Version 3 counted every stream row a session had ever had,
+so a stream one run could not reach and a later one could completed the session. But a cross-sensor verdict
+describes the streams it was computed from: a re-run that could not reach the late camera judged the others aligned,
+its passing verdicts became the newest, and the late camera's row from the earlier, failing run still counted toward
+coverage — so the store called a failed session `PASS`. Per-row coverage means a session completes when a single run
+measures it through, which writes a newer row with nothing unreachable. The run says so too: the pipeline raises
+`IncompleteRunError` after committing, and its message carries the count.
 
 ### `session_measurements/<metric>.lance`
 

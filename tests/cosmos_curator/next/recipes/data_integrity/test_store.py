@@ -126,12 +126,18 @@ def _skewed_metrics(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> list[CheckRe
     return _metrics_for([(0, _ONE_MINUTE_NS), (_SKEW_NS, _ONE_MINUTE_NS + _SKEW_NS)], thresholds)
 
 
+def _offset_metrics() -> list[CheckResult]:
+    """Two sensors two seconds out of step: past the default spread threshold, so the session fails."""
+    return _metrics_for([(0, _ONE_MINUTE_NS), (2 * _SKEW_NS, _ONE_MINUTE_NS + 2 * _SKEW_NS)])
+
+
 def _append_session(
     root: str,
     session_path: str,
     *,
     num_streams: int,
     num_unreadable: int = 0,
+    num_unreachable: int = 0,
     error: str | None = None,
     created_at: datetime.datetime = _LATEST,
 ) -> str:
@@ -153,6 +159,7 @@ def _append_session(
                 session_path=session_path,
                 num_streams=num_streams,
                 num_unreadable=num_unreadable,
+                num_unreachable=num_unreachable,
                 error=error,
             )
         ],
@@ -855,11 +862,10 @@ def test_session_rollup_errors_on_a_session_the_run_did_not_measure_through(
 
     The unreachable-stream case: the run found two streams, reached one, and wrote no
     row for the other, so nothing in ``stream.lance`` can force the session to ERROR.
-    What does is ``num_streams`` -- what the session was found to *hold* -- against the
-    rows the store actually has.
+    What does is the session row's own ``num_unreachable``.
     """
     _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER, session_metrics=_aligned_metrics())
-    _append_session(store_root, SESSION, num_streams=2)
+    _append_session(store_root, SESSION, num_streams=2, num_unreachable=1)
 
     rollup = store.session_rollup(store_root)
     assert rollup["stream_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 0}
@@ -867,24 +873,112 @@ def test_session_rollup_errors_on_a_session_the_run_did_not_measure_through(
     assert rollup["status"] == "ERROR"
 
 
-def test_a_session_two_runs_measured_between_them_rolls_up_pass(
+def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(
     store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
 ) -> None:
-    """Counting rows rather than storing a shortfall is what lets a re-run close the gap.
+    """Coverage belongs to the run that judged the session, not to the store's history.
 
-    Coverage is a question about the store, not about any one run: the stream a first
-    run could not reach and a second one could is measured either way, and the session
-    completes without either run revising a column. A stored ``num_unreachable`` would
-    have pinned this session at ``ERROR`` for good.
+    The first run measured both streams and failed the session on skew. The second
+    reached only one: its session verdicts pass, because one stream has nothing to be
+    out of step with, and they are now the newest. The rear stream's row from the first
+    run must not complete that partial verdict -- the session stays ERROR, not PASS.
     """
-    _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER, session_metrics=_aligned_metrics())
-    _write(store_root, [make_stream("/data/session/rear.mp4", perfect())], created_at=_LATER)
-    _append_session(store_root, SESSION, num_streams=2)
+    rear = "/data/session/rear.mp4"
+    _write(
+        store_root,
+        [make_stream(FRONT, perfect()), make_stream(rear, perfect())],
+        created_at=_EARLIER,
+        session_metrics=_offset_metrics(),
+    )
+    assert store.session_rollup(store_root)["status"] == "FAIL"
+
+    _write(store_root, [make_stream(FRONT, perfect())], created_at=_LATER, session_metrics=_aligned_metrics())
+    _append_session(store_root, SESSION, num_streams=2, num_unreachable=1)
 
     rollup = store.session_rollup(store_root)
-    assert rollup["stream_status_counts"] == {"PASS": 2, "FAIL": 0, "ERROR": 0}
-    assert rollup["session_status_counts"] == {"PASS": 1, "FAIL": 0, "ERROR": 0}
-    assert rollup["status"] == "PASS"
+    assert rollup["session_status_counts"] == {"PASS": 0, "FAIL": 0, "ERROR": 1}
+    assert rollup["status"] == "ERROR"
+
+
+def test_a_complete_run_after_a_partial_one_decides_the_session(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """A session that one run could not measure through completes when a later run does.
+
+    And the later verdict stands on its own: the partial run's history is kept, but
+    neither its coverage nor its verdicts linger once a complete row supersedes it.
+    """
+    rear = "/data/session/rear.mp4"
+    _write(store_root, [make_stream(FRONT, perfect())], created_at=_EARLIER, session_metrics=_aligned_metrics())
+    _append_session(store_root, SESSION, num_streams=2, num_unreachable=1, created_at=_LATER)
+    assert store.session_rollup(store_root)["status"] == "ERROR"
+
+    _write(
+        store_root,
+        [make_stream(FRONT, perfect()), make_stream(rear, perfect())],
+        created_at=_LATEST,
+        session_metrics=_offset_metrics(),
+    )
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["session_status_counts"] == {"PASS": 0, "FAIL": 1, "ERROR": 0}
+    assert rollup["status"] == "FAIL"
+    assert len(store.read_sessions(store_root, latest=False)) == 3, "every run's session row is kept"
+
+
+def test_a_session_does_not_borrow_verdicts_from_an_older_run(
+    store_root: str, make_stream: Callable[..., StreamResult], perfect: Callable[..., list[int]]
+) -> None:
+    """Verdicts count only when they come from the run that wrote the session's newest row.
+
+    The first run judged the session and failed it. The second measured the same
+    streams but offered no session verdicts, so the newest verdicts describe a
+    measurement the newest row is not about. That is ERROR, not the old FAIL.
+    """
+    rear = "/data/session/rear.mp4"
+    _write(
+        store_root,
+        [make_stream(FRONT, perfect()), make_stream(rear, perfect())],
+        created_at=_EARLIER,
+        session_metrics=_offset_metrics(),
+    )
+    _write(store_root, [make_stream(FRONT, perfect()), make_stream(rear, perfect())], created_at=_LATER)
+
+    rollup = store.session_rollup(store_root)
+    assert rollup["session_status_counts"] == {"PASS": 0, "FAIL": 0, "ERROR": 1}
+
+
+def test_session_rollup_refuses_a_store_from_before_schema_4(store_root: str) -> None:
+    """A v3 session row has no coverage column, so the rollup names the problem instead of guessing.
+
+    Reading the missing count as zero would let a partial session roll up as measured
+    through, which is the bug schema 4 exists to fix.
+    """
+    v3_schema = pa.schema([field for field in store_schema.SESSION_SCHEMA if field.name != "num_unreachable"])
+    run_id = store.new_run_id()
+    row = store.session_row(
+        session_id=store.session_key(SESSION),
+        run_id=run_id,
+        created_at=_EARLIER,
+        session_path=SESSION,
+        num_streams=1,
+        num_unreadable=0,
+    )
+    del row["num_unreachable"]
+    store.append_rows([row], store.join(store_root, store_schema.SESSION_DATASET), v3_schema, None)
+    store.commit_run(
+        store_root,
+        run_id=run_id,
+        created_at=_EARLIER,
+        tool="data-integrity",
+        session_path=None,
+        thresholds=DEFAULT_THRESHOLDS,
+        num_streams=1,
+        storage_options=None,
+    )
+
+    with pytest.raises(ValueError, match=r"num_unreachable.*fresh store root"):
+        store.session_rollup(store_root)
 
 
 def test_re_measuring_one_stream_under_a_wider_session_strands_neither(

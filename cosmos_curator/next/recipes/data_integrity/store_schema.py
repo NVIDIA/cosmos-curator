@@ -87,7 +87,11 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 #: Current writers no longer emit it -- an indexed stream is measured on the clock
 #: ``checks.camera_alignment_fields`` selects, which is ``"sensor"`` for EOF/SOF/MOE and
 #: ``"container_pts"`` for PTS -- but readers still accept it for rows already stored.
-STORE_SCHEMA_VERSION = 3
+#:
+#: 4 added ``num_unreachable`` to :data:`SESSION_SCHEMA`, so a session row says how
+#: many of the streams it found its own run could not reach. Not additive, for the
+#: same reason 3 was not: a store written at version 3 or earlier needs a fresh root.
+STORE_SCHEMA_VERSION = 4
 
 STREAM_DATASET = "stream.lance"
 EVALUATION_DATASET = "evaluation.lance"
@@ -279,6 +283,11 @@ SESSION_SCHEMA: pa.Schema = pa.schema(
         # A session listed but empty is 0 and 0, which is a finding about the input.
         pa.field("num_streams", pa.int64(), nullable=False),
         pa.field("num_unreadable", pa.int64(), nullable=False),
+        # How many of the streams found this run could not reach, and so left without
+        # a row. Nonzero means the session-grain verdicts beside this row were judged
+        # over fewer streams than the session holds, so the rollup cannot call it PASS
+        # (or FAIL) until a later run measures it through.
+        pa.field("num_unreachable", pa.int64(), nullable=False),
         # Which clock this session's streams were measured on, rolled up by
         # :func:`~cosmos_curator.core.sensors.data_integrity.results.session_timestamp_source`:
         # ``sensor`` only when every contributing stream had one, else ``container_pts``

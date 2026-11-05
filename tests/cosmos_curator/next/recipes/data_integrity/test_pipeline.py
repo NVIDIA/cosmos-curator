@@ -414,9 +414,12 @@ def test_an_unreachable_stream_costs_the_run_its_exit_status_but_adds_no_row(
     assert len(rows) == NUM_STREAMS
     assert str(locked) not in {row["source"] for row in rows}
 
-    # The store does not forget the shortfall, though: session "a" was found to hold a
-    # stream the store has no row for, so it reads ERROR rather than PASS. Otherwise
+    # The store does not forget the shortfall, though: session "a"'s own row says one of
+    # its streams could not be reached, so it reads ERROR rather than PASS. Otherwise
     # only the run's exit status knew, and that is gone by the next read.
+    session_rows = {row["session_path"]: row for row in store.read_sessions(str(store_root))}
+    assert session_rows[str(dataset / "a")]["num_unreachable"] == 1
+    assert session_rows[str(dataset / "b")]["num_unreachable"] == 0
     sessions = {row["session_path"]: row["status"] for row in store.session_rollup(str(store_root))["sessions"]}
     assert sessions == {str(dataset / "a"): "ERROR", str(dataset / "b"): "PASS"}
     assert store.session_rollup(str(store_root))["status"] == "ERROR"

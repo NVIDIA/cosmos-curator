@@ -34,7 +34,7 @@ from cosmos_curator.core.sensors.data_integrity.instruments import (
 )
 from cosmos_curator.core.sensors.data_integrity.results import SensorBounds, StreamResult
 from cosmos_curator.core.sensors.types.types import TimestampSource
-from cosmos_curator.next.recipes.data_integrity import reevaluate, store
+from cosmos_curator.next.recipes.data_integrity import reevaluate, store, store_schema
 
 NO_HEADER_RATE = Fraction(0, 1)
 SESSION = "/data/session"
@@ -300,6 +300,50 @@ def test_a_re_judged_session_verdict_moves_the_rollup(session_measured: tuple[st
     reevaluate.reevaluate(root, thresholds=NO_SKEW)
     assert store.session_rollup(root, policy=store.policy_id(DEFAULT_THRESHOLDS))["status"] == "PASS"
     assert store.session_rollup(root, policy=store.policy_id(NO_SKEW))["status"] == "FAIL"
+
+
+def test_re_judging_cannot_complete_a_session_a_run_did_not_measure_through(
+    session_measured: tuple[str, str],
+) -> None:
+    """A re-judge writes verdicts, never session rows, so it cannot undo a partial run.
+
+    The newest session row says its run could not reach one of the two streams. Its
+    verdicts are re-judged under any policy asked for, and the session stays ERROR under
+    every one of them until a run measures it through.
+    """
+    root, _ = session_measured
+    run_id = store.new_run_id()
+    created_at = datetime.datetime(2099, 1, 1, tzinfo=datetime.UTC)
+    store.append_rows(
+        [
+            store.session_row(
+                session_id=store.session_key(SESSION),
+                run_id=run_id,
+                created_at=created_at,
+                session_path=SESSION,
+                num_streams=2,
+                num_unreadable=0,
+                num_unreachable=1,
+            )
+        ],
+        store.join(root, store_schema.SESSION_DATASET),
+        store_schema.SESSION_SCHEMA,
+        None,
+    )
+    store.commit_run(
+        root,
+        run_id=run_id,
+        created_at=created_at,
+        tool="data-integrity",
+        session_path=None,
+        thresholds=DEFAULT_THRESHOLDS,
+        num_streams=1,
+        storage_options=None,
+    )
+
+    reevaluate.reevaluate(root, thresholds=NO_SKEW)
+    assert store.session_rollup(root, policy=store.policy_id(DEFAULT_THRESHOLDS))["status"] == "ERROR"
+    assert store.session_rollup(root, policy=store.policy_id(NO_SKEW))["status"] == "ERROR"
 
 
 def test_every_session_metric_is_re_judged(session_measured: tuple[str, str]) -> None:

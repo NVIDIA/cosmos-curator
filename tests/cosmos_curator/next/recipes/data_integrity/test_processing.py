@@ -16,6 +16,7 @@
 """Unit tests for the function the Ray Data stage runs on one session."""
 
 import datetime
+import os
 import pathlib
 import pickle
 from collections.abc import Callable, Iterator
@@ -29,8 +30,9 @@ from loguru import logger
 
 from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, NAME_ORDERING, SESSION_INSTRUMENTS
 from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
-from cosmos_curator.next.recipes.data_integrity import processing, store_schema
+from cosmos_curator.next.recipes.data_integrity import processing, store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
+from cosmos_curator.next.recipes.data_integrity.sources import SOURCE_SENSOR_TIMESTAMPS_SUFFIX
 from cosmos_curator.next.recipes.mp4_index import processing as mp4_index_processing
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
@@ -42,6 +44,10 @@ from cosmos_curator.next.utils.uris import normalize_location
 
 RUN_ID = "0" * 32
 CREATED_AT = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.UTC)
+#: Write stamps for tests that stack runs, distinct so which row is newest never ties.
+_EARLIER = datetime.datetime(2026, 8, 21, tzinfo=datetime.UTC)
+_LATER = datetime.datetime(2026, 8, 22, tzinfo=datetime.UTC)
+_LATEST = datetime.datetime(2026, 8, 23, tzinfo=datetime.UTC)
 
 #: How many metrics a stream with a usable declared rate produces, and therefore how
 #: many measurement rows and how many evaluations it contributes.
@@ -438,6 +444,149 @@ def test_an_unreachable_stream_leaves_no_row_and_does_not_cost_its_siblings(
     assert record["unreadable"] == 0
     assert record["streams"] == 2, "the count of streams found is unchanged by one being unreachable"
     assert [row["source"] for row in stream_rows] == [str(path / "front.mp4")]
+
+
+def _check_and_commit(
+    session: pathlib.Path,
+    *,
+    created_at: datetime.datetime,
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Measure one session and commit its rows the way the pipeline driver does.
+
+    The driver's half of a run without Ray: append every dataset the worker's record
+    carries, then the ``run.lance`` row that makes them visible. Each call is its own
+    run, so a test can stack runs and read back what the store makes of them.
+    """
+    config = _config(session, thresholds=thresholds)
+    run_id = store.new_run_id()
+    record = processing.check_session(
+        {"session_path": str(session)}, config=config, run_id=run_id, created_at=created_at
+    )
+    root = str(config.output.store_root)
+    for dataset, rows in _rows(record).items():
+        store.append_rows(rows, store.join(root, dataset), processing.DATASET_SCHEMAS[dataset], None)
+    store.commit_run(
+        root,
+        run_id=run_id,
+        created_at=created_at,
+        tool="data-integrity",
+        session_path=None,
+        thresholds=config.checks.thresholds.to_thresholds(),
+        num_streams=int(record["streams"]) - int(record["unreachable"]),
+        storage_options=None,
+    )
+    return record
+
+
+@pytest.fixture
+def offset_rig(
+    tmp_path: pathlib.Path,
+    h264_video: Callable[..., bytes],
+    sensor_timeline: Callable[..., pathlib.Path],
+) -> pathlib.Path:
+    """Three cameras that each look healthy, one of them recording two seconds late.
+
+    Every stream passes on its own; only the session-grain checks see the offset, and
+    only when the late camera is among the streams they are judged over.
+    """
+    rig = tmp_path / "rig"
+    rig.mkdir()
+    for name, start_ns in (
+        ("a.mp4", _SENSOR_EPOCH_NS),
+        ("b.mp4", _SENSOR_EPOCH_NS),
+        ("c.mp4", _SENSOR_EPOCH_NS + 2_000_000_000),
+    ):
+        (rig / name).write_bytes(h264_video(frames=30))
+        sensor_timeline(rig / name, frames=30, start_ns=start_ns)
+    return rig
+
+
+def _lock(video: pathlib.Path) -> None:
+    """Make a camera unreachable -- its video and its timeline -- the way ``unreachable_video`` does."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file regardless, so the stream would be reachable")
+    for path in (video, pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")):
+        path.chmod(0o000)
+
+
+def _unlock(video: pathlib.Path) -> None:
+    """Undo :func:`_lock`."""
+    for path in (video, pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")):
+        path.chmod(0o644)
+
+
+def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(offset_rig: pathlib.Path) -> None:
+    """The reproduced case, through the real session metrics and the real Lance store.
+
+    The complete run fails the session on the late camera. The rerun cannot reach it,
+    so its own cross-camera verdicts -- over the two aligned cameras -- pass and become
+    the newest. The session must still not read PASS, and the rerun's good per-stream
+    work must still be committed.
+    """
+    root = str(offset_rig.parent / "di-store")
+    first = _check_and_commit(offset_rig, created_at=_EARLIER)
+    assert first["failed_session_metrics"] > 0
+    assert store.session_rollup(root)["status"] == "FAIL"
+
+    _lock(offset_rig / "c.mp4")
+    try:
+        rerun = _check_and_commit(offset_rig, created_at=_LATER)
+    finally:
+        _unlock(offset_rig / "c.mp4")
+
+    assert rerun["unreachable"] == 1
+    assert rerun["failed_session_metrics"] == 0, "judged over a and b alone, the session looks aligned"
+    (session_row,) = store.read_sessions(root)
+    assert (session_row["num_streams"], session_row["num_unreachable"]) == (3, 1)
+    sessions = store.session_rollup(root)["sessions"]
+    assert [entry["status"] for entry in sessions] == ["ERROR"]
+    rerun_sources = {row["source"] for row in store.read_streams(root) if row["run_id"] == session_row["run_id"]}
+    assert rerun_sources == {str(offset_rig / "a.mp4"), str(offset_rig / "b.mp4")}
+
+
+def test_a_complete_run_after_a_partial_one_restores_the_verdict(offset_rig: pathlib.Path) -> None:
+    """A run that reaches every camera again decides the session, and no run's history is lost."""
+    root = str(offset_rig.parent / "di-store")
+    _check_and_commit(offset_rig, created_at=_EARLIER)
+    _lock(offset_rig / "c.mp4")
+    try:
+        _check_and_commit(offset_rig, created_at=_LATER)
+    finally:
+        _unlock(offset_rig / "c.mp4")
+    assert store.session_rollup(root)["status"] == "ERROR"
+
+    _check_and_commit(offset_rig, created_at=_LATEST)
+
+    assert store.session_rollup(root)["status"] == "FAIL"
+    history = store.read_sessions(root, latest=False)
+    assert sorted(row["num_unreachable"] for row in history) == [0, 0, 1]
+
+
+def test_a_complete_run_under_another_policy_cannot_vouch_for_a_partial_runs_verdicts(
+    offset_rig: pathlib.Path,
+) -> None:
+    """A session's verdicts must come from the run that wrote its newest row.
+
+    The partial rerun's passing verdicts are the newest under the default policy. A
+    later complete run judged under a different policy writes the newest session row
+    but no default-policy verdicts. Asked about the default policy, the rollup must not
+    pair that complete row with the partial run's verdicts and call the session PASS.
+    """
+    root = str(offset_rig.parent / "di-store")
+    _check_and_commit(offset_rig, created_at=_EARLIER)
+    _lock(offset_rig / "c.mp4")
+    try:
+        _check_and_commit(offset_rig, created_at=_LATER)
+    finally:
+        _unlock(offset_rig / "c.mp4")
+    other_policy = {"max_gaps": 99}
+    _check_and_commit(offset_rig, created_at=_LATEST, thresholds=other_policy)
+
+    default = store.policy_id(_config(offset_rig).checks.thresholds.to_thresholds())
+    other = store.policy_id(_config(offset_rig, thresholds=other_policy).checks.thresholds.to_thresholds())
+    assert [entry["status"] for entry in store.session_rollup(root, policy=default)["sessions"]] == ["ERROR"]
+    assert [entry["status"] for entry in store.session_rollup(root, policy=other)["sessions"]] == ["FAIL"]
 
 
 def test_every_record_carries_every_column(session: pathlib.Path, tmp_path: pathlib.Path) -> None:

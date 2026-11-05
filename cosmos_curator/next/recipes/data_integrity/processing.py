@@ -204,6 +204,7 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
     created_at: datetime.datetime,
     session_path: str,
     num_streams: int,
+    num_unreachable: int = 0,
     error: str | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     """Turn one session's measured streams into the session-grain store rows.
@@ -223,6 +224,10 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
             ``len(results)`` when some were unreachable. What the run found is the
             honest count for a session row; the shortfall is the run-level
             ``unreachable`` count and the reason the run exits nonzero.
+        num_unreachable: how many of those streams could not be reached. Recorded on
+            the session row so the session-grain verdicts beside it say they were
+            judged over a partial session, which the rollup then cannot call a pass
+            or a fail; a later run that reaches every stream supersedes it.
         error: why the session could not be listed, if it could not be.
 
     Returns:
@@ -241,6 +246,7 @@ def build_session_rows(  # noqa: PLR0913 -- one argument per fact the rows recor
                 session_path=session_path,
                 num_streams=num_streams,
                 num_unreadable=sum(1 for result in results if result.error is not None),
+                num_unreachable=num_unreachable,
                 timestamp_source=session_clock(results),
                 error=error,
             )
@@ -450,6 +456,7 @@ def check_session(
         created_at=created_at,
         session_path=session_path,
         num_streams=len(sources),
+        num_unreachable=unreachable,
     )
     for dataset, dataset_rows in session_rows.items():
         rows.setdefault(dataset, []).extend(dataset_rows)
