@@ -40,8 +40,9 @@ For checkpointing and recovery, `video_transcode` and `video_embed` (enrichment)
 components are the canonical reference. Migrate other recipes and older recovery helpers toward that pattern, but check
 the [extensions it lacks](../../docs/curator/design/curator-next-checkpoint-recovery.md#expansion-across-curator-next)
 first: row-level selection (embeddings, robot-action-caption) and several field sets in one commit
-(multimodal-embedding) each need an explicit extension, not a force-fit. `lance_fragment_recovery` is deprecated; its
-producers (mp4-index, multimodal-split, robot-action-split) migrate to shared append publication explicitly. Likewise,
+(multimodal-embedding) each need an explicit extension, not a force-fit. `robot_action_split` also uses append, with
+one work item expanding to many rows. `lance_fragment_recovery` is deprecated; its remaining producers (mp4-index,
+multimodal-split) migrate to shared append publication explicitly. Likewise,
 `legacy/caption_fragment_recovery`, video-caption's former two-phase engine, is deprecated; multimodal-caption and
 multimodal-embedding migrate to shared enrichment explicitly.
 

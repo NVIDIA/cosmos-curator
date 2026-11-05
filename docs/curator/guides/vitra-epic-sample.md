@@ -166,15 +166,19 @@ Measured on one RTX PRO 6000 Blackwell:
 |---|---|
 | Input | 140 episodes, 1 video, 371 MB |
 | Spans discovered | 100, after the duration filter and per-description dedup |
-| Clips written | **100 succeeded, 0 failed** |
-| Lance table | 100 rows, 23 columns, 100 distinct `clip_id` |
+| Run result | **`published 1 item(s) as 100 row(s) with 0 terminal error(s); 0 item(s) pending; 0 clip(s) failed`** |
+| Lance table | 100 rows, 26 columns, 100 distinct `clip_id`, none with `error_stage` set |
 | Durations | 0.60-1.90 s, median 0.88 s, 93.1 s total |
 | Distinct subtask sentences | 83 |
 | Output | 33 MB — 100 clip MP4s and 100 action `.bin` files |
 
 Rows carry the canonical egocentric schema: `clip_id`, `span_group_id`, `episode_id`, `subtask_name`,
 `frame_start`/`frame_end`, `start_ns`/`end_ns`, `native_fps`, `episode_from_timestamp`, `clip_uri`,
-`action_data_uri`, `camera_motion_annotation`.
+`action_data_uri`, `camera_motion_annotation`, plus the source chunk (`chunk_id`, `chunk_mp4_uri`,
+`data_parquet_uri`) and `error_stage`/`error_message`. A clip that could not be cut keeps its row with
+null `clip_uri` and a non-null `error_stage`.
+
+A work item is one source chunk — here the shard's one MP4 — so the run publishes one item as 100 rows.
 
 ```
 Pick up the white mug by its handle.
@@ -184,8 +188,10 @@ Pick up the soapy bowl from the sink.
 Place the bowl into the sink.
 ```
 
-Because `clip_id` is a content digest, rerunning against the same `lance_uri` reconciles rather than
-duplicates — point a second run at it and it cuts only what is missing.
+Rerunning against the same `lance_uri` does not duplicate: a chunk already in the table is not
+pending, so a second run publishes `0 item(s) as 0 row(s)`. Each run publishes one selection of at most
+`execution.max_items` chunks atomically, and an interrupted run resumes from its checkpoints; rerun
+while the summary reports items pending. Terminal errors are not retried in the same table.
 
 ## Troubleshooting
 
@@ -208,6 +214,11 @@ spec: 21 camera-space keypoints per hand, 16 flattened 3x3 rotations per hand, p
 
 **Every span dropped by the duration filter** — the defaults are 4-20 s and VITRA episodes are
 sub-second. See the config above.
+
+**`has a different producer, item ID column, or result contract; use a new output location`** — the
+table was written by an earlier version of the recipe or with different `split`, `source_dataset`,
+`action_format`, or `video_bitrate` settings. Point `output.media_root` (and `lance_uri`, if set) at a
+new location.
 
 **`TypeError: EngineArgs.__init__() got an unexpected keyword argument`** — repository code newer than
 the image. Use a matching image or drop `--curator-path`.

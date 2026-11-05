@@ -33,6 +33,7 @@ import io
 import json
 import multiprocessing
 import re
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -50,6 +51,7 @@ from cosmos_curator.core.utils.storage.s3_client import S3Prefix
 from cosmos_curator.core.utils.storage.storage_client import StorageClient
 from cosmos_curator.core.utils.storage.storage_utils import get_storage_client, path_exists, read_bytes
 from cosmos_curator.next.recipes.robot_action_split.config import ResolvedRobotActionSplitConfig, SpanFilterConfig
+from cosmos_curator.next.recipes.robot_action_split.contracts import INPUT_SCHEMA, make_chunk_id
 from cosmos_curator.next.recipes.robot_action_split.identities import (
     make_clip_id,
     make_source_id,
@@ -200,11 +202,8 @@ def _list_shard_dirs(
         s3p = S3Prefix(root.rstrip("/") + "/")
         root_key = s3p.prefix.rstrip("/") + "/"
         bucket = s3p.bucket
-        try:
-            all_objects = client.list_recursive(s3p)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Failed to list objects under {root!r} (profile={storage_profile!r}): {exc}")
-            return []
+        # A listing failure propagates: read as an empty dataset, it would publish nothing and exit cleanly.
+        all_objects = client.list_recursive(s3p)
 
         subdir_names: dict[str, set[str]] = {}
         for obj in all_objects:
@@ -984,7 +983,7 @@ def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatc
     """
     workers = config.execution.discovery_workers
     requested_views = config.output.views
-    storage_profile = config.execution.storage_profile
+    storage_profile = config.input.storage_profile
     video_bitrate = config.output.video_bitrate
     chunk_limit = config.input.limit
 
@@ -996,6 +995,10 @@ def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatc
         logger.info(f"Listing shard dirs under {dataset_root!r} (profile={storage_profile!r})")
         shard_dirs = _list_shard_dirs(dataset_root, storage_profile=storage_profile)
         logger.info(f"Found {len(shard_dirs)} shard dir(s) under {dataset_root!r}")
+        if not shard_dirs:
+            # A root without shards is a wrong path or profile, not a dataset with nothing to do.
+            msg = f"No dataset shard (a directory with meta/info.json) found under {dataset_root!r}"
+            raise ValueError(msg)
         # Identity comes from the discovered shard URI, never from the URI the caller happened to list.
         # Listing a dataset root and listing its shards individually describe the same content, and
         # _list_shard_dirs normalizes both to the same shard path -- so keying on the input would give one
@@ -1008,7 +1011,9 @@ def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatc
     if not uris:
         return []
     with ThreadPoolExecutor(max_workers=min(len(uris), workers)) as pool:
-        shard_entries = [entry for entries in pool.map(_list_one, uris) for entry in entries]
+        # Overlapping inputs -- a dataset root and one of its shards, or one URI twice -- name
+        # the same shard. Keep each once, in discovery order, so no span is discovered twice.
+        shard_entries = list(dict.fromkeys(entry for entries in pool.map(_list_one, uris) for entry in entries))
     if not shard_entries:
         return []
 
@@ -1107,13 +1112,68 @@ def discover_spans(config: ResolvedRobotActionSplitConfig) -> list[ChunkSpanBatc
     for item in all_items:
         by_chunk.setdefault((item.chunk_mp4_uri, item.data_parquet_uri), []).append(item)
 
-    max_per_batch = config.execution.max_segments_per_batch
     batches = [
-        ChunkSpanBatch(
-            chunk_mp4_uri=mp4_uri, data_parquet_uri=parquet_uri, items=chunk_items[start : start + max_per_batch]
-        )
+        ChunkSpanBatch(chunk_mp4_uri=mp4_uri, data_parquet_uri=parquet_uri, items=chunk_items)
         for (mp4_uri, parquet_uri), chunk_items in by_chunk.items()
-        for start in range(0, len(chunk_items), max_per_batch)
     ]
     logger.info(f"Discovery produced {len(batches)} chunk span batch(es)")
     return batches
+
+
+# Chunk-level fields a work item carries once rather than in every span.
+_CHUNK_SPAN_FIELDS = frozenset({"chunk_mp4_uri", "data_parquet_uri"})
+# Span fields a saved selection may carry. ``spans_json`` is a persisted recovery format:
+# decoding ignores fields a later SpanWorkItem dropped, and a field added later needs a
+# default so saved selections still decode.
+_SPAN_FIELDS = frozenset(field.name for field in attrs.fields(SpanWorkItem)) - _CHUNK_SPAN_FIELDS
+
+
+def encode_spans(items: list[SpanWorkItem]) -> str:
+    """Render a chunk's spans as canonical JSON, without the chunk-level fields the work item carries."""
+    spans = [attrs.asdict(item, filter=lambda field, _value: field.name not in _CHUNK_SPAN_FIELDS) for item in items]
+    return json.dumps(spans, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def decode_chunk(item: dict[str, Any]) -> ChunkSpanBatch:
+    """Rebuild a chunk's spans from one work item in ``contracts.INPUT_SCHEMA``."""
+    chunk = {"chunk_mp4_uri": item["chunk_mp4_uri"], "data_parquet_uri": item["data_parquet_uri"]}
+    spans = json.loads(item["spans_json"])
+    return ChunkSpanBatch(
+        **chunk,
+        items=[
+            SpanWorkItem(**{key: value for key, value in span.items() if key in _SPAN_FIELDS}, **chunk)
+            for span in spans
+        ],
+    )
+
+
+def items_table(batches: list[ChunkSpanBatch]) -> pa.Table:
+    """Identify each discovered chunk as one work item in ``contracts.INPUT_SCHEMA``.
+
+    Raises ``ValueError`` when two spans share a ``clip_id``: every clip is one
+    row in the clip table, and its consumers join on ``clip_id``.
+    """
+    counts = Counter(item.clip_id for batch in batches for item in batch.items)
+    repeated = sorted(clip_id for clip_id, count in counts.items() if count > 1)
+    if repeated:
+        msg = (
+            f"Discovery emitted duplicate clip_id value(s), e.g. {repeated[:5]}; check input.uris for overlapping roots"
+        )
+        raise ValueError(msg)
+    return pa.Table.from_pylist(
+        [
+            {
+                "chunk_id": make_chunk_id(batch.chunk_mp4_uri, batch.data_parquet_uri),
+                "chunk_mp4_uri": batch.chunk_mp4_uri,
+                "data_parquet_uri": batch.data_parquet_uri,
+                "spans_json": encode_spans(batch.items),
+            }
+            for batch in batches
+        ],
+        schema=INPUT_SCHEMA,
+    )
+
+
+def discover_items(config: ResolvedRobotActionSplitConfig) -> pa.Table:
+    """Discover every chunk's spans as append work items, before Ray execution or output creation."""
+    return items_table(discover_spans(config))

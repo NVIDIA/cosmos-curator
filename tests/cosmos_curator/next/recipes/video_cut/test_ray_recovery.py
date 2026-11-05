@@ -25,7 +25,8 @@ from cosmos_curator.core.utils.storage.s3_client import S3Prefix
 from cosmos_curator.next.append import commit
 from cosmos_curator.next.append.attempts import reconcile_and_select_attempt
 from cosmos_curator.next.core.ray_checkpoints import STAGED_FILE_EXTENSION, read_staged_table, write_staged_table
-from cosmos_curator.next.media.ffmpeg import ProbeError, VideoMetadata
+from cosmos_curator.next.media.failures import ProbeError
+from cosmos_curator.next.media.ffmpeg import VideoMetadata
 from cosmos_curator.next.recipes.video_cut import discovery, fixed_stride, pipeline
 from cosmos_curator.next.recipes.video_cut.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_cut.config import (

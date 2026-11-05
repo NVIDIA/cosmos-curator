@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import pytest
 
 from cosmos_curator.next.media import smart_cut
+from cosmos_curator.next.media.failures import CutError
 from cosmos_curator.next.media.smart_cut import (
     _encode_cmd,
     _error_tail,
@@ -266,7 +267,7 @@ def test_selected_source_pts_match_ignores_earlier_runs() -> None:
 
 
 def test_run_encode_rejects_a_wrong_selection(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A clean ffmpeg exit is not enough: the wrong frames must still fail the cut."""
+    """A clean ffmpeg exit is not enough: the wrong frames must still fail the cut, as a property of the source."""
     index = _index(list(range(120)), (0, 50, 100))
 
     def fake_run_ff(cmd: list[str], errf) -> bool:  # noqa: ANN001, ARG001
@@ -274,10 +275,8 @@ def test_run_encode_rejects_a_wrong_selection(monkeypatch: pytest.MonkeyPatch) -
         return True
 
     monkeypatch.setattr(smart_cut, "_run_ff", fake_run_ff)
-    with tempfile.TemporaryFile() as errf:
-        assert not _run_encode("src.mp4", "out.mp4", index, 63, 3, "4M", 1, errf)
-        errf.seek(0)
-        assert b"Decoded source PTS do not match" in errf.read()
+    with tempfile.TemporaryFile() as errf, pytest.raises(CutError, match="decoded source PTS do not match"):
+        _run_encode("src.mp4", "out.mp4", index, 63, 3, "4M", 1, errf)
 
 
 def test_run_encode_accepts_the_requested_selection(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -236,9 +236,9 @@ will give them to you.
 - **Driver memory scales with fragment *count*, not with corpus size.** Every run
   writes both columns on **every** fragment, so the driver collects one metadata
   payload per fragment before it commits — measured at ~740 bytes on a nine-column
-  table, most of it the fragment's own file metadata. A fragment is one producer
-  publish batch — `clips_per_publish_batch`, default 8,000 rows — so 250M rows is
-  ~31,250 fragments and ~22 MiB of payloads, and 500M rows ~62,500 and ~44 MiB.
+  table, most of it the fragment's own file metadata. A fragment holds the producer's
+  `execution.rows_per_fragment` rows — robot-action-split's default is 8,000 clip
+  rows — so 250M rows is ~31,250 fragments and ~22 MiB of payloads, and 500M rows ~62,500 and ~44 MiB.
   That is a *lower* bound, since a production fragment references more data files
   than the measured fixture, and a table compacted into ~1,000-row fragments would
   put 250M rows into 250,000 fragments and roughly 176 MiB on the driver.
@@ -841,12 +841,12 @@ any measurement.
 ### Before raising the producer's publish batch
 
 Fragment count and the fit sample's cluster count are the same division, so the
-obvious lever on one moves the other. The producer pins `max_rows_per_file` to
-`clips_per_publish_batch`, which fixes both:
+obvious lever on one moves the other. The producer packs `rows_per_fragment` rows
+into each fragment, which fixes both:
 
 ```text
-fragments = rows             / clips_per_publish_batch   ->  62,500 at 500M rows
-C         = fit_sample_rows  / clips_per_publish_batch   ->  500
+fragments = rows             / rows_per_fragment   ->  62,500 at 500M rows
+C         = fit_sample_rows  / rows_per_fragment   ->  500
 ```
 
 Whole-fragment sampling is cluster sampling, so `C` is what the basis is actually
@@ -854,7 +854,7 @@ fitted over. Doubling the publish batch to cut a 500M-row table to 31,250 fragme
 therefore drops `C` to 250, giving back half of the fit quality the producer's
 fragment count currently supplies for free.
 
-Two things follow. First, this is **not Curate's field** — `clips_per_publish_batch`
+Two things follow. First, this is **not Curate's field** — `rows_per_fragment`
 belongs to the producer, so changing it is a cross-package request, and Curate is the
 consumer that silently pays for it. Second, do not open that request on the strength
 of a fragment count alone. The number sounds large next to the range where Lance
@@ -863,8 +863,8 @@ this table: report manifest open and scan-planning latency at the current fragme
 count, and whether it grows enough to register against the scan it precedes.
 
 If it does register, **compaction is the remedy that leaves the producer's field
-alone** — it rewrites fragments after the fact, so `clips_per_publish_batch` and the
-recovery unit it sizes stay where they are, and no cross-package request is needed.
+alone** — it rewrites fragments after the fact, so the producer's `rows_per_fragment`
+stays where it is, and no cross-package request is needed.
 It does not leave `C` alone, though, and that is the trap: the sampler takes a
 fragment prefix of the table as **read**, so a compaction target divides
 `fit_sample_rows` exactly as the publish batch does. Lance's `compact_files` targets

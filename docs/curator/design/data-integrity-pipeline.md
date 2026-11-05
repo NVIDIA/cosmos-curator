@@ -424,9 +424,10 @@ Arrow type and cannot travel as typed columns of a single Ray record. The flat s
 columns carry everything logging and the run summary need, so nothing reads `rows` except
 the append step.
 
-All Lance writes stay on the driver. Concurrent `append_rows` from many workers would hit
-the create-or-append race that `robot_action_split/lance_sink.py` flags as an open TODO,
-and there is no reason to inherit it.
+All Lance writes stay on the driver. Concurrent `append_rows` from many workers would race
+to create the table on first write; Curator Next producers avoid that by creating or opening
+their table once on the driver before any work (shared append publication's `open_target`),
+and there is no reason to inherit the race.
 
 `stream_idx` is not in the record: it selects which video stream to open *inside* a
 container, and stays at the `run_checks` default of 0, which is also `di`'s default — so a

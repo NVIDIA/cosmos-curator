@@ -339,3 +339,11 @@ def test_a_fill_whose_identity_misses_a_provenance_column_is_refused() -> None:
             resources=WorkerResources(scan_batch_size=1),
             weights_name=None,
         )
+
+
+@pytest.mark.parametrize("builder", [build_text_fill, build_image_fill])
+def test_text_and_image_apply_only_to_rows_with_a_clip(
+    builder: Callable[[EmbeddingPipelineConfig], ModalityFill], make_embeddings_config: EmbeddingsConfigFactory
+) -> None:
+    """A row without a clip records a clip that was never produced; neither its labels nor media are embedded."""
+    assert builder(make_embeddings_config()).applicability_filter == "clip_uri IS NOT NULL AND clip_uri != ''"

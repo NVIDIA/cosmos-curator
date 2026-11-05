@@ -10,7 +10,8 @@ fresh-cluster scenario in ``fresh_cluster.py`` reuses. ``config`` is the recipe'
 config, whose ``kind`` the spec's owner must name; ``recipe.discover`` finds its work items
 without external services. ``results`` must hold one valid canonical result in the spec's
 ``result_fields`` for each of at least three discovered items: at least two that append
-rows and one that appends none.
+rows, and one empty outcome when the recipe can produce one (a recipe whose every item
+owes rows, such as robot-action-split, cannot).
 When the spec declares an ``error_column``, at least one result must be a terminal error.
 Recipe-specific summary keys are unrestricted. The recipe's ``run_config`` must run through
 its pipeline module's ``run_append``; the suite replaces the ``start_ray`` and ``process``
@@ -99,12 +100,33 @@ def _appends(dataset: lance.LanceDataset) -> list[lance.Transaction]:
     ]
 
 
-def _expected_errors(spec: contracts.AppendSpec, results: pa.Table, item_ids: list[str]) -> list[dict[str, Any]]:
+def _error_items(spec: contracts.AppendSpec, results: pa.Table, item_ids: list[str]) -> int:
+    """Count the selected items whose result is a terminal error, as publication does."""
+    if spec.error_column is None:
+        return 0
+    selected = results.filter(pc.is_in(results[spec.id_column], value_set=pa.array(item_ids, type=pa.string())))
+    return selected.num_rows - selected[spec.error_column].null_count
+
+
+def _failed_items(spec: contracts.AppendSpec, results: pa.Table, item_ids: list[str]) -> list[dict[str, Any]]:
+    """Return the item ID and error of every selected item whose result is a terminal error."""
+    assert spec.error_column is not None
+    selected = results.filter(pc.is_in(results[spec.id_column], value_set=pa.array(item_ids, type=pa.string())))
+    failed = selected.filter(pc.is_valid(selected[spec.error_column]))
+    return sorted(failed.select([spec.id_column, spec.error_column]).to_pylist(), key=json.dumps)
+
+
+def _expected_error_rows(spec: contracts.AppendSpec, results: pa.Table, item_ids: list[str]) -> list[dict[str, Any]]:
+    """Return the item ID and error of every expanded row that carries a terminal error.
+
+    Expansion decides which rows carry an error: one outcome row per failed item,
+    or, for a recipe whose items expand to several rows, each row it marks failed.
+    """
     if spec.error_column is None:
         return []
-    selected = results.filter(pc.is_in(results[spec.id_column], value_set=pa.array(item_ids, type=pa.string())))
-    errors = selected.filter(pc.is_valid(selected[spec.error_column]))
-    return sorted(errors.select([spec.id_column, spec.error_column]).to_pylist(), key=json.dumps)
+    rows = _expected_rows(spec, results, item_ids)
+    errors = [{spec.id_column: row[spec.id_column], spec.error_column: row[spec.error_column]} for row in rows]
+    return sorted((error for error in errors if error[spec.error_column] is not None), key=json.dumps)
 
 
 class AppendConformance:
@@ -150,7 +172,7 @@ class AppendConformance:
         assert properties[CONTRACT_DIGEST_KEY] == spec.contract_digest
         expected = _expected_rows(spec, results, item_ids)
         assert _appended_rows(published, spec) == expected
-        errors = len(_expected_errors(spec, results, item_ids))
+        errors = _error_items(spec, results, item_ids)
         assert {name: summary[name] for name in outcome.summary()} == {
             "input_items": len(item_ids),
             "selected_items": len(item_ids),
@@ -171,7 +193,8 @@ class AppendConformance:
         spec = bindings.spec
         if spec.error_column is None:
             pytest.skip("The recipe declares no terminal errors")
-        expected = _expected_errors(spec, results, _sorted_ids(recipe.discover(config), spec))
+        item_ids = _sorted_ids(recipe.discover(config), spec)
+        expected = _expected_error_rows(spec, results, item_ids)
         assert expected
         _replace_ray(recipe, monkeypatch, results=results)
         summary = recipe.pipeline.run_config(config)
@@ -182,7 +205,11 @@ class AppendConformance:
             columns=[spec.id_column, spec.error_column], filter=pc.field(spec.error_column).is_valid()
         )
         assert sorted(errors.to_pylist(), key=json.dumps) == expected
-        assert summary["errors"] == len(expected)
+        # Independently of the recipe's expansion: every failed item keeps its own error in some row.
+        published = {(row[spec.id_column], row[spec.error_column]) for row in errors.to_pylist()}
+        for failed in _failed_items(spec, results, item_ids):
+            assert (failed[spec.id_column], failed[spec.error_column]) in published, failed
+        assert summary["errors"] == _error_items(spec, results, item_ids)
         rerun = recipe.pipeline.run_config(config)
         assert (rerun["selected_items"], rerun["errors"]) == (0, 0)
 

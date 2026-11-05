@@ -11,8 +11,9 @@ input:
   # If your dataset is not listed, add "<your-folder-name>": "<spec>" to
   # ACTION_BINARY_SPEC_BY_DATASET before running.
   source_dataset: feb_08_500hr_lerobot_no_bframes
-  # Caps the number of source chunk MP4s discovered, NOT the number of output
-  # clips — each chunk file can contain many spans (subtask segments). On one
+  # Caps the number of data chunk directories (data/chunk-NNN/) discovery reads,
+  # NOT the number of output clips — each directory's data files can reference
+  # several chunk MP4s per view, each with many spans (subtask segments). On one
   # production mecka dataset, limit: 1 alone produced 805 clips, so a small
   # limit here can still yield a much larger clip count than expected.
   # Remove entirely for a full run.
@@ -37,6 +38,4 @@ output:
   video_bitrate: 2M
 execution:
   discovery_workers: 4
-  max_segments_per_batch: 50
-  cut_attempts: 3
   storage_profile: default

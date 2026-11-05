@@ -109,11 +109,7 @@ from cosmos_curator.next.embeddings.schemas import (
     TEXT_COLUMN_GROUP,
     EmbeddingColumnGroup,
 )
-from cosmos_curator.next.recipes.robot_action_split.contracts import (
-    CLIP_RECORD_SCHEMA_VERSION,
-    MEDIA_CONTRACT_VERSION,
-)
-from cosmos_curator.next.recipes.robot_action_split.records import CLIP_SCHEMA
+from cosmos_curator.next.recipes.robot_action_split.contracts import CLIP_SCHEMA
 from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 
 # The producer's free-form subtask label. Named here rather than imported from
@@ -123,6 +119,7 @@ from cosmos_curator.next.utils.lance_utils import LANCE_DATA_STORAGE_VERSION
 SUBTASK_PROSE_COLUMN: str = "subtask_name"
 
 _LABEL_COLUMNS = ("task_name", SUBTASK_PROSE_COLUMN)
+_ERROR_COLUMNS = ("error_stage", "error_message")
 
 _ROWS_FOR_INTRA_DUPLICATE = 2
 
@@ -641,10 +638,9 @@ def _fragment_table(
         fields.append(field)
         if field.name == KEY_COLUMN:
             columns[field.name] = pa.array(list(clip_ids), type=field.type)
-        elif field.name == "record_schema_version":
-            columns[field.name] = pa.array([CLIP_RECORD_SCHEMA_VERSION] * len(clip_ids), type=field.type)
-        elif field.name == "media_contract_version":
-            columns[field.name] = pa.array([MEDIA_CONTRACT_VERSION] * len(clip_ids), type=field.type)
+        elif field.name in _ERROR_COLUMNS:
+            # Every fixture clip was produced; a non-null error_stage would mark it failed.
+            columns[field.name] = pa.nulls(len(clip_ids), type=field.type)
         elif field.name == "clip_uri":
             columns[field.name] = pa.array(
                 [f"s3://fixture/clips/{clip_id}.mp4" for clip_id in clip_ids],

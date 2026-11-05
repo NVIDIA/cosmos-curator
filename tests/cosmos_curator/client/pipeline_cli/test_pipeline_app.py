@@ -252,7 +252,6 @@ def test_pipeline_template_outputs_robot_action_split_payload() -> None:
         "input.uris",
         "input.source_dataset",
         "output.media_root",
-        "output.lance_uri",
     ]
 
 

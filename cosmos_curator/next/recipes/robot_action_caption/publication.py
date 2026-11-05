@@ -497,8 +497,8 @@ def require_exact_coverage(
     # builds the update table from the TUPLE - one row per owed entry - so a
     # repeat would reach ``update_columns`` as two right-side rows for one join
     # key and it would publish whichever it picked. The producer does enforce
-    # uniqueness (``robot_action_split/recovery.py`` refuses a duplicate on every
-    # run), and this asserts that where it is load-bearing rather than re-deriving
+    # uniqueness (robot-action-split publishes each chunk's clips exactly once),
+    # and this asserts that where it is load-bearing rather than re-deriving
     # it, because other consumers of this same table decline to rely on it and
     # this recipe's write path is what breaks if they are right.
     if len(owed_set) != len(owed):

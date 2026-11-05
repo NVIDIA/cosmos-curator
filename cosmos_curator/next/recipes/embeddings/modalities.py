@@ -81,6 +81,11 @@ _BYTES_PER_GB = 1024**3
 # rows by the embedder to preserve cardinality.
 _IMAGE_APPLICABILITY_FILTER = "clip_uri IS NOT NULL AND clip_uri != ''"
 
+# Text needs only labels, which every row has, but a row without a clip records a
+# clip robot-action-split could not produce: its labels describe no training data,
+# so embedding them would only make it look curatable.
+_TEXT_APPLICABILITY_FILTER = _IMAGE_APPLICABILITY_FILTER
+
 ACTION_APPLICABILITY_FILTER = "action_data_uri IS NOT NULL AND action_data_uri != ''"
 """Rows the action modality can embed: those carrying a Mecka ACT2 action artifact.
 
@@ -305,8 +310,8 @@ def _model_result_fingerprint(spec: ModelSpec) -> str:
 def build_text_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
     """Build the text fill: a SentenceTransformer over each clip's task / subtask text.
 
-    Text applies to every row, so it declares no applicability filter, and the leg
-    never fails per row: every pending row it visits comes back complete.
+    Text applies to every row that has a clip, and the leg never fails per row:
+    every pending row it visits comes back complete.
     """
     # Computed once and spent twice - as the value rows must already hold to count
     # as current, and as the value this run's rows will carry. Two derivations
@@ -316,7 +321,7 @@ def build_text_fill(config: EmbeddingPipelineConfig) -> ModalityFill:
         modality=Modality.TEXT,
         group=TEXT_COLUMN_GROUP,
         source_columns=SentenceTransformerTextEmbedder.SOURCE_COLUMNS,
-        applicability_filter=None,
+        applicability_filter=_TEXT_APPLICABILITY_FILTER,
         result_identity={TEXT_COLUMN_GROUP.provenance_columns[0]: fingerprint},
         embedder_cls=SentenceTransformerTextEmbedder,
         embedder_kwargs={

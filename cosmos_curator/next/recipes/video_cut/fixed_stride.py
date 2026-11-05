@@ -20,7 +20,8 @@ import ray
 from botocore.exceptions import ClientError
 
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
-from cosmos_curator.next.media.ffmpeg import MediaError, ProbeError, VideoMetadata, probe_video_path, probe_video_source
+from cosmos_curator.next.media.failures import MediaError, ProbeError
+from cosmos_curator.next.media.ffmpeg import VideoMetadata, probe_video_path, probe_video_source
 from cosmos_curator.next.media.spans import fixed_stride_spans, seconds_to_nanoseconds
 from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, FixedStrideConfig, ResolvedVideoCutConfig
 from cosmos_curator.next.recipes.video_cut.contracts import (
@@ -29,7 +30,8 @@ from cosmos_curator.next.recipes.video_cut.contracts import (
     media_fields,
     source_result,
 )
-from cosmos_curator.next.recipes.video_cut.sources import s3_client, unreadable_source_error
+from cosmos_curator.next.recipes.video_cut.sources import unreadable_source_error
+from cosmos_curator.next.utils.source_objects import s3_client
 
 
 def probe_source(uri: str, *, execution: ExecutionConfig) -> tuple[VideoMetadata, int]:

@@ -27,8 +27,9 @@ from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.next.append.attempts import AppendAttempt, reconcile_and_select_attempt
 from cosmos_curator.next.append.execution import checkpointed_processing
 from cosmos_curator.next.core.ray_autoscaling import ReleasePendingDownloadActors
-from cosmos_curator.next.media.ffmpeg import InvalidMediaError, UnsupportedMediaError, probe_video_path
-from cosmos_curator.next.recipes.video_cut import pipeline, sources, transnetv2, transnetv2_nvdec
+from cosmos_curator.next.media.failures import InvalidMediaError, UnsupportedMediaError
+from cosmos_curator.next.media.ffmpeg import probe_video_path
+from cosmos_curator.next.recipes.video_cut import pipeline, transnetv2, transnetv2_nvdec
 from cosmos_curator.next.recipes.video_cut.bindings import resolve_bindings
 from cosmos_curator.next.recipes.video_cut.config import (
     ExecutionConfig,
@@ -38,6 +39,7 @@ from cosmos_curator.next.recipes.video_cut.config import (
 )
 from cosmos_curator.next.recipes.video_cut.contracts import SOURCE_SCHEMA, make_source_id, make_span_id
 from cosmos_curator.next.recipes.video_cut.discovery import discover_items
+from cosmos_curator.next.utils import source_objects
 from tests.cosmos_curator.next.recipes.video_cut.conftest import SOURCE_URIS
 
 _URI = "s3://test-bucket/source.mp4"
@@ -172,7 +174,9 @@ def test_download_failure_classification(code: str, monkeypatch: pytest.MonkeyPa
     """Missing or archived objects are terminal, as in fixed-stride; environment failures propagate."""
     error = ClientError({"Error": {"Code": code}}, "GetObject")
     monkeypatch.setattr(transnetv2, "download_bytes", Mock(side_effect=error))
-    monkeypatch.setattr(sources, "s3_client", lambda _: SimpleNamespace(s3=SimpleNamespace(head_bucket=lambda **_: {})))
+    monkeypatch.setattr(
+        source_objects, "s3_client", lambda _: SimpleNamespace(s3=SimpleNamespace(head_bucket=lambda **_: {}))
+    )
     downloader = transnetv2.SourceDownloader(storage_profile="default")
     source = {"source_id": make_source_id(_URI), "source_uri": _URI}
     if terminal:

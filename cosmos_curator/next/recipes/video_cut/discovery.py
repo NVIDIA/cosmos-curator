@@ -8,7 +8,7 @@ import pyarrow as pa
 from cosmos_curator.core.utils.storage.s3_client import S3Prefix
 from cosmos_curator.next.recipes.video_cut.config import InputConfig, ResolvedVideoCutConfig
 from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id
-from cosmos_curator.next.recipes.video_cut.sources import s3_client
+from cosmos_curator.next.utils.source_objects import s3_client
 from cosmos_curator.next.utils.uris import normalize_s3_uri
 
 

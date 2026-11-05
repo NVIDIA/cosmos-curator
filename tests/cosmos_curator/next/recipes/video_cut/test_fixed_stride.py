@@ -14,10 +14,12 @@ import pytest
 from botocore.exceptions import ClientError
 
 from cosmos_curator.next.media import ffmpeg
-from cosmos_curator.next.media.ffmpeg import InvalidMediaError, ProbeError, UnsupportedMediaError, VideoMetadata
-from cosmos_curator.next.recipes.video_cut import fixed_stride, pipeline, sources
+from cosmos_curator.next.media.failures import InvalidMediaError, MediaError, ProbeError, UnsupportedMediaError
+from cosmos_curator.next.media.ffmpeg import VideoMetadata
+from cosmos_curator.next.recipes.video_cut import fixed_stride, pipeline
 from cosmos_curator.next.recipes.video_cut.config import ResolvedVideoCutConfig, resolve_config_data
 from cosmos_curator.next.recipes.video_cut.contracts import INPUT_SCHEMA, make_source_id
+from cosmos_curator.next.utils import source_objects
 from tests.cosmos_curator.next.recipes.video_cut.conftest import probed_source
 
 _URI = "s3://test-bucket/source.mp4"
@@ -133,7 +135,7 @@ def test_bad_media_is_terminal_but_empty_plans_are_successful(
     config: ResolvedVideoCutConfig,
     downloads: list[Path],
     monkeypatch: pytest.MonkeyPatch,
-    error_type: type[ffmpeg.MediaError],
+    error_type: type[MediaError],
 ) -> None:
     """A local probe's media error finishes the source; a short source is a successful empty plan."""
 
@@ -198,7 +200,7 @@ def test_only_unreadable_objects_are_terminal(
         download_to_path=fail,
     )
     monkeypatch.setattr(fixed_stride, "s3_client", lambda _: client)
-    monkeypatch.setattr(sources, "s3_client", lambda _: client)
+    monkeypatch.setattr(source_objects, "s3_client", lambda _: client)
     monkeypatch.setattr(fixed_stride, "probe_video_source", inconclusive)
     if terminal:
         row = _cut(config)

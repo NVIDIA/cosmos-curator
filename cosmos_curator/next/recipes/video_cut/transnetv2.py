@@ -28,7 +28,8 @@ from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.models.registry import resolve_registered_model
 from cosmos_curator.models.transnetv2 import predict_transitions
 from cosmos_curator.next.core.ray_autoscaling import configure_download_actor_autoscaling
-from cosmos_curator.next.media.ffmpeg import InvalidMediaError, MediaError, probe_video_path
+from cosmos_curator.next.media.failures import InvalidMediaError, MediaError
+from cosmos_curator.next.media.ffmpeg import probe_video_path
 from cosmos_curator.next.media.spans import Span, fixed_stride_spans, seconds_to_nanoseconds
 from cosmos_curator.next.recipes.video_cut.config import ExecutionConfig, ResolvedVideoCutConfig, TransNetV2Config
 from cosmos_curator.next.recipes.video_cut.contracts import (

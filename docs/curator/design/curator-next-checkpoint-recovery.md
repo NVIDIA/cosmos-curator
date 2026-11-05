@@ -7,8 +7,9 @@ work.
 
 The shared implementation covers two kinds of publication. **Enrichment** fills a recipe's owned columns on existing
 Lance rows, one whole fragment at a time; `video-transcode`, `video-embed`, and `video-caption` use it. **Append** adds
-a producer's rows to a Lance table it owns; `video-cut` uses it. [The shared model](#the-shared-model) describes what
-both kinds share: assumptions, run sequence, workspaces, failure handling, and summaries. [Enrichment
+a producer's rows to a Lance table it owns; `video-cut` and `robot-action-split` use it. [The shared
+model](#the-shared-model) describes what both kinds share: assumptions, run sequence, workspaces, failure handling, and
+summaries. [Enrichment
 publication](#enrichment-publication) and [append publication](#append-publication) each describe only what their kind
 adds, including an adoption example. Other recipes migrate explicitly; see
 [Expansion across Curator Next](#expansion-across-curator-next).
@@ -457,8 +458,9 @@ scope, expansion, packed fragment writes, atomic publication, and cleanup.
 - `owner` names the recipe. `result_contract` holds result-defining settings, excluding execution tuning.
 - `validate_batch` validates terminal results. `expand` sees all results, including errors, and must produce at least
   one row per item. It may yield several Arrow tables to bound expansion memory.
-- Optional `error_column` is a nullable string field in both results and output. Publication counts non-null errors;
-  the recipe's expansion preserves the error and diagnostic fields in the canonical table.
+- Optional `error_column` is a nullable string field in both results and output. Publication counts items whose
+  result has a non-null error; the recipe's expansion preserves the error and diagnostic fields in the canonical
+  table, on one outcome row or on each of several rows a failed item expands to.
 
 One staged result per item prevents a checkpoint from advancing after only part of its output is durable. Expansion
 happens during publication. Empty results and terminal errors must never disappear during expansion.
@@ -676,18 +678,22 @@ a recipe's data contract justifies it. Their current behaviors:
 
 - Mp4-index records classified failures in a queryable `errors.lance` table and skips them on later runs, except
   `FileNotFoundError` or with `execution.skip_known_failures=false`.
-- Multimodal-split and robot-action-split record item failures, publish the rest, and retry failures on the next run.
-- Mp4-index and robot-action-split make rows visible as work completes, not once per selection.
+- Multimodal-split records item failures, publishes the rest, and retries failures on the next run.
+- Mp4-index makes rows visible as work completes, not once per selection.
 
 These structural differences need a decision before copying video-cut:
 
 - **Work item.** Multimodal-split discovers sessions but publishes and retries episodes, which exist only after
   planning. With sessions as work items, episodes dropped while splitting a published session are not retried in that
   output.
-- **Discovered fields.** Robot-action-split's discovered fields include floats and a list of floats, which the scalar
-  item schema rejects. It also groups clips by source chunk so each chunk downloads once.
 - **Result size.** Mp4-index rows can be very large, since the per-frame list grows with duration, while fragment and
   validation sizes count rows, not bytes.
+
+[Robot-action-split](curator-next-robot-action-split.md) has migrated. Its work item is one source chunk, so each chunk
+downloads once; the chunk's discovered spans, whose fields include floats and a list of floats, travel as one JSON
+string, which satisfies the scalar item schema. A chunk stages one result listing its clips, and expansion writes one
+row per clip, successful or failed. A chunk that fails as a whole sets `error_column` on its result and on every clip
+row, so `errors` counts failed chunks.
 
 ## Expansion across Curator Next
 
@@ -711,8 +717,7 @@ two-phase engine that video-caption owned before its migration,
 [`caption_fragment_recovery`](../../../cosmos_curator/next/legacy/caption_fragment_recovery/__init__.py), which stages
 Parquet. Multimodal-caption also publishes through it, one fragment per commit, while multimodal-embedding uses its own
 atomic publisher. Multimodal-caption's whole-fragment, `episode_id`-checkpointed enrichment is the closest fit; the
-engine retires once both migrate. Mp4-index, multimodal-split, and
-robot-action-split still append through the deprecated
+engine retires once both migrate. Mp4-index and multimodal-split still append through the deprecated
 [`lance_fragment_recovery`](../../../cosmos_curator/next/utils/lance_fragment_recovery.py), which retires once they
 migrate to append publication. They append rows in bounded fragments as work completes and treat row presence in the
 table as their progress record. Migrating means checkpointing one result per work item, representing empty outcomes and
@@ -754,9 +759,11 @@ step to run exactly once per ID. Finally, it runs the recipe's own `run_config`,
 once, and remove the workspace. The
 [transcode](../../../tests/cosmos_curator/next/recipes/video_transcode/test_ray_checkpoint.py),
 [embedding](../../../tests/cosmos_curator/next/recipes/video_embed/test_ray_pipeline.py),
-[caption](../../../tests/cosmos_curator/next/recipes/video_caption/test_ray_pipeline.py), and cut
+[caption](../../../tests/cosmos_curator/next/recipes/video_caption/test_ray_pipeline.py), cut
 ([fixed-stride](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_recovery.py),
-[TransNetV2](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_transnetv2.py)) tests show the stand-ins.
+[TransNetV2](../../../tests/cosmos_curator/next/recipes/video_cut/test_ray_transnetv2.py)), and
+[robot-action-split](../../../tests/cosmos_curator/next/recipes/robot_action_split/test_ray_recovery.py) tests show the
+stand-ins.
 
 Each migration must document how it satisfies the [assumptions above](#assumptions-and-guarantees) and demonstrate that
 clean and resumed runs produce the same visible logical records and payload references. Exercise the failure boundaries,

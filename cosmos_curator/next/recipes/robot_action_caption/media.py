@@ -20,7 +20,8 @@ import pyarrow as pa
 import pybase64
 from loguru import logger
 
-from cosmos_curator.next.media.ffmpeg import MediaError, probe_video_bytes
+from cosmos_curator.next.media.failures import MediaError
+from cosmos_curator.next.media.ffmpeg import probe_video_bytes
 from cosmos_curator.next.recipes.robot_action_caption.contracts import MEDIA_TYPE
 from cosmos_curator.next.recipes.robot_action_caption.datasource import SCAN_SCHEMA
 from cosmos_curator.next.recipes.robot_action_caption.table import CLIP_ID_COLUMN, CLIP_URI_COLUMN

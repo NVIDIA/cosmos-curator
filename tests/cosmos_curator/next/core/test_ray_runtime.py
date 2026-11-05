@@ -12,9 +12,11 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from ray._common.retry import format_exception, matches_error
 
 from cosmos_curator.core.utils import environment
 from cosmos_curator.next.core import ray_runtime
+from cosmos_curator.next.media import failures
 
 
 def test_stability_configuration_preserves_high_memory_detector_by_default(
@@ -35,6 +37,22 @@ def test_stability_configuration_preserves_high_memory_detector_by_default(
     assert high_memory_detector_config.detection_time_interval_s == 30
     assert "ProbeError" in context.retried_map_errors
     assert context.max_map_retries == 3
+
+
+@pytest.mark.parametrize(
+    ("error", "retried"),
+    [
+        (failures.ProbeError("FFprobe timed out"), True),
+        (failures.FFmpegRunError("ffmpeg was killed by signal 9"), True),
+        (failures.InvalidMediaError("invalid data"), False),
+        (failures.UnsupportedMediaError("no video stream"), False),
+        (failures.CutError("wrote 3/4 frames"), False),
+    ],
+)
+def test_ray_retries_exactly_the_inconclusive_media_failures(error: Exception, *, retried: bool) -> None:
+    """Ray matches the raised class's own name, so retryable media failures must be named, terminal ones never."""
+    formatted = format_exception(error)
+    assert any(matches_error(pattern, formatted) for pattern in ray_runtime._MAP_RETRY_PATTERNS) is retried
 
 
 def test_stability_configuration_can_disable_expected_video_memory_warnings(

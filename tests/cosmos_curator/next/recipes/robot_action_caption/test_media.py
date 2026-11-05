@@ -39,7 +39,7 @@ import pyarrow as pa
 import pytest
 from loguru import logger
 
-from cosmos_curator.next.media import ffmpeg
+from cosmos_curator.next.media import failures
 from cosmos_curator.next.recipes.robot_action_caption import media
 from cosmos_curator.next.recipes.robot_action_caption.datasource import (
     CHECKPOINT_ID_COLUMN,
@@ -599,7 +599,7 @@ def test_a_probe_fault_exposes_only_the_stable_clip_id(
     leaked = "moov atom not found\nforged-warning"
 
     def raise_probe_fault(_data: bytes) -> object:
-        raise ffmpeg.InvalidMediaError(leaked)
+        raise failures.InvalidMediaError(leaked)
 
     monkeypatch.setattr(media, "probe_video_bytes", raise_probe_fault)
     warnings: list[str] = []
@@ -631,11 +631,11 @@ def test_an_inconclusive_probe_failure_fails_the_attempt(
 
     def raise_probe_fault(_data: bytes) -> object:
         message = "FFprobe timed out"
-        raise ffmpeg.ProbeError(message)
+        raise failures.ProbeError(message)
 
     monkeypatch.setattr(media, "probe_video_bytes", raise_probe_fault)
 
-    with pytest.raises(ffmpeg.ProbeError, match="FFprobe timed out"):
+    with pytest.raises(failures.ProbeError, match="FFprobe timed out"):
         media_fetch()(scanned_batch(str(clip)))
 
 

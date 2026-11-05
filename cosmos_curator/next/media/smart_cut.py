@@ -53,16 +53,49 @@ import re
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import IO, Any
 
 from loguru import logger
 
+from cosmos_curator.next.media.failures import (
+    CutError,
+    FFmpegRunError,
+    InvalidMediaError,
+    MediaError,
+    ProbeError,
+    UnsupportedMediaError,
+)
+from cosmos_curator.next.media.ffmpeg import probe_video_source
+
 _DEFAULT_BITRATE = "2M"
 _PROBE_TIMEOUT_S = 600
 _CUT_TIMEOUT_S = 600
 _PROBE_RETRIES = 2
+
+
+def _probe_failure(
+    source: str, result: subprocess.CompletedProcess[str], message: str
+) -> InvalidMediaError | ProbeError:
+    """Classify a failed probe with the shared FFprobe contract, never from its stderr.
+
+    The source's structured FFprobe error decides: only invalid data in a complete
+    local source is a ``MediaError``. Anything else is an inconclusive ``ProbeError``,
+    including a source that probes cleanly and one that misses the transcode metadata
+    contract (duration, frame rate, size), which cutting does not use and which says
+    nothing about why this probe failed.
+    """
+    detail = f"{message}: {(result.stderr or '').strip()[-300:]}"
+    try:
+        probe_video_source(source, timeout_s=_PROBE_TIMEOUT_S)
+    except InvalidMediaError as exc:
+        return InvalidMediaError(f"{detail} ({exc})")
+    except (MediaError, ProbeError):
+        pass
+    return ProbeError(detail)
+
 
 # Layouts where ONE packet is guaranteed to be exactly ONE displayed frame, so the packet-derived
 # index is the frame index and the (decoding, therefore expensive) cardinality check can be skipped.
@@ -144,7 +177,7 @@ def _ffprobe(args: list[str]) -> subprocess.CompletedProcess[str]:
     # Retry a failed probe a couple of times: probes read the source (possibly over a
     # network mount / S3, or sharing a node's disk/CPU with other concurrent probes), so
     # a transient blip -- a nonzero return *or* a timeout -- should not fail the whole
-    # chunk outright. Only a timeout that persists across every retry propagates.
+    # chunk outright. Only a timeout that persists across every retry propagates, as a ProbeError.
     cmd = ["ffprobe", "-v", "error", *args]
     attempt = 1
     while True:
@@ -152,9 +185,10 @@ def _ffprobe(args: list[str]) -> subprocess.CompletedProcess[str]:
             result = subprocess.run(  # noqa: S603
                 cmd, capture_output=True, text=True, check=False, timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             if attempt > _PROBE_RETRIES:
-                raise
+                msg = f"ffprobe timed out after {exc.timeout}s"
+                raise ProbeError(msg) from exc
             time.sleep(0.5 * attempt)
             attempt += 1
             continue
@@ -229,13 +263,12 @@ def _displayed_frame_count(source: str) -> int:
          "-of", "default=nw=1:nk=1", source]
     )  # fmt: skip
     if r.returncode != 0:
-        msg = f"displayed-frame probe failed for {source!r}: {r.stderr.strip()[-300:]}"
-        raise ValueError(msg)
+        raise _probe_failure(source, r, f"displayed-frame probe failed for {source!r}")
     lines = r.stdout.strip().splitlines()
     val = lines[0].strip() if lines else ""
     if not val.isdigit():
         msg = f"{source!r}: ffprobe reported no displayed frame count ({val!r})"
-        raise ValueError(msg)
+        raise ProbeError(msg)
     return int(val)
 
 
@@ -256,9 +289,7 @@ def _prefix_packet_and_frame_counts(source: str, seconds: int) -> tuple[int, int
          "-show_entries", "frame=pts", "-of", "csv=p=0", source]
     )  # fmt: skip
     if pk.returncode != 0 or fr.returncode != 0:
-        err = (pk.stderr or fr.stderr or "").strip()[-300:]
-        msg = f"prefix index probe failed for {source!r}: {err}"
-        raise ValueError(msg)
+        raise _probe_failure(source, pk if pk.returncode != 0 else fr, f"prefix index probe failed for {source!r}")
     # Only the FIRST csv field is the flags string: some containers append side-data columns
     # (MPEG-TS emits "K__,MPEGTS Stream ID,224"), and matching "D" against the whole line would
     # treat the "ID" in that label as a DISCARD flag and drop almost every packet.
@@ -300,8 +331,9 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
       * ``always`` -- decode the WHOLE file and compare (CI and per-dataset audits);
       * ``never`` -- trust the packet index (only for a layout already verified).
 
-    A mismatch raises: no cut mode is safe against a bad index, so ``cut_plan`` propagates it
-    and the caller skips the whole chunk rather than emit silently shifted clips.
+    A mismatch raises ``UnsupportedMediaError``: no cut mode is safe against a bad index, so
+    ``cut_plan`` propagates it and the caller fails the whole source rather than emit silently
+    shifted clips.
 
     Stream-copy is enabled only when the source is all-intra AND packets are already in
     presentation order (no B-frame reordering), so copying packets in file order yields
@@ -315,28 +347,27 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
          "stream=time_base,codec_name,field_order:format=format_name", "-of", "json", source]
     )  # fmt: skip
     if meta.returncode != 0:
-        msg = f"ffprobe failed for {source!r}: {meta.stderr.strip()[-300:]}"
-        raise ValueError(msg)
+        raise _probe_failure(source, meta, f"ffprobe failed for {source!r}")
     try:
         meta_json = json.loads(meta.stdout or "{}")
     except json.JSONDecodeError as e:
         msg = f"ffprobe returned unparsable metadata for {source!r}: {e}"
-        raise ValueError(msg) from e
+        raise ProbeError(msg) from e
     # Containers that expose a "program" (MPEG-TS/HLS) make ffprobe emit the stream twice; the
     # entries are identical, so take the first.
     streams = meta_json.get("streams") or []
     if not streams:
         msg = f"{source!r} has no video stream"
-        raise ValueError(msg)
+        raise UnsupportedMediaError(msg)
     stream0 = streams[0]
     tb_val = str(stream0.get("time_base") or "").strip()
     if "/" not in tb_val:
         msg = f"{source!r} has no usable time_base ({tb_val!r})"
-        raise ValueError(msg)
+        raise UnsupportedMediaError(msg)
     num, den = (int(x) for x in tb_val.split("/", 1))
     if num <= 0 or den <= 0:
         msg = f"{source!r} has non-positive time_base {num}/{den}"
-        raise ValueError(msg)
+        raise UnsupportedMediaError(msg)
     codec_name = str(stream0.get("codec_name") or "")
     field_order = str(stream0.get("field_order") or "")
     format_name = str((meta_json.get("format") or {}).get("format_name") or "")
@@ -345,9 +376,12 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         ["-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts,flags", "-of", "json", source]
     )
     if pk.returncode != 0:
-        msg = f"packet index probe failed for {source!r}: {pk.stderr.strip()[-300:]}"
-        raise ValueError(msg)
-    packets = json.loads(pk.stdout).get("packets", [])
+        raise _probe_failure(source, pk, f"packet index probe failed for {source!r}")
+    try:
+        packets = json.loads(pk.stdout).get("packets", [])
+    except json.JSONDecodeError as e:
+        msg = f"ffprobe returned an unparsable packet index for {source!r}: {e}"
+        raise ProbeError(msg) from e
     file_pts: list[int] = []
     keyframe_rows: list[int] = []
     all_intra = True
@@ -361,7 +395,7 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         val = p.get("pts")
         if val in (None, "N/A"):
             msg = f"{source!r} packet {row} has no pts"
-            raise ValueError(msg)
+            raise UnsupportedMediaError(msg)
         if "K" in flags:
             keyframe_rows.append(len(file_pts))  # this frame's index in file/decode order
         else:
@@ -369,7 +403,7 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         file_pts.append(int(val))
     if not file_pts:
         msg = f"{source!r} produced an empty packet index"
-        raise ValueError(msg)
+        raise UnsupportedMediaError(msg)
 
     file_monotonic = all(file_pts[i] > file_pts[i - 1] for i in range(1, len(file_pts)))
     pts = sorted(file_pts)
@@ -396,14 +430,25 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
             f"({codec_name or '?'} in {format_name or '?'}); every cut would be content-shifted "
             f"while still producing the requested frame count"
         )
-        raise ValueError(msg)
+        raise UnsupportedMediaError(msg)
+
+    # A decode that yields no frames at all says the decoder is missing or failed, not that the
+    # packets are not frames: ffprobe exits 0 either way, so only a nonzero count is evidence.
+    def _no_frames_decoded(n_pkts: int, scope: str) -> None:
+        decoder = codec_name or "?"
+        msg = f"{source!r}: decoding {n_pkts} packet(s) {scope} yielded no frames ({decoder} decoder unavailable?)"
+        raise ProbeError(msg)
 
     if verify_index == "always":
         displayed = _displayed_frame_count(source)
+        if displayed == 0:
+            _no_frames_decoded(len(pts), "over the whole file")
         if displayed != len(pts):
             _reject(len(pts), displayed, "over the whole file")
     elif verify_index == "auto" and not _is_one_packet_per_frame(codec_name, field_order, format_name):
         n_pk, n_fr = _prefix_packet_and_frame_counts(source, _PREFIX_VERIFY_SECONDS)
+        if n_fr == 0 and n_pk > 0:
+            _no_frames_decoded(n_pk, f"in the first {_PREFIX_VERIFY_SECONDS}s")
         if n_pk != n_fr:
             _reject(n_pk, n_fr, f"in the first {_PREFIX_VERIFY_SECONDS}s")
     return _Index(
@@ -521,13 +566,18 @@ def _output_frame_count(path: str) -> int:
 
 
 def _run_ff(cmd: list[str], errf: IO[bytes]) -> bool:
-    """Run an ffmpeg/ffprobe command, capturing stderr to *errf*. True iff exit code 0."""
-    return (
-        subprocess.run(  # noqa: S603
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errf, timeout=_CUT_TIMEOUT_S, check=False
-        ).returncode
-        == 0
-    )
+    """Run an ffmpeg/ffprobe command, capturing stderr to *errf*. True iff exit code 0.
+
+    Raises ``FFmpegRunError`` when a signal ended the run: the machine stopped it,
+    so no fallback encode should be attempted and the cut is not judged on its output.
+    """
+    returncode = subprocess.run(  # noqa: S603
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errf, timeout=_CUT_TIMEOUT_S, check=False
+    ).returncode
+    if returncode < 0:
+        msg = f"{Path(cmd[0]).name} was killed by signal {-returncode}"
+        raise FFmpegRunError(msg)
+    return returncode == 0
 
 
 def _error_tail(errf: IO[bytes], limit: int = 600) -> str:
@@ -542,13 +592,8 @@ def _error_tail(errf: IO[bytes], limit: int = 600) -> str:
     return "\n".join(line for line in text.splitlines() if "showinfo@source" not in line).strip()[-limit:]
 
 
-def _selected_source_pts_match(errf: IO[bytes], log_start: int, expected_pts: list[int]) -> bool:
-    """Verify the decoded frames' source PTS before lossy encoding and the timestamp reset.
-
-    A wrong-but-same-length selection passes every frame count and timestamp check, so identity
-    has to be confirmed while the source PTS are still observable -- which is what the showinfo
-    pass in :func:`_encode_cmd` logs.
-    """
+def _logged_source_pts(errf: IO[bytes], log_start: int) -> list[int]:
+    """Return the source PTS the showinfo pass in :func:`_encode_cmd` logged since *log_start*."""
     errf.seek(log_start)
     selected: list[int] = []
     for line in errf:
@@ -557,7 +602,17 @@ def _selected_source_pts_match(errf: IO[bytes], log_start: int, expected_pts: li
             if m is not None:
                 selected.append(int(m.group(1)))
     errf.seek(0, 2)
-    return selected == expected_pts
+    return selected
+
+
+def _selected_source_pts_match(errf: IO[bytes], log_start: int, expected_pts: list[int]) -> bool:
+    """Verify the decoded frames' source PTS before lossy encoding and the timestamp reset.
+
+    A wrong-but-same-length selection passes every frame count and timestamp check, so identity
+    has to be confirmed while the source PTS are still observable -- which is what the showinfo
+    pass in :func:`_encode_cmd` logs.
+    """
+    return _logged_source_pts(errf, log_start) == expected_pts
 
 
 def _run_encode(  # noqa: PLR0913
@@ -572,13 +627,20 @@ def _run_encode(  # noqa: PLR0913
     *,
     gpu: bool = False,
 ) -> bool:
-    """Re-encode [start, start+nframes-1], rejecting the run if the wrong frames were selected."""
+    """Re-encode [start, start+nframes-1]; True iff ffmpeg exited cleanly.
+
+    Raises ``CutError`` when the run selected other source frames than requested, and
+    ``FFmpegRunError`` when it logged none, which leaves the selection unobserved.
+    """
     log_start = errf.tell()
     if not _run_ff(_encode_cmd(source, output, index, start, nframes, bitrate, threads, gpu=gpu), errf):
         return False
+    if not _logged_source_pts(errf, log_start):
+        msg = "ffmpeg logged no decoded source frames, so the selection could not be verified"
+        raise FFmpegRunError(msg)
     if not _selected_source_pts_match(errf, log_start, index.pts[start : start + nframes]):
-        errf.write(b"\nDecoded source PTS do not match the requested frame range\n")
-        return False
+        msg = "decoded source PTS do not match the requested frame range"
+        raise CutError(msg)
     return True
 
 
@@ -610,7 +672,11 @@ def _smartcut(  # noqa: PLR0913
         body = str(Path(_tmpdir) / "body.mp4")
         lst = str(Path(_tmpdir) / "concat.txt")
         # Head: re-encode [start, kf-1], decoding from an earlier keyframe and selecting by PTS.
-        if not _run_encode(source, head, index, start, kf - start, bitrate, threads, errf, gpu=gpu):
+        # A wrong head selection is judged by the full re-encode fallback, not here.
+        try:
+            if not _run_encode(source, head, index, start, kf - start, bitrate, threads, errf, gpu=gpu):
+                return False
+        except CutError:
             return False
         # Body: stream-copy [kf, end]. kf is a keyframe, so +0.25 tick lands exactly on it.
         body_ss = _seconds(index.pts[kf] + 0.25, index.num, index.den)
@@ -631,7 +697,7 @@ def _smartcut(  # noqa: PLR0913
         return _run_ff(concat_cmd, errf)
 
 
-def _cut_one(  # noqa: C901, PLR0912, PLR0913
+def _cut_one(  # noqa: C901, PLR0911, PLR0912, PLR0913
     source: str,
     cut: dict[str, Any],
     index: _Index,
@@ -652,23 +718,29 @@ def _cut_one(  # noqa: C901, PLR0912, PLR0913
         "success": False,
         "error": None,
         "mode": None,
+        "failure": None,
     }
-    if end >= len(index):
-        rec["error"] = f"endFrame {end} beyond source length {len(index)}"
+
+    def failed(failure: Exception) -> dict[str, Any]:
+        rec["failure"] = failure
+        rec["error"] = str(failure)
         return rec
+
+    if end >= len(index):
+        return failed(CutError(f"endFrame {end} beyond source length {len(index)}"))
 
     start_pts = index.pts[start]
     if start_pts < 0:
         # Input -ss cannot seek to a negative timestamp (ffmpeg clamps it to 0), which
         # would silently cut the wrong frames. Fail this cut rather than mis-cut it.
-        rec["error"] = f"start frame {start} has negative PTS {start_pts}; cannot seek accurately"
-        return rec
+        return failed(CutError(f"start frame {start} has negative PTS {start_pts}; cannot seek accurately"))
     pts = index.pts
     if (start > 0 and pts[start] == pts[start - 1]) or (start + 1 < len(pts) and pts[start] == pts[start + 1]):
         # A duplicated (non-unique) start PTS makes the -ss seek ambiguous: it would
         # silently shift the clip while keeping the right frame count. Fail it instead.
-        rec["error"] = f"start frame {start} has an ambiguous (duplicated) PTS {start_pts}; cannot seek accurately"
-        return rec
+        return failed(
+            CutError(f"start frame {start} has an ambiguous (duplicated) PTS {start_pts}; cannot seek accurately")
+        )
 
     use_copy = allow_stream_copy and index.stream_copy_safe
     # Smart-cut candidate keyframe: the first keyframe at/after start (only when enabled + safe).
@@ -711,18 +783,21 @@ def _cut_one(  # noqa: C901, PLR0912, PLR0913
             rec["mode"] = "encode"
             # Decode from an earlier keyframe and select [start, end] by integer source PTS.
             if not _run_encode(source, output, index, start, expected, bitrate, threads, errf, gpu=gpu):
-                rec["error"] = f"ffmpeg re-encode failed: {_error_tail(errf)}"
-                return rec
+                # ffmpeg gives no structured cause, so a failed run proves nothing about the media.
+                return failed(FFmpegRunError(f"ffmpeg re-encode failed: {_error_tail(errf)}"))
             rec["written_frames"] = _output_frame_count(output)
+            if rec["written_frames"] < 0:
+                return failed(FFmpegRunError(f"could not count the frames written to {output!r}"))
             if rec["written_frames"] != expected:
-                rec["error"] = f"wrote {rec['written_frames']}/{expected} frames"
-            else:
-                rec["success"] = True
+                return failed(CutError(f"wrote {rec['written_frames']}/{expected} frames"))
+            rec["success"] = True
     except subprocess.TimeoutExpired:
-        rec["error"] = "ffmpeg/ffprobe timed out"
+        return failed(FFmpegRunError("ffmpeg/ffprobe timed out"))
+    except (CutError, FFmpegRunError, ProbeError) as e:
+        return failed(e)
     except OSError as e:
         # A per-cut failure (e.g. unwritable output dir / temp file) is isolated to this cut.
-        rec["error"] = f"failed to run cut: {e}"
+        return failed(FFmpegRunError(f"failed to run cut: {e}"))
     return rec
 
 
@@ -738,15 +813,23 @@ def cut_plan(  # noqa: C901, PLR0913
     verify_index: str = "auto",
     gpu: bool = False,
     tmp_dir: str | None = None,
+    on_cut: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Cut every range in *cuts* from *source*, one independent ffmpeg per cut.
 
     Each cut fast-seeks to its exact start PTS and stream-copies (all-intra source) or
     re-encodes with libopenh264 (CPU) or h264_nvenc (GPU, when *gpu* is True) at the
     given *bitrate*. Returns one record per cut:
-    ``{"output", "expected_frames", "written_frames", "success", "error", "mode"}``;
+    ``{"output", "expected_frames", "written_frames", "success", "error", "mode", "failure"}``;
     ``success`` is True only when the exact requested frame count was produced. A per-cut
-    failure is isolated to that cut.
+    failure is isolated to that cut, and ``failure`` holds it under the shared media failure
+    contract: a ``CutError`` when the source cannot yield the cut's exact frames, otherwise an
+    inconclusive ``FFmpegRunError`` or ``ProbeError`` -- a timeout, an OS error such as a full
+    disk, a killed or failed ffmpeg, or an output that could not be counted -- that a retry
+    may resolve. ``error`` is its message.
+
+    ``on_cut``, when given, receives each record as soon as its cut finishes, on the worker
+    thread that ran it, so a caller can consume and remove each output while later cuts run.
 
     ``workers`` runs that many cuts concurrently; ``threads`` caps each ffmpeg's threads
     (default 1 each -> minimal per-worker CPU/RAM, for packing many pipeline workers).
@@ -755,8 +838,9 @@ def cut_plan(  # noqa: C901, PLR0913
     check on *source* (see :func:`_probe_index`); a violation raises rather than silently
     shifting every cut from this source.
 
-    Raises ``ValueError`` for an invalid/duplicate cut, an unreadable source, or a source
-    whose packet index is not a frame index.
+    Raises ``ValueError`` or ``TypeError`` for an invalid or duplicate cut; a ``MediaError``
+    when the source is invalid or its packet index is not a frame index; and a ``ProbeError``
+    when the index probe failed without establishing either.
     """
     if not cuts:
         return []
@@ -786,7 +870,7 @@ def cut_plan(  # noqa: C901, PLR0913
     index = _probe_index(source, verify_index=verify_index)
 
     def run(c: dict[str, Any]) -> dict[str, Any]:
-        return _cut_one(
+        rec = _cut_one(
             source,
             c,
             index,
@@ -797,6 +881,9 @@ def cut_plan(  # noqa: C901, PLR0913
             gpu=gpu,
             tmp_dir=tmp_dir,
         )
+        if on_cut is not None:
+            on_cut(rec)
+        return rec
 
     if workers <= 1:
         return [run(c) for c in cuts]
@@ -865,7 +952,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_stream_copy=not args.no_stream_copy,
             verify_index=args.verify_index,
         )
-    except (ValueError, OSError, subprocess.SubprocessError):
+    except (ValueError, OSError, RuntimeError):
         logger.exception("cannot run plan")
         return 1
 

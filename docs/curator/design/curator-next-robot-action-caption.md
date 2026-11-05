@@ -482,10 +482,13 @@ Foreign or missing digests remain **latest contract wins**: they are re-owed
 exactly as before, so a contract change recaptions every row in the configured
 scope instead of silently mixing semantics within that scope.
 
-The public helper then intersects that pending definition with
+The public helper first requires `clip_uri IS NOT NULL`, in every scope:
+`robot-action-split` keeps a row for each clip it could not produce, with a null
+`clip_uri` and its `error_stage`, and such a row has nothing to caption. It then
+intersects that owed definition with
 `curate_selection_reason = 'selected'` when `input.selected_only` is true.
 Lance's three-valued logic naturally excludes NULL as well as every non-selected
-Curate verdict. When the switch is false, the helper returns the pending half
+Curate verdict. When the switch is false, the helper returns the owed rows
 unchanged. The column and selected value are local read-contract constants in
 the caption recipe: captioning consumes persisted table data and does not import
 the Curate recipe at runtime.
@@ -1783,8 +1786,10 @@ The same determinism argument drives the retry policy: a decode failure or a
 size violation cannot change on a second read, so retrying it only multiplies
 the wasted transfer.
 
-A **null `clip_uri`** is named as its own cause rather than handed to the reader.
-Rendering a null location into a string yields `"None"`, which the reader then
+A **null `clip_uri`** never reaches the media stage through the work filter,
+which owes only rows with a clip; the refusal below is a backstop for a row that
+arrives some other way. Such a row is named as its own cause rather than handed
+to the reader. Rendering a null location into a string yields `"None"`, which the reader then
 refuses as a missing local object — and the published `media object is missing:
 None` would equally describe a clip really named `None`. Instead the row carries
 the fixed diagnostic `clip_uri is null: the source row names no media location`,
@@ -2513,8 +2518,8 @@ diagnosable from them alone, without reconstructing any of it from source.
   scan tasks, and the largest fragment bounds one source task's scan tail. It no
   longer determines the media task count; lightweight rows are split into
   bounded execution blocks before fetch. Here the fragments are even — 8,000
-  rows apiece, the `clips_per_publish_batch` default the producing split run
-  wrote at, plus a short remainder. The distribution remains useful because the
+  rows apiece, the `execution.rows_per_fragment` default the producing split
+  run wrote at, plus a short remainder. The distribution remains useful because the
   maximum and the mean can diverge, exposing source-scan skew even though fetch
   work is independently partitioned. Summarised from manifest metadata by
   [`report_table_shape`](../../../cosmos_curator/next/utils/lance_utils.py),

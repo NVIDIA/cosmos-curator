@@ -13,7 +13,8 @@ import pytest
 from cosmos_curator.core.utils.misc import retry_utils
 from cosmos_curator.next.enrichment import inputs
 from cosmos_curator.next.enrichment.execution import selection_datasource
-from cosmos_curator.next.media.ffmpeg import ProbeError, TranscodeError, VideoMetadata
+from cosmos_curator.next.media.failures import ProbeError
+from cosmos_curator.next.media.ffmpeg import TranscodeError, VideoMetadata
 from cosmos_curator.next.recipes.video_transcode import processing
 from cosmos_curator.next.recipes.video_transcode.config import ResolvedVideoTranscodeConfig
 from cosmos_curator.next.recipes.video_transcode.contracts import CLIP_FIELDS, READ_COLUMNS

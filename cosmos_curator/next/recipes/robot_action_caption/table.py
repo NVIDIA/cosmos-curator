@@ -294,8 +294,7 @@ def _pending_filter(digest: str, model_id: str) -> str:
     # double-quoted name parses as a STRING LITERAL, which silently compares two
     # constants and matches every row instead of raising.
     #
-    # `!=` rather than `<>` because `!=` is the spelling already proven against
-    # `count_rows(filter=...)` on this surface in `robot_action_split/recovery.py`.
+    # `!=` rather than `<>`: the spelling the Lance filter surface is known to accept here.
     #
     # `regexp_like(..., '\S')` is Lance's supported nonblank check. `trim` is not
     # accepted by its filter planner, while length alone treats whitespace as
@@ -316,15 +315,20 @@ def _pending_filter(digest: str, model_id: str) -> str:
 
 
 def caption_work_filter(digest: str, model_id: str, *, selected_only: bool) -> str:
-    """Return the SQL predicate selecting the rows this attempt owes."""
-    pending = _pending_filter(digest, model_id)
-    if not selected_only:
-        return pending
-    # Keep the identifier bare: Lance's scanner filter parser treats a
+    """Return the SQL predicate selecting the rows this attempt owes.
+
+    Only rows with a clip are owed. Robot-action-split keeps a row for every
+    clip it could not produce, with a null ``clip_uri`` and its ``error_stage``;
+    those rows have nothing to caption, in either scope.
+    """
+    # Keep identifiers bare: Lance's scanner filter parser treats a
     # double-quoted identifier as a string literal and silently matches the
     # wrong rows. Values still go through the shared SQL literal escaper.
+    owed = f"({CLIP_URI_COLUMN} IS NOT NULL AND {_pending_filter(digest, model_id)})"
+    if not selected_only:
+        return owed
     selected = sql_string_literal(CURATE_SELECTED_VALUE)
-    return f"({pending} AND {CURATE_SELECTION_REASON} = {selected})"
+    return f"({owed} AND {CURATE_SELECTION_REASON} = {selected})"
 
 
 def _caption_group_presence(dataset: lance.LanceDataset) -> _CaptionGroupPresence:

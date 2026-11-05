@@ -13,127 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end integration test for robot-action-split.
+"""End-to-end tests for robot-action-split over a synthetic dataset with a real all-intra MP4.
 
-Builds a minimal synthetic LeRobot/Mecka dataset on disk, runs the full
-discovery → cut → Lance write pipeline, and asserts correct outputs at
-each stage.
-
-Dataset layout created by this test
--------------------------------------
-
-  {tmp}/dataset/
-    meta/
-      info.json              fps=24, observation.images.main 64x64
-      subtasks.parquet       0="pick up coffee pod"  1="open machine lid"
-      tasks.parquet          0="make coffee"
-      episodes/
-        chunk-000/
-          file-000.parquet   episode_index, episode_id, videos/*/from_timestamp
-    data/
-      chunk-000/
-        file-000.parquet     200 frames: 100xsubtask0 + 100xsubtask1, with action data
-    videos/
-      observation.images.main/
-        chunk-000/
-          file-000.mp4       reuses tests/.../test_clip_10s.mp4 (24fps, 10s, 240 frames)
-
-Span geometry
--------------
-  - fps=24, frames 0-99 = subtask 0 (~4.2 s), frames 100-199 = subtask 1 (~4.2 s)
-  - episode_from_timestamp=0.0 so abs_start/abs_end = frame_start/end directly
-  - Both spans pass min_duration_s=4.0 and max_duration_s=20.0
+The dataset (see ``conftest.write_dataset``) holds one 24 fps episode of two
+subtasks, 100 frames each, recorded by one view: one chunk work item owing two
+clips. Real smart cuts run here, so these tests skip without libopenh264.
+Publication runs through ``run_config`` with the processing plan run in-process,
+except the integration test, which runs the real Ray Data plan.
 """
 
 import json
 import pickle
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import lance
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from cosmos_curator.next.recipes.robot_action_split.config import ResolvedRobotActionSplitConfig
-from cosmos_curator.next.recipes.robot_action_split.contracts import (
-    CLIP_RECORD_SCHEMA_VERSION,
-    MEDIA_CONTRACT_VERSION,
+from cosmos_curator.next.append.execution import ProcessingScope
+from cosmos_curator.next.recipes.robot_action_split import pipeline
+from cosmos_curator.next.recipes.robot_action_split.config import ResolvedRobotActionSplitConfig, resolve_config
+from cosmos_curator.next.recipes.robot_action_split.discovery import SpanWorkItem, discover_items, discover_spans
+from cosmos_curator.next.recipes.robot_action_split.processing import _build_sidecar_bytes, clip_fields, cut_chunks
+from tests.cosmos_curator.next.append.helpers import replace_ray, stage_results
+from tests.cosmos_curator.next.recipes.robot_action_split.conftest import (
+    FPS,
+    FRAMES_PER_SUBTASK,
+    SOURCE_TASK_DESCRIPTION,
+    TOTAL_FRAMES,
+    make_config,
+    write_dataset,
 )
-from cosmos_curator.next.recipes.robot_action_split.discovery import SpanWorkItem, discover_spans
-from cosmos_curator.next.recipes.robot_action_split.lance_sink import (
-    append_clip_fragment,
-    open_or_create_clip_table,
-    write_clip_fragment,
-)
-from cosmos_curator.next.recipes.robot_action_split.pipeline import _publish_outcomes, run
-from cosmos_curator.next.recipes.robot_action_split.processing import (
-    _build_sidecar_bytes,
-    _make_base_fields,
-    process_batch,
-)
-from cosmos_curator.next.recipes.robot_action_split.records import clip_table
-
-_SOURCE_TASK_DESCRIPTION = "  A person prepares coffee by loading a pod and opening the machine.\n"
-
-
-def _write_outcomes(outcomes: list[dict], *, lance_uri: str) -> int:
-    """Bootstrap, stage, and commit one fragment of successful outcome rows."""
-    open_or_create_clip_table(uri=lance_uri, storage_profile="default")
-    table = clip_table(
-        outcomes,
-        record_schema_version=CLIP_RECORD_SCHEMA_VERSION,
-        media_contract_version=MEDIA_CONTRACT_VERSION,
-    )
-    candidate = write_clip_fragment(table, uri=lance_uri, storage_profile="default")
-    assert candidate is not None
-    return append_clip_fragment(candidate, uri=lance_uri, storage_profile="default", attempts=1)
-
-
-def _make_all_intra_mp4(output: Path) -> None:
-    """Generate a 10-second all-intra H.264 MP4 at 24 fps using libopenh264.
-
-    Every frame is a keyframe (-g 1), so smart cut can stream-copy the entire
-    span without needing libx264 (which may not be present in dev builds).
-    """
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("ffmpeg not available")
-    # Check libopenh264 is available
-    enc_result = subprocess.run(  # noqa: S603
-        [shutil.which("ffmpeg") or "ffmpeg", "-encoders"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if "libopenh264" not in enc_result.stdout:
-        pytest.skip("libopenh264 encoder not available")
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    subprocess.run(  # noqa: S603
-        [
-            ffmpeg,
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"testsrc=duration=10:size=64x64:rate={_FPS}",
-            "-c:v",
-            "libopenh264",
-            "-g",
-            "1",
-            "-bf",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
 
 
 def _uri_to_path(uri: str) -> Path:
@@ -143,158 +56,10 @@ def _uri_to_path(uri: str) -> Path:
     return Path(uri)
 
 
-# ---------------------------------------------------------------------------
-# Fixture: synthetic dataset
-# ---------------------------------------------------------------------------
-
-_FPS = 24
-_FRAMES_PER_SUBTASK = 100  # ~4.17 s per subtask
-_TOTAL_FRAMES = _FRAMES_PER_SUBTASK * 2  # 200 frames = ~8.33 s
-
-
-def _write_dataset(root: Path) -> Path:
-    """Write a minimal LeRobot/Mecka dataset under *root* and return its path."""
-    dataset = root / "dataset"
-
-    # meta/info.json
-    meta = dataset / "meta"
-    meta.mkdir(parents=True)
-    (meta / "info.json").write_text(
-        json.dumps(
-            {
-                "fps": _FPS,
-                "features": {
-                    "observation.images.main": {"shape": [64, 64, 3]},
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    # meta/subtasks.parquet
-    pq.write_table(
-        pa.table(
-            {
-                "subtask_index": pa.array([0, 1], type=pa.int64()),
-                "subtask": pa.array(["pick up coffee pod", "open machine lid"]),
-            }
-        ),
-        str(meta / "subtasks.parquet"),
-    )
-
-    # meta/tasks.parquet
-    pq.write_table(
-        pa.table(
-            {
-                "task_index": pa.array([0], type=pa.int64()),
-                "task": pa.array(["make coffee"]),
-            }
-        ),
-        str(meta / "tasks.parquet"),
-    )
-
-    # meta/episodes/chunk-000/file-000.parquet
-    ep_dir = meta / "episodes" / "chunk-000"
-    ep_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.table(
-            {
-                "episode_index": pa.array([0], type=pa.int64()),
-                "episode_id": pa.array(["ep_000"]),
-                "task_description": pa.array(
-                    [_SOURCE_TASK_DESCRIPTION],
-                    type=pa.large_string(),
-                ),
-                "videos/observation.images.main/chunk_index": pa.array([0], type=pa.int64()),
-                "videos/observation.images.main/file_index": pa.array([0], type=pa.int64()),
-                "videos/observation.images.main/from_timestamp": pa.array([0.0]),
-                "dataset_from_index": pa.array([0], type=pa.int64()),
-            }
-        ),
-        str(ep_dir / "file-000.parquet"),
-    )
-
-    # data/chunk-000/file-000.parquet — 200 frames: 100 subtask0, 100 subtask1
-    data_dir = dataset / "data" / "chunk-000"
-    data_dir.mkdir(parents=True)
-    n = _TOTAL_FRAMES
-    frame_indices = list(range(n))
-    subtask_indices = [0] * _FRAMES_PER_SUBTASK + [1] * _FRAMES_PER_SUBTASK
-    action_data = [[float(i), float(i) * 0.1] for i in range(n)]
-    # Straight-line dolly trajectory (identity orientation, position drifting
-    # along one axis) so process_batch's camera-motion annotation has a
-    # non-trivial, deterministic trajectory to describe.
-    camera_position = [[0.0, i * 0.02, 0.0] for i in range(n)]
-    camera_rotation = [[0.0, 0.0, 0.0, 1.0] for _ in range(n)]
-    pq.write_table(
-        pa.table(
-            {
-                "episode_index": pa.array([0] * n, type=pa.int64()),
-                "frame_index": pa.array(frame_indices, type=pa.int64()),
-                "subtask_index": pa.array(subtask_indices, type=pa.int64()),
-                "task_index": pa.array([0] * n, type=pa.int64()),
-                "action": pa.array(action_data),
-                "observation.state.camera_position": pa.array(camera_position),
-                "observation.state.camera_rotation": pa.array(camera_rotation),
-            }
-        ),
-        str(data_dir / "file-000.parquet"),
-    )
-
-    # videos/observation.images.main/chunk-000/file-000.mp4
-    # All-intra so smart cut stream-copies without needing libx264.
-    vid_dir = dataset / "videos" / "observation.images.main" / "chunk-000"
-    vid_dir.mkdir(parents=True)
-    _make_all_intra_mp4(vid_dir / "file-000.mp4")
-
-    return dataset
-
-
-# ---------------------------------------------------------------------------
-# Config helper
-# ---------------------------------------------------------------------------
-
-
-def _make_config(dataset_path: Path, output_path: Path) -> ResolvedRobotActionSplitConfig:
-    return ResolvedRobotActionSplitConfig.model_validate(
-        {
-            "schema_version": 1,
-            "kind": "robot-action-split",
-            "input": {
-                "uris": [str(dataset_path.parent)],  # dataset root parent
-                "source_dataset": "test_dataset",
-            },
-            "split": {
-                "min_duration_s": 4.0,
-                "max_duration_s": 20.0,
-            },
-            "output": {
-                "media_root": str(output_path),
-                "lance_uri": str(output_path / "clips.lance"),
-                "action_format": "pickle",
-                "views": [],
-            },
-            "execution": {
-                "storage_profile": "default",
-                "discovery_workers": 1,
-                "max_segments_per_batch": 50,
-                "cut_attempts": 1,
-                "media_write_attempts": 1,
-                "progress": False,
-            },
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def dataset(tmp_path: Path) -> Path:
-    """Write the synthetic dataset and return its path."""
-    return _write_dataset(tmp_path)
+    """Write the synthetic dataset with a real MP4 and return its shard path."""
+    return write_dataset(tmp_path)
 
 
 @pytest.fixture
@@ -332,16 +97,28 @@ def span_work_item_fields() -> dict[str, Any]:
     }
 
 
-def test_base_outcome_fields_include_task_description(span_work_item_fields: dict[str, Any]) -> None:
-    """Verify common outcome fields carry descriptions to success and failure rows."""
+def _cut_in_process(processing: ProcessingScope, config: ResolvedRobotActionSplitConfig) -> None:
+    """Run the plan's real per-chunk cuts without Ray and stage their outcomes as the plan's writer would."""
+    attempt = processing._attempt
+    stage_results(attempt, cut_chunks(attempt.selection, config=config), complete=False)
+
+
+def _run(config: ResolvedRobotActionSplitConfig, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    with monkeypatch.context() as patch:
+        replace_ray(pipeline, patch, results=None, process=lambda scope: _cut_in_process(scope, config))
+        return pipeline.run_config(config)
+
+
+def test_clip_fields_include_task_description(span_work_item_fields: dict[str, Any]) -> None:
+    """Common clip fields carry descriptions to finished and failed clips."""
     span_work_item = SpanWorkItem(**span_work_item_fields)
-    fields = _make_base_fields(span_work_item, "test_dataset")
+    fields = clip_fields(span_work_item, "test_dataset")
 
     assert fields["task_description"] == span_work_item.task_description
 
 
 def test_sidecar_places_task_description_after_task_name(span_work_item_fields: dict[str, Any]) -> None:
-    """Verify the JSON sidecar preserves the description and its key position."""
+    """The JSON sidecar preserves the description and its key position."""
     span_work_item = SpanWorkItem(**span_work_item_fields)
     sidecar = json.loads(_build_sidecar_bytes(span_work_item, "clip.mp4", "action.bin"))
     keys = list(sidecar)
@@ -350,188 +127,131 @@ def test_sidecar_places_task_description_after_task_name(span_work_item_fields: 
     assert keys.index("task_description") == keys.index("task_name") + 1
 
 
-def test_discovery_finds_two_spans(dataset: Path, output_path: Path) -> None:
-    """Stage 1: parquet discovery emits exactly two spans with correct geometry.
+def test_discovery_finds_two_spans_in_one_chunk(dataset: Path, output_path: Path) -> None:
+    """Parquet discovery emits one chunk owing exactly two spans with correct geometry.
 
-    The data parquet has 200 frames split evenly between subtask 0 and subtask 1.
     Both subtasks span ~4.17 s at 24 fps, so both pass the min_duration_s=4.0 filter.
     """
-    config = _make_config(dataset, output_path)
+    config = make_config(dataset, output_path)
     batches = discover_spans(config)
-
-    # Two spans across one batch (same chunk MP4 + data parquet).
-    items = [item for batch in batches for item in batch.items]
+    assert len(batches) == 1
+    items = batches[0].items
     assert len(items) == 2, f"Expected 2 spans, got {len(items)}"
 
-    subtask_names = {item.subtask_name for item in items}
-    assert subtask_names == {"pick up coffee pod", "open machine lid"}
-    assert all(item.task_description == _SOURCE_TASK_DESCRIPTION for item in items)
-
-    # Geometry: each span covers _FRAMES_PER_SUBTASK frames.
+    assert {item.subtask_name for item in items} == {"pick up coffee pod", "open machine lid"}
+    assert all(item.task_description == SOURCE_TASK_DESCRIPTION for item in items)
     for item in items:
-        assert item.frame_end - item.frame_start == _FRAMES_PER_SUBTASK
-        assert abs(item.duration_s - _FRAMES_PER_SUBTASK / _FPS) < 0.01
-        assert item.native_fps == _FPS
+        assert item.frame_end - item.frame_start == FRAMES_PER_SUBTASK
+        assert abs(item.duration_s - FRAMES_PER_SUBTASK / FPS) < 0.01
+        assert item.native_fps == FPS
         assert item.episode_from_timestamp == 0.0
 
     # span_group_id is distinct per span; clip_id is a stable digest distinct from span_group_id.
-    group_ids = [item.span_group_id for item in items]
-    assert len(set(group_ids)) == 2
-    clip_ids = [item.clip_id for item in items]
-    assert len(set(clip_ids)) == 2
-    # clip_id is always a fresh digest (includes bitrate + contract version), never the raw span_group_id.
+    assert len({item.span_group_id for item in items}) == 2
+    assert len({item.clip_id for item in items}) == 2
     for item in items:
         assert item.clip_id != item.span_group_id
         assert len(item.clip_id) == 64  # SHA-256 hex
 
 
 def test_span_timestamp_translation(dataset: Path, output_path: Path) -> None:
-    """Stage 1b: nanosecond translation uses integer frame-index space.
+    """Nanosecond translation uses integer frame-index space.
 
     With episode_from_timestamp=0.0 and fps=24:
       subtask 0  frames 0-99   -> start_ns=0, end_ns=round(100/24*1e9)
       subtask 1  frames 100-199 -> start_ns=round(100/24*1e9)
     """
-    config = _make_config(dataset, output_path)
-    items = sorted(
-        [item for batch in discover_spans(config) for item in batch.items],
-        key=lambda x: x.frame_start,
-    )
+    config = make_config(dataset, output_path)
+    items = sorted(discover_spans(config)[0].items, key=lambda x: x.frame_start)
 
     subtask0, subtask1 = items
     assert subtask0.start_ns == 0
-    expected_mid_ns = round(_FRAMES_PER_SUBTASK / _FPS * 1e9)
+    expected_mid_ns = round(FRAMES_PER_SUBTASK / FPS * 1e9)
     assert subtask0.end_ns == expected_mid_ns
     assert subtask1.start_ns == expected_mid_ns
-    assert subtask1.end_ns == round(_TOTAL_FRAMES / _FPS * 1e9)
+    assert subtask1.end_ns == round(TOTAL_FRAMES / FPS * 1e9)
 
 
-def test_cut_produces_clips_and_action_files(dataset: Path, output_path: Path) -> None:
-    """Stage 2: processing cuts both spans and writes clips + action files.
+def test_cut_produces_clips_action_files_and_sidecars(dataset: Path, output_path: Path) -> None:
+    """Processing one chunk cuts both spans and writes clips, action files, and sidecars.
 
-    Each successful span produces:
+    Each finished clip produces:
       output/video/observation.images.main/<clip_id>.mp4
-      output/action/<span_group_id>.bin
+      output/action/<action_id>.pickle
       output/temp_metas/<clip_id>.json
     """
-    config = _make_config(dataset, output_path)
-    batches = discover_spans(config)
-    assert len(batches) == 1
+    config = make_config(dataset, output_path)
+    outcome = cut_chunks(discover_items(config), config=config).to_pylist()[0]
 
-    outcomes = process_batch(batches[0], config=config)
-
-    succeeded = [o for o in outcomes if o["status"] == "success"]
-    failed = [o for o in outcomes if o["status"] != "success"]
-    assert not failed, f"Unexpected failures: {failed}"
-    assert len(succeeded) == 2
-    assert all(outcome["task_description"] == _SOURCE_TASK_DESCRIPTION for outcome in succeeded)
-
-    for outcome in succeeded:
-        # Clip MP4 exists and is non-empty.
-        clip_path = _uri_to_path(outcome["clip_uri"])
-        assert clip_path.exists(), f"Clip not found: {clip_path}"
+    assert outcome["error_stage"] is None
+    clips = outcome["clips"]
+    assert [clip["error_stage"] for clip in clips] == [None, None]
+    assert all(clip["task_description"] == SOURCE_TASK_DESCRIPTION for clip in clips)
+    for clip in clips:
+        clip_path = _uri_to_path(clip["clip_uri"])
         assert clip_path.stat().st_size > 0
-
-        # Action bin exists.
-        action_path = _uri_to_path(outcome["action_data_uri"])
-        assert action_path.exists(), f"Action file not found: {action_path}"
-
-        # Sidecar JSON is valid and references the correct clip.
-        sidecar_path = output_path / "temp_metas" / f"{outcome['clip_id']}.json"
-        assert sidecar_path.exists()
-        sidecar = json.loads(sidecar_path.read_text())
-        assert sidecar["clip_uuid"] == outcome["clip_id"]
-        assert sidecar["span_group_uuid"] == outcome["span_group_id"]
-        assert sidecar["task_description"] == _SOURCE_TASK_DESCRIPTION
-
-    # Action data contains the correct frame count.
-    for outcome in succeeded:
-        action_data = pickle.loads(_uri_to_path(outcome["action_data_uri"]).read_bytes())  # noqa: S301
-        assert "action" in action_data
-        assert len(action_data["action"]) == _FRAMES_PER_SUBTASK
+        sidecar = json.loads((output_path / "temp_metas" / f"{clip['clip_id']}.json").read_text())
+        assert sidecar["clip_uuid"] == clip["clip_id"]
+        assert sidecar["span_group_uuid"] == clip["span_group_id"]
+        assert sidecar["task_description"] == SOURCE_TASK_DESCRIPTION
+        action_data = pickle.loads(_uri_to_path(clip["action_data_uri"]).read_bytes())  # noqa: S301
+        assert len(action_data["action"]) == FRAMES_PER_SUBTASK
+        # The fixture's straight-line dolly trajectory gets a motion annotation.
+        assert "dollies" in clip["camera_motion_annotation"].lower()
 
 
-def test_camera_motion_annotation_populated(dataset: Path, output_path: Path) -> None:
-    """Stage 2b: a clip with camera trajectory data gets a non-empty motion annotation.
+def test_run_publishes_one_row_per_clip_once(dataset: Path, output_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run appends both clips with their labels in one commit; a rerun finds nothing to do."""
+    config = make_config(dataset, output_path)
+    summary = _run(config, monkeypatch)
 
-    The fixture's ``camera_position``/``camera_rotation`` columns describe a
-    straight-line dolly move, so ``process_batch`` should compute a non-``None``
-    ``camera_motion_annotation`` string for both successful spans.
-    """
-    config = _make_config(dataset, output_path)
-    batches = discover_spans(config)
-    outcomes = process_batch(batches[0], config=config)
+    assert (summary["input_items"], summary["selected_items"], summary["remaining_items"]) == (1, 1, 0)
+    assert (summary["appended_rows"], summary["errors"], summary["failed_clips"]) == (2, 0, 0)
+    dataset_table = lance.dataset(config.output.lance_uri)
+    table = dataset_table.to_table()
+    assert sorted(table["subtask_name"].to_pylist()) == ["open machine lid", "pick up coffee pod"]
+    assert table["task_description"].to_pylist() == [SOURCE_TASK_DESCRIPTION, SOURCE_TASK_DESCRIPTION]
+    assert table["error_stage"].null_count == 2
+    assert len(set(table["chunk_id"].to_pylist())) == 1
+    assert summary["clips_lance_version"] == dataset_table.version
 
-    succeeded = [o for o in outcomes if o["status"] == "success"]
-    assert len(succeeded) == 2
-    for outcome in succeeded:
-        annotation = outcome["camera_motion_annotation"]
-        assert isinstance(annotation, str)
-        assert annotation
-        assert "dollies" in annotation.lower()
-
-
-def test_lance_write_produces_correct_rows(dataset: Path, output_path: Path) -> None:
-    """Stage 3: successful outcomes are committed to Lance with the correct schema.
-
-    Asserts row count and clip_id uniqueness across the two rows.
-    """
-    config = _make_config(dataset, output_path)
-    batches = discover_spans(config)
-    outcomes = process_batch(batches[0], config=config)
-
-    lance_uri = str(output_path / "clips.lance")
-    version = _write_outcomes(outcomes, lance_uri=lance_uri)
-
-    assert version >= 1
-
-    ds = lance.dataset(lance_uri)
-    table = ds.to_table()
-    assert len(table) == 2
-
-    # clip_id is unique.
-    clip_ids = table.column("clip_id").to_pylist()
-    assert len(set(clip_ids)) == 2
-
-    # subtask names are what we put in the parquet.
-    subtask_names = set(table.column("subtask_name").to_pylist())
-    assert subtask_names == {"pick up coffee pod", "open machine lid"}
-    assert table.column("task_description").to_pylist() == [_SOURCE_TASK_DESCRIPTION, _SOURCE_TASK_DESCRIPTION]
-    assert table.column("record_schema_version").to_pylist() == [4, 4]
-
-    # The transaction identifies the producing recipe and operation.
-    txn = ds.read_transaction(version)
-    assert txn is not None
-    assert txn.transaction_properties == {"kind": "robot-action-split", "operation": "append-clips"}
+    again = _run(config, monkeypatch)
+    assert (again["selected_items"], again["appended_rows"], again["failed_clips"]) == (0, 0, 0)
+    assert again["clips_lance_version"] == summary["clips_lance_version"]
 
 
-def test_lance_write_produces_multiple_fragments(dataset: Path, output_path: Path) -> None:
-    """A publish batch smaller than the successful row count commits one fragment per batch.
+def test_rows_pack_into_fragments_by_rows_per_fragment(
+    dataset: Path, output_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fragment size is clip rows, independent of the chunk that produced them."""
+    config = make_config(dataset, output_path, rows_per_fragment=1)
+    _run(config, monkeypatch)
 
-    Pure Lance I/O (``process_batch`` and ``_publish_outcomes`` called directly,
-    not through Ray Data), so this does not need the ``ray_local`` fixture other
-    Ray-Data-path tests in this module require.
-    """
-    config = _make_config(dataset, output_path)
-    config = config.model_copy(update={"execution": config.execution.model_copy(update={"clips_per_publish_batch": 1})})
-    batches = discover_spans(config)
-    outcomes = process_batch(batches[0], config=config)
-    success = [o for o in outcomes if o["status"] == "success"]
+    clips = lance.dataset(config.output.lance_uri)
+    assert clips.count_rows() == 2
+    assert [fragment.count_rows() for fragment in clips.get_fragments()] == [1, 1]
 
-    lance_uri = str(output_path / "clips_frags.lance")
-    open_or_create_clip_table(uri=lance_uri, storage_profile="default")
-    config = config.model_copy(update={"output": config.output.model_copy(update={"lance_uri": lance_uri})})
-    _publish_outcomes(outcomes, config=config, initial_clips_version=1)
 
-    ds = lance.dataset(lance_uri)
-    assert ds.count_rows() == len(success)
-    assert len(ds.get_fragments()) == len(success)
+def test_a_missing_chunk_publishes_its_clips_as_errors(
+    dataset: Path, output_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every clip of a chunk whose MP4 is gone keeps a row naming the failure, and is not retried."""
+    config = make_config(dataset, output_path)
+    next(dataset.glob("videos/*/chunk-000/file-000.mp4")).unlink()
+    summary = _run(config, monkeypatch)
+
+    assert (summary["appended_rows"], summary["errors"]) == (2, 1)
+    assert (summary["failed_clips"], summary["failed_clips_by_stage"]) == (2, {"chunk-stage": 2})
+    rows = lance.dataset(config.output.lance_uri).to_table().to_pylist()
+    assert {row["error_stage"] for row in rows} == {"chunk-stage"}
+    assert all(row["clip_uri"] is None for row in rows)
+    assert _run(config, monkeypatch)["selected_items"] == 0
 
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("ray_local")
 def test_full_pipeline_run(dataset: Path, output_path: Path) -> None:
-    """Full pipeline over the default Ray Data path: run() reports correct counts.
+    """The real Ray Data plan cuts, checkpoints, and publishes; a rerun appends nothing.
 
     Declares ``ray_local`` so the run always lands on the small shared cluster
     rather than on whatever cluster an earlier test happened to leave behind.
@@ -545,19 +265,10 @@ def test_full_pipeline_run(dataset: Path, output_path: Path) -> None:
             {
                 "schema_version": 1,
                 "kind": "robot-action-split",
-                "input": {
-                    "uris": [str(dataset.parent)],
-                    "source_dataset": "test_dataset",
-                },
+                "input": {"uris": [str(dataset.parent)], "source_dataset": "test_dataset"},
                 "split": {"min_duration_s": 4.0, "max_duration_s": 20.0},
-                "output": {
-                    "media_root": str(output_path / "media"),
-                    "lance_uri": str(output_path / "clips.lance"),
-                    "action_format": "pickle",
-                    "views": [],
-                },
+                "output": {"media_root": str(output_path / "media"), "action_format": "pickle"},
                 "execution": {
-                    "storage_profile": "default",
                     "discovery_workers": 1,
                     # Must fit the ``ray_local`` CPU budget. Ray Data does not
                     # reject a task whose request exceeds cluster capacity - it
@@ -570,58 +281,17 @@ def test_full_pipeline_run(dataset: Path, output_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    config = resolve_config(config_path)
 
-    summary = run(str(config_path))
+    summary = pipeline.run_config(config)
 
-    assert summary["succeeded"] == 2
-    assert summary["failed"] == 0
-    assert summary["total"] == 2
-    assert "attempt_id" not in summary
+    assert (summary["selected_items"], summary["appended_rows"], summary["errors"]) == (1, 2, 0)
+    assert summary["cleanup_complete"] is True
+    clips = lance.dataset(config.output.lance_uri).to_table()
+    assert clips.num_rows == 2
+    assert all(_uri_to_path(uri).is_file() for uri in clips["clip_uri"].to_pylist())
+    assert not Path(config.output.staging_root_uri).exists() or not any(Path(config.output.staging_root_uri).iterdir())
 
-    # Lance table committed with 2 rows.
-    ds = lance.dataset(str(output_path / "clips.lance"))
-    assert len(ds.to_table()) == 2
-
-
-def test_sequential_pipeline_run(dataset: Path, output_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicit sequential path (ray_data=false) produces same counts as the Ray Data path."""
-    import cosmos_curator.next.recipes.robot_action_split.pipeline as _pipeline_mod  # noqa: PLC0415
-
-    _msg = "_iter_ray_data must not be called when ray_data=False"
-
-    def _should_not_be_called(*_a: object, **_kw: object) -> object:
-        raise AssertionError(_msg)
-
-    monkeypatch.setattr(_pipeline_mod, "_iter_ray_data", _should_not_be_called)
-    config_path = output_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "kind": "robot-action-split",
-                "input": {
-                    "uris": [str(dataset.parent)],
-                    "source_dataset": "test_dataset",
-                },
-                "split": {"min_duration_s": 4.0, "max_duration_s": 20.0},
-                "output": {
-                    "media_root": str(output_path / "media"),
-                    "lance_uri": str(output_path / "clips.lance"),
-                    "action_format": "pickle",
-                    "views": [],
-                },
-                "execution": {
-                    "storage_profile": "default",
-                    "discovery_workers": 1,
-                    "ray_data": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    summary = run(str(config_path))
-
-    assert summary["succeeded"] == 2
-    assert summary["failed"] == 0
-    assert summary["total"] == 2
+    again = pipeline.run_config(config)
+    assert (again["selected_items"], again["appended_rows"]) == (0, 0)
+    assert pa.Table.equals(lance.dataset(config.output.lance_uri).to_table(), clips)

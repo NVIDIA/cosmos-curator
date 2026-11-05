@@ -105,6 +105,9 @@ input:
     - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_98/
     - s3://nv-00-10206-robot/cosmos3_action_data/mecka/20260509_46000h_everyday_mono_no_wrist_lerobot/v0/shard_99/
   source_dataset: 20260509_46000h_everyday_mono_no_wrist_lerobot
+  # Input is GCS, output is AWS S3. A profile carries exactly one endpoint_url,
+  # so these cannot be the same profile; execution.storage_profile serves the output.
+  storage_profile: team-gcs-cosmos
 split:
   min_duration_s: 4.0
   max_duration_s: 20.0
@@ -112,14 +115,15 @@ output:
   # S3, not cluster-local Lustre: Lustre is per-cluster, so output written there
   # is stranded when the run moves clusters. S3 keeps the Lance table and clips
   # reachable from anywhere and survives losing a cluster entirely.
+  #
+  # The clip table is bound to its producer's result contract. A table written
+  # before robot-action-split adopted shared append publication carries no
+  # binding and is refused, so point a new run at a fresh media_root.
   media_root: s3://cosmos3-action-data/mecka/robot_clips_batch01/
   lance_uri: s3://cosmos3-action-data/mecka/robot_clips_batch01/lance/clips.lance
   action_format: bin
 execution:
-  # Input is GCS, output is AWS S3. A profile carries exactly one endpoint_url,
-  # so these cannot be the same profile.
-  storage_profile: team-gcs-cosmos
-  output_storage_profile: egocentric-writer
+  storage_profile: egocentric-writer
   discovery_workers: 48
   # Measured, not guessed: 11 concurrent tasks used ~0.34 cores and ~3.0G RSS
   # each (they are I/O-bound on GCS reads and S3 writes; the stream-copy path
@@ -131,26 +135,18 @@ execution:
   # measured ~2,400 clips/min; the same recipe on the `cpu` partition (capped at
   # cpu=192 per user, so 5 lanes) managed ~550. Dropping to 2 would buy more cuts
   # per lane only by taking memory the head turned out to need.
+  #
+  # cut_cpus is also the number of concurrent cuts within a chunk's task.
   cut_cpus: 3
-  ray_data: true
   # Chunk MP4s stage here before cutting. A chunk is ~4h of video (~25G), and
   # concurrent cuts land several lanes per node, so node-local /tmp ran out
   # instantly at only 40 cuts: 1172/1172 tasks failed with "No space left on
   # device". /config is the fs11 workspace mount (250T quota) rather than the
   # 10G-capped home, and it carried ~290 concurrent cuts without trouble.
   tmp_dir: /config/tmp
-  # Each commit writes exactly one Lance fragment, and every commit re-checks its
-  # ids against the fragments already committed to prove idempotence -- so commit
-  # cost grows with fragment count and the total is quadratic in commit count.
-  # Measured: a 250-id presence scan takes 70ms over 60 fragments and 1008ms over
-  # 2400, and live commits went 0.9s -> 1.24s over just 48 commits. At 250 clips
-  # per commit batch 1 needs 4860 commits and ends up spending more time
-  # committing than cutting.
-  #
-  # 2500 (10x250) cuts that to ~486 commits. The tradeoff is a driver-recovery
-  # window, not a worker one: this buffer lives on the driver, so a preempted lane
-  # replays only its own unfinished batch, while the clips it already handed back
-  # are recut when the HEAD dies. At the observed 480 clips/min that is ~5 min of
-  # recutting per head loss -- affordable on a 24h wall, and it was not on
-  # oci-aga's 4h windows, which is why that config keeps 250.
-  clips_per_publish_batch: 2500
+  # One work item is one chunk MP4, and a run publishes at most max_items chunks
+  # in one atomic append; rerun while remaining_items is nonzero or null. Chunk
+  # outcomes checkpoint every rows_per_checkpoint chunks, so a lost head or lane
+  # repeats chunks in flight and finished chunks still waiting for their
+  # checkpoint group to fill, never published or checkpointed ones.
+  max_items: 1000

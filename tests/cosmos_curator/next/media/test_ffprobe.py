@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cosmos_curator.next.media import ffmpeg
+from cosmos_curator.next.media import failures, ffmpeg
 
 _LOCAL = Path("/staged/source.mp4")
 _SIGNED = "https://private.invalid/source.mp4?signature=secret"
@@ -19,18 +19,18 @@ _INVALID_DATA = b'{"error": {"code": -1094995529, "string": "Invalid data found 
 @pytest.mark.parametrize(
     ("source", "returncode", "stdout", "expected"),
     [
-        pytest.param(_LOCAL, 1, _INVALID_DATA, ffmpeg.InvalidMediaError, id="local-invalid-data"),
-        pytest.param(_SIGNED, 1, _INVALID_DATA, ffmpeg.ProbeError, id="remote-invalid-data"),
-        pytest.param(_LOCAL, -9, _INVALID_DATA, ffmpeg.ProbeError, id="killed-after-reporting-error"),
-        pytest.param(_LOCAL, -9, b"", ffmpeg.ProbeError, id="killed-without-output"),
-        pytest.param(_LOCAL, 1, b'{"error": {"code": -12}}', ffmpeg.ProbeError, id="out-of-memory"),
-        pytest.param(_LOCAL, 1, b'{"error": {"code": -5}}', ffmpeg.ProbeError, id="io-error"),
-        pytest.param(_LOCAL, 1, b'{"error": {"code": -2}}', ffmpeg.ProbeError, id="missing-local-file"),
-        pytest.param(_LOCAL, 1, b"", ffmpeg.ProbeError, id="stderr-alone-is-inconclusive"),
-        pytest.param(_LOCAL, 1, b'{"error":', ffmpeg.ProbeError, id="truncated-json"),
-        pytest.param(_LOCAL, 1, b"\xff", ffmpeg.ProbeError, id="invalid-encoding"),
-        pytest.param(_LOCAL, 1, b"[]", ffmpeg.ProbeError, id="invalid-payload"),
-        pytest.param(_LOCAL, 1, b'{"error": null}', ffmpeg.ProbeError, id="missing-error-code"),
+        pytest.param(_LOCAL, 1, _INVALID_DATA, failures.InvalidMediaError, id="local-invalid-data"),
+        pytest.param(_SIGNED, 1, _INVALID_DATA, failures.ProbeError, id="remote-invalid-data"),
+        pytest.param(_LOCAL, -9, _INVALID_DATA, failures.ProbeError, id="killed-after-reporting-error"),
+        pytest.param(_LOCAL, -9, b"", failures.ProbeError, id="killed-without-output"),
+        pytest.param(_LOCAL, 1, b'{"error": {"code": -12}}', failures.ProbeError, id="out-of-memory"),
+        pytest.param(_LOCAL, 1, b'{"error": {"code": -5}}', failures.ProbeError, id="io-error"),
+        pytest.param(_LOCAL, 1, b'{"error": {"code": -2}}', failures.ProbeError, id="missing-local-file"),
+        pytest.param(_LOCAL, 1, b"", failures.ProbeError, id="stderr-alone-is-inconclusive"),
+        pytest.param(_LOCAL, 1, b'{"error":', failures.ProbeError, id="truncated-json"),
+        pytest.param(_LOCAL, 1, b"\xff", failures.ProbeError, id="invalid-encoding"),
+        pytest.param(_LOCAL, 1, b"[]", failures.ProbeError, id="invalid-payload"),
+        pytest.param(_LOCAL, 1, b'{"error": null}', failures.ProbeError, id="missing-error-code"),
     ],
 )
 def test_probe_failure_requires_explicit_local_media_error(
@@ -54,7 +54,7 @@ def test_probe_failure_requires_explicit_local_media_error(
     monkeypatch.setattr(ffmpeg.subprocess, "run", fail)
     with pytest.raises(expected) as exc_info:
         ffmpeg.probe_video_source(source)
-    assert isinstance(exc_info.value, ffmpeg.MediaError) == (expected is ffmpeg.InvalidMediaError)
+    assert isinstance(exc_info.value, failures.MediaError) == (expected is failures.InvalidMediaError)
     assert "secret" not in str(exc_info.value)
     assert str(source) not in str(exc_info.value)
 
@@ -66,9 +66,9 @@ def test_probe_timeout_is_not_a_terminal_media_outcome(monkeypatch: pytest.Monke
         raise subprocess.TimeoutExpired(command, 1)
 
     monkeypatch.setattr(ffmpeg.subprocess, "run", timeout)
-    with pytest.raises(ffmpeg.ProbeError, match="timed out after 1s") as exc_info:
+    with pytest.raises(failures.ProbeError, match="timed out after 1s") as exc_info:
         ffmpeg.probe_video_source(_SIGNED, timeout_s=1)
-    assert not isinstance(exc_info.value, ffmpeg.MediaError)
+    assert not isinstance(exc_info.value, failures.MediaError)
     assert "secret" not in str(exc_info.value)
 
 
@@ -88,7 +88,7 @@ def test_missing_probe_binary_propagates(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_malformed_probe_response_is_not_terminal(monkeypatch: pytest.MonkeyPatch, stdout: bytes) -> None:
     """Malformed responses cannot establish an unusable source even after a successful exit."""
     monkeypatch.setattr(ffmpeg.subprocess, "run", lambda *_, **__: SimpleNamespace(stdout=stdout))
-    with pytest.raises(ffmpeg.ProbeError):
+    with pytest.raises(failures.ProbeError):
         ffmpeg.probe_video_source(_LOCAL)
 
 
@@ -99,7 +99,7 @@ def test_readable_media_without_video_is_unsupported(monkeypatch: pytest.MonkeyP
         "run",
         lambda *_, **__: SimpleNamespace(stdout=b'{"streams": [{"codec_type": "audio"}]}'),
     )
-    with pytest.raises(ffmpeg.UnsupportedMediaError, match="No video stream"):
+    with pytest.raises(failures.UnsupportedMediaError, match="No video stream"):
         ffmpeg.probe_video_source(_LOCAL)
 
 
@@ -108,7 +108,7 @@ def test_real_probe_classifies_corruption_and_missing_path_differently(tmp_path:
     """Real FFprobe distinguishes two failures that both exit with status one."""
     corrupt = tmp_path / "corrupt.mp4"
     corrupt.write_bytes(b"invalid media")
-    with pytest.raises(ffmpeg.InvalidMediaError):
+    with pytest.raises(failures.InvalidMediaError):
         ffmpeg.probe_video_source(corrupt)
-    with pytest.raises(ffmpeg.ProbeError):
+    with pytest.raises(failures.ProbeError):
         ffmpeg.probe_video_source(tmp_path / "missing.mp4")

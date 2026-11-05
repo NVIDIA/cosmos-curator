@@ -115,7 +115,7 @@ Two rules follow from the layering:
   blocks on two runs of the same config.
 - **Never treat a shard as storage geometry.** A shard does not rewrite,
   compact, or repartition the table. Fragment geometry belongs to the producer
-  leg, whose publish batch size is what decides it — see
+  leg, whose `execution.rows_per_fragment` is what decides it — see
   [`robot-action-split`](curator-next-robot-action-split.md) for the producing
   side. A consumer that reshaped fragments to suit its own parallelism would be
   rewriting another leg's durable storage to buy execution convenience it can

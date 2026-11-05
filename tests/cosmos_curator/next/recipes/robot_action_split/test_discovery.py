@@ -48,6 +48,7 @@ import pyarrow.parquet as pq
 import pytest
 from loguru import logger
 
+from cosmos_curator.next.recipes.robot_action_split import discovery
 from cosmos_curator.next.recipes.robot_action_split.config import (
     ResolvedRobotActionSplitConfig,
     SpanFilterConfig,
@@ -55,6 +56,8 @@ from cosmos_curator.next.recipes.robot_action_split.config import (
 from cosmos_curator.next.recipes.robot_action_split.discovery import (
     SpanWorkItem,
     _read_shard_meta,
+    decode_chunk,
+    discover_items,
     discover_spans,
 )
 
@@ -203,7 +206,7 @@ def _make_config(dataset_root: Path) -> ResolvedRobotActionSplitConfig:
             "schema_version": 1,
             "kind": "robot-action-split",
             "input": {"uris": [str(dataset_root)], "source_dataset": "test_dataset"},
-            "output": {"media_root": str(output), "lance_uri": str(output / "clips.lance")},
+            "output": {"media_root": str(output), "lance_uri": str(output / "clips.lance"), "action_format": "pickle"},
             "execution": {"storage_profile": "default", "discovery_workers": 1},
             "split": dict(TEST_DURATION_BOUNDS),
         }
@@ -828,6 +831,7 @@ def test_chunk_limit_selects_the_same_chunks_on_every_run(tmp_path: Path) -> Non
             "output": {
                 "media_root": str(tmp_path / "output"),
                 "lance_uri": str(tmp_path / "output" / "clips.lance"),
+                "action_format": "pickle",
             },
             # Several workers, so completion order genuinely varies between runs.
             "execution": {"storage_profile": "default", "discovery_workers": 6},
@@ -891,3 +895,66 @@ def test_listing_a_root_and_listing_its_shards_give_the_same_clip_ids(tmp_path: 
 
     assert by_root, "expected the root listing to discover spans"
     assert by_root == by_shard
+
+
+def test_a_root_without_shards_fails_discovery(tmp_path: Path) -> None:
+    """An input root holding no shard is a wrong path or profile, never an empty dataset to publish."""
+    empty_root = tmp_path / "dataset"
+    empty_root.mkdir()
+    with pytest.raises(ValueError, match="No dataset shard"):
+        discover_spans(_make_config(empty_root))
+
+
+def test_an_s3_listing_failure_fails_discovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A listing error propagates rather than reading as an empty dataset that publishes nothing."""
+
+    class _FailingClient:
+        def list_recursive(self, _prefix: object) -> list[dict[str, str]]:
+            msg = "listing denied"
+            raise PermissionError(msg)
+
+    monkeypatch.setattr(discovery, "_get_client", lambda _uri, _profile: _FailingClient())
+    local = _make_config(tmp_path / "dataset")
+    config = local.model_copy(update={"input": local.input.model_copy(update={"uris": ("s3://bucket/robot/",)})})
+    with pytest.raises(PermissionError, match="listing denied"):
+        discover_spans(config)
+
+
+def test_each_chunk_is_one_work_item_however_many_spans_it_holds(tmp_path: Path) -> None:
+    """Every span of a chunk travels in one work item, so its MP4 downloads once per selection."""
+    dataset_root = tmp_path / "dataset"
+    for index in range(2):
+        _write_shard(dataset_root / f"shard_{index:02d}")
+    config = _make_config(dataset_root)
+
+    batches = discover_spans(config)
+    items = discover_items(config)
+
+    keys = [(batch.chunk_mp4_uri, batch.data_parquet_uri) for batch in batches]
+    assert len(keys) == len(set(keys))
+    assert items.num_rows == len(batches)
+    assert sum(len(decode_chunk(item).items) for item in items.to_pylist()) == len(_discovered(config))
+
+
+def test_overlapping_inputs_discover_each_span_once(tmp_path: Path) -> None:
+    """A root listed with one of its own shards names that shard twice; its spans are still discovered once."""
+    root = tmp_path / "dataset"
+    shard = _write_shard(root / "shard_00")
+    _write_shard(root / "shard_01")
+    by_root = _make_config(root)
+    raw = by_root.model_dump()
+    raw["input"]["uris"] = [str(root), str(shard), str(root)]
+    overlapping = ResolvedRobotActionSplitConfig.model_validate(raw)
+
+    assert sorted(item.clip_id for item in _discovered(overlapping)) == sorted(
+        item.clip_id for item in _discovered(by_root)
+    )
+    assert discover_items(overlapping).num_rows == discover_items(by_root).num_rows
+
+
+def test_a_repeated_clip_id_fails_discovery(tmp_path: Path) -> None:
+    """Every clip is one row that consumers join on, so a repeated identity never reaches a work item."""
+    batch = discover_spans(_make_config(_write_shard(tmp_path / "dataset" / "shard_00")))[0]
+    batch.items.append(batch.items[0])
+    with pytest.raises(ValueError, match="duplicate clip_id"):
+        discovery.items_table([batch])

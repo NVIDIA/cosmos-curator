@@ -48,7 +48,10 @@ _MAP_RETRY_PATTERNS: list[str] = [
     "EndpointConnectionError",
     "ReadTimeoutError",
     "IncompleteRead",
+    # Inconclusive media runs from cosmos_curator.next.media.failures. Ray matches the
+    # raised class's own name, so every retryable media failure is named here.
     "ProbeError",
+    "FFmpegRunError",
 ]
 _MAP_MAX_RETRIES = 3
 
@@ -88,7 +91,7 @@ def configure_ray_data_stability(
       kills in IO / transcode / write stages.
     - ``retried_map_errors`` + ``max_map_retries`` (PR ray-project/ray#63023)
       retry map functions when the raised exception looks like a transient
-      network / S3 / OS error or inconclusive FFprobe failure, up to
+      network / S3 / OS error or inconclusive FFprobe or FFmpeg failure, up to
       ``_MAP_MAX_RETRIES`` retries. A recipe
       that turns its own IO errors into per-item failure rows never reaches
       this layer for those stages; what it backstops there is the stages that

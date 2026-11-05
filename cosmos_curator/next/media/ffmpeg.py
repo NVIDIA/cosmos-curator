@@ -25,6 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
 
+from cosmos_curator.next.media.failures import InvalidMediaError, MediaError, ProbeError, UnsupportedMediaError
 from cosmos_curator.next.media.spans import Span, nanoseconds_to_ffmpeg_timestamp, seconds_to_nanoseconds
 
 _DECODER_THREADS = 1
@@ -70,44 +71,8 @@ class VideoMetadata:
     video_codec: str
 
 
-class MediaError(RuntimeError):
-    """Base for media failures attributable to one source or clip.
-
-    Callers distinguish these from every other exception: a ``MediaError`` is a
-    data outcome for one item, while anything else is a broken environment or a
-    programming error and should fail the task it happened in.
-    """
-
-
 class TranscodeError(MediaError):
     """Raised when FFmpeg cannot produce one planned clip."""
-
-
-class ProbeError(RuntimeError):
-    """FFprobe failed without establishing a permanent media problem.
-
-    Timeouts, process termination, IO failures, and unrecognized responses may
-    be retried. Exhausting retries must fail the task rather than turn this
-    exception into a terminal media outcome.
-    """
-
-
-class InvalidMediaError(MediaError):
-    """FFprobe explicitly reported invalid data in a complete local source.
-
-    Callers must finish staging immutable input before probing a local path.
-    The same diagnostic over HTTP remains a :class:`ProbeError`, since a
-    transport failure can make otherwise valid media appear truncated.
-    """
-
-
-class UnsupportedMediaError(MediaError):
-    """Raised when media is readable but does not satisfy the v1 contract.
-
-    FFprobe returned metadata, but it cannot support the requested operation.
-    Remote callers should verify this against a complete local copy before
-    recording a terminal outcome.
-    """
 
 
 @lru_cache(maxsize=8)

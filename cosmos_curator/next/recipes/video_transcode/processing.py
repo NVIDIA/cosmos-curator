@@ -15,8 +15,8 @@ import pyarrow.compute as pc
 from botocore.exceptions import BotoCoreError
 
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
+from cosmos_curator.next.media.failures import ProbeError
 from cosmos_curator.next.media.ffmpeg import (
-    ProbeError,
     TranscodeError,
     assert_video_encoder_available,
     probe_video_path,

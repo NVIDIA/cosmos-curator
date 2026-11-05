@@ -21,20 +21,33 @@ from typing import Any
 
 from cosmos_curator.next.core.pipeline_kind import PipelineKind, PipelinePreset, PipelineRunOutput, PreparedPipelineRun
 
+_TEMPLATE_PREAMBLE = """\
+# Optional output overrides are derived from `media_root` when omitted:
+#   lance_uri: <media_root>/lance/clips.lance
+#   staging_root_uri: <media_root>/staging/robot-action-split
+# The clip table is bound to the split settings, source_dataset, action_format, and video_bitrate;
+# changing any of them needs a new lance_uri.
+# Set input.storage_profile when the source datasets live in a different store than the outputs,
+# which use execution.storage_profile.
+# Each run publishes at most execution.max_items chunks. Rerun while remaining_items is nonzero or null.
+"""
 
-def _template_yaml() -> str:
-    return """\
+_TEMPLATE_BODY = """\
 schema_version: 1
 kind: robot-action-split
 
 input:
-  uris: [s3://example-bucket/robot_data/lerobot_v30/my_dataset/]
-  source_dataset: my_dataset
+  uris: [s3://example-bucket/robot_data/lerobot_v30/libero_10/]
+  # Registered in cosmos_curator/next/media/action_binary.py; set output.action_format: pickle otherwise.
+  source_dataset: libero_10
 
 output:
   media_root: s3://example-bucket/robot_clips/
-  lance_uri: s3://example-bucket/robot_clips/lance/clips.lance
 """
+
+
+def _template_yaml() -> str:
+    return _TEMPLATE_PREAMBLE + _TEMPLATE_BODY
 
 
 def _template_payload() -> dict[str, Any]:
@@ -42,22 +55,18 @@ def _template_payload() -> dict[str, Any]:
 
     return {
         "kind": "robot-action-split",
-        "description": "Extract subtask clips from a LeRobot/Mecka dataset and publish to Lance.",
+        "description": "Extract subtask clips from a LeRobot/Mecka dataset with chunk-level Ray checkpoints.",
         "required_fields": [
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "robot-action-split"},
             {
                 "path": "input.uris",
-                "example": ["s3://example-bucket/robot_data/lerobot_v30/my_dataset/"],
+                "example": ["s3://example-bucket/robot_data/lerobot_v30/libero_10/"],
             },
-            {"path": "input.source_dataset", "example": "my_dataset"},
+            {"path": "input.source_dataset", "example": "libero_10"},
             {"path": "output.media_root", "example": "s3://example-bucket/robot_clips/"},
-            {
-                "path": "output.lance_uri",
-                "example": "s3://example-bucket/robot_clips/lance/clips.lance",
-            },
         ],
-        "config": yaml.safe_load(_template_yaml()),
+        "config": yaml.safe_load(_TEMPLATE_BODY),
     }
 
 
@@ -101,16 +110,12 @@ def _prepare_run(
     resolved_config = resolve_config(config, overrides=set_overrides)
 
     def run() -> PipelineRunOutput:
-        from cosmos_curator.next.recipes.robot_action_split.pipeline import run as _run  # noqa: PLC0415
+        from cosmos_curator.next.append.execution import summary_message  # noqa: PLC0415
+        from cosmos_curator.next.recipes.robot_action_split.pipeline import run_config  # noqa: PLC0415
 
-        summary = _run(str(config), config=resolved_config)
-        return PipelineRunOutput(
-            json_payload=summary,
-            message=(
-                f"robot-action-split: {summary.get('succeeded', 0)} clip(s) succeeded, "
-                f"{summary.get('failed', 0)} failed"
-            ),
-        )
+        summary = run_config(resolved_config)
+        message = f"{summary_message('robot-action-split', summary)}; {summary['failed_clips']} clip(s) failed"
+        return PipelineRunOutput(json_payload=summary, message=message)
 
     return run
 

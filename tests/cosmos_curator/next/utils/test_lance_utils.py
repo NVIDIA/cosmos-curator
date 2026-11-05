@@ -41,7 +41,6 @@ import lance
 import pyarrow as pa
 import pytest
 
-from cosmos_curator.next.recipes.robot_action_split import contracts, lance_sink
 from cosmos_curator.next.utils import lance_utils
 from cosmos_curator.next.utils.lance_utils import count_rows, distinct_non_null_values, report_table_shape
 
@@ -284,20 +283,6 @@ def test_a_double_quoted_name_in_where_is_an_identifier_not_a_literal(tmp_path: 
         dataset, _IDENTITY_COLUMN, max_values=_PRODUCERS_INSPECTED, where=f'"{_KEEPER_COLUMN}" IS NOT NULL'
     )
     assert values == ("fp-kept",)
-
-
-def test_lance_sink_and_utils_share_one_storage_version() -> None:
-    """The Extract sink writes at the version lance_utils owns, not a private copy.
-
-    Executed coverage for the single-owner arrangement: robot_action_split's own
-    suite skips entirely without a libopenh264 encoder, so it cannot gate this.
-    """
-    assert lance_sink.LANCE_DATA_STORAGE_VERSION == lance_utils.LANCE_DATA_STORAGE_VERSION
-
-
-def test_contracts_no_longer_defines_a_storage_version() -> None:
-    """The duplicate definition is gone, so the two next/ tables cannot disagree."""
-    assert not hasattr(contracts, "LANCE_DATA_STORAGE_VERSION")
 
 
 def _write_uneven_fragments(path: pathlib.Path, sizes: Sequence[int]) -> lance.LanceDataset:

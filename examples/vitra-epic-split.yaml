@@ -17,6 +17,4 @@ output:
   video_bitrate: 2M
 execution:
   discovery_workers: 2
-  max_segments_per_batch: 50
-  cut_attempts: 3
   storage_profile: default

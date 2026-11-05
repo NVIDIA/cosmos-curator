@@ -421,6 +421,24 @@ def test_planning_excludes_a_fragment_with_only_unselected_pending_rows(
     assert plan.fragments == ()
 
 
+def test_a_selected_row_without_a_clip_is_not_owed(make_clips_table: ClipsTableFactory) -> None:
+    """Selection does not make a row whose clip was never produced captionable."""
+    uri = make_clips_table(
+        rows=2,
+        rows_per_file=2,
+        clip_uris=[None, "s3://b/c1.mp4"],
+        selection=[CURATE_SELECTED_VALUE, CURATE_SELECTED_VALUE],
+    )
+
+    plan = plan_caption_scan(
+        lance.dataset(uri),
+        caption_work_filter(DIGEST, MODEL, selected_only=True),
+        shard=None,
+    )
+
+    assert plan.num_rows == 1
+
+
 def test_planning_counts_only_selected_pending_rows_in_a_mixed_fragment(
     make_clips_table: ClipsTableFactory,
 ) -> None:
@@ -613,20 +631,20 @@ def test_a_count_above_the_fragment_total_leaves_shards_empty(make_clips_table: 
     assert sum(1 for ids in planned if not ids) == count - 2
 
 
-def test_a_null_clip_uri_is_carried_through_the_scan(make_clips_table: ClipsTableFactory) -> None:
-    """A row naming no media location is emitted with a null ``clip_uri``, not refused.
+def test_a_row_without_a_clip_is_not_owed(make_clips_table: ClipsTableFactory) -> None:
+    """A row naming no media location records a clip the producer could not cut, so it is never scanned.
 
-    Refusing it here would fail the read task and so the whole attempt, whereas
-    the media stage can refuse the single row that names no location and let the
-    rest of the corpus caption. :data:`SCAN_SCHEMA` declares the column nullable
-    for exactly this row.
+    Robot-action-split keeps such a row, with its ``error_stage``, for every clip
+    it failed to produce. The work filter excludes it in every scope, so it is
+    neither captioned nor counted as owed; the media stage's refusal of a null
+    location remains only as a backstop.
     """
     uri = make_clips_table(rows=2, clip_uris=[None, "s3://b/c1.mp4"])
 
     scanned = read_all(uri)
 
-    assert scanned.column(CLIP_ID_COLUMN).to_pylist() == ["c0", "c1"]
-    assert scanned.column(CLIP_URI_COLUMN).to_pylist() == [None, "s3://b/c1.mp4"]
+    assert scanned.column(CLIP_ID_COLUMN).to_pylist() == ["c1"]
+    assert scanned.column(CLIP_URI_COLUMN).to_pylist() == ["s3://b/c1.mp4"]
 
 
 def test_a_present_context_column_reaches_the_prompt(make_clips_table: ClipsTableFactory) -> None:

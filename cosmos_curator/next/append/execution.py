@@ -17,7 +17,7 @@ error outcomes together, then removes the verified workspace.
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, update_wrapper
 from typing import Any, cast
 
 import attrs
@@ -76,7 +76,8 @@ class SelectionDatasource(Datasource):
             rows = self._items.slice(start, stop - start).to_pylist()
             tasks.append(
                 ReadTask(
-                    partial(_read_items, rows, self._items.schema),
+                    # Ray names a read task over 1 MiB by its read_fn.__name__, which a bare partial lacks.
+                    update_wrapper(partial(_read_items, rows, self._items.schema), _read_items),
                     BlockMetadata(num_rows=len(rows), size_bytes=None, input_files=None, exec_stats=None),
                     schema=self._items.schema,
                     per_task_row_limit=per_task_row_limit,

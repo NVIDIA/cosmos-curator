@@ -12,7 +12,7 @@ import numpy.typing as npt
 import torch
 from torch.utils.dlpack import from_dlpack
 
-from cosmos_curator.next.media.ffmpeg import InvalidMediaError, UnsupportedMediaError
+from cosmos_curator.next.media.failures import InvalidMediaError, UnsupportedMediaError
 from cosmos_curator.next.recipes.video_cut.transnetv2 import normalize_frame_timestamps
 
 # One resize call per frame spent most GPU time on small launches, which also

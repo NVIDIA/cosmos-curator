@@ -51,6 +51,12 @@ def test_selection_datasource_reads_every_item_once(items: pa.Table, parallelism
         datasource.get_read_tasks(0)
 
 
+def test_selection_read_tasks_are_named(items: pa.Table) -> None:
+    """Ray formats its large-read-task warning with the read function's name."""
+    for task in execution.SelectionDatasource(items).get_read_tasks(3):
+        assert task.read_fn.__name__ == "_read_items"
+
+
 @pytest.mark.parametrize("fail_write", [False, True])
 def test_processing_scope_owns_checkpoint_and_sink(
     bindings: contracts.AppendBindings, items: pa.Table, monkeypatch: pytest.MonkeyPatch, *, fail_write: bool

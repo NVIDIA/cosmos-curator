@@ -2,6 +2,40 @@
 
 ## Latest
 
+### Breaking Changes
+
+- Move `robot-action-split` to shared append publication. A work item is one source chunk, which
+  downloads once and stages one outcome; each run publishes one selection of at most
+  `execution.max_items` chunks atomically and resumes interrupted work from checkpoints, so rerun
+  while `remaining_items` is nonzero or null. Terminal errors become clip rows with null
+  `clip_uri` and `action_data_uri` and a non-null `error_stage`, replacing `errors.json` and
+  `run_summary.json`; the clip table adds `chunk_id`, `chunk_mp4_uri`, `data_parquet_uri`,
+  `error_stage`, and `error_message` and drops `record_schema_version` and
+  `media_contract_version`. Remove `execution.output_storage_profile`,
+  `clips_per_publish_batch`, `max_segments_per_batch`, `ray_data`, `storage_attempts`, and
+  `cut_attempts`; `execution.storage_profile` now serves the outputs and the new
+  `input.storage_profile` the source datasets. `output.lance_uri` and the new
+  `output.staging_root_uri` default under `output.media_root`. The table is bound to its split
+  settings and `output.media_root`, and finished clips must reference payloads beneath that root,
+  so moving the media root needs a new table. Existing clip tables are refused;
+  write to a new output location. The run summary replaces `total`, `succeeded`, `failed`, and
+  `outcomes` with the shared append summary, whose `errors` counts failed chunks, plus
+  `failed_clips` and `failed_clips_by_stage`. An unregistered `source_dataset` with
+  `action_format: bin` now fails config validation.
+
+### Changed
+
+- Skip clip rows without a `clip_uri` in `robot-action-caption`'s work filter in both input
+  scopes, and in the `embeddings` text modality, matching image.
+- Share one media failure contract between `ffmpeg` and `smart_cut` in
+  `cosmos_curator.next.media.failures`: terminal `MediaError` (`InvalidMediaError`,
+  `UnsupportedMediaError`, `CutError`) only on positive evidence, and retryable `ProbeError` and
+  `FFmpegRunError`, which the shared Ray runtime retries by name. `smart_cut` cut records carry
+  `failure` instead of a stderr-derived flag, and `cut_plan` raises `MediaError` or `ProbeError`
+  for its source instead of `ValueError`; it also accepts `on_cut` to consume each cut as it
+  finishes. Video-cut and robot-action-split share the missing-or-archived source check in
+  `cosmos_curator.next.utils.source_objects`.
+
 ## [2.9.0]
 
 ### Released

@@ -25,7 +25,7 @@ replaces fixed-stride span generation with a parquet-driven span provider.
 This recipe brings robot action dataset curation into the Curator Next programming
 model, giving it:
 
-- The shared config/manifest/receipt contract the planner already understands
+- The shared config contract and checkpointed append publication
 - Curator's scalability invariants (bounded per-attempt work, no global Lance scans)
 - GOP-aware smart cut — stream-copy for interior frames, re-encode only the head
 - Clean separation between span discovery (CPU-bound, parquet-driven) and media
@@ -196,7 +196,8 @@ input:
   uris:
     - s3://example-bucket/robot_data/lerobot_v30/dataset_name/
   source_dataset: dataset_name
-  limit: null   # max source chunk MP4s to process; matches video-split semantics
+  limit: null   # max data chunk directories (data/chunk-NNN/) discovery reads; for smoke runs
+  # storage_profile: <profile>   # defaults to execution.storage_profile; set it when sources live in another store
 
 split:
   min_duration_s: 4.0
@@ -210,18 +211,30 @@ split:
 
 output:
   media_root: s3://example/clips/
-  lance_uri: s3://example/robot_clips.lance
+  lance_uri: s3://example/clips/lance/clips.lance              # default <media_root>/lance/clips.lance
+  staging_root_uri: s3://example/clips/staging/robot-action-split  # default; recovery workspace
   action_format: bin   # "bin" (ACT2, default) or "pickle" (debug)
   video_bitrate: "2M"  # bitrate for libopenh264 head re-encode (only ~0.5 frames/clip on GOP=2 sources)
   views: []            # empty = all available views
 
 execution:             # all fields optional; shown with defaults
-  storage_profile: default
+  storage_profile: default        # serves the clip table, staging root, and media payloads
   discovery_workers: 4
-  max_segments_per_batch: 50
-  clips_per_publish_batch: 8000   # commit a Lance fragment every N successful clip rows
-  storage_attempts: 3             # retries for the idempotent Lance fragment commit
+  cut_cpus: 4.0                   # CPUs per chunk task, and concurrent cuts within it
+  max_items: 1000                 # chunks per published selection; null = every pending chunk
+  rows_per_checkpoint: 8          # chunk outcomes per checkpoint group
+  rows_per_fragment: 8000         # clip rows per appended Lance fragment
+  media_write_attempts: 3         # attempts per clip, action, or sidecar write before the task fails
+  chunk_download_attempts: 3      # attempts to stage a remote chunk MP4 before the task fails
+  no_progress_timeout_s: 7200     # Ray Data's wedge detector; one task cuts a whole chunk
+  commit_attempts: 5
+  tmp_dir: null
 ```
+
+The split settings, `source_dataset`, `action_format`, `video_bitrate`, and the media and action contract
+versions form the result contract that binds the clip table (see "Cross-Run Recovery"); changing any of them
+needs a new `lance_uri`. Locations, `views`, `input.limit`, and every `execution` setting select or schedule work
+without changing a chunk's outcome, so they stay outside it.
 
 After the first successful publication from a discovered shard, its source
 media and span-defining Parquet/JSON metadata are immutable inputs. Corrected
@@ -282,9 +295,15 @@ Discovery phases:
    `task_description` from episode metadata.
 4. **Filter + dedup** — apply `split.*` config (duration bounds, label skip,
    per-episode dedup per subtask label).
-5. **Batch assembly** — group `SpanWorkItem` objects by `(chunk_mp4_uri, data_parquet_uri)`.
+5. **Chunk assembly** — group `SpanWorkItem` objects by `(chunk_mp4_uri, data_parquet_uri)`. Each group is
+   one work item: `chunk_id` digests both URIs, and the group's spans travel as canonical JSON in `spans_json`,
+   which round-trips their float geometry exactly through the selection manifest.
+   `spans_json` is a persisted recovery format: decoding ignores span fields a later version no longer has, and a
+   field added to `SpanWorkItem` needs a default so saved selections still resume.
 
-No source media is touched during discovery.
+No source media is touched during discovery. A listing failure, or an input root with no shard, fails discovery
+instead of reading as an empty dataset. Overlapping inputs, such as a root listed with one of its shards, discover
+each shard once, and a repeated `clip_id` fails discovery.
 
 ---
 
@@ -308,27 +327,50 @@ frames per clip on average. Copied frames are bit-exact — no generation loss.
 
 ### Cutting Flow
 
-`process_batch` handles all spans from one `(chunk_mp4_uri, data_parquet_uri)` pair:
+`cut_chunk` handles all spans of one work item, the `(chunk_mp4_uri, data_parquet_uri)` pair, and returns one
+terminal chunk outcome:
 
 ```text
-process_batch(ChunkSpanBatch(chunk_mp4_uri, data_parquet_uri, [SpanWorkItem, ...]))
+cut_chunk(work item: chunk_id, chunk_mp4_uri, data_parquet_uri, spans_json)
   │
-  ├─ read_bytes(chunk_mp4_uri)    → chunk_bytes   ─┐ one try/except:
-  ├─ read_bytes(data_parquet_uri) → parquet_bytes  ─┘ any failure → all items failed
-  ├─ parse parquet → action_arrays for all episodes in this batch
-  ├─ write chunk_bytes to temp file (cut_plan requires a local path)
+  ├─ read_bytes(data_parquet_uri)        missing/archived → chunk error "load"
+  ├─ parse parquet → action_arrays       unparseable      → chunk error "parquet-parse"
+  ├─ download chunk_mp4_uri to a temp file (cut_plan requires a local path), chunk_download_attempts times
+  │                                      missing/archived → chunk error "chunk-stage"
   │
-  ├─ cut_plan(chunk_local, cut_specs, bitrate=video_bitrate, smart_cut=True)
+  ├─ cut_plan(chunk_local, cut_specs, bitrate=video_bitrate, smart_cut=True, workers=cut_cpus, on_cut=finish)
   │      builds per-frame PTS index from container packets (no decode)
   │      for each span: stream-copy interior GOPs + re-encode head → local clip MP4
   │      falls back to full re-encode if stream copy would be inexact
-  │      any failure → all items failed
+  │      span outside the chunk          → clip error "cut", before cut_plan runs
+  │      invalid or unindexable source (MediaError) → chunk error "cut-index"
+  │      inconclusive index probe (ProbeError)      → raise
   │
-  └─ for each SpanWorkItem (independently; one failure does not skip others):
-       ├─ write_media(clip_uri, ...)       — failure → failed outcome
-       ├─ encode_action_bin + write_media  — failure → failed outcome
-       └─ write_media(sidecar_uri, ...)    — failure → failed outcome
+  └─ finish(cut record), as each cut completes on cut_plan's worker threads:
+       ├─ cut the source cannot yield (CutError)    → clip error "cut"
+       ├─ inconclusive run (FFmpegRunError, ProbeError) → raise (failed or killed ffmpeg, timeout,
+       │                                       OS error such as a full disk, uncountable output)
+       ├─ slice + encode action data        → clip error "action" on ValueError/KeyError/IndexError
+       ├─ write clip, action, and sidecar   → retried media_write_attempts times, then raise
+       └─ remove the local clip
 ```
+
+A chunk error fails every clip the chunk owes with the same stage and message. Every other failure — storage
+environment, credentials, permissions, throttling, tools, or anything unclassified — raises without an outcome,
+so the chunk stays retryable (Ray Data's map retries cover transient errors first). Media failures follow the
+shared contract in [`media/failures.py`](../../../cosmos_curator/next/media/failures.py): `smart_cut` reports a
+`MediaError` only on positive evidence -- FFprobe's structured invalid-data error, an index that is not a frame
+index, a decode that selects other frames, or a completed cut with the wrong frame count -- and everything else as
+`ProbeError` or `FFmpegRunError`, which the shared runtime retries by name. A full scratch disk or a timeout under
+load therefore never becomes a published clip error. Payloads are durable before the outcome is returned, and their
+paths are deterministic, so a replayed chunk rewrites the same objects. Each clip is uploaded and removed as soon
+as its cut finishes, so a task's local disk holds the chunk MP4 plus at most `cut_cpus` clips.
+
+A chunk that keeps raising — for example, a deterministic failure the policy does not recognize — fails every
+run that resumes its selection, and the selection's other chunks wait with it. The raised error carries a note
+naming the chunk's `chunk_id` and `chunk_mp4_uri`. Fix the cause, or remove the
+recovery workspace under `output.staging_root_uri` to discard the saved selection; its staged outcomes are then
+recomputed by the next run.
 
 ### Frame Accuracy and Timestamp Translation
 
@@ -400,19 +442,16 @@ The `output.action_format` config field controls serialization:
 
 ## Lance Schema
 
-`records.py` publishes successful outcomes to the canonical, append-only `CLIP_SCHEMA` table and
-projects failed outcomes separately to a replaced-each-run `errors.json` report — never to
-Lance. Keeping failures out of the canonical table (rather than a mixed success/failure schema)
-is what makes the append-once-per-`clip_id` recovery invariant below hold: a retried failure never
-collides with an already-committed row, because a failed attempt never gets a canonical row to
-retry against in the first place.
+Each chunk stages one terminal outcome (`CHUNK_SCHEMA`: the chunk's identity and URIs, a list of clip outcomes,
+and a chunk-level `error_stage`/`error_message`). Publication expands outcomes into `CLIP_SCHEMA`, one row per
+clip the chunk owes, finished or failed. A failed clip keeps its identity, labels, and geometry, with null
+`clip_uri` and `action_data_uri` and a non-null `error_stage`, so every discovered clip — and therefore every
+chunk — remains present in current rows.
 
 `CLIP_SCHEMA`:
 
 | Column | Arrow type | Non-null | Meaning |
 |--------|-----------|---------|---------|
-| `record_schema_version` | `int32` | yes | `CLIP_RECORD_SCHEMA_VERSION` at write time |
-| `media_contract_version` | `int32` | yes | `MEDIA_CONTRACT_VERSION` at write time |
 | `clip_id` | `string` | yes | Stable per-view clip identifier |
 | `span_group_id` | `string` | yes | Stable id shared across all views of this span |
 | `view_name` | `string` | yes | Camera view (e.g. `observation.images.wrist_image`) |
@@ -431,14 +470,14 @@ retry against in the first place.
 | `end_ns` | `int64` | yes | Span end (exclusive) as nanoseconds within the chunk MP4 |
 | `native_fps` | `float64` | yes | Source video frame rate |
 | `episode_from_timestamp` | `float64` | yes | Episode start offset within the chunk MP4 (seconds) |
-| `clip_uri` | `large_string` | yes | Written clip MP4 URI |
-| `action_data_uri` | `large_string` | yes | Written action `.bin`/`.pickle` URI |
+| `clip_uri` | `large_string` | no | Written clip MP4 URI; null exactly when the clip failed |
+| `action_data_uri` | `large_string` | no | Written action `.bin`/`.pickle` URI; null exactly when the clip failed |
 | `camera_motion_annotation` | `large_string` | no | Computed motion description, when available |
-
-The `errors.json` report carries the same identity, labels, episode metadata, and
-geometry columns as `CLIP_SCHEMA` plus non-null `error_stage` and `error_message`;
-it has no `clip_uri`/`action_data_uri`/`camera_motion_annotation`, and it is never
-diffed for dedup — a rerun simply replaces it.
+| `chunk_id` | `string` | yes | Work item: digest of `chunk_mp4_uri` and `data_parquet_uri` |
+| `chunk_mp4_uri` | `string` | yes | Source chunk MP4 the clip was cut from |
+| `data_parquet_uri` | `string` | yes | Source data parquet holding the clip's episode |
+| `error_stage` | `string` | no | Terminal failure stage; null for a finished clip |
+| `error_message` | `string` | no | Terminal failure diagnostic, bounded to 8,192 characters |
 
 `clip_id` and `span_group_id` are SHA-256 digests. `span_group_id` hashes
 `(source_id, episode_id, subtask_index, frame_start)`. `clip_id` always hashes
@@ -449,126 +488,108 @@ multi-view sources. `action_data_uri` is keyed by `action_id`, which hashes
 not the media or metadata bytes at that location. Its stability therefore
 depends on the source media and span-defining Parquet/JSON metadata remaining
 immutable at that versioned shard URI.
-`task_description` participates in none of these identities. Record schema
-version 4 adds that nullable metadata field; reconciliation rejects rows stamped
-with version 3. `MEDIA_CONTRACT_VERSION` remains unchanged because it versions
-generated MP4 bytes and clip identity, not metadata-only Lance or sidecar fields.
+`task_description` participates in none of these identities.
+`MEDIA_CONTRACT_VERSION` versions generated MP4 bytes and clip identity, not metadata-only Lance or sidecar
+fields. The table no longer carries per-row schema or media version columns: the append contract binding in the
+schema metadata names the result contract, which includes both contract versions.
+
+Terminal diagnostics are ordinary rows:
+
+```python
+import lance
+
+clips = lance.dataset("s3://example/clips/lance/clips.lance")
+failed = clips.scanner(
+    filter="error_stage IS NOT NULL",
+    columns=["clip_id", "chunk_mp4_uri", "error_stage", "error_message"],
+)
+```
 
 **Downstream — embeddings.** The embed leg
 ([curator-next-embeddings.md](curator-next-embeddings.md)) consumes a projection
 of this table (`clip_id`, `task_name`, `subtask_name`, `clip_uri`,
 `action_data_uri`, `source_dataset`) and adds its vectors as additive, nullable
 per-modality column groups (`embedding_<modality>_*`) written directly onto
-`clips.lance`, plus a fitted action-PCA basis. `CLIP_SCHEMA` declares all six of those
-columns non-null, which the embed leg's read contract (`EMBED_SOURCE_ROW`) already expects.
+`clips.lance`, plus a fitted action-PCA basis. Its read contract (`EMBED_SOURCE_ROW`) already declares both
+URIs nullable; the text and image modalities apply only to rows with a `clip_uri`, and action only to rows with
+an `action_data_uri`, so failed clips receive no vectors and Curate never claims them.
+
+**Downstream — captioning.** Robot-action-caption owes only rows with a non-null `clip_uri`, in both its
+`selected_only` scopes; see [curator-next-robot-action-caption.md](curator-next-robot-action-caption.md).
 
 ---
 
 ## Cross-Run Recovery
 
-The recovery protocol follows [Curator Next Incremental Curation](curator-next-incremental-curation.md): a canonical Lance table that
-is both published output and cross-run checkpoint, deterministic identities, idempotent fragment-scoped
-commits, and driver-side reconciliation before any expensive work starts.
+`robot-action-split` uses shared append publication
+([checkpoint recovery](curator-next-checkpoint-recovery.md#append-publication)), with
+[video-cut](curator-next-video-cut.md) as the reference producer. The shared code owns selection, Ray Data
+checkpoints, packed fragment writes, atomic publication, and workspace cleanup; this recipe owns discovery, the
+processing graph, payload durability, and the terminal-error policy.
+
+**Migration decisions.** Recorded per
+[append migration decisions](curator-next-checkpoint-recovery.md#append-migration-decisions):
+
+| Decision | `robot-action-split` |
+| --- | --- |
+| Work item and identity | One source chunk: one view's chunk MP4 and the data parquet holding its episodes, identified by `chunk_id`. Its spans travel in the item as `spans_json`. A chunk downloads once and `cut_plan` cuts its spans `cut_cpus` at a time; per-clip work items would download each chunk once per clip, and grouping clips back into chunks inside the plan needs a Ray Data shuffle whose `map_groups` tasks each process a whole hash partition of chunks. Rows keep `clip_id` as their own identity. |
+| Durable result and payloads | One `CHUNK_SCHEMA` outcome per chunk, listing every clip. Clip MP4s, action payloads, and sidecars are written to deterministic paths before the outcome returns. Views of one span share one action payload and rewrite identical bytes. |
+| Publication and visibility | Each run publishes one selection of at most `execution.max_items` chunks (default 1,000) atomically; rows are no longer visible every `clips_per_publish_batch` rows. Rerun while `remaining_items` is nonzero or null. `max_items` also bounds the selection manifest, which saves each chunk's spans. |
+| Failure policy | Terminal: a missing or archived source object, unparseable data parquet, an unindexable chunk, a completed cut without the exact frames, and action data that cannot be sliced or encoded. A chunk error marks the chunk outcome, which publication counts as a terminal error, and every clip it owes. Cuts and index probes the environment failed, chunk downloads, and payload writes retry or raise; everything else raises and stays retryable. A published terminal error is not retried on a later run; retrying it needs a new output location. |
+| Compatibility and ownership | The table is bound to `owner: robot-action-split`, `id_column: chunk_id`, and the split contract (split settings, `source_dataset`, `action_format`, `video_bitrate`, `output.media_root`, media and action contract versions, `behavior_version`). `media_root` is bound because validation checks that every finished clip's payload URIs sit beneath it, as video-transcode does for its clips; the table and staging locations are not. One producer appends to a table. Tables written before this migration carry no binding and are refused; use a new output location. |
+
+**Run sequence.** `run_config` calls `run_append` with discovery as a callback:
+
+1. Open or create the clip table and validate its contract binding.
+2. Resume a saved selection without discovery, or discover chunks, look up published `chunk_id`s in current rows
+   with one projected scan, and select up to `max_items` pending chunks in `chunk_id` order.
+3. Start Ray, then run `cut_clips` inside the shared checkpoint scope: `scope.read()` yields one block per chunk,
+   filtered by the checkpoint before any download, and `cut_chunks` runs in the same task with `cut_cpus` CPUs.
+   Outcomes are validated and staged in checkpoint groups of `rows_per_checkpoint` chunks.
+4. Expand staged outcomes into clip rows, pack them into `rows_per_fragment`-row fragments, and append them in one
+   transaction; then remove the verified workspace.
+
+An interrupted run repeats only chunks that were in flight or waiting in an unwritten checkpoint group; a resumed
+selection keeps its saved chunks even if discovery or `max_items` changes. The run summary is the shared append
+summary plus `failed_clips`, `failed_clips_by_stage`, `clips_lance_uri`, and `clips_lance_version`. Its `errors`
+counts chunks that failed as a whole; `failed_clips` counts every failed clip this run published, read from the
+fragments it appended, and the CLI message reports it too.
+`errors.json` and `run_summary.json` are no longer written.
 
 **Immutable source contract.** Exact rerun and recovery require the source media
 and the Parquet/JSON metadata under each discovered shard URI to remain
-unchanged after rows from that shard are published. In particular, correcting a
-span's frame or time bounds in place is unsupported: `span_group_id` includes
-`frame_start` but not the end bound, so reconciliation may treat the corrected
-span as the already-published clip rather than as new work.
+unchanged after rows from that shard are published. Completion is per chunk: once a chunk is published, a
+corrected or newly added span in that chunk is not discovered as pending work.
 
 Publish corrected source artifacts at versioned shard URIs, normally beneath a
 versioned dataset root, and write to a new `output.lance_uri` and
 `output.media_root`, or completely rebuild the existing outputs. Changing only
 the source root while retaining the cumulative output is insufficient: moving
 the shards creates new source identities, but the old rows remain canonical
-because this recipe appends and reconciles; it does not retire or replace rows
+because this recipe only appends; it does not retire or replace rows
 from earlier source versions.
 
-**v3-to-v4 rollout.** Record schema v4 adds nullable `task_description`.
-The recipe intentionally provides no in-place migration. Strict schema
-validation refuses an existing v3 table that lacks the field before
-reconciliation starts. Manually adding the field is not enough: reconciliation
-separately refuses old rows still stamped with `record_schema_version = 3`.
-Recreating the table is the simplest rollout, but rerunning this recipe recuts
-and republishes the media. For an expensive existing table, use a separate
-metadata-only backfill keyed by `(source_id, episode_id)` to populate
-`task_description` for every matching span/view row and stamp the completed
-rows with schema version 4.
-
-**Recovery unit.** `source_id` hashes one normalized discovered shard URI. A
-shard can still contain many chunk MP4s and thousands of spans, so it is too
-coarse a unit to check "is this already done" against. The natural recovery
-unit is `ChunkSpanBatch`'s key, `(chunk_mp4_uri, data_parquet_uri)`: the same unit
-`_iter_sequential` downloads once and reuses, and the unit Ray Data parallelizes
-over. Reconciliation (`recovery.reconcile_batches`) operates at `clip_id`
-granularity within each batch: a batch whose every `(span, view)` `clip_id` is
-already committed is dropped before any chunk MP4 download; a
-partially-committed batch is still downloaded and cut, but only for its
-still-missing `SpanWorkItem`s.
-
-**Why no known-source replan shortcut.** Unlike `video-split`, span discovery here (`discover_spans`) is cheap,
-pure parquet/JSON metadata reading — no video decode, no probing (see "Span Provider" above: *"No source media
-is touched during discovery"*). `video-split`'s reconciliation goes to real effort reconstructing a known
-source's expected clip geometry from stored Lance fields specifically to avoid re-probing, since probing costs
-an object read. That shortcut isn't needed here: rerunning `discover_spans` in full is itself the cheap,
-authoritative way to recompute "what should exist" while source artifacts obey
-the immutable source contract above. Reconciliation is therefore a direct diff
-against freshly discovered `clip_id`s rather than a replan from stored metadata.
-
-**Idempotent commits.** Successful clip rows are buffered and staged/committed as one Lance fragment every
-`clips_per_publish_batch` rows (buffer-to-threshold, plus one final smaller flush at run end — the same shape
-`video-split` uses), via the shared `cosmos_curator.next.utils.lance_fragment_recovery` primitives: before each
-commit, the candidate fragment's `clip_id`s are checked against the latest table — all present means the
-fragment already landed (skip), none present means it's safe to append, and partial presence is a protocol
-violation (raised, never silently resolved). The same check resolves an ambiguous commit response before retry.
-
-**Action sidecar and multi-view rows.** Unlike `video-split`'s one-row-per-unit-of-work, multiple `CLIP_SCHEMA`
-rows (one per view) share one action `.bin` file. Reconciliation and commit still operate at `clip_id` (per-row)
-granularity — a partially-committed span (one view's clip committed, another's still missing) is a normal,
-independently-retryable state, not a violation. The action `.bin` write inherits the same
-durable-payload-before-metadata-commit property as clip media: `action_id` and its destination path are
-deterministic, so a redundant write (from a retry, or from each view's independent write attempt at the same
-shared path) is safe to blindly repeat.
-
-**Ordering under `input.limit`.** `limit` caps the number of distinct chunk MP4s discovery processes. Because
-reconciliation only ever diffs against the current run's freshly discovered batch set — never a wider stored
-expectation — a `limit`-capped smoke run can't be misread as "this shard is fully processed." This does require
-chunk selection order to be deterministic across runs (e.g. sorted by URI), so two `limit`-capped runs over the
-same input see the same missing-work set rather than a shifting window.
-
-**Known gap.** Commit granularity is row-count-based (buffer-to-`clips_per_publish_batch`), not chunk-based —
-a crash mid-buffer loses that buffer's uncommitted work, same as `video-split`. A `robot-action-split` run
-smaller than one publish batch (well under the 8,000-row default) gets no more incremental checkpointing
-benefit than a single-shot writer would; only large-scale runs see the crash-safety improvement. Lowering
-`clips_per_publish_batch` trades checkpoint frequency for fragment count / downstream Ray Data parallelism.
+**Ordering under `input.limit`.** `limit` caps the number of data chunk directories (`data/chunk-NNN/`) discovery
+reads, counted across all input URIs and shards in a deterministic order, so a `limit`-capped smoke run selects the
+same directories on every run. Every data file in a kept directory is read, and the chunk MP4s its spans reference
+become work items. The cap applies before span parsing, so a smoke run skips parsing the rest of the dataset, and
+therefore before dedup. LeRobot v3 stores each episode in one data file, so keeping or dropping whole directories
+never splits the per-episode dedup group: a limited run publishes the same rows for its chunks as an unlimited run.
 
 ---
 
 ## Pipeline Execution
 
-`pipeline.run` reconciles freshly discovered spans against the canonical clip table
-before processing, then processes only missing work — sequentially (`_iter_sequential`)
-or in parallel via Ray Data `flat_map` (`_iter_ray_data`, the default). Successful clip
-rows are buffered and committed as a Lance fragment every `clips_per_publish_batch`
-rows, not only once at the end of the run.
-
 ```text
-pipeline.run(config)
+run_config(config)
   │
-  ├─ discover_spans(config)                          → list[ChunkSpanBatch]
-  ├─ open_or_create_clip_table(lance_uri)
-  ├─ reconcile_batches(batches, dataset)              → drop committed spans, keep the rest
-  │
-  ├─ for each remaining outcome (sequential or Ray Data flat_map):
-  │     buffer successful rows; flush a Lance fragment every clips_per_publish_batch
-  │
-  └─ write run_summary.json (local media_root only)
+  └─ run_append(resolve_bindings(config), discover_items, start_ray, cut_clips)
+       ├─ open_target(lance_uri)                       → validate the contract binding
+       ├─ resume saved selection, or discover_items    → chunk work items, minus published chunk_ids
+       ├─ start_ray: storage env for outputs and sources, progress, map retries, no-progress timeout
+       ├─ cut_clips: scope.read(num_cpus=cut_cpus) → map_batches(cut_chunks) → scope.write
+       └─ publish: expand to clip rows → pack rows_per_fragment → one Lance append → clean workspace
 ```
-
-Batching groups `SpanWorkItem` objects by `(chunk_mp4_uri, data_parquet_uri)` so
-each call to `process_batch` reads one chunk file and one parquet shard. The
-`max_segments_per_batch` config cap splits large chunks so each batch stays bounded.
 
 ---
 
@@ -580,7 +601,7 @@ each call to `process_batch` reads one chunk file and one parquet shard. The
 | Span provider | fixed-stride | parquet subtask |
 | Cut | `transcode_span` (full re-encode) | `cut_plan` (smart cut: stream copy + head re-encode) |
 | Downstream decode | `CameraSensor` | `CameraSensor` (shared) |
-| Toolkit: Lance publish | shared | shared |
+| Toolkit: Lance publish | shared | shared append publication |
 | Source manifest item | `{source_uri}` | `{dataset_root, chunk_mp4_uri, data_parquet_uri, ...}` |
 | Extra outputs | none | `.bin` per span |
 | Multi-view | no | yes |
@@ -613,7 +634,6 @@ In addition to the shared recipe configuration, identity, publication, and recov
   attempts and batch configurations
 - `span_group_id` is identical across per-view rows for the same span
 - action `.bin` files contain the expected per-frame fields in the registered spec
-- cross-run recovery is implemented per "Cross-Run Recovery" above: freshly discovered
-  spans are reconciled against the canonical clip table before any chunk MP4 is
-  downloaded, and successful clip rows commit incrementally as bounded, idempotent
-  Lance fragments
+- cross-run recovery is implemented per "Cross-Run Recovery" above: the recipe runs the shared append
+  conformance suite and the fresh-cluster resume scenario on its real Ray Data plan, and published chunks are
+  never downloaded again

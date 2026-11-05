@@ -345,27 +345,22 @@ the columns explicitly and Lance rejects an unknown one.
 | `clip_id`         | `string` (non-null) | all legs (logical id) | SHA-256 digest of `(span_group_id[, view_name], video_bitrate)` — a hash, **not** a readable composite |
 | `task_name`       | `string` (non-null) | text           | `meta/tasks.parquet` label for the span's `task_index`                                                 |
 | `subtask_name`    | `string` (non-null) | text           | `meta/subtasks.parquet` label for the span's `subtask_index` (dominant signal)                         |
-| `clip_uri`        | `large_string` (declared nullable; non-null in practice) | image    | `…/video/<view_name>/<clip_id>.mp4` — the **generated per-view clip**, not the original recording      |
-| `action_data_uri` | `large_string` (declared nullable; non-null in practice) | action   | `…/action/<action_id>.bin` (legacy `.pickle` may exist from debug runs but the embed leg rejects it); `action_id` derives from the **span**, not the view         |
+| `clip_uri`        | `large_string` (nullable; null on a failed clip) | text, image | `…/video/<view_name>/<clip_id>.mp4` — the **generated per-view clip**, not the original recording      |
+| `action_data_uri` | `large_string` (nullable; null on a failed clip) | action   | `…/action/<action_id>.bin` (legacy `.pickle` may exist from debug runs but the embed leg rejects it); `action_id` derives from the **span**, not the view         |
 | `source_dataset`  | `string` (non-null) | — (declared base contract; no worker projects it — see below) | `robot_action_split` run config `input.source_dataset` (one dataset per extract run) |
 
 
 `clip_id` is the stable per-clip identity carried on every base row, and it is
 also the **join key** that routes a computed vector back to its `clips.lance` row
 (§2.4, §3). `EMBED_SOURCE_ROW` declares four columns non-null (`clip_id`,
-`task_name`, `subtask_name`, `source_dataset`) and the two URI columns nullable;
-`robot_action_split` writes `clips.lance` via `CLIP_SCHEMA`, which is
-**successes-only** — a row is committed to `clips.lance` only once its clip and
-(when applicable) action artifact have actually been written, so `clip_uri` and
-`action_data_uri` are non-null on every row a fresh `robot_action_split` run
-produces. A failed clip never becomes a `clips.lance` row at all; it is recorded
-instead in that run's `errors.json` alongside the media root, outside the Lance
-table entirely. `EMBED_SOURCE_ROW` still *declares* the two URI columns nullable —
-looser than the producer's real guarantee — so the embed leg keeps working
-unchanged against an older table written before this schema tightened, and its
-per-modality applicability predicates (§8), which test `IS NOT NULL`, stay
-correct as defensive filters rather than becoming dead code: on a table produced
-under `CLIP_SCHEMA` they simply always evaluate true. Extra columns on
+`task_name`, `subtask_name`, `source_dataset`) and the two URI columns nullable,
+matching the producer: `robot_action_split` writes `clips.lance` via `CLIP_SCHEMA`
+with one row per clip, successful or failed. A successful clip carries both
+`clip_uri` and `action_data_uri`; a clip the producer could not produce keeps its
+row with both URIs null and a non-null `error_stage` / `error_message`, so terminal
+errors are queryable in the table itself. The per-modality applicability predicates
+(§8), which test `clip_uri` / `action_data_uri` `IS NOT NULL`, exclude those rows
+from every modality: they own no vector and are never owed. Extra columns on
 `clips.lance` — including the `embedding_*` groups the recipe itself adds — are
 irrelevant to a worker's scan, so widening the table never disturbs the read
 path.
@@ -2134,17 +2129,16 @@ from a present NULL, §3.)
 exactly the rows it will attempt:
 
   ```text
-  text   := true                                            (every row)
+  text   := clip_uri IS NOT NULL AND clip_uri != ''
   image  := clip_uri IS NOT NULL AND clip_uri != ''
   action := action_data_uri IS NOT NULL AND action_data_uri != ''
   ```
 
-  On a table produced by `robot_action_split`'s current `CLIP_SCHEMA` (§2.1) both
-  URIs are non-null on every row, since a failed clip is never committed to
-  `clips.lance` in the first place — these predicates are then always true and
-  cost nothing beyond the scan. They stay in place as a defensive contract check
-  against any table where that guarantee doesn't hold (an older table, or a
-  future producer), rather than being narrowed to assume it.
+  On a table produced by `robot_action_split`'s `CLIP_SCHEMA` (§2.1), a clip the
+  producer could not produce keeps its row with null `clip_uri` and
+  `action_data_uri` and a non-null `error_stage`. Text needs only labels, which
+  that row still has, but they describe no training data, so text shares image's
+  predicate: the row gets no vector in any modality and is never owed.
 
 - **Action is Mecka-only and purely structural.** A clip is applicable iff it
 carries a non-empty `action_data_uri`; there is **no** dexterous / `source_dataset`
