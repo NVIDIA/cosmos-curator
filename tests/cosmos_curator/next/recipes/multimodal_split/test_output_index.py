@@ -3,19 +3,44 @@
 
 """Atomic publication of one immutable camera-index receipt."""
 
+import hashlib
+import io
 import shutil
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import lance
 import numpy as np
 import pytest
 
+from cosmos_curator.core.utils.storage.s3_client import S3Client
 from cosmos_curator.next.recipes.mp4_index.lance_sink import open_or_create_manifest_table
-from cosmos_curator.next.recipes.multimodal_split import output_index
+from cosmos_curator.next.recipes.multimodal_split import output_index, storage
+
+
+def test_retry_checksum_streams_s3_through_a_bounded_read_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real smart_open reader hashes a remote payload without an unbounded body read."""
+    payload = b"video payload" * (256 * 1024)
+
+    class BoundedBody(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= 1024 * 1024
+            return super().read(size)
+
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    client.s3.get_object.return_value = {
+        "Body": BoundedBody(payload),
+        "ContentLength": len(payload),
+        "ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0},
+    }
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    assert output_index._payload_sha256("s3://bucket/clip.mp4", "default") == hashlib.sha256(payload).hexdigest()
+    client.s3.get_object.assert_called_once()
 
 
 @pytest.fixture

@@ -38,8 +38,10 @@ from uuid import uuid4
 import tenacity
 from botocore.exceptions import ClientError
 from loguru import logger
+from s3transfer.utils import MAX_SINGLE_UPLOAD_SIZE, ReadFileChunk
 
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix, get_s3_client_config, is_s3path
+from cosmos_curator.core.utils.storage.storage_client import UPLOAD_CHUNK_SIZE_BYTES
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_storage_client,
     is_missing_object_error,
@@ -55,6 +57,7 @@ from cosmos_curator.next.utils.local_uri import (
 
 _PRECONDITION_FAILED = 412
 _CONDITIONAL_REQUEST_CONFLICT = 409
+_S3_MULTIPART_MAX_PARTS = 10_000
 
 # A conditional PUT that collides with another conditional PUT on the same key
 # answers 409, which S3 documents as retryable and which proves nothing about
@@ -269,7 +272,7 @@ def remove_object(uri: str, *, storage_profile: str = "default") -> None:
     logger.info(f"Removed local object {uri}.")
 
 
-def write_if_absent(uri: str, data: bytes, *, storage_profile: str = "default") -> bool:
+def write_if_absent(uri: str, data: bytes | Path, *, storage_profile: str = "default") -> bool:
     """Create one object exactly once, reporting whether this call created it.
 
     The create is atomic against a concurrent caller, which is what makes it
@@ -279,7 +282,7 @@ def write_if_absent(uri: str, data: bytes, *, storage_profile: str = "default") 
 
     Args:
         uri: Local path, ``file://`` URI, or ``s3://`` object URI.
-        data: Complete object contents.
+        data: Complete object bytes or an immutable local file to stream.
         storage_profile: Credential profile for the remote write.
 
     Returns:
@@ -307,7 +310,7 @@ def write_if_absent(uri: str, data: bytes, *, storage_profile: str = "default") 
     raise ValueError(msg)
 
 
-def _write_local_if_absent(path: Path, data: bytes) -> bool:
+def _write_local_if_absent(path: Path, data: bytes | Path) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     # A regular file is the only existing entry that answers "another caller
     # created this object". A directory, a device, or a dangling symlink at the
@@ -332,7 +335,11 @@ def _write_local_if_absent(path: Path, data: bytes) -> bool:
 
     try:
         with os.fdopen(descriptor, "wb") as artifact:
-            artifact.write(data)
+            if isinstance(data, Path):
+                with data.open("rb") as source:
+                    shutil.copyfileobj(source, artifact)
+            else:
+                artifact.write(data)
             artifact.flush()
             os.fsync(artifact.fileno())
         try:
@@ -356,10 +363,20 @@ def _is_conditional_write_conflict(error: BaseException) -> bool:
     return status == _CONDITIONAL_REQUEST_CONFLICT or code == "ConditionalRequestConflict"
 
 
-def _put_s3_object_if_absent(client: S3Client, prefix: S3Prefix, data: bytes) -> bool:
-    """Issue one conditional PUT, reporting whether it created the object."""
+def _put_s3_object_if_absent(client: S3Client, prefix: S3Prefix, data: bytes | Path) -> bool:
+    """Issue one conditional upload, reporting whether it created the object."""
     try:
-        client.s3.put_object(Bucket=prefix.bucket, Key=prefix.prefix, Body=data, IfNoneMatch="*")
+        if isinstance(data, Path):
+            file_size = data.stat().st_size
+            if file_size > MAX_SINGLE_UPLOAD_SIZE:
+                _upload_s3_file_parts(client, prefix, data, file_size)
+            else:
+                with data.open("rb") as source:
+                    client.s3.put_object(
+                        Bucket=prefix.bucket, Key=prefix.prefix, Body=source, ContentLength=file_size, IfNoneMatch="*"
+                    )
+        else:
+            client.s3.put_object(Bucket=prefix.bucket, Key=prefix.prefix, Body=data, IfNoneMatch="*")
     except ClientError as exc:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         code = exc.response.get("Error", {}).get("Code")
@@ -376,7 +393,30 @@ def _put_s3_object_if_absent(client: S3Client, prefix: S3Prefix, data: bytes) ->
     return True
 
 
-def _write_s3_if_absent(location: str, data: bytes, *, storage_profile: str) -> bool:
+def _upload_s3_file_parts(client: S3Client, prefix: S3Prefix, source: Path, file_size: int) -> None:
+    """Stream file parts and conditionally publish them, aborting any failed attempt."""
+    upload_args = {"Bucket": prefix.bucket, "Key": prefix.prefix}
+    upload_args["UploadId"] = client.s3.create_multipart_upload(**upload_args)["UploadId"]
+    part_size = max(UPLOAD_CHUNK_SIZE_BYTES, (file_size + _S3_MULTIPART_MAX_PARTS - 1) // _S3_MULTIPART_MAX_PARTS)
+    parts = []
+    try:
+        for part_number, offset in enumerate(range(0, file_size, part_size), start=1):
+            # File slices bound reads and support SDK rewinds without buffering a complete part.
+            with ReadFileChunk.from_filename(str(source), offset, part_size) as body:
+                response = client.s3.upload_part(
+                    **upload_args, PartNumber=part_number, Body=body, ContentLength=len(body)
+                )
+            parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+        client.s3.complete_multipart_upload(**upload_args, MultipartUpload={"Parts": parts}, IfNoneMatch="*")
+    except BaseException:
+        try:
+            client.s3.abort_multipart_upload(**upload_args)
+        except Exception as error:  # noqa: BLE001 -- cleanup must not mask the upload failure
+            logger.warning("Could not abort multipart upload for {}: {}", prefix.path, error)
+        raise
+
+
+def _write_s3_if_absent(location: str, data: bytes | Path, *, storage_profile: str) -> bool:
     prefix = S3Prefix(location)
     client = get_storage_client(location, profile_name=storage_profile)
     if not isinstance(client, S3Client):

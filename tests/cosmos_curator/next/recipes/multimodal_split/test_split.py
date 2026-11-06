@@ -834,7 +834,7 @@ def test_a_clip_is_never_published_without_its_moov(
 
     real_write = output_index.write_if_absent
 
-    def fail_on_moov(location: str, data: bytes, *, storage_profile: str) -> bool:
+    def fail_on_moov(location: str, data: bytes | Path, *, storage_profile: str) -> bool:
         if location.endswith(".moov"):
             msg = "storage went away"
             raise OSError(msg)
@@ -896,7 +896,7 @@ def test_one_sensors_failure_leaves_the_other_sensors_clips_and_report_alone(
 
     real_write = output_index.write_if_absent
 
-    def fail_the_left_camera(location: str, data: bytes, *, storage_profile: str) -> bool:
+    def fail_the_left_camera(location: str, data: bytes | Path, *, storage_profile: str) -> bool:
         if "left.mp4" in location:
             msg = "storage went away"
             raise OSError(msg)
@@ -2064,7 +2064,7 @@ def test_output_index_publication_resumes_after_interruption(
         if boundary in ("moov", "media"):
             original = output_index.write_if_absent
 
-            def interrupt_payload(location: str, data: bytes, *, storage_profile: str) -> bool:
+            def interrupt_payload(location: str, data: bytes | Path, *, storage_profile: str) -> bool:
                 result = original(location, data, storage_profile=storage_profile)
                 if location.endswith(".moov" if boundary == "moov" else ".mp4"):
                     msg = "interrupted after payload write"
@@ -2119,3 +2119,58 @@ def test_episode_publication_requires_a_complete_output_index(
     with pytest.raises((ValueError, FileNotFoundError)):
         stage_episode_batch(assembled, uri=uri, storage_profile="default")
     assert lance.dataset(uri).count_rows() == 0
+
+
+@pytest.mark.parametrize("retry_conflict", [False, True])
+@pytest.mark.parametrize("whole_session", [False, True])
+def test_camera_publication_and_retry_never_materialize_the_mp4(
+    tmp_path: Path,
+    make_session: Callable[..., Path],
+    make_config: Callable[..., ResolvedMultimodalSplitConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    retry_conflict: bool,
+    whole_session: bool,
+) -> None:
+    """Publication, unfinished retry comparison, completed reuse, and indexed reads stay file-backed."""
+    root = tmp_path / "recordings"
+    frames = 90 if whole_session else 30
+    make_session(root, "session-000", frames=frames)
+    config = make_config(root, tmp_path / "media", whole_session=whole_session)
+    item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
+    read_bytes = Path.read_bytes
+
+    def forbid_mp4_read_bytes(path: Path) -> bytes:
+        if path.suffix == ".mp4":
+            msg = "MP4 payload must stay file-backed"
+            raise AssertionError(msg)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_mp4_read_bytes)
+    with monkeypatch.context() as patch:
+        patch.setattr(output_index, "write_fragments", Mock(side_effect=OSError("index staging interrupted")))
+        assert split_all(item, config=config) == []
+    assert _errors(config)[0]["message"] == "index staging interrupted"
+    media = next(Path(config.output.path).rglob("*.mp4"))
+    with media.open("rb") as stream:
+        expected_sha256 = hashlib.sha256(stream.read()).hexdigest()
+    if retry_conflict:
+        with media.open("r+b") as stream:
+            stream.write(b"conflicting bytes")
+        assert split_all(item, config=config) == []
+        assert "already exists with different bytes" in _errors(config)[0]["message"]
+        assert (
+            output_index.find_output_index(
+                str(media), uri=output_index.output_index_uri(str(media)), storage_profile="default"
+            )
+            is None
+        )
+    else:
+        clips = split_all(item, config=config)
+        assert len(clips) == 1
+        assert clips[0]["media_sha256"] == expected_sha256
+        episode = assemble_episode_group(pa.Table.from_pylist(clips, schema=SENSOR_OUTCOME_SCHEMA)).to_pylist()[0]
+        with output_index.open_episode_camera(episode, "front") as window:
+            assert len(list(window.frames())) == frames
+        monkeypatch.setattr(split_module, "encode_frames_to_path", Mock(side_effect=AssertionError("encoded twice")))
+        assert len(split_all(item, config=config)) == 1

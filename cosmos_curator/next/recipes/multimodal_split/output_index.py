@@ -28,7 +28,7 @@ from cosmos_curator.core.sensors.utils.video import (
     execute_streaming_decode_plan,
     make_streaming_decode_plan,
 )
-from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options, get_storage_client, read_bytes
+from cosmos_curator.core.utils.storage.storage_utils import get_lance_storage_options
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
     VIDEO_MANIFEST_SCHEMA,
@@ -70,8 +70,9 @@ def _digest(table: pa.Table) -> str:
     return hashlib.sha256(buffer.getvalue()).hexdigest()
 
 
-def _read(location: str, storage_profile: str) -> bytes:
-    return read_bytes(location, get_storage_client(location, profile_name=storage_profile))
+def _payload_sha256(location: str, storage_profile: str) -> str:
+    with open_sensor_source(location, storage_profile=storage_profile, read_buffer_bytes=1024 * 1024) as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
 
 
 def find_output_index(media_location: str, *, uri: str, storage_profile: str) -> pa.Table | None:
@@ -141,8 +142,9 @@ def publish_output_index(  # noqa: PLR0913 -- one encoded output and its two clo
     if result["status"] != "success":
         msg = f"Could not index output MP4: {result['error_message']}"
         raise ValueError(msg)
-    media = local.read_bytes()
-    moov = Path(result["moov_location"]).read_bytes()
+    moov = Path(result["moov_location"])
+    media_sha256 = _payload_sha256(str(local), storage_profile)
+    moov_sha256 = _payload_sha256(str(moov), storage_profile)
     location = normalize_location(destination)
     moov_location = f"{destination}.moov"
     result.update(
@@ -154,8 +156,8 @@ def publish_output_index(  # noqa: PLR0913 -- one encoded output and its two clo
         moov_location=moov_location,
         alignment_timestamps_ns=alignment_timestamps_ns,
         source_timestamps_ns=source_timestamps_ns,
-        media_sha256=hashlib.sha256(media).hexdigest(),
-        moov_sha256=hashlib.sha256(moov).hexdigest(),
+        media_sha256=media_sha256,
+        moov_sha256=moov_sha256,
         split_contract_digest=split_contract_digest,
     )
     table = result_table(result, schema=OUTPUT_INDEX_SCHEMA)
@@ -169,10 +171,13 @@ def publish_output_index(  # noqa: PLR0913 -- one encoded output and its two clo
     if existing is not None and _digest(existing) != _digest(table):
         msg = f"Output index conflicts with the committed receipt for {destination}"
         raise ValueError(msg)
-    for target, payload in ((moov_location, moov), (destination, media)):
+    for target, payload, expected_sha256 in (
+        (moov_location, moov, moov_sha256),
+        (destination, local, media_sha256),
+    ):
         if (
             not write_if_absent(target, payload, storage_profile=storage_profile)
-            and _read(target, storage_profile) != payload
+            and _payload_sha256(target, storage_profile) != expected_sha256
         ):
             msg = f"Output payload already exists with different bytes: {target}"
             raise ValueError(msg)

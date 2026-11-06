@@ -158,6 +158,12 @@ per-camera completion receipt. The episode row becomes
 visible only after every planned camera has a complete index and every planned non-camera sensor has a complete
 receipt. Staging an episode verifies index bindings, media size, decoder-header availability, and the alignment grid.
 
+Publication hashes the encoded local files incrementally and passes file paths to the shared conditional writer.
+Local copies and S3 uploads stream the payload. S3 files up to 5 GiB use one conditional PUT; larger files use
+multipart upload with 100 MiB parts and conditional completion, increasing part size to respect the part-count limit.
+Failed multipart attempts are aborted; conditional-write conflicts restart the upload. Payload buffers stay bounded
+even for `whole_session`; frame-index and timestamp metadata still scale with frame count.
+
 Each camera has a one-row manifest, avoiding a shared index-table commit bottleneck. Its schema extends
 `VIDEO_MANIFEST_SCHEMA` with non-null `alignment_timestamps_ns` and
 `source_timestamps_ns` arrays, both in output presentation order, plus `media_sha256`, `moov_sha256`, and
@@ -168,8 +174,8 @@ Its `video_id` identifies the individual output MP4.
 `index_sha256` hashes the complete single-row index using an uncompressed Arrow IPC stream with the output schema.
 
 A restart validates and reuses completed receipts without re-encoding. An attempt interrupted before index commit
-can replay media/header writes and index publication. Existing payloads must be byte-identical; conflicts fail
-without overwriting them. Already-published episodes and their payloads remain immutable by contract.
+can replay media/header writes and index publication. Existing payloads are checked with a streaming SHA-256 comparison;
+conflicts fail without overwriting them. Already-published episodes and their payloads remain immutable by contract.
 Empty index tables left by the previous bootstrap/append writer are rejected with a fresh-output-directory error;
 new publication never commits an empty table.
 

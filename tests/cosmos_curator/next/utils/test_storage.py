@@ -32,14 +32,16 @@ separately in ``test_media_reader``.
 """
 
 import pathlib
+from typing import BinaryIO
 from unittest.mock import Mock, call
 
 import pytest
 from botocore.exceptions import ClientError
+from s3transfer.utils import MAX_SINGLE_UPLOAD_SIZE
 
 from cosmos_curator.core.utils.storage.azure_client import AzurePrefix
 from cosmos_curator.core.utils.storage.s3_client import S3Client
-from cosmos_curator.core.utils.storage.storage_client import StoragePrefix
+from cosmos_curator.core.utils.storage.storage_client import UPLOAD_CHUNK_SIZE_BYTES, StoragePrefix
 from cosmos_curator.next.utils import storage
 
 
@@ -644,3 +646,204 @@ def test_write_if_absent_accepts_a_file_created_between_presence_checks(
     monkeypatch.setattr(pathlib.Path, "exists", another_writer_wins)
     assert storage.write_if_absent(str(target), b"loser") is False
     assert target.read_bytes() == b"winner"
+
+
+def test_write_if_absent_copies_a_file_without_reading_it_all(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """File-backed writes retain local create-once behavior without a whole-file byte buffer."""
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(b"video payload")
+    target = tmp_path / "output/clip.mp4"
+    monkeypatch.setattr(pathlib.Path, "read_bytes", Mock(side_effect=AssertionError("whole-file read")))
+    assert storage.write_if_absent(target.as_uri(), source) is True
+    with target.open("rb") as stream:
+        assert stream.read() == b"video payload"
+    source.write_bytes(b"different payload")
+    assert storage.write_if_absent(target.as_uri(), source) is False
+    with target.open("rb") as stream:
+        assert stream.read() == b"video payload"
+
+
+def test_file_copy_failure_does_not_publish_or_leave_a_partial_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted copy removes its temporary artifact before propagating the failure."""
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(b"video payload")
+    target = tmp_path / "output/clip.mp4"
+
+    def interrupted_copy(source: BinaryIO, destination: BinaryIO) -> None:
+        destination.write(source.read(2))
+        message = "copy interrupted"
+        raise OSError(message)
+
+    monkeypatch.setattr(storage.shutil, "copyfileobj", interrupted_copy)
+    with pytest.raises(OSError, match="copy interrupted"):
+        storage.write_if_absent(str(target), source)
+    assert list(target.parent.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", [b"", b"video payload"])
+def test_write_if_absent_streams_a_small_file_in_one_conditional_s3_put(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    """Small and empty files are passed to S3 as streams, not byte buffers."""
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(payload)
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    uploaded: list[bytes] = []
+
+    def put_object(**kwargs: object) -> None:
+        body = kwargs["Body"]
+        assert not isinstance(body, bytes)
+        uploaded.append(b"".join(iter(lambda: body.read(2), b"")))
+        assert kwargs["IfNoneMatch"] == "*"
+
+    client.s3.put_object.side_effect = put_object
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    assert storage.write_if_absent("s3://bucket/clip.mp4", source) is True
+    assert uploaded == [payload]
+    client.s3.create_multipart_upload.assert_not_called()
+
+
+@pytest.mark.parametrize("file_size", [8 * 1024**2 + 1, UPLOAD_CHUNK_SIZE_BYTES + 1, MAX_SINGLE_UPLOAD_SIZE])
+def test_file_upload_uses_one_streamed_put_through_the_single_put_limit(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, file_size: int
+) -> None:
+    """A sparse file at or below the S3 limit needs one PUT regardless of multipart part size."""
+    source = tmp_path / "encoded.mp4"
+    with source.open("wb") as stream:
+        stream.truncate(file_size)
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    client.s3.create_multipart_upload.side_effect = AssertionError("File fits in a streamed PutObject")
+
+    def put_object(**kwargs: object) -> None:
+        body = kwargs["Body"]
+        assert not isinstance(body, bytes)
+        assert body.read(1) == b"\0"
+        assert kwargs["ContentLength"] == file_size
+        assert kwargs["IfNoneMatch"] == "*"
+
+    client.s3.put_object.side_effect = put_object
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    assert storage.write_if_absent("s3://bucket/clip.mp4", source) is True
+    client.s3.put_object.assert_called_once()
+    client.s3.create_multipart_upload.assert_not_called()
+
+
+def test_file_upload_above_the_single_put_limit_uses_the_shared_part_size(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One byte over the S3 limit streams multipart slices using the shared upload chunk size."""
+    source = tmp_path / "encoded.mp4"
+    file_size = MAX_SINGLE_UPLOAD_SIZE + 1
+    with source.open("wb") as stream:
+        stream.truncate(file_size)
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    client.s3.create_multipart_upload.return_value = {"UploadId": "upload-id"}
+
+    def upload_part(**kwargs: object) -> dict[str, str]:
+        body = kwargs["Body"]
+        offset = (kwargs["PartNumber"] - 1) * UPLOAD_CHUNK_SIZE_BYTES
+        assert kwargs["ContentLength"] == min(UPLOAD_CHUNK_SIZE_BYTES, file_size - offset)
+        assert not isinstance(body, bytes)
+        assert body.read(1) == b"\0"
+        return {"ETag": f"etag-{kwargs['PartNumber']}"}
+
+    client.s3.upload_part.side_effect = upload_part
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    assert storage.write_if_absent("s3://bucket/clip.mp4", source) is True
+    assert client.s3.upload_part.call_count == len(range(0, file_size, UPLOAD_CHUNK_SIZE_BYTES))
+    assert client.s3.complete_multipart_upload.call_args.kwargs["IfNoneMatch"] == "*"
+    client.s3.put_object.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["success", "exists", "conflict", "part_error", "denied", "abort_error"])
+def test_file_multipart_upload_is_bounded_conditional_and_cleans_up(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str], outcome: str
+) -> None:
+    """Conditional losers abort; 409 restarts the upload; other failures keep their original error."""
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(b"0123456789")
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    client.s3.create_multipart_upload.return_value = {"UploadId": "upload-id"}
+    uploaded: list[bytes] = []
+
+    def upload_part(**kwargs: object) -> dict[str, str]:
+        body = kwargs["Body"]
+        assert not isinstance(body, bytes)
+        uploaded.append(b"".join(iter(lambda: body.read(2), b"")))
+        return {"ETag": f"etag-{kwargs['PartNumber']}"}
+
+    client.s3.upload_part.side_effect = upload_part
+    if outcome != "success":
+        code, status = {
+            "exists": ("PreconditionFailed", 412),
+            "conflict": ("ConditionalRequestConflict", 409),
+            "part_error": ("AccessDenied", 403),
+            "denied": ("AccessDenied", 403),
+            "abort_error": ("AccessDenied", 403),
+        }[outcome]
+        error = ClientError({"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}, "Upload")
+        if outcome == "part_error":
+            client.s3.upload_part.side_effect = error
+        else:
+            client.s3.complete_multipart_upload.side_effect = [error, {}] if outcome == "conflict" else error
+        if outcome == "abort_error":
+            client.s3.abort_multipart_upload.side_effect = OSError("abort transport failure")
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(storage, "MAX_SINGLE_UPLOAD_SIZE", 4)
+    monkeypatch.setattr(storage, "UPLOAD_CHUNK_SIZE_BYTES", 4)
+    if outcome in ("part_error", "denied", "abort_error"):
+        with pytest.raises(ClientError, match="AccessDenied"):
+            storage.write_if_absent("s3://bucket/clip.mp4", source)
+    else:
+        assert storage.write_if_absent("s3://bucket/clip.mp4", source) is (outcome != "exists")
+    attempts = 2 if outcome == "conflict" else 1
+    assert client.s3.create_multipart_upload.call_count == attempts
+    if outcome == "part_error":
+        assert uploaded == []
+        client.s3.complete_multipart_upload.assert_not_called()
+    else:
+        assert uploaded == [b"0123", b"4567", b"89"] * attempts
+        for completion in client.s3.complete_multipart_upload.call_args_list:
+            assert completion.kwargs["IfNoneMatch"] == "*"
+            assert completion.kwargs["MultipartUpload"]["Parts"] == [
+                {"ETag": f"etag-{index}", "PartNumber": index} for index in (1, 2, 3)
+            ]
+    assert client.s3.abort_multipart_upload.call_count == (0 if outcome == "success" else 1)
+    if outcome == "abort_error":
+        assert "abort transport failure" in capfd.readouterr().err
+
+
+def test_multipart_file_slices_grow_to_stay_within_the_part_limit(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Larger part lengths still use seekable file slices rather than larger byte buffers."""
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(b"0123456789")
+    client = Mock(spec=S3Client)
+    client.s3 = Mock()
+    client.s3.create_multipart_upload.return_value = {"UploadId": "upload-id"}
+    uploaded: list[bytes] = []
+
+    def upload_part(**kwargs: object) -> dict[str, str]:
+        body = kwargs["Body"]
+        assert body.read(2) in (b"01", b"56")
+        body.seek(0)
+        uploaded.append(b"".join(iter(lambda: body.read(2), b"")))
+        assert kwargs["ContentLength"] == 5
+        return {"ETag": f"etag-{kwargs['PartNumber']}"}
+
+    client.s3.upload_part.side_effect = upload_part
+    monkeypatch.setattr(storage, "get_storage_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(storage, "MAX_SINGLE_UPLOAD_SIZE", 4)
+    monkeypatch.setattr(storage, "UPLOAD_CHUNK_SIZE_BYTES", 4)
+    monkeypatch.setattr(storage, "_S3_MULTIPART_MAX_PARTS", 2)
+    assert storage.write_if_absent("s3://bucket/clip.mp4", source) is True
+    assert uploaded == [b"01234", b"56789"]
