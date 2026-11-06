@@ -11,11 +11,11 @@ from ray.data._internal.actor_autoscaler.autoscaling_actor_pool import (
     ActorPoolScalingRequest,
     AutoscalingActorConfig,
 )
-from ray.data._internal.actor_autoscaler.default_actor_autoscaler import DefaultActorAutoscaler
+from ray.data._internal.actor_autoscaler.backlog_aware_actor_autoscaler import BacklogAwareActorAutoscaler
 from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
 from ray.data._internal.execution.operators import actor_pool_map_operator
 from ray.data._internal.execution.operators.actor_pool_map_operator import ActorPoolMapOperator, _ActorPool
-from ray.data.context import AutoscalingConfig, DataContext
+from ray.data.context import DataContext
 
 from cosmos_curator.next.core.ray_autoscaling import (
     ReleasePendingDownloadActors,
@@ -27,11 +27,14 @@ def test_download_autoscaling_configuration_is_scoped_and_idempotent() -> None:
     """Repeated configuration preserves other callbacks and never mutates the ambient context."""
     context = DataContext()
     original = list(context.custom_execution_callback_classes)
+    original_max_delta = context.autoscaling_config.actor_pool_max_upscaling_delta
     scoped = context.copy()
     configure_download_actor_autoscaling(scoped)
     configure_download_actor_autoscaling(scoped)
     assert scoped.autoscaling_config.actor_pool_util_upscaling_threshold == 1.0
+    assert scoped.autoscaling_config.actor_pool_max_upscaling_delta == 1
     assert scoped.custom_execution_callback_classes == [*original, ReleasePendingDownloadActors]
+    assert context.autoscaling_config.actor_pool_max_upscaling_delta == original_max_delta
     assert context.custom_execution_callback_classes == original
 
 
@@ -63,11 +66,14 @@ def test_pending_actor_cleanup_preserves_cooldown_active_tasks_and_future_growth
     op = Mock(spec=ActorPoolMapOperator)
     op._ray_remote_args = {"resources": {"curator_io": 1}}
     op.data_context = DataContext()
+    configure_download_actor_autoscaling(op.data_context)
     op.metrics.num_inputs_received = 100
+    op.metrics.average_num_inputs_per_task = 1
     op.get_autoscaling_actor_pools.return_value = [pool]
     op.has_completed.return_value = False
     op._inputs_complete = False
     state = Mock()
+    state.op = op
     state.total_enqueued_input_blocks.return_value = 100
     state._scheduling_status.under_resource_limits = True
     topology = {op: state}
@@ -75,9 +81,7 @@ def test_pending_actor_cleanup_preserves_cooldown_active_tasks_and_future_growth
     resources.get_allocation.return_value = None
     resources.get_op_usage.return_value = None
     resources.get_budget.return_value = None
-    autoscaler = DefaultActorAutoscaler(
-        topology, resources, config=AutoscalingConfig(actor_pool_util_upscaling_threshold=1.0)
-    )
+    autoscaler = BacklogAwareActorAutoscaler(topology, resources, config=op.data_context.autoscaling_config)
     callback = ReleasePendingDownloadActors()
     executor = Mock(_topology=topology)
 
@@ -94,7 +98,7 @@ def test_pending_actor_cleanup_preserves_cooldown_active_tasks_and_future_growth
     assert pool.num_running_actors() == 13  # Seven tasks exceed the 0.5 threshold again.
     assert pool.num_active_actors() == pool.num_tasks_in_flight() == 7
 
-    # New demand can grow the pool again, and a late worker can start that actor.
+    # A backlog of 100 tasks requests only one new actor; a late worker can start it.
     while pool.num_idle_actors():
         pool.on_task_submitted(pool.select_actors())
     autoscaler.try_trigger_scaling()

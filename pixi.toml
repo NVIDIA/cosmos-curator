@@ -22,6 +22,7 @@ pip = "*"
 platforms = ["linux-64", "linux-aarch64"]
 
 [feature.core.dependencies]
+aiohttp = ">=3.14.4" # keep the conda solve compatible with ray[default] 2.60
 astral = "*"
 attrs = "*"
 azure-identity = "*"
@@ -62,13 +63,14 @@ websockets = "<16" # google-genai requires websockets<16
 cosmos-xenna = "==0.5.13"
 foxglove-schemas-protobuf = "*"
 google-genai = ">=1.59.0" # conda-forge package is too old
+grpcio-reflection = "*" # vLLM metrics import ray.serve, which requires gRPC reflection in Ray 2.60
 ngcsdk = "*" # not available on conda-forge
 pillow = ">=12.2.0"  # CVE-2026-40192: patched in Pillow 12.2.0+ (core PyPI dep)
 pyasn1 = ">=0.6.3" # CVE remediation: require 0.6.3+ (fixes vs vulnerable 0.6.2 in default/core envs)
 pybase64 = ">=1.5.0" # SIMD base64 for bulk per-row data-URL encode; matches the version vllm already pins
 pylance = ">=14.0.0,<15.0.0" # conda-forge package is too old
 pulp = "*" # conda-forge package is too old
-ray = { version = "==2.59.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
+ray = { version = "==2.60.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
 webdataset = "*" # conda-forge package pulls in pytorch
 
 [feature.core.tasks]
@@ -126,6 +128,7 @@ platforms = ["linux-64", "linux-aarch64"]
 
 [feature.dev.dependencies]
 gpustat = "*"
+multidict = ">=6.6.3,<7" # keep the conda solve compatible with the deployment client's pyproject.toml constraint
 pytest-mock = "*"
 safetensors = "*"
 
@@ -214,7 +217,7 @@ nvidia-nvtx = "*"
 [feature.vllm.dependencies]
 transformers = ">=5.16.1,<5.21.0" # keep the conda solve within vLLM's supported range
 
-# Ray 2.59.0's ray.data.llm multimodal stage imports vLLM's chat utilities from their
+# Ray 2.60.0's ray.data.llm multimodal stage imports vLLM's chat utilities from their
 # pre-0.32 path; cosmos_curator/next/core/ray_llm_compat.py bridges it until Ray catches up.
 [feature.vllm.pypi-dependencies]
 torch = "==2.14.0" # vLLM 0.33.0 requires torch==2.14.0

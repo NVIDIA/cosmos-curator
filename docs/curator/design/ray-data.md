@@ -165,6 +165,12 @@ threshold (1.0 for one in-flight task and concurrency one), and do not derive a 
 resource snapshot. Actors hold slots while idle or backpressured too; task admission and payload memory budgets remain
 separate concerns.
 
+Ray 2.60's backlog-aware autoscaler can request multiple actors in one decision, while its resource budget still
+does not account for `curator_io`. The shared download configuration limits each scale-up decision to one actor,
+preserving bounded pending actor requests when IO slots are full. Pending actors count toward utilization and stop
+further scale-up until capacity becomes available. This limit applies to the media dataset context, including other
+actor pools in that plan, without changing the ambient context or imposing a fixed pool maximum.
+
 Ray 2.58 also suppresses utilization-based scale-down while an actor is pending. If idle actors hold all IO slots,
 an extra pending actor can therefore prevent the pool from shrinking. Video-cut's TransNetV2 plan and video-transcode
 use `next.core.ray_autoscaling.configure_download_actor_autoscaling` on their media dataset contexts. Its execution

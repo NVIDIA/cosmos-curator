@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Release surplus pending download actors that block Ray 2.58 scale-down.
+"""Bound download actor scale-up and release surplus pending actors.
+
+Ray 2.60's backlog-aware autoscaler can request several actors before any obtains
+a curator_io slot. Keep media-plan growth at one actor per decision so an IO-limited
+pool does not turn queued tasks into queued actor requests.
 
 Ray's default autoscaler refuses utilization-based scale-down while an actor is
 pending, even when idle actors hold every curator_io slot. Use the execution
@@ -22,6 +26,7 @@ from cosmos_curator.core.utils import environment
 def configure_download_actor_autoscaling(context: DataContext) -> None:
     """Scope reachable scale-up and pending-actor cleanup to a media plan's context."""
     context.autoscaling_config.actor_pool_util_upscaling_threshold = 1.0
+    context.autoscaling_config.actor_pool_max_upscaling_delta = 1
     if ReleasePendingDownloadActors not in context.custom_execution_callback_classes:
         context.custom_execution_callback_classes.append(ReleasePendingDownloadActors)
 

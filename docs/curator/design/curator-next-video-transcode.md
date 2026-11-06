@@ -60,8 +60,10 @@ charge CPU and memory budgets for many submitted downloads that are still waitin
 The pool starts with one actor and has no startup-derived maximum. Late workers can supply additional slots, and
 actors and their in-flight tasks can restart after worker loss. The download callable retains only configuration,
 not required progress or a source-payload cache. The media plan sets the actor upscaling threshold to 1.0: Ray's default
-1.75 cannot be reached with one in-flight task per actor. Pending actors count toward utilization, preventing repeated scale-up while
-the next actor waits for capacity. These settings do not change the ambient context used by publication.
+1.75 cannot be reached with one in-flight task per actor. It also limits each scale-up decision to one actor so Ray
+2.60's backlog-aware autoscaler does not request many actors waiting for IO slots. Pending actors count toward
+utilization, preventing repeated scale-up while the next actor waits for capacity. These settings do not change the
+ambient context used by publication.
 The shared download-autoscaling utility also cancels surplus pending IO actors when ready actors are idle, allowing
 Ray 2.58's normal scale-down to proceed. Ray's cooldown, minimum pool size, and future scale-up remain in effect.
 

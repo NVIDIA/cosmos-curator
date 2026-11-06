@@ -201,7 +201,7 @@ def test_runtime_features_are_separated_from_core() -> None:
 
     assert "channels" not in core_feature
     assert core_pypi_dependencies["cosmos-xenna"] == "==0.5.13"
-    assert core_pypi_dependencies["ray"] == {"version": "==2.59.0", "extras": ["default", "data"]}
+    assert core_pypi_dependencies["ray"] == {"version": "==2.60.0", "extras": ["default", "data"]}
     for dependency_name in ("fastapi", "starlette", "uvicorn", "websockets"):
         assert dependency_name in core_dependencies
     for dependency_name in ("google-genai", "webdataset"):
