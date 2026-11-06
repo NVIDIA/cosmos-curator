@@ -735,6 +735,15 @@ unit_tests:
     - PYTHONFAULTHANDLER=1 pytest -s -n "${PYTEST_XDIST_WORKERS:-4}" --dist loadfile
     # Save the raw coverage data file
     - cp .coverage .coverage.unit_tests || true
+  after_script:
+    # Worker startup errors precede actor registration, so Ray cannot forward
+    # them to pytest. Keep them as artifacts instead of expanding the job log.
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ] && [ -d /tmp/ray ]; then
+        mkdir -p unit-ray-logs
+        find /tmp/ray -type f \( -name raylet.err -o -name 'worker-*.err' \) \
+          -newermt "$CI_JOB_STARTED_AT" -exec cp --parents {} unit-ray-logs/ \;
+      fi
   artifacts:
     when: always
     reports:
@@ -743,6 +752,7 @@ unit_tests:
       - unit-htmlcov/
       - unit-coverage.xml
       - .coverage.unit_tests
+      - unit-ray-logs/
     expire_in: 1 week
   retry:
     max: 2

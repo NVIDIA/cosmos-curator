@@ -253,7 +253,10 @@ def test_apply_split_stage_wires_transnetv2_actor_resources() -> None:
     assert kwargs["compute"].min_size == 1
     assert kwargs["compute"].max_size == 3
     assert kwargs["compute"].initial_size == 1
-    assert kwargs["runtime_env"].get("py_executable") == "pixi run --as-is -e default python"
+    assert (
+        kwargs["runtime_env"].get("py_executable")
+        == "pixi run --as-is -e default python -m cosmos_curator.core.utils.hf_module_cache"
+    )
     assert kwargs["runtime_env"].get("env_vars") == {
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
         "VLLM_CACHE_ROOT": "/tmp/vllm",  # noqa: S108

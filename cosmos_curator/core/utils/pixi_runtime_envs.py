@@ -14,6 +14,9 @@
 # limitations under the License.
 """A Pixi-based runtime environment for Ray."""
 
+import shlex
+import sys
+
 from ray.runtime_env import RuntimeEnv
 
 _RAY_DATA_GPU_ENV_VARS = {
@@ -36,8 +39,8 @@ class PixiRuntimeEnv(RuntimeEnv):
     """RuntimeEnv that launches Python inside a Pixi environment.
 
     This thin wrapper forwards all arguments to :class:`ray.runtime_env.RuntimeEnv`
-    but overrides the ``py_executable`` to run ``python`` via ``pixi run --as-is``
-    when a Pixi environment name is provided.
+    but overrides ``py_executable`` to select the Pixi environment and configure a
+    private Transformers module cache before loading Ray's worker entry point.
     """
 
     def __init__(self, env_name: str, env_vars: dict[str, str] | None = None) -> None:
@@ -53,9 +56,10 @@ class PixiRuntimeEnv(RuntimeEnv):
 
         """
         copied_env_vars = None if env_vars is None else dict(env_vars)
+        python = f"pixi run --as-is -e {shlex.quote(env_name)} python" if env_name else shlex.quote(sys.executable)
         super().__init__(
             env_vars=copied_env_vars,
-            py_executable=f"pixi run --as-is -e {env_name} python" if env_name else None,
+            py_executable=f"{python} -m cosmos_curator.core.utils.hf_module_cache",
         )
 
 

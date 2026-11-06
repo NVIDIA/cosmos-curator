@@ -167,6 +167,17 @@ that corresponds to the environment `default` in [pixi.toml](../../../pixi.toml)
 Every `env` needs to be listed in [pixi.toml](../../../pixi.toml).
 Note as a convention enforced by `pixi`, you should use `-` instead of `_` for the `env` name.
 
+Workers launched through `PixiRuntimeEnv`, including Xenna stages and Next model actors,
+run a lightweight launcher before Ray imports their code. It gives each worker a private
+`HF_MODULES_CACHE` under node-local `/tmp`, overriding inherited module-cache and `TMPDIR`
+settings. Transformers copies custom Python modules there from the staged model directory;
+workers never share partially copied modules. `HF_HOME`, `HF_HUB_CACHE`, model weight paths,
+and the shared NFS/Lustre weight cache stay unchanged, so this does not download weights again.
+The directory is reused for the worker's lifetime and removed on normal interpreter exit.
+Abrupt exits such as `SIGKILL` or `os._exit` can leave small directories for node-local
+temporary-directory cleanup. Direct model loading outside `PixiRuntimeEnv` is unaffected;
+subprocesses started inside a worker inherit its environment.
+
 Then when building the docker image for running pipelines, use option `--envs` to specify which Pixi environments to be included in the build.
 
 In case you find it hard to configure your `env` using `pixi`, you can add a `post_install.sh` script under `package/cosmos_curator/envs/<env_name>/`.
