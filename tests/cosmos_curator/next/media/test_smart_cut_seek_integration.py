@@ -27,11 +27,13 @@ CPU only, no model weights, a few seconds.
 import json
 import shutil
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from cosmos_curator.next.media import smart_cut
 from cosmos_curator.next.media.smart_cut import _probe_index, cut_plan
 
 pytestmark = pytest.mark.integration
@@ -77,6 +79,29 @@ def source(tmp_path_factory: pytest.TempPathFactory) -> Path:
         pytest.skip("libopenh264 unavailable; cannot build the fixture source")
     (out_dir / "colours.json").write_text(json.dumps({i: _colour(i) for i in range(_NUM_FRAMES)}))
     return mp4
+
+
+@pytest.fixture(scope="module")
+def vp9_source(source: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep the identifiable frames but use a non-H.264 codec with keyframes every 50."""
+    ffmpeg = _require("ffmpeg")
+    encoders = subprocess.run(  # noqa: S603
+        [ffmpeg, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if "libvpx-vp9" not in encoders.stdout:
+        pytest.skip("libvpx-vp9 unavailable; cannot build the non-H.264 fixture")
+    output = tmp_path_factory.mktemp("smart_cut_vp9") / "source.mp4"
+    subprocess.run(  # noqa: S603
+        [ffmpeg, "-y", "-v", "error", "-i", str(source), "-an", "-c:v", "libvpx-vp9",
+         "-g", "50", "-keyint_min", "50", "-lag-in-frames", "0", "-auto-alt-ref", "0",
+         "-deadline", "realtime", "-cpu-used", "8", "-lossless", "1", "-threads", "1",
+         "-pix_fmt", "yuv420p", "-video_track_timescale", str(_FPS), str(output)],
+        capture_output=True, check=True,
+    )  # fmt: skip
+    return output
 
 
 def _decoded_frame_ids(source: Path, clip: Path) -> list[int]:
@@ -166,6 +191,87 @@ def test_cut_starts_on_requested_source_frame(cut_source: Path, tmp_path: Path, 
     assert _decoded_frame_ids(cut_source, out) == list(range(start, end + 1))
 
 
+def test_validation_rejects_concealed_corruption_with_complete_frame_count(tmp_path: Path) -> None:
+    """Decoder errors can preserve every frame and timestamp despite a zero probe exit code."""
+    ffmpeg = _require("ffmpeg")
+    ffprobe = _require("ffprobe")
+    encoders = subprocess.run(  # noqa: S603
+        [ffmpeg, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=20,
+    )
+    if not any(len(fields := line.split()) > 1 and fields[1] == "mpeg4" for line in encoders.stdout.splitlines()):
+        pytest.skip("native mpeg4 encoder unavailable; cannot build the corruption fixture")
+
+    clean = tmp_path / "clean.mp4"
+    subprocess.run(  # noqa: S603
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=10",
+         "-frames:v", "10", "-c:v", "mpeg4", "-g", "1", "-q:v", "3", str(clean)],
+        capture_output=True, check=True, timeout=20,
+    )  # fmt: skip
+    packet_probe = subprocess.run(  # noqa: S603
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_packets",
+         "-show_entries", "packet=pos,size,flags", "-of", "json", str(clean)],
+        capture_output=True, text=True, check=True, timeout=20,
+    )  # fmt: skip
+    packets = json.loads(packet_probe.stdout)["packets"]
+    assert len(packets) == 10
+    assert all("K" in packet["flags"] for packet in packets)
+    packet = packets[4]
+    assert int(packet["size"]) >= 64
+    damaged = bytearray(clean.read_bytes())
+    offset = int(packet["pos"]) + 32
+    assert any(damaged[offset : offset + 32])
+    # Damage the coded picture, preserving the MP4 sample table and packet boundaries.
+    damaged[offset : offset + 32] = bytes(32)
+    corrupt = tmp_path / "corrupt.mp4"
+    corrupt.write_bytes(damaged)
+
+    probe_args = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-count_frames",
+        "-show_entries",
+        "stream=time_base,start_pts,duration,nb_read_frames:format=duration:frame=best_effort_timestamp",
+        "-of",
+        "json",
+    ]
+    clean_probe = subprocess.run(  # noqa: S603
+        [*probe_args, str(clean)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=20,
+    )
+    corrupt_probe = subprocess.run(  # noqa: S603
+        [*probe_args, str(corrupt)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert not clean_probe.stderr.strip()
+    assert corrupt_probe.returncode == 0
+    assert corrupt_probe.stderr.strip(), "the damaged picture must reproduce decoder errors"
+    clean_metadata = json.loads(clean_probe.stdout)
+    corrupt_metadata = json.loads(corrupt_probe.stdout)
+    assert len(clean_metadata["frames"]) == len(corrupt_metadata["frames"]) == 10
+    assert clean_metadata["streams"][0]["nb_read_frames"] == "10"
+    assert corrupt_metadata["streams"][0]["nb_read_frames"] == "10"
+    assert corrupt_metadata == clean_metadata, "counts, decoded PTS, and time metadata must survive corruption"
+
+    index = _probe_index(str(clean), verify_index="always")
+    assert smart_cut._validate_output(str(clean), index, 0, 10) == (10, None)
+    _, error = smart_cut._validate_output(str(corrupt), index, 0, 10)
+    assert error is not None, "complete counts and timing must not mask decoder errors"
+
+
 def test_seek_at_frame_timestamp_alone_is_not_enough(transport_stream: Path, tmp_path: Path) -> None:
     """Guard the MPEG-TS regression: a bare target-frame seek drops the reference keyframe.
 
@@ -187,3 +293,97 @@ def test_seek_at_frame_timestamp_alone_is_not_enough(transport_stream: Path, tmp
         "a bare target-frame seek now lands correctly on MPEG-TS; re-check whether the "
         "keyframe-anchored decode is still required"
     )
+
+
+def test_hybrid_preserves_source_timing_with_90000_timescale(tmp_path: Path) -> None:
+    """The EPIC timing regression also occurs with compatible H.264 segments."""
+    ffmpeg = _require("ffmpeg")
+    ffprobe = _require("ffprobe")
+    source = tmp_path / "50fps.mp4"
+    encoded = subprocess.run(  # noqa: S603
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=50",
+         "-frames:v", "200", "-c:v", "libopenh264", "-g", "50", "-b:v", "4M", "-threads", "1",
+         "-video_track_timescale", "90000", str(source)],
+        capture_output=True, check=False,
+    )  # fmt: skip
+    if encoded.returncode != 0:
+        pytest.skip("libopenh264 unavailable; cannot build the fixture source")
+    output = tmp_path / "hybrid.mp4"
+    record = cut_plan(
+        str(source),
+        [{"startFrame": 49, "endFrame": 105, "output": str(output)}],
+        smart_cut=True,
+    )[0]
+    assert record["success"], record
+    assert record["mode"] == "smartcut", "compatible H.264 must retain the hybrid fast path"
+    result = subprocess.run(  # noqa: S603
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries",
+         "stream=nb_read_frames,duration,avg_frame_rate", "-of", "json", str(output)],
+        capture_output=True, text=True, check=True,
+    )  # fmt: skip
+    stream = json.loads(result.stdout)["streams"][0]
+    assert stream["nb_read_frames"] == "57"
+    assert float(stream["duration"]) == pytest.approx(1.14, abs=0.00001)
+    assert stream["avg_frame_rate"] == "50/1"
+
+
+def test_non_h264_hybrid_candidate_falls_back_to_full_encode(
+    vp9_source: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incompatible splice must become a correctly selected and timed full encode."""
+    start, end = 45, 55
+    index = _probe_index(str(vp9_source))
+    assert index.codec_name == "vp9"
+    assert index.smart_cut_safe
+    assert not index.stream_copy_safe
+    assert index.keyframe_at_or_before(start) == 0
+    assert index.next_keyframe_at_or_after(start) == 50
+    assert start < 50 <= end
+
+    warnings = []
+    monkeypatch.setattr(smart_cut.logger, "warning", lambda *args: warnings.append(args))
+    output = tmp_path / "fallback.mp4"
+    record = cut_plan(
+        str(vp9_source),
+        [{"startFrame": start, "endFrame": end, "output": str(output)}],
+        smart_cut=True,
+        gpu=False,
+    )[0]
+    assert record["success"], record
+    assert record["mode"] == "encode"
+    assert "vp9" in record["fallback_reason"]
+    assert not warnings
+    assert record["written_frames"] == end - start + 1
+    assert _decoded_frame_ids(vp9_source, output) == list(range(start, end + 1))
+
+    result = subprocess.run(  # noqa: S603
+        [_require("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_frames", "-count_frames",
+         "-show_entries", "stream=codec_name,nb_read_frames,duration,time_base:frame=best_effort_timestamp",
+         "-of", "json", str(output)],
+        capture_output=True, text=True, check=True,
+    )  # fmt: skip
+    metadata = json.loads(result.stdout)
+    stream = metadata["streams"][0]
+    assert stream["codec_name"] == "h264"
+    assert int(stream["nb_read_frames"]) == end - start + 1
+    assert float(stream["duration"]) == pytest.approx((end - start + 1) / _FPS, abs=0.000001)
+    actual_pts = [int(frame["best_effort_timestamp"]) * Fraction(stream["time_base"]) for frame in metadata["frames"]]
+    assert actual_pts == [Fraction(i, _FPS) for i in range(end - start + 1)]
+
+
+@pytest.mark.parametrize("extension", ["ts", "mkv"])
+@pytest.mark.parametrize("start", [0, 31, 50])
+def test_copy_and_encode_to_other_containers(source: Path, tmp_path: Path, extension: str, start: int) -> None:
+    """Generic CLI outputs retain their normal muxer offset and duration representation."""
+    output = tmp_path / f"cut.{extension}"
+    # Tiny solid-colour TS clips need enough packets for FFmpeg's format autodetection.
+    count = 12
+    record = cut_plan(
+        str(source),
+        [{"startFrame": start, "endFrame": start + count - 1, "output": str(output)}],
+        smart_cut=True,
+    )[0]
+    assert record["success"], record
+    assert _decoded_frame_ids(source, output) == list(range(start, start + count))

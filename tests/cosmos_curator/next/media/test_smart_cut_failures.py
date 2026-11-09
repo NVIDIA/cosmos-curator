@@ -176,12 +176,12 @@ def test_geometry_selection_and_frame_count_failures_are_cut_errors(
     assert isinstance(_cut_one(tmp_path)["failure"], CutError)
 
     monkeypatch.setattr(smart_cut, "_run_encode", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(smart_cut, "_output_frame_count", lambda _path: 9)
+    monkeypatch.setattr(smart_cut, "_validate_output", lambda *_a: (9, "decoded 9/10 frames"))
     short = _cut_one(tmp_path)
     assert isinstance(short["failure"], CutError)
-    assert short["error"] == "wrote 9/10 frames"
+    assert short["error"] == "decoded 9/10 frames"
 
-    monkeypatch.setattr(smart_cut, "_output_frame_count", lambda _path: -1)
+    monkeypatch.setattr(smart_cut, "_validate_output", lambda *_a: (-1, "output decode probe failed"))
     uncounted = _cut_one(tmp_path)["failure"]
     assert isinstance(uncounted, FFmpegRunError)
     assert not isinstance(uncounted, MediaError)
@@ -200,9 +200,11 @@ def test_a_wrong_smart_cut_head_falls_back_to_the_full_reencode(
             raise CutError(msg)
         return True
 
-    index = _Index(1, 30, list(range(60)), stream_copy_safe=False, keyframes=(0, 15, 30), smart_cut_safe=True)
+    index = _Index(
+        1, 30, list(range(60)), stream_copy_safe=False, keyframes=(0, 15, 30), smart_cut_safe=True, codec_name="h264"
+    )
     monkeypatch.setattr(smart_cut, "_run_encode", encode)
-    monkeypatch.setattr(smart_cut, "_output_frame_count", lambda _path: 10)
+    monkeypatch.setattr(smart_cut, "_validate_output", lambda *_a: (10, None))
     record = smart_cut._cut_one(
         "source.mp4", _cut(tmp_path), index, "2M", 1, allow_stream_copy=True, smart_cut=True, tmp_dir=str(tmp_path)
     )
@@ -214,7 +216,9 @@ def test_on_cut_receives_each_record_as_its_cut_finishes(tmp_path: Path, monkeyp
     """Callers can consume and remove each output while later cuts run."""
     monkeypatch.setattr(smart_cut, "_probe_index", lambda _source, verify_index="auto": _index())  # noqa: ARG005
     monkeypatch.setattr(
-        smart_cut, "_cut_one", lambda _source, cut, *_args, **_kwargs: {"output": cut["output"], "success": True}
+        smart_cut,
+        "_cut_one",
+        lambda _source, cut, *_args, **_kwargs: {"output": cut["output"], "success": True, "mode": "copy"},
     )
     seen: list[str] = []
     cuts = [{"startFrame": i, "endFrame": i + 1, "output": str(tmp_path / f"{i}.mp4")} for i in (0, 10, 20)]

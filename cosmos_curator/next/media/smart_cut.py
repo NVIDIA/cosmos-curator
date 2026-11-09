@@ -55,6 +55,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 from pathlib import Path
 from typing import IO, Any
 
@@ -210,6 +211,9 @@ class _Index:
         stream_copy_safe: bool,
         keyframes: tuple[int, ...] = (),
         smart_cut_safe: bool = False,
+        codec_name: str = "",
+        end_pts: int | None = None,
+        durations: list[int | None] | None = None,
     ) -> None:
         self.num = num
         self.den = den
@@ -220,9 +224,19 @@ class _Index:
         # smart_cut_safe, since that depends on file order rather than presentation order.
         self.keyframes = keyframes
         self.smart_cut_safe = smart_cut_safe
+        self.codec_name = codec_name
+        self.end_pts = end_pts
+        self.durations = durations if durations is not None else [None] * len(pts)
 
     def __len__(self) -> int:
         return len(self.pts)
+
+    def end_of_frame(self, frame: int) -> int | None:
+        """Return the sample's end; a VFR gap need not belong to its preceding frame."""
+        duration = self.durations[frame]
+        if duration is not None:
+            return self.pts[frame] + duration
+        return self.pts[frame + 1] if frame + 1 < len(self) else self.end_pts
 
     def next_keyframe_at_or_after(self, frame: int) -> int | None:
         """Return first keyframe index >= *frame*, or None if there is none at/after it."""
@@ -344,7 +358,7 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         raise ValueError(msg)
     meta = _ffprobe(
         ["-select_streams", "v:0", "-show_entries",
-         "stream=time_base,codec_name,field_order:format=format_name", "-of", "json", source]
+         "stream=time_base,codec_name,field_order,start_pts,duration_ts:format=format_name", "-of", "json", source]
     )  # fmt: skip
     if meta.returncode != 0:
         raise _probe_failure(source, meta, f"ffprobe failed for {source!r}")
@@ -373,7 +387,7 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
     format_name = str((meta_json.get("format") or {}).get("format_name") or "")
 
     pk = _ffprobe(
-        ["-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts,flags", "-of", "json", source]
+        ["-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts,duration,flags", "-of", "json", source]
     )
     if pk.returncode != 0:
         raise _probe_failure(source, pk, f"packet index probe failed for {source!r}")
@@ -383,6 +397,7 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         msg = f"ffprobe returned an unparsable packet index for {source!r}: {e}"
         raise ProbeError(msg) from e
     file_pts: list[int] = []
+    file_durations: list[int | None] = []
     keyframe_rows: list[int] = []
     all_intra = True
     for row, p in enumerate(packets):
@@ -401,12 +416,19 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
         else:
             all_intra = False
         file_pts.append(int(val))
+        try:
+            duration = int(p.get("duration", 0))
+        except (TypeError, ValueError):
+            duration = 0
+        file_durations.append(duration if duration > 0 else None)
     if not file_pts:
         msg = f"{source!r} produced an empty packet index"
         raise UnsupportedMediaError(msg)
 
     file_monotonic = all(file_pts[i] > file_pts[i - 1] for i in range(1, len(file_pts)))
-    pts = sorted(file_pts)
+    ordered = sorted(zip(file_pts, file_durations, strict=True), key=lambda item: item[0])
+    pts = [pts_value for pts_value, _ in ordered]
+    durations = [duration for _, duration in ordered]
     duplicates = sum(1 for i in range(1, len(pts)) if pts[i] == pts[i - 1])
     if duplicates:
         # VFR sources can legitimately repeat a PTS; do NOT drop the whole chunk. Instead
@@ -451,6 +473,13 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
             _no_frames_decoded(n_pk, f"in the first {_PREFIX_VERIFY_SECONDS}s")
         if n_pk != n_fr:
             _reject(n_pk, n_fr, f"in the first {_PREFIX_VERIFY_SECONDS}s")
+    end_pts = None
+    try:
+        candidate_end = int(stream0.get("start_pts", pts[0])) + int(stream0["duration_ts"])
+        if candidate_end > pts[-1]:
+            end_pts = candidate_end
+    except (KeyError, TypeError, ValueError):
+        pass  # Some containers do not report the terminal sample's end timestamp.
     return _Index(
         num,
         den,
@@ -462,6 +491,9 @@ def _probe_index(source: str, verify_index: str = "auto") -> _Index:  # noqa: C9
             pts, tuple(sorted(bisect.bisect_left(pts, file_pts[row]) for row in keyframe_rows))
         ),
         smart_cut_safe=smart_cut_safe,
+        codec_name=codec_name,
+        end_pts=end_pts,
+        durations=durations,
     )
 
 
@@ -528,41 +560,76 @@ def _encode_cmd(  # noqa: PLR0913
         f"settb=expr={index.num}/{index.den},trim=start_pts={index.pts[start]},"
         f"trim=end_frame={nframes},showinfo@source=checksum=0,setpts=PTS-STARTPTS"
     )
+    track_timescale = (
+        ["-video_track_timescale", str(index.den)] if Path(output).suffix.lower() in {".mp4", ".mov", ".m4v"} else []
+    )
     return [
         "ffmpeg", "-y", "-nostdin", "-nostats", "-v", "info", "-copyts", "-seek_timestamp", "1",
         *seek, "-noaccurate_seek", "-i", source, "-map", "0:v:0", "-an",
         "-frames:v", str(nframes), "-vf", vf,
         "-c:v", encoder, *extra, "-b:v", bitrate, "-pix_fmt", "yuv420p",
         *([] if use_nvenc else ["-threads", str(threads)]),
-        *_timing_flags(), output,
+        *_timing_flags(), *track_timescale, output,
     ]  # fmt: skip
 
 
-def _copy_cmd(source: str, output: str, ss: str, nframes: int) -> list[str]:
+def _copy_cmd(source: str, output: str, ss: str, nframes: int, *, timescale: int | None = None) -> list[str]:
     """Build the ffmpeg stream-copy command for a single clip."""
     # Stream copy: seek onto the (keyframe) start frame and copy exactly nframes packets.
     # Safe only for all-intra sources with in-order packets (see _probe_index).
     return [
         "ffmpeg", "-y", "-nostdin", "-v", "error", "-seek_timestamp", "1",
         "-ss", ss, "-i", source, "-map", "0:v:0", "-an",
-        "-frames:v", str(nframes), "-c", "copy", "-avoid_negative_ts", "make_zero", output,
+        "-frames:v", str(nframes), "-c", "copy", "-avoid_negative_ts", "make_zero",
+        *(["-video_track_timescale", str(timescale)] if timescale is not None else []), output,
     ]  # fmt: skip
 
 
-def _output_frame_count(path: str) -> int:
-    """Return the frame count of the output file, preferring fast container metadata over a full decode."""
-    # Prefer the container's nb_frames (no decode); it is written accurately for the mp4
-    # we just produced. Fall back to an exact decode count only if it is unavailable.
-    fast = _ffprobe(
-        ["-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "default=nk=1:nw=1", path]
-    ).stdout.strip()
-    if fast.isdigit() and int(fast) > 0:
-        return int(fast)
-    out = _ffprobe(
-        ["-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames",
-         "-of", "default=nk=1:nw=1", path]
-    ).stdout.strip()  # fmt: skip
-    return int(out) if out.isdigit() else -1
+def _validate_output(path: str, index: _Index, start: int, expected: int) -> tuple[int, str | None]:  # noqa: PLR0911
+    """Decode once to verify cardinality and source-relative presentation timing.
+
+    MP4 sample counts can describe packets that never decode. A correct decoded count
+    alone also misses time-base corruption, so compare the displayed PTS as well.
+    Check the final duration only when the source provides an endpoint.
+    """
+    result = _ffprobe(
+        ["-select_streams", "v:0", "-show_frames", "-show_entries",
+         "stream=time_base,start_pts,duration:format=duration:frame=best_effort_timestamp",
+         "-of", "json", path]
+    )  # fmt: skip
+    # _ffprobe uses -v error: warnings are suppressed, but concealed decoder errors
+    # can still emit every requested frame and leave ffprobe's exit status at zero.
+    if result.returncode != 0 or result.stderr.strip():
+        return -1, "output decode probe failed"
+    try:
+        payload = json.loads(result.stdout)
+        stream = payload["streams"][0]
+        frames = payload.get("frames", [])
+        count = len(frames)
+        if count != expected:
+            return count, f"decoded {count}/{expected} frames"
+        output_tick = Fraction(stream["time_base"])
+        if output_tick <= 0:
+            return count, "invalid output time base"
+        source_tick = Fraction(index.num, index.den)
+        output_origin = int(stream.get("start_pts", 0)) * output_tick
+        origin_tolerance = output_tick / 2 + Fraction(1, 1_000_000)
+        # Relative intervals subtract two independently rounded endpoints, each up to half a tick off.
+        tolerance = output_tick + Fraction(1, 1_000_000)
+        for offset, (frame, source_pts) in enumerate(zip(frames, index.pts[start : start + expected], strict=True)):
+            actual = int(frame["best_effort_timestamp"]) * output_tick - output_origin
+            wanted = (source_pts - index.pts[start]) * source_tick
+            if abs(actual - wanted) > (origin_tolerance if offset == 0 else tolerance):
+                return count, "output presentation timestamps do not match the requested source range"
+        end_pts = index.end_of_frame(start + expected - 1)
+        if end_pts is not None:
+            wanted_duration = (end_pts - index.pts[start]) * source_tick
+            duration = stream.get("duration") or payload.get("format", {}).get("duration")
+            if abs(Fraction(duration) - wanted_duration) > tolerance:
+                return count, "output duration does not match the requested source range"
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError):
+        return -1, "invalid decoded output metadata"
+    return count, None
 
 
 def _run_ff(cmd: list[str], errf: IO[bytes]) -> bool:
@@ -663,9 +730,9 @@ def _smartcut(  # noqa: PLR0913
     Re-encode ONLY the head [start, kf-1] -- those frames sit before the first keyframe inside the
     clip, so they depend on frames before ``start`` and cannot be copied -- and STREAM-COPY the body
     [kf, end] bit-exact (kf is a keyframe, so the copied range is self-contained). Both segments
-    begin on an IDR, so they concatenate cleanly. Returns True on a clean run; the CALLER still
-    validates the output frame count and falls back to a full re-encode on any mismatch, so a bad
-    concat can never ship a wrong clip.
+    must use the head encoder's H.264 codec, enforced by the caller's eligibility check.
+    Returns True on a clean run; the caller still
+    validates decoded frames and timing and falls back to a full re-encode on any mismatch.
     """
     with tempfile.TemporaryDirectory(dir=tmp_dir) as _tmpdir:
         head = str(Path(_tmpdir) / "head.mp4")
@@ -680,7 +747,7 @@ def _smartcut(  # noqa: PLR0913
             return False
         # Body: stream-copy [kf, end]. kf is a keyframe, so +0.25 tick lands exactly on it.
         body_ss = _seconds(index.pts[kf] + 0.25, index.num, index.den)
-        if not _run_ff(_copy_cmd(source, body, body_ss, end - kf + 1), errf):
+        if not _run_ff(_copy_cmd(source, body, body_ss, end - kf + 1, timescale=index.den), errf):
             return False
         with Path(lst).open("w") as fh:
             # Escape single quotes per the concat-demuxer syntax ('\'' inside a quoted path);
@@ -719,6 +786,7 @@ def _cut_one(  # noqa: C901, PLR0911, PLR0912, PLR0913
         "error": None,
         "mode": None,
         "failure": None,
+        "fallback_reason": None,
     }
 
     def failed(failure: Exception) -> dict[str, Any]:
@@ -755,8 +823,8 @@ def _cut_one(  # noqa: C901, PLR0911, PLR0912, PLR0913
         with tempfile.TemporaryFile() as errf:
             Path(output).parent.mkdir(parents=True, exist_ok=True)
 
-            # Fast paths (validated by frame count below; ANY miss falls back to a full re-encode, so a
-            # bad copy/concat can never ship a wrong clip):
+            # Packet-copy safety does not imply compatibility with the H.264 head encoder.
+            # Pure copies remain codec-independent; only hybrid splices need that compatibility.
             #   - whole-clip stream-copy: an all-intra file, OR the clip starts exactly on a keyframe;
             #   - smart-cut: re-encode only the pre-keyframe head, stream-copy the rest.
             if use_copy or kf == start:
@@ -768,28 +836,47 @@ def _cut_one(  # noqa: C901, PLR0911, PLR0912, PLR0913
                     _copy_cmd(source, output, _seconds(start_pts + 0.25, index.num, index.den), expected), errf
                 )
             elif kf is not None and kf <= end:
-                rec["mode"] = "smartcut"
-                ok = _smartcut(source, output, start, kf, end, index, bitrate, threads, errf, gpu=gpu, tmp_dir=tmp_dir)
+                if index.codec_name == "h264":
+                    rec["mode"] = "smartcut"
+                    ok = _smartcut(
+                        source, output, start, kf, end, index, bitrate, threads, errf, gpu=gpu, tmp_dir=tmp_dir
+                    )
+                else:
+                    rec["fallback_reason"] = (
+                        f"source codec {index.codec_name or 'unknown'} is incompatible with the H.264 hybrid head"
+                    )
+                    ok = False
             else:
                 ok = False  # no fast path applies (or none enabled) -> full re-encode
 
             if ok:
-                rec["written_frames"] = _output_frame_count(output)
-                if rec["written_frames"] == expected:
+                rec["written_frames"], validation_error = _validate_output(output, index, start, expected)
+                if validation_error is None:
                     rec["success"] = True
                     return rec
+                rec["fallback_reason"] = validation_error
+            elif rec["mode"] is not None:
+                rec["fallback_reason"] = "fast-path ffmpeg operation failed"
 
             # Full re-encode: the default path AND the frame-exact fallback for any fast-path miss.
+            # Codec ineligibility is expected, not a failed fast-path attempt.
+            if rec["fallback_reason"] is not None and rec["mode"] is not None:
+                logger.warning("Full re-encode for frames {}..{}: {}", start, end, rec["fallback_reason"])
             rec["mode"] = "encode"
+            # Attribute a failure to this attempt, not to an earlier fast-path diagnostic.
+            errf.seek(0)
+            errf.truncate()
             # Decode from an earlier keyframe and select [start, end] by integer source PTS.
             if not _run_encode(source, output, index, start, expected, bitrate, threads, errf, gpu=gpu):
                 # ffmpeg gives no structured cause, so a failed run proves nothing about the media.
                 return failed(FFmpegRunError(f"ffmpeg re-encode failed: {_error_tail(errf)}"))
-            rec["written_frames"] = _output_frame_count(output)
-            if rec["written_frames"] < 0:
-                return failed(FFmpegRunError(f"could not count the frames written to {output!r}"))
-            if rec["written_frames"] != expected:
-                return failed(CutError(f"wrote {rec['written_frames']}/{expected} frames"))
+            rec["written_frames"], validation_error = _validate_output(output, index, start, expected)
+            if validation_error is not None:
+                if rec["written_frames"] < 0:
+                    # The output itself could not be probed/decoded; that is inconclusive
+                    # about the media, not evidence the cut is wrong.
+                    return failed(FFmpegRunError(f"could not validate {output!r}: {validation_error}"))
+                return failed(CutError(validation_error))
             rec["success"] = True
     except subprocess.TimeoutExpired:
         return failed(FFmpegRunError("ffmpeg/ffprobe timed out"))
@@ -820,10 +907,14 @@ def cut_plan(  # noqa: C901, PLR0913
     Each cut fast-seeks to its exact start PTS and stream-copies (all-intra source) or
     re-encodes with libopenh264 (CPU) or h264_nvenc (GPU, when *gpu* is True) at the
     given *bitrate*. Returns one record per cut:
-    ``{"output", "expected_frames", "written_frames", "success", "error", "mode", "failure"}``;
-    ``success`` is True only when the exact requested frame count was produced. A per-cut
-    failure is isolated to that cut, and ``failure`` holds it under the shared media failure
-    contract: a ``CutError`` when the source cannot yield the cut's exact frames, otherwise an
+    ``{"output", "expected_frames", "written_frames", "success", "error", "mode", "failure",
+    "fallback_reason"}``; success requires the requested decoded count and presentation
+    timing, not just MP4 header counts. Hybrid cuts require H.264 sources to match the head
+    encoder; other codecs retain safe pure-copy cuts and otherwise fall back to a full
+    re-encode. Fallback reasons are recorded per cut; expected codec fallbacks use the
+    plan summary rather than per-cut warnings. A per-cut failure is isolated to that cut,
+    and ``failure`` holds it under the shared media failure contract: a
+    ``CutError`` when the source cannot yield the cut's exact frames, otherwise an
     inconclusive ``FFmpegRunError`` or ``ProbeError`` -- a timeout, an OS error such as a full
     disk, a killed or failed ffmpeg, or an output that could not be counted -- that a retry
     may resolve. ``error`` is its message.
@@ -886,9 +977,18 @@ def cut_plan(  # noqa: C901, PLR0913
         return rec
 
     if workers <= 1:
-        return [run(c) for c in cuts]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(run, cuts))
+        results = [run(c) for c in cuts]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(run, cuts))
+    logger.info(
+        "Cut plan complete: {} clips, {} fully encoded, {} failed (source codec {})",
+        len(results),
+        sum(record["mode"] == "encode" for record in results),
+        sum(not record["success"] for record in results),
+        index.codec_name or "unknown",
+    )
+    return results
 
 
 def _load_plan(plan_path: Path) -> dict[str, Any]:
