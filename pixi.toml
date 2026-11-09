@@ -15,34 +15,38 @@ version = "1.0.0"
 PYTHONNOUSERSITE = "1"  # isolate pixi environments from user/system site-packages
 
 [dependencies]
-python = "==3.13.14"
+python = "==3.13.18" # CVE remediation: 3.13.15 fixes CVE-2026-11940/11972/15308; 3.13.18 adds CVE-2026-115557/19445/19553/82049
 pip = "*"
 
 [feature.linux]
 platforms = ["linux-64", "linux-aarch64"]
 
 [feature.core.dependencies]
-aiohttp = ">=3.14.4" # keep the conda solve compatible with ray[default] 2.60
+aiohttp = ">=3.14.4" # CVE remediation: 3.14.4 fixes CVE-2026-111064, CVE-2026-111066, GHSA-2g87-pp6c-29x5; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it; also keeps the conda solve compatible with ray[default] 2.60
 astral = "*"
 attrs = "*"
 azure-identity = "*"
 azure-storage-blob = "*"
+brotli-python = ">=1.2.1" # CVE remediation: 1.2.1 fixes CVE-2026-111497; conda name for pypi "brotli" (pulled in by urllib3's conda recipe); conda dep so the conda solve doesn't pin a lower version out from under it
 cattrs = "*"
+certifi = ">=2026.10.18" # CVE remediation: 2026.10.18 fixes GHSA-6q48-6c7w-9gw2; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
+dnspython = ">=2.9.0" # CVE remediation: 2.9.0 fixes CVE-2026-114605; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
 easydict = "*"
 fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM requires fastapi[standard]<0.137
 huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
 mcap = ">=1.3.1,<2.0.0"
+multidict = ">=6.6.3,<7" # mirror pyproject.toml's own pin (line 37) into the conda solve
 numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 nvidia-ml-py = "*"
 nvtx = "==0.2.15" # match vLLM's NVTX requirement
-openssl = ">=3.6.2,<4.0a0" # default env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
+openssl = ">=3.6.5,<4.0a0" # default env: bin/openssl; 3.6.5 fixes CVE-2026-84782, CVE-2026-84784, CVE-2026-72897, CVE-2026-54873; stay on 3.x
 pandas = "*"
 pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
 pydantic = ">=2.12,<3"
 pyproj = "*"
-pyjwt = ">=2.12.0" # CVE remediation: require 2.12+ (fixes vs vulnerable 2.11.x in default/core envs)
+pyjwt = ">=2.14.0" # CVE remediation: 2.14.0 fixes CVE-2026-102266/102267/102268/102271/102272/102273
 pytest = "*"
 pytest-asyncio = "*"
 pytest-cov = "*"
@@ -56,7 +60,9 @@ tenacity = "*"
 timezonefinder = "*"
 tqdm = "*"
 typer = ">=0.21.0"
+urllib3 = ">=2.8.0" # CVE remediation: 2.8.0 fixes CVE-2026-97687, CVE-2026-97689; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
 uvicorn = "*"
+virtualenv = ">=21.14.9" # CVE remediation: highest floor needed across CVE-2026-102925/102930/102937/113718/113722/113723/113725/113726/113732/113776; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
 websockets = "<16" # google-genai requires websockets<16
 
 [feature.core.pypi-dependencies]
@@ -64,9 +70,10 @@ cosmos-xenna = "==0.5.13"
 foxglove-schemas-protobuf = "*"
 google-genai = ">=1.59.0" # conda-forge package is too old
 grpcio-reflection = "*" # vLLM metrics import ray.serve, which requires gRPC reflection in Ray 2.60
+msgpack = ">=1.2.3" # CVE remediation: 1.2.3 fixes CVE-2026-114613 (no conda-forge build; pypi-only dep)
 ngcsdk = "*" # not available on conda-forge
 pillow = ">=12.2.0"  # CVE-2026-40192: patched in Pillow 12.2.0+ (core PyPI dep)
-pyasn1 = ">=0.6.3" # CVE remediation: require 0.6.3+ (fixes vs vulnerable 0.6.2 in default/core envs)
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197
 pybase64 = ">=1.5.0" # SIMD base64 for bulk per-row data-URL encode; matches the version vllm already pins
 pylance = ">=14.0.0,<15.0.0" # conda-forge package is too old
 pulp = "*" # conda-forge package is too old
@@ -90,11 +97,17 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [feature.tools.dependencies]
+aiohttp = ">=3.14.4" # CVE remediation: 3.14.4 fixes CVE-2026-111064, CVE-2026-111066, GHSA-2g87-pp6c-29x5; same floor as core, tools/cluster don't pull in core
+certifi = ">=2026.10.18" # CVE remediation: 2026.10.18 fixes GHSA-6q48-6c7w-9gw2; same floor as core, tools/cluster don't pull in core
+multidict = ">=6.6.3,<7" # mirror pyproject.toml's own pin (line 37) into the conda solve; tools/cluster don't pull in core
+openssl = ">=3.6.5,<4.0a0" # CVE remediation: same floor as core; tools/cluster don't pull in core
 pre-commit = "==4.2.0"
 pydantic = ">=2.12,<3"
 python-build = "*"
 setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
 setuptools-scm = ">=8"
+urllib3 = ">=2.8.0" # CVE remediation: 2.8.0 fixes CVE-2026-97687, CVE-2026-97689; same floor as core, tools/cluster don't pull in core
+virtualenv = ">=21.14.9" # CVE remediation: highest floor needed across CVE-2026-102925/102930/102937/113718/113722/113723/113725/113726/113732/113776; same floor as core, tools/cluster don't pull in core
 
 [feature.tools.pypi-dependencies]
 cosmos-curator = { path = ".", editable = true }
@@ -117,6 +130,7 @@ nvtop = "*"
 [feature.cluster.pypi-dependencies]
 awscli = "*"
 awscli-plugin-endpoint = "*"
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197; pulled in by awscli, same floor as core
 
 [feature.cluster.tasks]
 nvitop = "nvitop"
@@ -176,7 +190,7 @@ cuda-bindings = "==13.0.*"
 cuda-python = "==13.0.*"
 nvidia-cuda-cccl = "==13.0.*"
 nvidia-cuda-crt = "==13.0.*"
-PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
+PyNvVideoCodec = ">=2.0.4" # not available on conda-forge. Floor only: vLLM pins ==2.0.4 (through 0.33.0), so vLLM envs resolve to 2.0.4; no upper bound so anything without that pin, and future vLLM releases, pick up newer versions. NVIDIA versions are not date-ordered (2.1.0 predates 2.0.4).
 timm = "*" # conda-forge package pulls in torchvision, which is behind; torch is pinned by vllm/vllm-omni
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
@@ -256,17 +270,18 @@ cuda-python = "13.0.*"
 cuda-version = "13.0.*"
 loguru = "*"
 numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
-openssl = ">=3.6.2,<4.0a0" # cuml env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
+openssl = ">=3.6.5,<4.0a0" # cuml env: bin/openssl; 3.6.5 fixes CVE-2026-84782, CVE-2026-84784, CVE-2026-72897, CVE-2026-54873; stay on 3.x
 pillow = ">=12.2.0" # CVE-2026-40192: same floor as core; cuml omits core so pin conda pillow (RAPIDS pulls it), not only core's pypi-dep
-pyjwt = ">=2.12.0" # CVE remediation: PyJWT 2.12+ (cuml env; same floor as core)
+pyjwt = ">=2.14.0" # CVE remediation: 2.14.0 fixes CVE-2026-102266/102267/102268/102271/102272/102273 (cuml env; same floor as core)
+msgpack-python = ">=1.2.3" # CVE remediation: 1.2.3 fixes CVE-2026-114613; conda name differs from the pypi "msgpack" dep in core.pypi-dependencies, and distributed/rapids-dask-dependency pull the conda build in here, so it needs its own conda-side floor
 raft-dask = "*"
 setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
-tornado = ">=6.5.5" # CVE remediation: Tornado 6.5.5+ (cuml env; fixes vs vulnerable 6.5.3)
+tornado = ">=6.5.9" # CVE remediation: 6.5.9 fixes GHSA-c2m8-h5v5-343r, GHSA-chx6-46f5-w4vp (cuml env)
 tqdm = "*"
 
 [feature.cuml.pypi-dependencies]
 ngcsdk = "*" # not available on conda-forge
-pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as core)
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197 (cuml env; same floor as core)
 pylance = ">=14.0.0,<15.0.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
@@ -275,6 +290,7 @@ transformers = ">=5.11.0,<6.0.0" # native Cosmos3 support requires recent Transf
 [feature.transformers.pypi-dependencies]
 # sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
 cuda-bindings = "==13.0.*"
+nltk = ">=3.10.4" # CVE remediation: 3.10.4 fixes CVE-2026-81726, GHSA-j456-xh4h-cpf2 (pulled in transitively via cosmos_guardrail; only style-transfer resolves nltk today, but its unconditional deps are already pulled in elsewhere so this adds no real footprint to default/seedvr)
 sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch
 
 # SeedVR2 super-resolution dependencies.
@@ -312,7 +328,7 @@ transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require 
 [feature.legacy-transformers.pypi-dependencies]
 # Legacy models pull torch directly; keep torch's CUDA bindings on the 13.0 line.
 cuda-bindings = "==13.0.*"
-PyNvVideoCodec = ">=2.0.4,<2.1" # video-embed keeps decode, preprocessing, and inference on the GPU
+PyNvVideoCodec = ">=2.2.4" # video-embed keeps decode, preprocessing, and inference on the GPU; no vLLM in this env so it is free of vLLM's ==2.0.4 pin; floor only
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"

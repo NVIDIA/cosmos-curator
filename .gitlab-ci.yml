@@ -23,9 +23,6 @@ default:
   interruptible: true
 
 variables:
-  # Versions
-  PYTHON_VERSION: "3.13.14"
-
   # GitLab Runner feature flags
   FF_USE_FASTZIP: "true"
 

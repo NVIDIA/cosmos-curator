@@ -22,6 +22,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 RUN curl -fsSL https://pixi.sh/install.sh | \
     PIXI_VERSION="${PIXI_VERSION}" PIXI_HOME=/opt/pixi PIXI_NO_PATH_UPDATE=1 PIXI_NO_TELEMETRY=1 sh
 
+# rclone: prebuilt upstream release binary (static Go), replaces Ubuntu's apt rclone whose Go stdlib is frozen at the
+# distro toolchain. Used only by model_utils.copy_model_weights. To bump: set RCLONE_VERSION and both sha256 values
+# from the release's SHA256SUMS (rclone-v<ver>-linux-{amd64,arm64}.zip). unzip stays in this builder stage only.
+ARG RCLONE_VERSION=1.75.2
+ARG RCLONE_SHA256_AMD64=349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702
+ARG RCLONE_SHA256_ARM64=7e1e8d69654941b7b7df84ee74c5f7fb09cce7d5496947fb7bf16b55ff427d10
+RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in \
+         amd64) RCLONE_ARCH=amd64; RCLONE_SHA256="${RCLONE_SHA256_AMD64}" ;; \
+         arm64) RCLONE_ARCH=arm64; RCLONE_SHA256="${RCLONE_SHA256_ARM64}" ;; \
+         *) echo "unsupported architecture for rclone" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL --retry 5 --retry-delay 3 --max-time 300 -o /tmp/rclone.zip \
+        "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-${RCLONE_ARCH}.zip" \
+    && echo "${RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c - \
+    && mkdir -p /opt/rclone \
+    && unzip -j /tmp/rclone.zip "rclone-v${RCLONE_VERSION}-linux-${RCLONE_ARCH}/rclone" -d /opt/rclone \
+    && chmod 0755 /opt/rclone/rclone \
+    && rm -f /tmp/rclone.zip
+
 {% if not slim and 'seedvr' in envs %}
 # SeedVR tarball: fetch here so the main image does not need curl (libcurl pulls krb5).
 ARG SEEDVR_COMMIT=e4de8c2
@@ -338,13 +358,16 @@ SHELL ["/bin/bash", "-c"]
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ENV TZ=America/Los_Angeles
 
+# CVE-2026-109518: fixed in apt 2.8.4ubuntu0.1 via noble's standard archive (not Pro-gated); the
+# base image ships 2.8.3. Upgrade just these two rather than a blanket `apt-get upgrade`.
 RUN apt-get update \
+    && apt-get install --no-install-recommends --option=Dpkg::Options::=--force-confdef --only-upgrade -y \
+    apt libapt-pkg6.0t64 \
     && apt-get install --no-install-recommends --option=Dpkg::Options::=--force-confdef -y \
     ca-certificates \
 {%- if nsight %}
     nsight-systems-2025.3.2 \
 {%- endif %}
-    rclone \
 {%- if redistributable %}
     libaom3 \
     libdav1d7 \
@@ -368,6 +391,16 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+{% if not nsight %}
+# Nsight Compute comes with the CUDA devel base image (cuda-nsight-compute-13-x -> nsight-compute-<ver>). Nothing in this
+# image uses it and its bundled Go binaries carry CVEs we cannot patch, so remove it. Purge through dpkg so the package
+# database stays consistent; the package list is looked up (not hard-coded) so this also works where the packages are absent.
+RUN pkgs="$(dpkg-query -W -f='${binary:Package}\n' 'cuda-nsight-compute-*' 'nsight-compute-*' 2>/dev/null || true)" && \
+    if [ -n "${pkgs}" ]; then apt-get purge -y ${pkgs}; fi && \
+    rm -rf /opt/nvidia/nsight-compute && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+{% endif %}
+
 {% if redistributable %}
 COPY --from=ffmpeg-builder /opt/ffmpeg /opt/ffmpeg
 RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
@@ -389,6 +422,8 @@ RUN found=$(find /opt/ffmpeg /usr/lib /usr/local/lib -name 'libopenh264*' 2>/dev
 RUN ln -sf /usr/local/cuda/bin/ptxas /usr/local/cuda/bin/ptxas-blackwell
 
 COPY --from=wheels-builder /opt/pixi/bin/pixi /usr/local/bin/pixi
+COPY --from=wheels-builder /opt/rclone/rclone /usr/local/bin/rclone
+RUN rclone version
 
 {% if redistributable %}
 ARG PKG_CONFIG_PATH
