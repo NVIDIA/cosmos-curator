@@ -715,60 +715,30 @@ keeps the `botocore` error only as `backend_error` and `__cause__` — so absent
 unavailable all arrive as one exception type carrying none of the two signals above. Read from
 the top only, a 403 looked like nothing at all and the stream got the manufactured
 data-quality error this section exists to prevent. `sources.error_chain` does the walk and
-`sources.error_code` / `sources.http_status` read the two signals off it, all three shared with
-the sidecar reader below, which has to tell the same three apart for the same reason. Sited
-there rather than here because that is the module the `smart_open` wrapper comes from, and
-because one reading of an error shape is what keeps a denial from being anything else.
+`sources.error_code` / `sources.http_status` read the two signals off it. These helpers live
+in the source I/O module, where the `smart_open` wrapper is used.
 
 **Which clock a stream is measured on.** `checks.camera_alignment_fields` is an ordered
 preference shared with `multimodal-split`: `eof_ns`, `sof_ns`, `moe_ns`, `pts_ns`, `edited_pts_ns`,
 defaulting to `[eof_ns]`. Each stream is measured on the first field available to it, and a stream
 with none is a per-stream error — the run carries on. A stream with a current `mp4-index` row takes
 its clock from that row alone; EOF/SOF/MOE come from an index extension, and plain `mp4-index`
-output has none of them. Any other stream is opened: `eof_ns` is the sidecar below, `pts_ns` and
-`edited_pts_ns` are the container's presentation times without and with the edit list, and
-SOF/MOE are unavailable. `dts_ns` is not offered, because decode order always ascends and so
+output has none of them. For any other stream, EOF/SOF/MOE are unavailable; explicitly
+selected `pts_ns` and `edited_pts_ns` are read from the container, without and with the edit list. `dts_ns` is not offered, because decode order always ascends and so
 cannot fail the ordering metric. A run over sources without recorder clocks lists `edited_pts_ns`
 after `eof_ns` to keep measuring them on container PTS.
 
-**The sensor timeline was not there, or was not usable.** When `eof_ns` is consulted for a stream
-the index does not answer, `run_checks` looks for a `<video>.mp4.timestamps.npy` sidecar beside it
-and hands it to the sensor, which then measures and reports sensor times instead of container PTS
-(see [Timestamp provenance][metrics-provenance] for why that matters). The four outcomes are
-deliberately different. **Absent** is the ordinary case — most sources have no sidecar — so it
-is not a finding by itself: the next listed field is tried, and the stream is an error only when
-none is available. **Present but
-unusable** — corrupt, or a length that disagrees with the video's frame count — fails the
-stream, because falling back silently would hide the one thing an operator can act on, and
-because a timeline matched to frames by position leaves *every* frame's sensor time in doubt
-when the count is wrong. **Unreachable** is neither, and is classified exactly as an
-unreachable video is: it is the same bucket and the same credentials, so a denial there says
-nothing about the recording. Telling those apart is what `error_chain` is for above — through
-`smart_open`'s wrapper, a missing sidecar and a denied one are the same exception type. The
-fourth is **present but disowned**, below.
+**Recorded clocks require an index.** Data-integrity never probes or reads timestamp NPY
+sidecars or derived-clip marker files. A stream without a usable index cannot supply
+EOF/SOF/MOE, even if legacy artifacts exist beside its video. With the default `[eof_ns]`,
+that stream is a per-stream error. Explicitly listing `pts_ns` or `edited_pts_ns` permits
+measurement on container PTS instead. An index remains optional for those modes.
 
-**This recipe grades source sessions, not split clips.** The distinction is not
-enforceable in general — a path is a path, and a clip directory holds an MP4 and a sidecar
-like any other — but it decides what the numbers mean. `multimodal-split` cuts a session by
-resampling every camera onto one evenly spaced grid at the configured output rate, and writes
-*that grid* to `<clip>.mp4.timestamps.npy`, deliberately, so a later stage reads a clip the
-way it read a session. Graded as a recording, such a session answers the session grain before
-it is asked: every camera sits on the same lattice, so spread is zero and overlap total
-however ragged the rig behind the clips was, because the alignment is the splitter's and the
-original skew is already gone. The instants a camera observed are kept beside the grid as
-`<clip>.mp4.sensor_timestamps.npy`, and that file is the discriminator: nothing a recorder writes
-produces it, so `read_sensor_timestamps` treats its presence as the tree disowning the timeline
-next to it, logs which artifact it found, and measures container PTS instead. For clips written
-before the rename, the reader recognizes `<clip>.mp4.observations.npy` as the same discriminator;
-new split runs write only `.sensor_timestamps.npy`. Existence is the
-whole signal — the marker holds one observation per output frame and repeats wherever a frame
-was dropped, so it is non-decreasing where a timeline must strictly ascend, and could not be
-read as one. Keyed per stream rather than per directory, since twelve cameras share a clip
-directory and each names its own artifacts. This is cheap insurance on an unsupported input,
-not support for it: the honest answer for a derived clip is that rig sync is unanswerable, and
-that is the answer it now gives.
+**This recipe grades source sessions.** Container PTS describes the mux's timeline rather
+than the recorder's clock. Indexed EOF/SOF/MOE must have established acquisition-time
+provenance; a resampling grid does not establish rig synchronization.
 
-Absence is not a finding *per stream*, but it does decide the session grain. `session_metrics`
+The selected clock also decides the session grain. `session_metrics`
 rolls the contributing streams' clocks into one value — `sensor` only when every one of them
 reported it, else `container_pts` or `mixed` — and both session-grain metrics declare
 `requires_sensor_timestamps`, so on anything but `sensor` they never run. Their rows are
@@ -817,12 +787,10 @@ grades one.
 | Metric ran but was undefined on too little data | measurement row with `is_defined` false, plus a `SKIPPED` evaluation row | 0 |
 | Metric never ran, with no usable rate | measurement row with `is_defined` null, plus a `SKIPPED` evaluation row | 0 |
 | Session listed cleanly and held no streams | `session.lance` row with `num_streams` 0, no `error` and a null `timestamp_source` — nothing contributed a clock — plus a never-ran session measurement and a `SKIPPED` verdict per session metric; counted in the summary. Rolls up `ERROR`, matching a live report on an empty session | 0 |
-| No field in `camera_alignment_fields` available to the stream — under the default, no sidecar and no indexed `eof_ns` | stream row with `error` naming the requested fields | 0 |
+| No field in `camera_alignment_fields` available to the stream — under the default, no usable indexed `eof_ns` | stream row with `error` naming the requested fields | 0 |
 | No sensor clock, with container PTS listed in `camera_alignment_fields` | stream row measured on `container_pts`, recorded in `timestamp_source` | 0 |
 | Session whose streams were not all on sensor times | `session.lance` row with `timestamp_source` `container_pts` or `mixed`, plus a session measurement row with `is_defined` null and every metric column null, and a `SKIPPED` verdict naming the clock. Not counted as a failure, and a re-judge cannot turn it into a pass | 0 |
 | Session of one camera, that camera on sensor times | session measurement row with `is_defined` false and `num_sensors` 1, plus a `SKIPPED` verdict — measured, with nothing to compare, which is a different finding from the row above | 0 |
-| Sidecar present but unreadable, or of the wrong length | stream row with `error`, as for any unreadable input | 0 |
-| Sidecar unreachable: 403, 5xx, or a transport failure | no stream row — the same as an unreachable video, since it is the same denial | nonzero, after the commit |
 | Stream unreachable: expired token, 403, 5xx, or an exhausted transport budget | no stream row; counted, and reported by the failure. Its session's row records it in `num_unreachable`, so the session rolls up `ERROR` rather than `PASS` until a later run reaches every stream — even if an earlier run measured the whole session | nonzero, after the commit |
 | Session that could not be listed | `session.lance` row with `error` set, and nothing else; counted and named by the failure | nonzero, after the commit |
 | Invalid config, or an input set expanding to zero sessions | nothing | nonzero |
@@ -955,10 +923,11 @@ One narrow case does validate up front: `input.mp4_index_uri`. `run_config` open
 manifest it cannot open fails the run. That is not the rejected alternative above — it is one
 read rather than one per session, and it proves a config setting rather than a path's
 liveness. It fails rather than falling back because the index decides which *clock* the run
-measures on: scanning the videos instead would put part of the run on sidecars or media PTS
+measures on: scanning the videos instead would put part of the run on media PTS
 where the rest is on indexed EOF, a difference no stored row explains. A manifest that is readable but
 does not cover a video, or whose row no longer matches its bytes, still falls back to reading
-that one video — that is a miss, not a misconfiguration. Where the two part is a configured
+that one video's explicitly selected container PTS, or records an error when none of the
+requested clocks is available — that is a miss, not a misconfiguration. Where the two part is a configured
 manifest that does not exist: `di` reads that as "not built yet" and scans, while a run reads
 it as a typo and fails. An operator watching one session can afford to scan, a
 thousand-session run cannot afford to do it silently.

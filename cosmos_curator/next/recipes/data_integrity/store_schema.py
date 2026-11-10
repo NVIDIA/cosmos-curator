@@ -160,7 +160,7 @@ STREAM_SCHEMA: pa.Schema = pa.schema(
         pa.field("expected_hz_source", pa.string()),
         # Which clock every timing column above was measured on. Persisted rather than
         # derived at read time because it cannot be recovered later: the row keeps the
-        # numbers, not the sidecar that explains them. A query for streams whose
+        # numbers, not the source clock that explains them. A query for streams whose
         # cadence is real has to filter on this.
         pa.field("timestamp_source", pa.string()),
         # Non-null means the source could not be read; this stream has no rows in any

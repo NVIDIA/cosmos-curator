@@ -278,7 +278,7 @@ def test_a_stream_row_records_the_clock_it_was_measured_on(
     make_stream: Callable[..., StreamResult],
     perfect: Callable[..., list[int]],
 ) -> None:
-    """Provenance is persisted, not re-derived: the row keeps the numbers, not the sidecar.
+    """Provenance is persisted, not re-derived: the row keeps the numbers, not the source clock.
 
     Without this column a stored jitter of nearly zero is unreadable -- a rig that is
     genuinely steady and a constant-frame-rate mux that invented the timeline both

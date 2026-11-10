@@ -32,8 +32,8 @@ ordered preference shared with ``multimodal-split``
 (:mod:`cosmos_curator.next.recipes.mp4_index.timestamp_field_selection`). Given an ``mp4-index``
 manifest, a stream the manifest covers takes its timeline from the index instead of
 being opened (:mod:`cosmos_curator.next.recipes.mp4_index.index_lookup`). Every other
-stream is opened as usual, whether the manifest has no row for it or the row it has
-cannot be used.
+stream can use explicitly selected container PTS, whether the manifest has no row for
+it or the row it has cannot be used. Recorded EOF/SOF/MOE clocks require an index.
 """
 
 import pathlib
@@ -42,8 +42,6 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import BinaryIO, cast, get_args
 
-import numpy as np
-import numpy.typing as npt
 from loguru import logger
 
 from cosmos_curator.core.sensors.data.mp4 import Mp4FrameIndex, Mp4Metadata
@@ -56,13 +54,11 @@ from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import (
     StreamingCameraSensor,
 )
 from cosmos_curator.core.sensors.types.types import DataSource, VideoFrameAlignmentField
-from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
 from cosmos_curator.core.utils.storage.storage_utils import is_remote_path
 from cosmos_curator.core.utils.storage_cli import open_storage_source
 from cosmos_curator.next.recipes.data_integrity import storage_io
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.recipes.mp4_index.timestamp_field_selection import (
-    INDEX_ONLY_ALIGNMENT_FIELDS,
     CameraAlignmentField,
     first_complete_alignment_field,
 )
@@ -116,55 +112,6 @@ def open_source(
     else:
         with pathlib.Path(source).open("rb") as local_stream:
             yield stream_wrapper(local_stream) if stream_wrapper is not None else local_stream
-
-
-#: What a recorder's sensor-timestamps artifact is called, relative to the media it describes.
-#: Spelled the same way ``multimodal_split`` spells it (see that recipe's ``uris.py``),
-#: because that is the artifact this reads on the way *in*; not imported from there,
-#: since one recipe reaching into another's naming would couple them over a constant.
-#: What that recipe writes on the way *out* wears the same name and is not the same
-#: thing -- see :data:`_RESAMPLED_CLIP_MARKER_SUFFIXES`.
-SOURCE_SENSOR_TIMESTAMPS_SUFFIX = ".timestamps.npy"
-
-#: The artifact whose presence means the timeline beside it is a resampling grid rather
-#: than a recording's own clock.
-#:
-#: ``multimodal_split`` cuts a session into clips by resampling every camera onto one
-#: evenly spaced grid at the configured output rate, and writes *that grid* to
-#: :data:`SOURCE_SENSOR_TIMESTAMPS_SUFFIX` -- deliberately, so a later stage reads a
-#: clip the way it read a session. The instants a camera actually observed go beside
-#: it under this name instead. Read as a sensor timeline, the grid answers the session
-#: grain's question before it is asked: every camera is on the same lattice, so spread
-#: is zero and overlap total, however far out of sync the rig behind the clips was. So
-#: a clip is measured on its container's PTS and reported as such, which is the outcome
-#: for any other source that cannot say when its frames happened.
-#:
-#: Absence of a marker is not proof of a recorder, only of nothing claiming otherwise.
-#: This recipe is meant for sessions as recorded, and a derived tree is out of contract
-#: rather than supported by this; the check is here because being wrong quietly is
-#: worse than paying for one current-marker probe and, when absent, one legacy probe.
-_RESAMPLED_CLIP_MARKER_SUFFIXES = (".sensor_timestamps.npy", ".observations.npy")
-
-#: S3 / Azure error codes that mean the object is not there. Distinct from
-#: :data:`~.session_runner._INFRASTRUCTURE_S3_CODES`, which answers the opposite
-#: question -- whether the request failed for reasons of our own access -- and never
-#: needed to name the 404 family because a missing *video* is a fact about the dataset
-#: rather than an absence to be tolerated. A missing sensor timeline is the common
-#: case, so this path has to recognise it precisely enough not to swallow a 403.
-_NOT_FOUND_CODES = frozenset(
-    {"404", "NoSuchKey", "NoSuchBucket", "BlobNotFound", "ContainerNotFound", "ResourceNotFound"}
-)
-_NOT_FOUND_STATUS = 404
-
-
-def source_sensor_timestamps_uri(source: str) -> str:
-    """Return where a stream's sensor timestamps would sit, whether or not they do."""
-    return f"{source}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}"
-
-
-def _resampled_clip_marker_uris(source: str) -> tuple[str, ...]:
-    """Return current and legacy marker locations in probe order."""
-    return tuple(f"{source}{suffix}" for suffix in _RESAMPLED_CLIP_MARKER_SUFFIXES)
 
 
 def error_chain(exc: BaseException) -> Generator[BaseException]:
@@ -241,148 +188,6 @@ def http_status(exc: BaseException) -> int | None:
         if isinstance(status, int):
             return status
     return None
-
-
-def _is_not_found(exc: BaseException) -> bool:
-    """Report whether ``exc`` says the object is absent, rather than unreachable.
-
-    Only absence may be treated as "this stream has no sensor timeline". Anything
-    else -- a denial, a 5xx, an expired token -- has to keep travelling, because
-    reading it as absence would quietly measure a whole rig against the container's
-    metronome and record that as the recording's own timeline. Which is why the code
-    and the status come from the same readers
-    :func:`~.session_runner.is_infrastructure_error` uses: whatever a chain is taken
-    to say, both questions have to be answered off the same reading of it.
-    """
-    if any(isinstance(error, FileNotFoundError) for error in error_chain(exc)):
-        return True
-    return error_code(exc) in _NOT_FOUND_CODES or http_status(exc) == _NOT_FOUND_STATUS
-
-
-def _timeline_is_derived(
-    source: str,
-    *,
-    s3_profile_name: str | None,
-    azure_profile_name: str,
-    endpoint_url: str | None,
-    stream_wrapper: Callable[[BinaryIO], BinaryIO] | None,
-) -> str | None:
-    """Return the marker beside ``source`` that disowns its timeline, if any.
-
-    Existence is the whole signal; the contents are never read, and could not be used
-    if they were. The marker holds one observation per output frame, which repeats
-    wherever the grid asked for more frames than the sensor produced -- a dropped
-    exposure -- so it is non-decreasing where a timeline must strictly ascend, and
-    :class:`~cosmos_curator.core.sensors.sensors.camera_sensor.CameraSensor` would
-    reject it. What it says instead is that something upstream distinguished the two
-    clocks and wrote the honest one down separately.
-
-    One byte is read because a stream that opens is not yet a stream that exists on
-    every backend, and a probe that cannot tell absence from a lazy handle would
-    disown every timeline it met.
-    """
-    for marker_uri in _resampled_clip_marker_uris(source):
-        try:
-            with open_source(
-                marker_uri,
-                s3_profile_name=s3_profile_name,
-                azure_profile_name=azure_profile_name,
-                endpoint_url=endpoint_url,
-                stream_wrapper=stream_wrapper,
-            ) as stream:
-                stream.read(1)
-        except OSError as exc:
-            if _is_not_found(exc):
-                continue
-            raise
-        return marker_uri
-    return None
-
-
-def read_sensor_timestamps(
-    source: str,
-    *,
-    s3_profile_name: str | None = None,
-    azure_profile_name: str = "default",
-    endpoint_url: str | None = None,
-    stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
-) -> npt.NDArray[np.int64] | None:
-    """Read the sensor timestamps recorded beside ``source``, or ``None`` if there are none.
-
-    The recipe half of preferring sensor times over container PTS: the sensor library
-    accepts a timeline but never a URI, so finding the artifact is this layer's job (see
-    :class:`~cosmos_curator.core.sensors.sensors.camera_sensor.CameraSensor`).
-
-    Four outcomes, and the difference between them matters:
-
-    * absent -- ``None``, and the caller tries the next configured clock (container
-      PTS if ``checks.camera_alignment_fields`` lists it, otherwise the stream is an
-      error). The ordinary case for any source whose recorder wrote no timeline.
-    * present but disowned -- ``None`` as well, and logged. A timeline the tree itself
-      says is a resampling grid is worth less than no timeline at all, because it
-      would be believed; see :data:`_RESAMPLED_CLIP_MARKER_SUFFIXES`.
-    * present but not a timeline -- ``ValueError`` from
-      :func:`~cosmos_curator.core.sensors.utils.timestamps.read_timestamps_ns`, which
-      the session runner records as that stream's error. An artifact that fails its
-      own reader is a defect worth reporting, not one to fall back from.
-    * unreachable -- propagated untouched, for
-      :func:`~.session_runner.is_infrastructure_error` to classify as it does any
-      other failed fetch.
-
-    Args:
-        source: the stream's local path or cloud URI. The timeline is looked for beside
-            it, under the same name plus :data:`SOURCE_SENSOR_TIMESTAMPS_SUFFIX`.
-        s3_profile_name: AWS profile forwarded to ``open_storage_source``.
-        azure_profile_name: Azure profile forwarded to ``open_storage_source``.
-        endpoint_url: optional S3 endpoint override.
-        stream_wrapper: optional wrapper applied to the timeline's stream, on the
-            same terms as the video's. A cancellable reader that covered only the
-            video would leave a hung fetch of this artifact uninterruptible, and it
-            is fetched first.
-
-    Raises:
-        ValueError: If the artifact exists but does not hold one ascending int64
-            ``.npy`` timeline.
-
-    """
-    uri = source_sensor_timestamps_uri(source)
-    try:
-        with open_source(
-            uri,
-            s3_profile_name=s3_profile_name,
-            azure_profile_name=azure_profile_name,
-            endpoint_url=endpoint_url,
-            stream_wrapper=stream_wrapper,
-        ) as stream:
-            sensor_timestamps_ns = read_timestamps_ns(stream)
-    except OSError as exc:
-        # Narrower than it looks: read_timestamps_ns raises ValueError for a bad
-        # artifact and documents OSError as meaning the bytes were never seen, so
-        # what reaches here is a failed fetch and nothing about the timeline itself.
-        if _is_not_found(exc):
-            return None
-        raise
-    # Only once a timeline is in hand, so the ordinary source -- no sidecar at all --
-    # pays nothing for a question that was already answered.
-    marker_uri = _timeline_is_derived(
-        source,
-        s3_profile_name=s3_profile_name,
-        azure_profile_name=azure_profile_name,
-        endpoint_url=endpoint_url,
-        stream_wrapper=stream_wrapper,
-    )
-    if marker_uri is not None:
-        # Logged rather than recorded as the stream's error: nothing here is broken,
-        # and the stored row says what it always says -- which clock this was measured
-        # on. The line is what tells an operator why a tree full of timelines reports
-        # container PTS anyway, or errors when no container clock was allowed.
-        logger.warning(
-            f"{uri} is a resampling grid, not a recording's clock "
-            f"({marker_uri} sits beside it); "
-            f"ignoring it as a sensor timeline"
-        )
-        return None
-    return sensor_timestamps_ns
 
 
 def observed_size_bytes(
@@ -475,43 +280,12 @@ def _measure_media(  # noqa: PLR0913 -- the source, its clock preference, and th
     stats: dict[str, float] | None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None,
 ) -> tuple[list[CheckResult], VideoInfo, ResolvedConfig]:
-    """Measure a stream no index row answers for, on the first field its media can supply.
+    """Measure an unindexed stream using an explicitly selected container PTS clock.
 
-    The same rules ``multimodal-split`` applies without an index: ``eof_ns`` is the
-    sensor timeline beside the video, ``edited_pts_ns`` and ``pts_ns`` are the
-    container's own presentation times (with and without the edit list), and SOF/MOE
-    exist only in an index. A sidecar is read only when ``eof_ns`` is consulted, and one
-    that is present but broken fails the stream rather than permitting the next field.
-
-    Raises:
-        ValueError: If the media can supply none of *alignment_fields*, or a sidecar sits
-            beside a non-zero ``stream_idx`` (see :func:`run_checks`).
-
+    Recorded EOF/SOF/MOE clocks require an index. Legacy sidecars are never probed.
     """
     for field in alignment_fields:
-        sensor_timestamps_ns: npt.NDArray[np.int64] | None = None
-        if field == VideoFrameAlignmentField.EOF_NS.value:
-            sensor_timestamps_ns = read_sensor_timestamps(
-                source,
-                s3_profile_name=s3_profile_name,
-                azure_profile_name=azure_profile_name,
-                endpoint_url=endpoint_url,
-                stream_wrapper=stream_wrapper,
-            )
-            if sensor_timestamps_ns is None:
-                continue
-            if stream_idx != 0:
-                # The artifact is named for the file, not for a stream within it, so which
-                # stream it describes is simply not recorded. Refused rather than guessed:
-                # applying it to another stream would either silently put that stream on a
-                # clock measured elsewhere, or fail on a frame count that says nothing about
-                # the recording.
-                msg = (
-                    f"{source_sensor_timestamps_uri(source)} does not record which video stream it describes, "
-                    f"so it cannot be applied to stream_idx {stream_idx}; only stream 0 is defined"
-                )
-                raise ValueError(msg)
-        elif field in INDEX_ONLY_ALIGNMENT_FIELDS:
+        if field not in ("pts_ns", "edited_pts_ns"):
             continue
         with open_source(
             source,
@@ -527,21 +301,16 @@ def _measure_media(  # noqa: PLR0913 -- the source, its clock preference, and th
                     _as_data_source(src), stream_idx=stream_idx, alignment_field=VideoFrameAlignmentField.PTS_NS
                 )
             else:
-                # eof_ns with its sidecar, or edited_pts_ns: the container's displayed PTS.
-                sensor = CameraSensor(
-                    _as_data_source(src),
-                    stream_idx=stream_idx,
-                    sensor_timestamps_ns=sensor_timestamps_ns,
-                )
+                sensor = CameraSensor(_as_data_source(src), stream_idx=stream_idx)
             if stats is not None:
                 stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
             return run_metrics(
                 sensor, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats
             )
     msg = (
-        f"no sensor-timestamp sidecar or requested camera timestamps for {source} from "
+        f"no requested camera timestamps for {source} from "
         f"{list(alignment_fields)}; add edited_pts_ns to checks.camera_alignment_fields to measure container PTS, "
-        f"and note SOF/MOE require input.mp4_index_uri"
+        f"EOF/SOF/MOE require input.mp4_index_uri"
     )
     raise ValueError(msg)
 
@@ -572,7 +341,7 @@ def run_checks(  # noqa: PLR0913
     Also where the stream's clock is chosen, from *alignment_fields* in order, so both
     entry points inherit one rule -- the one ``multimodal-split`` applies to cameras. A
     stream with a current ``mp4-index`` row is measured from that row alone, and never
-    reads a sensor timeline beside the video; any other stream is opened (see
+    opens the video; any other stream can use explicitly selected container PTS (see
     :func:`_measure_media`). A stream for which no listed field is available raises, so
     it is recorded as an error rather than silently measured on another clock.
 
@@ -580,21 +349,21 @@ def run_checks(  # noqa: PLR0913
         source: local path, ``s3://`` URI, or ``az://`` URI.
         expected_hz: expected sample rate for the rate-dependent metrics.
         thresholds: pass/fail policy (see :class:`Thresholds`).
-        stream_idx: which video stream to open (default 0). Only 0 may be paired with
-            a sensor timeline, since the sidecar names the file rather than a stream.
+        stream_idx: which video stream to open (default 0). Only 0 can use the index,
+            since a manifest row is keyed by file rather than by track.
         batch_size: timestamps per metric update; 0 feeds the whole array at once.
         s3_profile_name: optional AWS profile forwarded to ``open_storage_source``.
         azure_profile_name: Azure profile forwarded to ``open_storage_source``.
         endpoint_url: optional S3 endpoint override for S3-compatible stores.
         stats: optional out-parameter; ``sensor_init_ms`` is recorded here in
             addition to the ``stream_ms`` / ``evaluate_ms`` from ``run_metrics``.
-        stream_wrapper: optional wrapper applied to every stream this opens -- the
-            sensor timeline as well as the video (e.g. a byte-counting reader for
-            progress), for local paths as well as cloud URIs.
+        stream_wrapper: optional wrapper applied to the opened video (e.g. a byte-counting
+            reader for progress), for local paths as well as cloud URIs.
         index_lookup: optional opened ``mp4-index`` manifest. When it holds a usable row
             for ``source``, the timeline comes from that row instead of from the video;
-            otherwise the video is opened. Costs one metadata lookup per stream, to
-            confirm the row still describes the bytes there. Consulted only for
+            otherwise explicitly selected container PTS can be read from the video.
+            Costs one metadata lookup per stream to confirm the row still describes
+            the bytes there. Consulted only for
             ``stream_idx`` 0, since a manifest row is keyed by file, not by track.
         alignment_fields: camera timestamp fields in preference order (see
             :data:`~cosmos_curator.next.recipes.mp4_index.timestamp_field_selection.CameraAlignmentField`).
@@ -604,10 +373,7 @@ def run_checks(  # noqa: PLR0913
 
     Raises:
         ValueError: If no field in ``alignment_fields`` is available for the stream,
-            if ``alignment_fields`` is empty or names an unknown field, or if
-            ``stream_idx`` is not 0 and ``eof_ns`` finds a sensor timeline beside
-            ``source``; see :func:`read_sensor_timestamps` for why it cannot be
-            attributed to a particular stream.
+            or if ``alignment_fields`` is empty or names an unknown field.
 
     """
     fields = _validate_alignment_fields(alignment_fields)

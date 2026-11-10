@@ -244,14 +244,14 @@ def test_a_failing_session_metric_reaches_the_store(
 
     Two sensors that stopped a second apart, judged by a policy that allows no
     non-overlap at all. Every stream passes on its own, so a store reconstructing the
-    session from stream rows alone would read back ``PASS``. Sensor timelines beside
-    the clips are what let the session be judged rather than skipped.
+    session from stream rows alone would read back ``PASS``. Indexed sensor clocks
+    for the clips are what let the session be judged rather than skipped.
     """
     clips = tmp_path / "clips"
     (clips / "ragged").mkdir(parents=True)
     for name, frames in (("front.mp4", 30), ("rear.mp4", 60)):
         (clips / "ragged" / name).write_bytes(h264_video(frames=frames))
-        sensor_timeline(clips / "ragged" / name, frames=frames)
+        manifest = sensor_timeline(clips / "ragged" / name, frames=frames)
     store_root = tmp_path / "di-store"
 
     summary = pipeline.run_config(
@@ -259,7 +259,7 @@ def test_a_failing_session_metric_reaches_the_store(
             {
                 "schema_version": 1,
                 "kind": "data-integrity",
-                "input": {"sessions": [str(clips / "ragged")]},
+                "input": {"sessions": [str(clips / "ragged")], "mp4_index_uri": str(manifest)},
                 "output": {"store_root": str(store_root)},
                 "checks": {"thresholds": {"max_non_overlap_percent": 0.0}},
             }

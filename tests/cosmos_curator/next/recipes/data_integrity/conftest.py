@@ -31,7 +31,9 @@ from collections.abc import Callable, Iterator
 from fractions import Fraction
 
 import av
+import lance
 import numpy as np
+import pyarrow as pa
 import pytest
 from numpy.typing import NDArray
 
@@ -46,8 +48,13 @@ from cosmos_curator.core.sensors.data_integrity.results import (
     stream_result,
 )
 from cosmos_curator.core.sensors.types.types import TimestampSource
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
-from cosmos_curator.next.recipes.data_integrity.sources import SOURCE_SENSOR_TIMESTAMPS_SUFFIX
+from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
+from cosmos_curator.next.recipes.mp4_index.contracts import (
+    CONTAINER_KIND_NONFRAGMENTED,
+    VIDEO_MANIFEST_SCHEMA,
+    make_video_id,
+)
+from cosmos_curator.next.recipes.mp4_index.processing import process_one_video, result_table
 
 HZ_100_PERIOD_NS = 10_000_000  # one sample every 10 ms at 100 Hz
 
@@ -267,16 +274,9 @@ _FRAME_PERIOD_NS = 33_333_333
 
 @pytest.fixture
 def sensor_timeline() -> Callable[..., pathlib.Path]:
-    """Return a factory writing a sensor timeline beside a video.
+    """Return a factory appending a real index row with recorded EOF timestamps.
 
-    The sidecar is what makes a session-grain metric run at all: without it every
-    camera is measured on container PTS, the mux has already put them on one
-    regenerated grid, and the two cross-sensor checks skip rather than report a rig
-    that looks flawless by construction. So any test whose subject is a session
-    *verdict* has to write these, and one whose subject is the skip must not.
-
-    ``frames`` has to match the video's frame count exactly -- a timeline that does not
-    fit its video is a hard error, not something to fall back from.
+    Cross-sensor checks need indexed sensor clocks; container PTS cannot establish rig sync.
     """
 
     def _write(
@@ -286,10 +286,33 @@ def sensor_timeline() -> Callable[..., pathlib.Path]:
         start_ns: int = _SENSOR_EPOCH_NS,
         period_ns: int = _FRAME_PERIOD_NS,
     ) -> pathlib.Path:
-        sidecar = pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")
-        with sidecar.open("wb") as stream:
-            write_timestamps_ns(start_ns + np.arange(frames, dtype=np.int64) * period_ns, stream)
-        return sidecar
+        output = video.parent.parent / f"{video.parent.name}-mp4-index"
+        config = ResolvedMp4IndexConfig.model_validate(
+            {
+                "schema_version": 1,
+                "kind": "mp4-index",
+                "input": {
+                    "path_prefix": str(video.parent),
+                    "globs": ["*.mp4"],
+                    "container_kind": CONTAINER_KIND_NONFRAGMENTED,
+                },
+                "output": {"path": str(output)},
+            }
+        )
+        location = str(video.resolve())
+        result = process_one_video({"video_id": make_video_id(location), "media_location": location}, config=config)
+        assert result["status"] == "success", result["error_message"]
+        (row,) = result_table(result).to_pylist()
+        assert len(row["frames"]) == frames
+        for i, frame in enumerate(row["frames"]):
+            frame["eof_ns"] = start_ns + i * period_ns
+        manifest = output / "manifest.lance"
+        lance.write_dataset(
+            pa.Table.from_pylist([row], schema=VIDEO_MANIFEST_SCHEMA),
+            str(manifest),
+            mode="append" if manifest.exists() else "create",
+        )
+        return manifest
 
     return _write
 

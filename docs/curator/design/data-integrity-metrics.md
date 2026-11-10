@@ -32,15 +32,24 @@ A metric measures the timestamps it is handed and cannot tell where they came fr
 
 **Why it matters.** Presentation timestamps are the container's playback instructions, not a record of when the sensor collected data. Whether they reflect sensor time depends on how the file was muxed. A variable-frame-rate source carries the real sample times, and the metrics below measure exactly what they claim. A constant-frame-rate source does not: the encoder discards sensor times and regenerates them on a fixed grid, and each file's grid restarts at `0`. Against such a source the interval-based metrics (`RateMetric`, `TimestampGapMetric`, `JitterMetric`) see a metronome and report a flawless stream by construction, while the session-grain metrics see every sensor starting at the same instant and report zero spread with total overlap — in both cases regardless of what the hardware actually did. There is no standard for how a vendor relates the two: some anchor `pts[0]` to the first frame's sensor time and offset the rest, others space PTS evenly while the true sensor times drift.
 
-Measured on one internal 12-camera session (605 frames, 30 Hz), container PTS gives an interval of exactly 33.333 ms at every step and a cross-sensor spread of `0`. The same session's sensor timestamps — recorded in per-camera sidecar files on a clock shared across the rig — give intervals ranging 33.306–33.374 ms and put the cameras 133 ms apart, for 1.3% non-overlap. So a perfect score on container PTS means *nothing was measurable*, not *the data was verified healthy*.
+Measured on one internal 12-camera session (605 frames, 30 Hz), container PTS gives an interval of exactly 33.333 ms at every step and a cross-sensor spread of `0`. The same session's sensor timestamps — recorded on a clock shared across the rig — give intervals ranging 33.306–33.374 ms and put the cameras 133 ms apart, for 1.3% non-overlap. So a perfect score on container PTS means *nothing was measurable*, not *the data was verified healthy*.
 
-**Where sensor times come from.** A recording that has them carries a `<video>.mp4.timestamps.npy` sidecar: one `int64` epoch-nanosecond entry per displayable frame, on a clock shared across the rig. `CameraSensor` accepts that timeline and reports it in place of PTS, everywhere — `start_ns`, `end_ns`, `timestamps_ns`, `stream_timestamps()`, and the payload clock on a sampled window. The container's own PTS stays intact for seeking and decode planning, which is what the muxer's numbers are actually for.
+**Where sensor times come from.** Data-integrity reads recorded EOF/SOF/MOE from an
+`mp4-index` manifest extended with sensor timestamps. Plain index output contains container
+timing only. The selected recorded clock is reported as `sensor`; container PTS remains
+available for seeking and decode planning.
 
-The sidecar is an interface, not the format: it is where this codebase's one available sensor-timestamp source happens to live, deliberately converted out of any vendor's own representation before it reaches the sensor. Formats without this sidecar require a format-specific adapter that extracts a timestamp with established sensor-time provenance; MCAP `log_time` and `publish_time` alone do not establish sensor acquisition time. Such an adapter produces the same array, with nothing below it changing.
+The sensor library also accepts in-memory timestamp arrays from callers that establish their
+provenance. `CameraSensor` reports such an array in place of PTS in its bounds, timestamp
+iteration, and sampled-window payload clocks. This API does not prescribe a storage format.
+MCAP `log_time` and `publish_time` alone do not establish acquisition-time provenance, nor
+does an evenly spaced resampling grid.
 
-The sidecar is also not proof, which is why finding one is the recipe's job rather than the sensor's: `CameraSensor` reports any timeline it is handed as `sensor`, because a library that is given an array and no provenance has nothing else to say. `multimodal-split` writes an evenly spaced resampling grid under the same filename, and a grid believed is worse than no timeline at all — it produces exactly the flawless-by-construction numbers described above, with a provenance stamp saying they are trustworthy. See [data-integrity-pipeline.md](data-integrity-pipeline.md) for how the recipe tells the two apart.
-
-**When there is no sidecar.** Most sources have none, so its absence is not a finding: the stream is measured on container PTS and says so. A sidecar that exists but is unreadable, or whose length disagrees with the video's frame count, is a different matter and fails the stream — silently falling back would hide the one thing an operator can act on. Because a timeline is matched to frames by position, a count that disagrees leaves *every* frame's sensor time in doubt rather than only the missing ones'.
+**When there is no recorded clock.** The default `[eof_ns]` records a per-stream error when
+no usable index provides EOF. Explicitly listing `pts_ns` or `edited_pts_ns` allows container
+PTS measurements, reported as `container_pts`. Timestamp NPY sidecars are never consulted.
+Session metrics that require sensor timestamps are skipped for container or mixed clocks;
+container PTS alone cannot verify rig synchronization.
 
 Reading provenance beside the numbers is therefore how a reader tells a rig that is genuinely steady from a mux that invented the timeline; both produce near-zero jitter, and only one of them is a measurement. It is reported in the tool's output and persisted as a `stream.lance` column, so a query for streams whose cadence is real can filter on it.
 
@@ -54,7 +63,7 @@ The skip is recorded as *never ran* — `is_defined` null with every metric colu
 
 Two skips have to be told apart, and the provenance check runs first for that reason. One camera measured on sensor times is a session that *was* measured and had nothing to compare, so it stores real numbers with `is_defined = false` and `num_sensors = 1`. One camera on container PTS was never measurable, so it stores nulls. The distinction matters downstream: only the first is a fact a later policy can re-judge.
 
-This is honest about the tool's reach rather than a limitation to route around. Sensor timestamps have no cross-vendor standard, and the sidecar is the one source this codebase can read, so skipping says "this dataset cannot answer the cross-sensor question" instead of answering it wrong.
+This is honest about the tool's reach rather than a limitation to route around. Sensor timestamps have no cross-vendor standard, and indexed recorder clocks are the source this recipe can read, so skipping says "this dataset cannot answer the cross-sensor question" instead of answering it wrong.
 
 ## TimestampOrderingMetric
 

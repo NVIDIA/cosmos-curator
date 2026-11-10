@@ -215,8 +215,8 @@ class DataIntegrityChecksConfig(BaseModel):
         description=(
             "Camera timestamp preference order; each stream is measured on the first one available to it, "
             "and a stream with none of them is recorded as an error. An indexed stream reads only its "
-            "mp4-index record; any other stream takes eof_ns from a .timestamps.npy sidecar and pts_ns / "
-            "edited_pts_ns from its container. SOF/MOE require mp4-index. Add edited_pts_ns to measure "
+            "mp4-index record. EOF/SOF/MOE require mp4-index; other streams can read pts_ns / "
+            "edited_pts_ns from their container. Add edited_pts_ns to measure "
             "streams without sensor timestamps on container PTS."
         ),
         examples=[["eof_ns"], ["eof_ns", "edited_pts_ns"]],
@@ -399,7 +399,7 @@ _TEMPLATE_PREAMBLE = """\
 # It may be null only for `di`, which then prints its report without persisting anything;
 # a pipeline run requires it, since the store is the only thing such a run leaves behind.
 # `checks.camera_alignment_fields` defaults to [eof_ns]: a stream with no recorder EOF clock
-# (no .timestamps.npy sidecar, or an mp4-index row without eof_ns) is recorded as an error.
+# (no usable mp4-index row with eof_ns) is recorded as an error.
 # Use [eof_ns, edited_pts_ns] to measure such streams on container PTS instead.
 """
 

@@ -46,6 +46,7 @@ from cosmos_curator.next.recipes.data_integrity.session_runner import (
     run_stream,
     session_metrics,
 )
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 
 HZ_100_PERIOD_NS = 10_000_000  # one sample every 10 ms at 100 Hz
 
@@ -340,54 +341,20 @@ def test_run_session_judges_the_session_as_well_as_its_streams(
 ) -> None:
     """A session whose sensors stopped at different times fails on the session's own verdict.
 
-    Real files rather than canned results: the bounds a session metric folds are read
-    off each decode, so a fake would be measuring the fake. Sensor timelines beside
-    them for the same reason -- without those the cameras are on container PTS, where
-    a ragged session is unmeasurable rather than failing.
+    Real indexes carry the recorded bounds a session metric compares. Without those
+    clocks the cameras are on container PTS, where a ragged session is unmeasurable
+    rather than failing.
     """
     for name, frames in (("front.mp4", 30), ("rear.mp4", 15)):
         (tmp_path / name).write_bytes(h264_video(frames=frames))
-        sensor_timeline(tmp_path / name, frames=frames)
+        manifest = sensor_timeline(tmp_path / name, frames=frames)
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), index_lookup=Mp4IndexLookup.open_required(str(manifest)), expected_hz=30.0)
 
     assert {s.status for s in report.streams} == {OverallStatus.PASS}, "each stream is fine on its own"
     overlap = next(m for m in report.metrics if m.name == "multi_sensor_overlap")
     assert overlap.status is CheckStatus.FAIL
     assert report.status is OverallStatus.FAIL, "a session verdict has to be able to fail a passing set of streams"
-
-
-def test_a_session_of_resampled_clips_is_not_graded_as_a_rig(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-    sensor_timeline: Callable[..., pathlib.Path],
-) -> None:
-    """The shape a ``multimodal_split`` clip directory has, end to end through the runner.
-
-    That recipe cuts every camera to one span and resamples them onto one evenly spaced
-    grid, so the clips really are flawlessly aligned -- and the grid is written under the
-    recorder's own filename, with the observed instants beside it. Graded as a recording,
-    this session reports zero spread and total overlap no matter how ragged the rig
-    behind it was, because the alignment is the splitter's and the original skew is
-    already gone. Graded honestly, there is nothing here to grade: the marker disowns
-    both grids, both clips fall to container PTS, and the session grain skips.
-
-    The two clips are deliberately the same length on the same grid, since that is what
-    the splitter produces and what would otherwise pass.
-    """
-    for name in ("front.mp4", "rear.mp4"):
-        (tmp_path / name).write_bytes(h264_video(frames=30))
-        sensor_timeline(tmp_path / name, frames=30)
-        # What multimodal_split writes beside a clip, and what the runner reads as
-        # "the timeline next door is a grid" -- contents never opened.
-        with pathlib.Path(f"{tmp_path / name}.sensor_timestamps.npy").open("wb") as stream:
-            np.save(stream, np.arange(30, dtype=np.int64), allow_pickle=False)
-
-    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
-
-    assert {s.timestamp_source for s in report.streams} == {TimestampSource.CONTAINER_PTS}
-    assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
-    assert report.status is OverallStatus.PASS, "a skip is not a finding, and neither is a derived tree"
 
 
 def test_session_metrics_are_skipped_for_a_session_of_one_stream(
@@ -448,7 +415,7 @@ def test_a_session_without_sensor_timelines_is_skipped_rather_than_passed(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
 ) -> None:
-    """What a vendor's clips look like when no sidecar was ever produced beside them.
+    """Clips with no indexed recorded clock can only supply container PTS.
 
     Two cameras, both muxed at a constant frame rate, so their container timelines
     agree perfectly and the session would report a flawless rig. The whole session
@@ -479,16 +446,16 @@ def test_by_default_a_camera_without_sensor_timestamps_is_an_error_and_the_rest_
     """
     for name in ("front.mp4", "rear.mp4"):
         (tmp_path / name).write_bytes(h264_video(frames=30))
-    sensor_timeline(tmp_path / "front.mp4", frames=30)
+    manifest = sensor_timeline(tmp_path / "front.mp4", frames=30)
 
-    report = run_session(str(tmp_path), expected_hz=30.0)
+    report = run_session(str(tmp_path), index_lookup=Mp4IndexLookup.open_required(str(manifest)), expected_hz=30.0)
 
     by_name = {pathlib.Path(s.source).name: s for s in report.streams}
     assert by_name["front.mp4"].status is OverallStatus.PASS
     assert by_name["front.mp4"].timestamp_source is TimestampSource.SENSOR
     assert by_name["rear.mp4"].status is OverallStatus.ERROR
     assert by_name["rear.mp4"].error is not None
-    assert "no sensor-timestamp sidecar" in by_name["rear.mp4"].error
+    assert "no requested camera timestamps" in by_name["rear.mp4"].error
     assert report.status is OverallStatus.ERROR
 
 
@@ -500,9 +467,14 @@ def test_a_session_where_only_some_cameras_have_sensor_timelines_is_skipped_too(
     """Half a rig's real clock is not half an answer: the comparison needs one clock, not a better one."""
     for name in ("front.mp4", "rear.mp4"):
         (tmp_path / name).write_bytes(h264_video(frames=30))
-    sensor_timeline(tmp_path / "front.mp4", frames=30)
+    manifest = sensor_timeline(tmp_path / "front.mp4", frames=30)
 
-    report = run_session(str(tmp_path), expected_hz=30.0, alignment_fields=_EOF_OR_PTS)
+    report = run_session(
+        str(tmp_path),
+        index_lookup=Mp4IndexLookup.open_required(str(manifest)),
+        expected_hz=30.0,
+        alignment_fields=_EOF_OR_PTS,
+    )
 
     assert {m.status for m in report.metrics} == {CheckStatus.SKIPPED}
     assert all("disagree" in m.reason for m in report.metrics)

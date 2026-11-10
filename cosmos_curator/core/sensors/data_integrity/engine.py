@@ -195,7 +195,7 @@ def reason_without_sensor_timestamps(session_source: SessionTimestampSource | No
     invocations describing one session the same way.
 
     The cause is named rather than elided because the fix differs by cause: a session
-    on container PTS needs its sensor-timestamp sidecars, while a mixed one has some
+    on container PTS needs recorded sensor clocks, while a mixed one has some
     already and is missing the rest.
     """
     phrase = _SESSION_SOURCE_PHRASES.get(session_source, _UNEXPLAINED_SOURCE_PHRASE)

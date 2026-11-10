@@ -16,7 +16,6 @@
 """Unit tests for the function the Ray Data stage runs on one session."""
 
 import datetime
-import os
 import pathlib
 import pickle
 from collections.abc import Callable, Iterator
@@ -32,7 +31,6 @@ from cosmos_curator.core.sensors.data_integrity.instruments import INSTRUMENTS, 
 from cosmos_curator.core.sensors.data_integrity.results import CheckStatus, StreamResult
 from cosmos_curator.next.recipes.data_integrity import processing, store, store_schema
 from cosmos_curator.next.recipes.data_integrity.config import ResolvedDataIntegrityConfig
-from cosmos_curator.next.recipes.data_integrity.sources import SOURCE_SENSOR_TIMESTAMPS_SUFFIX
 from cosmos_curator.next.recipes.mp4_index import processing as mp4_index_processing
 from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
 from cosmos_curator.next.recipes.mp4_index.contracts import (
@@ -40,6 +38,7 @@ from cosmos_curator.next.recipes.mp4_index.contracts import (
     VIDEO_MANIFEST_SCHEMA,
     make_video_id,
 )
+from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.utils.uris import normalize_location
 
 RUN_ID = "0" * 32
@@ -366,7 +365,7 @@ def test_by_default_a_stream_without_a_sensor_clock_is_recorded_as_an_error(
 
     errors = {str(row["source"]): row["error"] for row in _rows(record)[store_schema.STREAM_DATASET]}
     assert "no complete camera timestamp column" in str(errors[str(session / "front.mp4")])
-    assert "no sensor-timestamp sidecar" in str(errors[str(session / "side.mp4")])
+    assert "no requested camera timestamps" in str(errors[str(session / "side.mp4")])
 
 
 def test_a_stale_index_row_reads_the_video_it_describes_rather_than_trusting_it(
@@ -451,6 +450,7 @@ def _check_and_commit(
     *,
     created_at: datetime.datetime,
     thresholds: dict[str, Any] | None = None,
+    mp4_index_uri: str,
 ) -> dict[str, object]:
     """Measure one session and commit its rows the way the pipeline driver does.
 
@@ -458,7 +458,7 @@ def _check_and_commit(
     carries, then the ``run.lance`` row that makes them visible. Each call is its own
     run, so a test can stack runs and read back what the store makes of them.
     """
-    config = _config(session, thresholds=thresholds)
+    config = _config(session, thresholds=thresholds, mp4_index_uri=mp4_index_uri)
     run_id = store.new_run_id()
     record = processing.check_session(
         {"session_path": str(session)}, config=config, run_id=run_id, created_at=created_at
@@ -484,7 +484,7 @@ def offset_rig(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
     sensor_timeline: Callable[..., pathlib.Path],
-) -> pathlib.Path:
+) -> tuple[pathlib.Path, pathlib.Path]:
     """Three cameras that each look healthy, one of them recording two seconds late.
 
     Every stream passes on its own; only the session-grain checks see the offset, and
@@ -498,25 +498,26 @@ def offset_rig(
         ("c.mp4", _SENSOR_EPOCH_NS + 2_000_000_000),
     ):
         (rig / name).write_bytes(h264_video(frames=30))
-        sensor_timeline(rig / name, frames=30, start_ns=start_ns)
-    return rig
+        manifest = sensor_timeline(rig / name, frames=30, start_ns=start_ns)
+    return rig, manifest
 
 
-def _lock(video: pathlib.Path) -> None:
-    """Make a camera unreachable -- its video and its timeline -- the way ``unreachable_video`` does."""
-    if os.geteuid() == 0:
-        pytest.skip("root reads a mode-000 file regardless, so the stream would be reachable")
-    for path in (video, pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")):
-        path.chmod(0o000)
+def _deny_camera(monkeypatch: pytest.MonkeyPatch, video: pathlib.Path) -> None:
+    """Inject an infrastructure failure at lookup; indexed checks do not open media."""
+    original = Mp4IndexLookup.index_for
+
+    def _index_for(lookup: Mp4IndexLookup, source: str, *, media_size_bytes: int | None = None) -> object:
+        if source == str(video):
+            message = f"access denied: {source}"
+            raise PermissionError(message)
+        return original(lookup, source, media_size_bytes=media_size_bytes)
+
+    monkeypatch.setattr(Mp4IndexLookup, "index_for", _index_for)
 
 
-def _unlock(video: pathlib.Path) -> None:
-    """Undo :func:`_lock`."""
-    for path in (video, pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")):
-        path.chmod(0o644)
-
-
-def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(offset_rig: pathlib.Path) -> None:
+def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(
+    offset_rig: tuple[pathlib.Path, pathlib.Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The reproduced case, through the real session metrics and the real Lance store.
 
     The complete run fails the session on the late camera. The rerun cannot reach it,
@@ -524,16 +525,15 @@ def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(offset_rig: pa
     the newest. The session must still not read PASS, and the rerun's good per-stream
     work must still be committed.
     """
-    root = str(offset_rig.parent / "di-store")
-    first = _check_and_commit(offset_rig, created_at=_EARLIER)
+    rig, manifest = offset_rig
+    root = str(rig.parent / "di-store")
+    first = _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_EARLIER)
     assert first["failed_session_metrics"] > 0
     assert store.session_rollup(root)["status"] == "FAIL"
 
-    _lock(offset_rig / "c.mp4")
-    try:
-        rerun = _check_and_commit(offset_rig, created_at=_LATER)
-    finally:
-        _unlock(offset_rig / "c.mp4")
+    with monkeypatch.context() as denied:
+        _deny_camera(denied, rig / "c.mp4")
+        rerun = _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_LATER)
 
     assert rerun["unreachable"] == 1
     assert rerun["failed_session_metrics"] == 0, "judged over a and b alone, the session looks aligned"
@@ -542,21 +542,22 @@ def test_a_partial_rerun_cannot_turn_a_failed_session_into_a_pass(offset_rig: pa
     sessions = store.session_rollup(root)["sessions"]
     assert [entry["status"] for entry in sessions] == ["ERROR"]
     rerun_sources = {row["source"] for row in store.read_streams(root) if row["run_id"] == session_row["run_id"]}
-    assert rerun_sources == {str(offset_rig / "a.mp4"), str(offset_rig / "b.mp4")}
+    assert rerun_sources == {str(rig / "a.mp4"), str(rig / "b.mp4")}
 
 
-def test_a_complete_run_after_a_partial_one_restores_the_verdict(offset_rig: pathlib.Path) -> None:
+def test_a_complete_run_after_a_partial_one_restores_the_verdict(
+    offset_rig: tuple[pathlib.Path, pathlib.Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A run that reaches every camera again decides the session, and no run's history is lost."""
-    root = str(offset_rig.parent / "di-store")
-    _check_and_commit(offset_rig, created_at=_EARLIER)
-    _lock(offset_rig / "c.mp4")
-    try:
-        _check_and_commit(offset_rig, created_at=_LATER)
-    finally:
-        _unlock(offset_rig / "c.mp4")
+    rig, manifest = offset_rig
+    root = str(rig.parent / "di-store")
+    _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_EARLIER)
+    with monkeypatch.context() as denied:
+        _deny_camera(denied, rig / "c.mp4")
+        _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_LATER)
     assert store.session_rollup(root)["status"] == "ERROR"
 
-    _check_and_commit(offset_rig, created_at=_LATEST)
+    _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_LATEST)
 
     assert store.session_rollup(root)["status"] == "FAIL"
     history = store.read_sessions(root, latest=False)
@@ -564,7 +565,8 @@ def test_a_complete_run_after_a_partial_one_restores_the_verdict(offset_rig: pat
 
 
 def test_a_complete_run_under_another_policy_cannot_vouch_for_a_partial_runs_verdicts(
-    offset_rig: pathlib.Path,
+    offset_rig: tuple[pathlib.Path, pathlib.Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A session's verdicts must come from the run that wrote its newest row.
 
@@ -573,18 +575,17 @@ def test_a_complete_run_under_another_policy_cannot_vouch_for_a_partial_runs_ver
     but no default-policy verdicts. Asked about the default policy, the rollup must not
     pair that complete row with the partial run's verdicts and call the session PASS.
     """
-    root = str(offset_rig.parent / "di-store")
-    _check_and_commit(offset_rig, created_at=_EARLIER)
-    _lock(offset_rig / "c.mp4")
-    try:
-        _check_and_commit(offset_rig, created_at=_LATER)
-    finally:
-        _unlock(offset_rig / "c.mp4")
+    rig, manifest = offset_rig
+    root = str(rig.parent / "di-store")
+    _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_EARLIER)
+    with monkeypatch.context() as denied:
+        _deny_camera(denied, rig / "c.mp4")
+        _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_LATER)
     other_policy = {"max_gaps": 99}
-    _check_and_commit(offset_rig, created_at=_LATEST, thresholds=other_policy)
+    _check_and_commit(rig, mp4_index_uri=str(manifest), created_at=_LATEST, thresholds=other_policy)
 
-    default = store.policy_id(_config(offset_rig).checks.thresholds.to_thresholds())
-    other = store.policy_id(_config(offset_rig, thresholds=other_policy).checks.thresholds.to_thresholds())
+    default = store.policy_id(_config(rig).checks.thresholds.to_thresholds())
+    other = store.policy_id(_config(rig, thresholds=other_policy).checks.thresholds.to_thresholds())
     assert [entry["status"] for entry in store.session_rollup(root, policy=default)["sessions"]] == ["ERROR"]
     assert [entry["status"] for entry in store.session_rollup(root, policy=other)["sessions"]] == ["FAIL"]
 
@@ -635,9 +636,9 @@ def test_a_failing_session_metric_is_counted_in_the_record(
     ragged.mkdir()
     for name, frames in (("front.mp4", 30), ("rear.mp4", 60)):
         (ragged / name).write_bytes(h264_video(frames=frames))
-        sensor_timeline(ragged / name, frames=frames)
+        manifest = sensor_timeline(ragged / name, frames=frames)
 
-    record = _check(ragged, thresholds={"max_non_overlap_percent": 0.0})
+    record = _check(ragged, mp4_index_uri=str(manifest), thresholds={"max_non_overlap_percent": 0.0})
     verdicts = {
         row["metric_name"]: row["check_status"] for row in _rows(record)[store_schema.SESSION_EVALUATION_DATASET]
     }

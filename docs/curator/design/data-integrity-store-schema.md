@@ -233,7 +233,7 @@ One row per stream a run touched, **including ones that failed to open**.
 *why* the rate/gap/jitter checks got skipped.
 
 `timestamp_source` is saved for a stronger reason: it can't be recovered later. The row keeps the numbers, not the
-sidecar that explains them, and a stored jitter of nearly zero is ambiguous without it — a rig that is genuinely
+source clock that explains them, and a stored jitter of nearly zero is ambiguous without it — a rig that is genuinely
 steady and a constant-frame-rate mux that regenerated the timeline both look like that. Only one is a measurement.
 A query for streams whose cadence is real filters on this column. See
 [Timestamp provenance](data-integrity-metrics.md#timestamp-provenance).

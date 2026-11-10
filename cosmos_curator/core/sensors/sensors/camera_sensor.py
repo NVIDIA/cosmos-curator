@@ -131,9 +131,7 @@ class CameraSensor:
                 report the container's presentation timestamps. Supplied rather
                 than read, because the library never accepts URIs and so cannot
                 go looking for whatever the recorder wrote beside the media (see
-                :data:`~cosmos_curator.core.sensors.types.types.DataSource`);
-                :func:`~cosmos_curator.core.sensors.utils.timestamps.read_timestamps_ns`
-                is what turns that artifact into this argument. Worth supplying
+                :data:`~cosmos_curator.core.sensors.types.types.DataSource`). Worth supplying
                 wherever it exists: a constant-frame-rate mux regenerates PTS on a
                 fixed grid, and a timeline measured off that grid describes the
                 encoder rather than the hardware.

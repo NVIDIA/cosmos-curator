@@ -201,8 +201,7 @@ def is_infrastructure_error(exc: BaseException) -> bool:
     HTTP status. The last two come from :func:`~.sources.error_code` and
     :func:`~.sources.http_status`, which read them defensively off whatever attributes
     the exception carries, the alternative being to import botocore and azure.core to
-    name two exception types. Shared with the sidecar reader, which asks the opposite
-    question -- was the object absent -- of the same two attributes.
+    name two exception types.
     """
     if any(cls.__name__ in _INFRASTRUCTURE_ERRORS for cls in type(exc).__mro__):
         return True

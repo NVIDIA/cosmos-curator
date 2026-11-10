@@ -24,7 +24,6 @@ from typing import BinaryIO
 
 import attrs
 import av
-import botocore.exceptions
 import numpy as np
 import numpy.typing as npt
 import pytest
@@ -35,14 +34,11 @@ from cosmos_curator.core.sensors.data_integrity.results import CheckResult, Chec
 from cosmos_curator.core.sensors.mp4.box_locate import get_moov_auto
 from cosmos_curator.core.sensors.mp4.moov import parse_video_track
 from cosmos_curator.core.sensors.types.types import TimestampSource
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.recipes.data_integrity.cli_support import cancellable_reader
 from cosmos_curator.next.recipes.data_integrity.session_runner import is_infrastructure_error
 from cosmos_curator.next.recipes.data_integrity.sources import (
-    SOURCE_SENSOR_TIMESTAMPS_SUFFIX,
     observed_size_bytes,
     open_source,
-    read_sensor_timestamps,
     run_checks,
 )
 
@@ -172,28 +168,46 @@ _SENSOR_EPOCH_NS = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z
 _EOF_OR_PTS = ("eof_ns", "edited_pts_ns")
 
 
-def _write_sensor_timeline(video: pathlib.Path, timestamps_ns: npt.NDArray[np.int64]) -> pathlib.Path:
-    """Write a sensor timeline beside *video*, through the same writer the rigs' converter uses."""
-    sidecar = pathlib.Path(f"{video}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}")
-    with sidecar.open("wb") as stream:
-        write_timestamps_ns(np.asarray(timestamps_ns, dtype=np.int64), stream)
-    return sidecar
-
-
-def _clip_with_timeline(
+@pytest.mark.parametrize("malformed", [False, True])
+@pytest.mark.parametrize("marker_suffix", [None, ".sensor_timestamps.npy", ".observations.npy"])
+@pytest.mark.parametrize("field", ["pts_ns", "edited_pts_ns"])
+def test_legacy_sidecars_are_never_opened_or_used(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
-    *,
-    frames: int = 30,
-    entries: int | None = None,
-) -> tuple[pathlib.Path, npt.NDArray[np.int64]]:
-    """Write a clip plus a sensor timeline of *entries* observations (default: one per frame)."""
+    monkeypatch: pytest.MonkeyPatch,
+    malformed: bool,  # noqa: FBT001
+    marker_suffix: str | None,
+    field: str,
+) -> None:
+    """Only an index supplies recorded clocks, regardless of nearby legacy artifacts."""
     clip = tmp_path / "front.mp4"
-    clip.write_bytes(h264_video(frames=frames))
-    count = frames if entries is None else entries
-    sensor_ns = _SENSOR_EPOCH_NS + np.arange(count, dtype=np.int64) * 33_333_333
-    _write_sensor_timeline(clip, sensor_ns)
-    return clip, sensor_ns
+    clip.write_bytes(h264_video(frames=30))
+    sidecar = pathlib.Path(f"{clip}.timestamps.npy")
+    if malformed:
+        sidecar.write_bytes(b"not a numpy file")
+    else:
+        np.save(sidecar, _SENSOR_EPOCH_NS + np.arange(30, dtype=np.int64) * 33_333_333)
+    if marker_suffix is not None:
+        pathlib.Path(f"{clip}{marker_suffix}").write_bytes(b"obsolete marker")
+    opened: list[str] = []
+
+    @contextlib.contextmanager
+    def _record_open(source: str, **kwargs: object) -> object:
+        opened.append(source)
+        with open_source(source, **kwargs) as stream:  # type: ignore[arg-type]
+            yield stream
+
+    monkeypatch.setattr("cosmos_curator.next.recipes.data_integrity.sources.open_source", _record_open)
+
+    _results, info, _cfg = run_checks(str(clip), expected_hz=None, alignment_fields=("eof_ns", field))
+
+    assert info.timestamp_source is TimestampSource.CONTAINER_PTS
+    assert info.start_ns == 0
+    assert opened == [str(clip)]
+
+    with pytest.raises(ValueError, match=r"EOF/SOF/MOE require input\.mp4_index_uri"):
+        run_checks(str(clip), expected_hz=None)
+    assert opened == [str(clip)]
 
 
 def test_a_video_with_no_sensor_timeline_is_an_error_unless_container_pts_is_allowed(
@@ -210,9 +224,7 @@ def test_a_video_with_no_sensor_timeline_is_an_error_unless_container_pts_is_all
     clip = tmp_path / "front.mp4"
     clip.write_bytes(h264_video(frames=30))
 
-    assert read_sensor_timestamps(str(clip)) is None
-
-    with pytest.raises(ValueError, match="no sensor-timestamp sidecar or requested camera timestamps"):
+    with pytest.raises(ValueError, match="no requested camera timestamps"):
         run_checks(str(clip), expected_hz=None)
 
     _results, info, _cfg = run_checks(str(clip), expected_hz=None, alignment_fields=_EOF_OR_PTS)
@@ -234,16 +246,17 @@ def test_raw_pts_is_measured_from_the_container_without_an_index(
     assert info.timestamp_source is TimestampSource.CONTAINER_PTS
 
 
-@pytest.mark.parametrize("field", ["sof_ns", "moe_ns"])
+@pytest.mark.parametrize("field", ["eof_ns", "sof_ns", "moe_ns"])
 def test_index_only_clocks_cannot_be_read_from_the_media(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
     field: str,
 ) -> None:
-    """SOF/MOE exist only in an index extension's output; a sidecar is EOF, not either of them."""
-    clip, _sensor_ns = _clip_with_timeline(tmp_path, h264_video)
+    """Recorded clocks exist only in an index extension's output."""
+    clip = tmp_path / "front.mp4"
+    clip.write_bytes(h264_video(frames=30))
 
-    with pytest.raises(ValueError, match=r"SOF/MOE require input\.mp4_index_uri"):
+    with pytest.raises(ValueError, match=r"EOF/SOF/MOE require input\.mp4_index_uri"):
         run_checks(str(clip), expected_hz=None, alignment_fields=(field,))
 
 
@@ -259,300 +272,9 @@ def test_an_unusable_preference_is_refused_before_anything_is_read(
         run_checks(str(tmp_path / "absent.mp4"), expected_hz=None, alignment_fields=fields)
 
 
-def test_a_sensor_timeline_beside_a_video_is_what_gets_measured(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """The point of the feature, end to end through the recipe's own entry point.
-
-    Asserted on the reported bounds rather than on the sensor, because those are what
-    the session-grain metrics compare across cameras -- and comparing container PTS is
-    how twelve cameras 133 ms apart came out at zero spread.
-    """
-    clip, sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-
-    _results, info, _cfg = run_checks(str(clip), expected_hz=None)
-
-    assert info.num_samples == len(sensor_ns)
-    assert info.start_ns == int(sensor_ns[0])
-    assert info.end_ns == int(sensor_ns[-1])
-
-
-def test_a_sensor_timeline_that_is_not_a_timeline_is_reported_not_fallen_back_from(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """A corrupt sidecar is a defect worth surfacing, not a reason to quietly use PTS.
-
-    Falling back would hide the one thing the operator can act on: something wrote an
-    artifact that fails its own reader.
-    """
-    clip = tmp_path / "front.mp4"
-    clip.write_bytes(h264_video(frames=30))
-    pathlib.Path(f"{clip}{SOURCE_SENSOR_TIMESTAMPS_SUFFIX}").write_bytes(b"not a npy file at all")
-
-    with pytest.raises(ValueError, match=r"not a valid \.npy timeline"):
-        run_checks(str(clip), expected_hz=None)
-
-
-def test_a_sensor_timeline_that_does_not_fit_the_video_is_reported(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """A timeline of the wrong length describes some other recording.
-
-    Entries are matched to frames by position, so a count that disagrees leaves every
-    frame's sensor time in doubt rather than only the missing ones'.
-    """
-    clip, _sensor_ns = _clip_with_timeline(tmp_path, h264_video, frames=30, entries=29)
-
-    with pytest.raises(ValueError, match="29 observations but the stream has 30 displayable frames"):
-        run_checks(str(clip), expected_hz=None)
-
-
-def test_a_timeline_is_refused_for_a_stream_it_may_not_describe(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """The sidecar names the file, so it cannot answer for one stream inside it.
-
-    ``--stream-idx 0`` and ``--stream-idx 1`` of one container are two streams, and the
-    store keys them apart -- but one timeline sits beside both. Applying it to the
-    second would either put that stream on a clock measured off the first, or fail on a
-    frame count that says nothing about the recording, so it is refused by name instead.
-    """
-    clip, _sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-
-    with pytest.raises(ValueError, match="only stream 0 is defined"):
-        run_checks(str(clip), expected_hz=None, stream_idx=1)
-
-
-def test_a_stream_index_is_only_refused_when_a_timeline_is_there_to_misapply(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """The refusal is about the artifact, not about the index.
-
-    Most sources carry no timeline, and those have nothing to attribute to the wrong
-    stream -- so a non-zero index goes on to be answered by the container, whatever it
-    has to say about it, rather than being turned away here.
-    """
-    clip = tmp_path / "front.mp4"
-    clip.write_bytes(h264_video(frames=30))
-
-    with pytest.raises(IndexError):
-        run_checks(str(clip), expected_hz=None, stream_idx=1, alignment_fields=_EOF_OR_PTS)
-
-
-#: Spelled out rather than imported from ``sources``, so that renaming the constant
-#: there cannot quietly stop this matching what ``multimodal_split`` actually writes
-#: (its ``uris.py``, ``_SENSOR_TIMESTAMPS_SUFFIX``). The name is the whole contract.
-_SENSOR_TIMESTAMPS_SUFFIX = ".sensor_timestamps.npy"
-
-
-def _disown_timeline(
-    video: pathlib.Path, *, frames: int, marker_suffix: str = _SENSOR_TIMESTAMPS_SUFFIX
-) -> pathlib.Path:
-    """Write beside *video* the marker ``multimodal_split`` writes beside a clip.
-
-    Shaped like the real one -- one entry per output frame, with the repeat a dropped
-    exposure leaves behind -- so the array here is a reminder of why it cannot simply
-    be read as the timeline instead: it does not strictly ascend.
-    """
-    marker = pathlib.Path(f"{video}{marker_suffix}")
-    observed = _SENSOR_EPOCH_NS + np.arange(frames, dtype=np.int64) * 33_333_333
-    observed[-1] = observed[-2]
-    with marker.open("wb") as stream:
-        np.save(stream, observed, allow_pickle=False)
-    return marker
-
-
-def test_a_resampling_grid_is_not_read_as_a_recorders_clock(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """A clip cut by ``multimodal_split`` carries a timeline no camera produced.
-
-    That recipe resamples every camera onto one evenly spaced grid and writes the grid
-    under the recorder's own filename, keeping the instants a camera observed beside it
-    instead. Believed, the grid answers the session grain before it is asked: every
-    camera sits on the same lattice, so spread is zero and overlap total however far
-    out of sync the rig was. So the marker disowns it: the clip has no EOF clock, and is
-    an error unless container PTS is allowed -- which begins at zero, and is what proves
-    which clock was used.
-    """
-    clip, sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-    _disown_timeline(clip, frames=30)
-
-    assert read_sensor_timestamps(str(clip)) is None
-
-    with pytest.raises(ValueError, match="no sensor-timestamp sidecar"):
-        run_checks(str(clip), expected_hz=None)
-    _results, info, _cfg = run_checks(str(clip), expected_hz=None, alignment_fields=_EOF_OR_PTS)
-    assert info.start_ns != int(sensor_ns[0]), "the disowned grid was measured anyway"
-    assert info.start_ns == 0
-
-
-def test_a_legacy_observations_marker_still_disowns_a_resampling_grid(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """Previously written multimodal clips must not make their grid look sensor-owned."""
-    clip, sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-    _disown_timeline(clip, frames=30, marker_suffix=".observations.npy")
-
-    assert read_sensor_timestamps(str(clip)) is None
-
-    _results, info, _cfg = run_checks(str(clip), expected_hz=None, alignment_fields=_EOF_OR_PTS)
-    assert info.start_ns != int(sensor_ns[0]), "the legacy marker did not disown the grid"
-    assert info.start_ns == 0
-
-
-def test_a_marker_disowns_only_the_timeline_beside_it(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """Per stream, not per directory: twelve cameras share a clip directory.
-
-    Both artifacts are named for one camera's media, so a marker belonging to another
-    camera says nothing about this one. Keyed on the directory instead, one derived
-    clip anywhere in a session would disown every real timeline in it.
-    """
-    clip, sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-    _disown_timeline(tmp_path / "rear.mp4", frames=30)
-
-    timeline = read_sensor_timestamps(str(clip))
-
-    assert timeline is not None, "a neighbour's marker disowned this camera's timeline"
-    assert int(timeline[0]) == int(sensor_ns[0])
-
-
-def test_the_stream_wrapper_reaches_the_sensor_timeline_too(
-    tmp_path: pathlib.Path,
-    h264_video: Callable[..., bytes],
-) -> None:
-    """Cancellation and byte counting have to cover the sidecar, which is fetched first.
-
-    A wrapper that reached only the video would leave a hung timeline fetch with no way
-    out: the read that blocks is the one before the one being watched.
-    """
-    clip, _sensor_ns = _clip_with_timeline(tmp_path, h264_video)
-    wrapped: list[bytes] = []
-
-    def _wrap(stream: BinaryIO) -> BinaryIO:
-        wrapped.append(stream.read(6))
-        stream.seek(0)
-        return stream
-
-    run_checks(str(clip), expected_hz=None, stream_wrapper=_wrap)
-
-    assert len(wrapped) == 2, "the sensor timeline was opened outside the wrapper"
-    assert wrapped[0] == b"\x93NUMPY", "the timeline is fetched first, so it is wrapped first"
-
-
-def _wrapped_s3_error(code: str, status: int) -> OSError:
-    """Build the exception ``smart_open`` raises for a failed S3 fetch.
-
-    It replaces every ``botocore`` ``ClientError`` with a bare ``IOError``, keeping the
-    original only as ``backend_error`` and as ``__cause__``. Reproduced here rather than
-    mocked loosely, because that wrapper is the whole difficulty: absent, denied and
-    unavailable all arrive as one exception type.
-    """
-    inner = botocore.exceptions.ClientError(
-        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
-        "GetObject",
-    )
-    wrapper = OSError(f"unable to access bucket: 'b' key: 'k' error: {inner}")
-    wrapper.backend_error = inner  # type: ignore[attr-defined]
-    wrapper.__cause__ = inner
-    return wrapper
-
-
-def _raise_on_open(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
-    """Make every cloud open fail with *exc*."""
-
-    @contextlib.contextmanager
-    def _fake_open_storage_source(_source: str, **_kwargs: object) -> "object":
-        raise exc
-        yield  # pragma: no cover -- unreachable, but keeps this a generator
-
-    monkeypatch.setattr(
-        "cosmos_curator.next.recipes.data_integrity.sources.open_storage_source", _fake_open_storage_source
-    )
-
-
-def test_a_sensor_timeline_that_is_absent_in_the_cloud_reads_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A remote 404 is the same "no sidecar here" as a local missing file.
-
-    Pinned against the real wrapper shape so a ``smart_open`` change cannot silently
-    turn every absent timeline into a per-stream error.
-    """
-    _raise_on_open(monkeypatch, _wrapped_s3_error("NoSuchKey", 404))
-
-    assert read_sensor_timestamps("s3://bucket/front.mp4") is None
-
-
-@pytest.mark.parametrize(
-    ("code", "status"),
-    [("AccessDenied", 403), ("InternalError", 500), ("ExpiredToken", 403)],
-)
-def test_an_unreachable_sensor_timeline_keeps_the_stream_unreachable(
-    code: str,
-    status: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A denial must not be read as absence, and must still count as unreachable.
-
-    Reading it as absence would measure a whole rig against the container's metronome
-    and record that as the recording's own timeline. Propagating it is only half the
-    job: :func:`is_infrastructure_error` has to recognise it too, or the stream gets a
-    manufactured data-quality error that supersedes an earlier healthy measurement.
-    """
-    exc = _wrapped_s3_error(code, status)
-    _raise_on_open(monkeypatch, exc)
-
-    with pytest.raises(OSError, match="unable to access bucket") as raised:
-        read_sensor_timestamps("s3://bucket/front.mp4")
-
-    assert is_infrastructure_error(raised.value)
-
-
-def test_an_unreachable_current_marker_does_not_fall_through_to_the_legacy_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A denied marker probe cannot turn a resampling grid into a trusted sensor timeline."""
-    payload = io.BytesIO()
-    write_timestamps_ns(np.array([_SENSOR_EPOCH_NS, _SENSOR_EPOCH_NS + 1], dtype=np.int64), payload)
-    source = "s3://bucket/front.mp4"
-    opened: list[str] = []
-    denied = _wrapped_s3_error("AccessDenied", 403)
-
-    @contextlib.contextmanager
-    def _fake_open_storage_source(uri: str, **_kwargs: object) -> "object":
-        opened.append(uri)
-        if uri == f"{source}.timestamps.npy":
-            yield io.BytesIO(payload.getvalue())
-            return
-        if uri == f"{source}.sensor_timestamps.npy":
-            raise denied
-        pytest.fail(f"marker probing continued after AccessDenied: {uri}")
-        yield  # pragma: no cover -- unreachable, but keeps this a generator
-
-    monkeypatch.setattr(
-        "cosmos_curator.next.recipes.data_integrity.sources.open_storage_source", _fake_open_storage_source
-    )
-
-    with pytest.raises(OSError, match="unable to access bucket") as raised:
-        read_sensor_timestamps(source)
-
-    assert raised.value is denied
-    assert is_infrastructure_error(raised.value)
-    assert opened == [f"{source}.timestamps.npy", f"{source}.sensor_timestamps.npy"]
-
-
-def test_a_bad_sensor_timeline_is_not_mistaken_for_an_unreachable_one() -> None:
+def test_invalid_timestamps_are_not_mistaken_for_an_unreachable_source() -> None:
     """The two failure kinds stay distinct, since only one of them says the data is bad."""
-    assert not is_infrastructure_error(ValueError("stream is not a valid .npy timeline"))
+    assert not is_infrastructure_error(ValueError("invalid indexed timestamps"))
     # A missing object is a fact about the dataset, so it stays a finding rather than
     # an absence of one -- which is why the 404 family is not infrastructure.
     assert not is_infrastructure_error(FileNotFoundError("front.mp4"))
@@ -730,26 +452,24 @@ def test_an_unindexed_stream_falls_back_to_opening_the_video(
     assert info.num_samples == 20, "the fallback measured the index's video instead of this one"
 
 
-def test_an_unindexed_stream_still_reads_its_sidecar(
+def test_a_partial_index_cannot_recover_eof_from_a_sidecar(
     tmp_path: pathlib.Path,
     h264_video: Callable[..., bytes],
 ) -> None:
-    """A miss is answered by the media's own rules, where EOF is the timeline beside the video."""
+    """A manifest miss leaves EOF unavailable even if a valid legacy sidecar exists."""
     covered = tmp_path / "front.mp4"
     video_bytes = h264_video(frames=30)
     covered.write_bytes(video_bytes)
-    rear_dir = tmp_path / "rear"
-    rear_dir.mkdir()
-    other, sensor_ns = _clip_with_timeline(rear_dir, h264_video, frames=20)
+    other = tmp_path / "rear.mp4"
+    other.write_bytes(h264_video(frames=20))
+    np.save(f"{other}.timestamps.npy", _eof_ns(20))
 
-    _results, info, _cfg = run_checks(
-        str(other),
-        expected_hz=None,
-        index_lookup=_StubLookup(str(covered), video_bytes),  # type: ignore[arg-type]
-    )
-
-    assert info.timestamp_source is TimestampSource.SENSOR
-    assert info.start_ns == int(sensor_ns[0])
+    with pytest.raises(ValueError, match=r"EOF/SOF/MOE require input\.mp4_index_uri"):
+        run_checks(
+            str(other),
+            expected_hz=None,
+            index_lookup=_StubLookup(str(covered), video_bytes),  # type: ignore[arg-type]
+        )
 
 
 def test_the_index_is_not_consulted_for_a_stream_it_cannot_describe(
@@ -790,7 +510,7 @@ def test_an_indexed_stream_never_reads_the_sidecar_beside_it(
     clip = tmp_path / "front.mp4"
     video_bytes = h264_video(frames=30)
     clip.write_bytes(video_bytes)
-    _write_sensor_timeline(clip, _SENSOR_EPOCH_NS + 7 + np.arange(29, dtype=np.int64) * 33_333_333)
+    np.save(f"{clip}.timestamps.npy", _SENSOR_EPOCH_NS + 7 + np.arange(29, dtype=np.int64) * 33_333_333)
     eof_ns = _eof_ns(30)
     lookup = _StubLookup(str(clip), video_bytes, eof_ns=eof_ns if indexed_eof else None)
     opened: list[str] = []
