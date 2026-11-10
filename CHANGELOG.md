@@ -1,9 +1,56 @@
 # Changelog
 
-## Latest
+## [2.10.0]
+
+### Released
+
+- 2026-11-10
 
 ### Breaking Changes
 
+- Upgrade `mp4-index` manifests to record schema version 9, adding the selected MP4 `track_id`
+  and source `ftyp_bytes` to metadata. Rebuild older manifests into a fresh output dataset;
+  existing `moov`/`moof` caches remain reusable, but rebuilding reads each source's `ftyp` again.
+- Require `input.mp4_index_uri` in `multimodal-split`, with a current, usable index record for
+  every camera. Remove legacy timestamp NPY inputs and direct source-container indexing from
+  the splitter. Build a manifest with `mp4-index` first; recorded EOF/SOF/MOE clocks require
+  a recorder-specific index extension, while ordinary indexes provide container timing.
+- Replace `multimodal-split` output timestamp NPY sidecars with per-camera `.mp4.index.lance`
+  manifests and `.mp4.moov` decoder headers. Episode record schema 3 and media contract 4 replace
+  the camera descriptor's timeline and sensor-timestamp locations and hashes with `mp4_index_uri`
+  and `index_sha256`. Use a fresh output root; existing episode datasets have no in-place migration.
+  Read output frames and both clocks through `open_episode_camera(episode_row, camera_key)`.
+- Replace `multimodal-split`'s per-camera `allow_pts_fallback` with ordered
+  `camera_alignment_fields`, defaulting to `[eof_ns]`. Select the first complete indexed clock
+  for each camera; use `[eof_ns, edited_pts_ns]` to explicitly allow container presentation times
+  when recorded EOF is unavailable. Changing clock preferences changes the split contract.
+- Replace `StreamingCameraSensor`'s `timestamps_ns` constructor argument with an indexed
+  `alignment_field` and optional paired `metadata`/`frame_index`. The default alignment is
+  `VideoFrameAlignmentField.PTS_NS`. `Mp4FrameIndex.pts_ns` now means presentation time before
+  playback edits; use `edited_pts_ns` for the former edit-adjusted timeline. Container timestamp
+  arrays are read-only.
+- Remove the sensor library's `utils.timestamps` module and its `read_timestamps_ns` and
+  `write_timestamps_ns` NPY serialization APIs. `CameraSensor` still accepts caller-supplied
+  in-memory sensor timestamp arrays.
+- Consolidate `di-check` and `di-session` into the config-driven `di` tool. Run
+  `pixi run -e di di <config.yaml>` with one file or session in `input.sessions`; move measurement,
+  threshold, storage, and credential options into the shared `data-integrity` config.
+  Rename `input.index_manifest_uri` to `input.mp4_index_uri`. A configured manifest that cannot
+  be read now fails the run instead of silently falling back to media reads.
+- Default data-integrity checks to `checks.camera_alignment_fields: [eof_ns]`. Streams without
+  a recorded EOF clock are errors unless another clock is explicitly listed; use
+  `[eof_ns, edited_pts_ns]` to permit container PTS. Recorded EOF/SOF/MOE must come from a usable
+  index; unindexed streams can read container PTS only when explicitly selected. Timestamp NPY
+  sidecars and derived-clip marker files are no longer consulted.
+- Advance the data-integrity store to schema version 4 with per-session `num_unreachable`.
+  Older session stores cannot accept new session rows or produce session rollups; remeasure
+  into a fresh store root so coverage belongs to the same run as its measurements.
+- Move `video-cut` to shared append publication, with one atomic publication per selected set
+  of sources. Rename `execution.sources_per_checkpoint` to `rows_per_checkpoint` and
+  `spans_per_fragment` to `rows_per_fragment`, move `probe_cpus` under `execution.fixed_stride`,
+  and remove `probe_mode`. Empty plans and terminal failures become source outcome rows with
+  null `span_id`; filter on `span_id IS NOT NULL` when reading spans. Earlier span tables and
+  recovery workspaces require a new output location.
 - Move `robot-action-split` to shared append publication. A work item is one source chunk, which
   downloads once and stages one outcome; each run publishes one selection of at most
   `execution.max_items` chunks atomically and resumes interrupted work from checkpoints, so rerun
@@ -22,9 +69,73 @@
   `outcomes` with the shared append summary, whose `errors` counts failed chunks, plus
   `failed_clips` and `failed_clips_by_stage`. An unregistered `source_dataset` with
   `action_format: bin` now fails config validation.
+- Rename `execution.parquet_rows_per_file` to `execution.rows_per_checkpoint` in
+  `video-transcode`, `video-embed`, and `video-caption`. Shared recovery stages results as Arrow
+  IPC and uses a new workspace layout; earlier unfinished workspaces are not resumed. Start
+  with fresh staging and rerun pending work. Compatible captions already published by the
+  former fragment-by-fragment implementation remain reusable.
+- Publish `video-caption`'s entire selected set of fragments in one Lance transaction. Set
+  `execution.max_fragments` to make smaller selections visible sooner, and rerun while
+  `remaining_fragments` is nonzero. Shared append recipes use `execution.max_items` and
+  `remaining_items`; a resumed append run may report an unknown remaining count until the next
+  discovery pass.
+- Remove the `size_check` argument from `copy_model_weights`. Existing destination files are
+  now always compared by size: matching files are skipped and differing files are replaced.
+
+### Added
+
+- Decode streaming camera frames directly from indexed sample byte ranges, using the selected
+  track's source decoder headers. Accept supplied indexes or build them lazily, and sample
+  across successive windows while retaining only the last selected RGB frame for repeats.
+- Add `cosmos3_super` to `multimodal-caption`, supporting every context mode through the native
+  Cosmos3 vLLM executor. Stage its model weights explicitly before running.
+- Add `ego_trajectory_absolute_poses_with_relative_motion` caption context, combining absolute
+  poses with forward, left, and upward displacement and heading change from the initial pose.
+  Require the explicit `context.ego.pose_convention: rfu_body_local_enu_v1` declaration for
+  sources whose body-axis convention is known.
+- Add a lightweight `di` Pixi environment for Linux and Apple Silicon. Check one video or
+  session without Ray using the same config as the distributed pipeline, with optional Lance
+  persistence and configurable per-session stream concurrency.
+- Add `execution.max_model_len` to `video-caption` to cap vLLM's request length for GPUs with
+  less available KV-cache memory. A configured limit is part of the caption result contract.
+- Add host setup and cleanup scripts to managed Slurm Ray through `runtime.host_setup_script`
+  and `runtime.host_cleanup_script`, and to `slurm submit` through `--host-setup-script` and
+  `--host-cleanup-script`. Setup runs before container import; cleanup is best effort.
+
+### Fixed
+
+- Prevent false data-integrity `PASS` results after partial reruns by tracking unreachable
+  streams on each session measurement instead of borrowing coverage from earlier runs.
+  Incomplete pipeline runs commit their available results and then exit with an error.
+  Session alignment checks remain skipped, including on re-evaluation, when the cameras do
+  not all report sensor timestamps.
+- Fall back to full re-encoding in `smart_cut` when copied source packets are incompatible
+  with the boundary encoder. Validate decoded frame counts and source-relative presentation
+  timing, including the final duration when known, before accepting an output.
+- Preserve the selected MP4 track and initialize indexed decoders from source `ftyp`/`moov`
+  through libav, retaining codec parameters, pixel format, color properties, and stream side
+  data. Recover MPEG-4 Part 2 frame dimensions from `stsd` when libav reports zero dimensions.
+- Retain root-level videos when `mp4-index` discovers an S3 prefix containing both videos and
+  nested prefixes.
+- Give each Ray worker launched through `PixiRuntimeEnv` a private Transformers module cache,
+  preventing concurrent imports from seeing partially copied custom model code. Model weight
+  caches remain shared.
+- Mount `local launch --pixi-path` workspaces at their original host path and run commands
+  there, allowing Pixi to reuse host-installed environments without relocation errors.
+- Request a Xenna autoscaling solve when a stage finishes in `STREAMING` or `SERVING` mode,
+  so freed CPUs and GPUs can be reassigned without waiting for the periodic autoscale interval.
 
 ### Changed
 
+- Stream `multimodal-split` media hashing and conditional uploads from local files, including
+  multipart uploads for large S3 objects. Payload buffering stays bounded for whole-session
+  outputs; frame indexes and timestamp metadata still scale with frame count.
+- Use shared checkpoint selection and recovery for `video-cut`, `robot-action-split`, and
+  `video-caption`. Resume saved work before discovering or selecting more input, and retry
+  publication from durable results without repeating checkpointed processing. Enrichment
+  recipes also accept `execution.max_fragments` to bound new publication selections.
+- Stage shared recovery results as Arrow IPC to preserve canonical Arrow types, null
+  fixed-size lists, field names, and metadata through checkpointing.
 - Skip clip rows without a `clip_uri` in `robot-action-caption`'s work filter in both input
   scopes, and in the `embeddings` text modality, matching image.
 - Share one media failure contract between `ffmpeg` and `smart_cut` in
@@ -35,6 +146,22 @@
   for its source instead of `ValueError`; it also accepts `on_cut` to consume each cut as it
   finishes. Video-cut and robot-action-split share the missing-or-archived source check in
   `cosmos_curator.next.utils.source_objects`.
+- Upgrade Ray to 2.60.0, Lance (`pylance`) to 14.0.2, Cosmos Xenna to 0.6.0, and Pixi in runtime
+  images to 0.84.0.
+- Upgrade regular vLLM inference to vLLM 0.33.0 with PyTorch 2.14.0 and torchvision 0.29.0.
+  Keep style transfer on the paired vLLM/vLLM-Omni 0.32.0 and PyTorch 2.13.0 stack, and bridge
+  Ray Data LLM's multimodal imports to the newer vLLM chat utilities.
+- Raise Python to 3.13.18 and update security baselines for OpenSSL, HTTP, authentication,
+  serialization, and other dependencies. Upgrade image APT packages and remove bundled Nsight
+  Compute when Nsight is disabled.
+  Raise the `legacy-transformers` PyNvVideoCodec baseline to 2.2.4.
+- Replace rclone with Python for local model-weight copies and remove rclone from runtime images.
+
+### Documentation
+
+- Document multimodal sensor input formats, camera clock selection, indexed decoding and
+  episode outputs, shared append and enrichment recovery, and the updated data-integrity
+  workflow. Explain B-frame curation risks and the limits of media validation.
 
 ## [2.9.0]
 
