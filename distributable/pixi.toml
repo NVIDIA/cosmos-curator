@@ -61,7 +61,7 @@ virtualenv = ">=21.14.9"
 websockets = "<16"
 
 [feature.core.pypi-dependencies]
-cosmos-xenna = "==0.5.13"
+cosmos-xenna = "==0.6.0"
 foxglove-schemas-protobuf = "*"
 google-genai = ">=1.59.0"
 grpcio-reflection = "*"

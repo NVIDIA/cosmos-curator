@@ -66,7 +66,7 @@ virtualenv = ">=21.14.9" # CVE remediation: highest floor needed across CVE-2026
 websockets = "<16" # google-genai requires websockets<16
 
 [feature.core.pypi-dependencies]
-cosmos-xenna = "==0.5.13"
+cosmos-xenna = "==0.6.0"
 foxglove-schemas-protobuf = "*"
 google-genai = ">=1.59.0" # conda-forge package is too old
 grpcio-reflection = "*" # vLLM metrics import ray.serve, which requires gRPC reflection in Ray 2.60
