@@ -25,7 +25,6 @@ import importlib
 import json
 import pathlib
 import shutil
-import subprocess
 import tempfile
 import time
 
@@ -519,27 +518,32 @@ def download_model_weights_from_local_to_workspace(
             future.result()
 
 
-def copy_model_weights(source_dir: pathlib.Path, dest_dir: pathlib.Path, *, size_check: bool = True) -> None:
-    """Copy model weights from source to destination using rclone.
+def _copy2_unless_same_size(source: str, dest: str) -> None:
+    """Copy ``source`` onto ``dest`` unless both exist and have the same size."""
+    source_size = pathlib.Path(source).stat().st_size
+    try:
+        dest_size = pathlib.Path(dest).stat().st_size
+    except FileNotFoundError:
+        dest_size = None
+    if source_size != dest_size:
+        shutil.copy2(source, dest)
 
-    This function uses rclone for efficient, optimized file copying with built-in
-    transfer progress and file comparison options.
+
+def copy_model_weights(source_dir: pathlib.Path, dest_dir: pathlib.Path) -> None:
+    """Copy model weights from source to destination.
+
+    An existing destination file is skipped when its size matches the source, and
+    replaced when the size differs. ``shutil.copytree`` lists each directory before
+    writing, so files created during the copy are not copied again.
 
     Args:
         source_dir: Source directory containing the model weights.
         dest_dir: Destination directory where the model weights should be copied.
-        size_check: Controls how to handle existing files:
-            - If True (default): Verifies existing files by comparing sizes. Re-copies
-              if sizes differ, skips if sizes match.
-            - If False: Skips all existing files without verification (assumes they're
-              correct). Only copies files that don't exist yet.
-            This is useful for efficiently copying model weights to a custom location
-            (e.g., local SSD) without re-copying files that are already present.
 
     Raises:
         FileNotFoundError: If the source directory does not exist.
         ValueError: If the source path is not a directory.
-        OSError: If there are permission or I/O errors during copying, or if rclone is not available.
+        OSError: If there are permission or I/O errors during copying.
 
     """
     if not source_dir.exists():
@@ -550,58 +554,9 @@ def copy_model_weights(source_dir: pathlib.Path, dest_dir: pathlib.Path, *, size
         msg = f"Source path is not a directory: {source_dir}"
         raise ValueError(msg)
 
-    # Create destination directory if it doesn't exist
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    size_check_msg = "with size check" if size_check else "without size check"
-    logger.info(f"Copying model weights from {source_dir} to {dest_dir} using rclone ({size_check_msg})...")
-
-    # Build rclone command
-    # copy: copy source directory contents to destination directory.
-    # --progress: show overall transfer progress.
-    rclone_cmd = [
-        "rclone",
-        "copy",
-        "--progress",
-    ]
-
-    if size_check:
-        # Only compare by size (skip files with matching size).
-        rclone_cmd.append("--size-only")
-    else:
-        # Skip all existing files without checking.
-        rclone_cmd.append("--ignore-existing")
-
-    # For rclone copy, directory sources copy contents by default.
-    rclone_cmd.extend(
-        [
-            str(source_dir),
-            str(dest_dir),
-        ]
-    )
-
-    try:
-        result = subprocess.run(  # noqa: S603
-            rclone_cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            stdin=subprocess.DEVNULL,
-        )
-
-        # Log rclone output
-        if result.stdout:
-            logger.debug(f"rclone output:\n{result.stdout}")
-
-        logger.info("Model weight copy complete")
-
-    except FileNotFoundError as e:
-        msg = "rclone command not found. Please ensure rclone is installed."
-        raise OSError(msg) from e
-    except subprocess.CalledProcessError as e:
-        msg = f"rclone failed with exit code {e.returncode}"
-        logger.error(f"{msg}\nstderr: {e.stderr}")
-        raise OSError(msg) from e
+    logger.info(f"Copying model weights from {source_dir} to {dest_dir}...")
+    shutil.copytree(source_dir, dest_dir, dirs_exist_ok=True, copy_function=_copy2_unless_same_size)
+    logger.info("Model weight copy complete")
 
 
 def _download_model_weights_from_huggingface_to_workspace(

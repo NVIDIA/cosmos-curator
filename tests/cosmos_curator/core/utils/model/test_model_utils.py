@@ -16,8 +16,6 @@
 
 import importlib
 import pathlib
-import shutil
-import subprocess
 import threading
 from types import SimpleNamespace
 
@@ -36,48 +34,6 @@ def _identity(path: str) -> str:
 
 def _return_none(_: str) -> None:
     """Return None regardless of the argument (helper for monkeypatch)."""
-
-
-@pytest.fixture
-def mock_rclone_copy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock `rclone copy` so copy tests do not require rclone installed."""
-
-    def fake_run(
-        cmd: list[str],
-        *,
-        capture_output: bool,
-        text: bool,
-        check: bool,
-        stdin: int,
-    ) -> SimpleNamespace:
-        assert capture_output is True
-        assert text is True
-        assert check is True
-        assert stdin == subprocess.DEVNULL
-        assert cmd[0:3] == ["rclone", "copy", "--progress"]
-
-        ignore_existing = "--ignore-existing" in cmd
-        size_only = "--size-only" in cmd
-        source = pathlib.Path(cmd[-2])
-        destination = pathlib.Path(cmd[-1])
-
-        for item in source.rglob("*"):
-            if not item.is_file():
-                continue
-            relative = item.relative_to(source)
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            if target.exists():
-                if ignore_existing:
-                    continue
-                if size_only and target.stat().st_size == item.stat().st_size:
-                    continue
-            shutil.copy2(item, target)
-
-        return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-    monkeypatch.setattr(model_utils.subprocess, "run", fake_run)
 
 
 def test_hack_copydir_to_cloud_storage_uploads_all_files(tmp_path: pathlib.Path) -> None:
@@ -473,14 +429,12 @@ def test_reduce_t5_model_weights_filters_encoder(monkeypatch: pytest.MonkeyPatch
     assert fake_torch.saved[0] == "unchanged"
 
 
-@pytest.mark.usefixtures("mock_rclone_copy")
 def test_copy_model_weights_copies_new_files(tmp_path: pathlib.Path) -> None:
     """Test that copy_model_weights copies files that don't exist in destination."""
     source = tmp_path / "source"
     dest = tmp_path / "dest"
     source.mkdir()
 
-    # Create source files including nested directories
     (source / "model.bin").write_bytes(b"model_data")
     (source / "config.json").write_text('{"key": "value"}')
     subdir = source / "subdir"
@@ -490,10 +444,8 @@ def test_copy_model_weights_copies_new_files(tmp_path: pathlib.Path) -> None:
     subdir2.mkdir()
     (subdir2 / "weights2.safetensors").write_bytes(b"safetensor_data2")
 
-    # Copy to destination
     model_utils.copy_model_weights(source, dest)
 
-    # Verify all files were copied
     assert (dest / "model.bin").read_bytes() == b"model_data"
     assert (dest / "config.json").read_text() == '{"key": "value"}'
     assert (dest / "subdir" / "weights.safetensors").read_bytes() == b"safetensor_data"
@@ -501,39 +453,33 @@ def test_copy_model_weights_copies_new_files(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("source_content", "dest_content", "size_check", "expected_content"),
+    ("source_content", "dest_content", "expected_content"),
     [
-        (b"model_data", b"model_data", True, b"model_data"),
-        (b"new_model_data", b"old_data", True, b"new_model_data"),
-        (b"model_data", b"old_data", False, b"old_data"),
+        (b"model_data", b"model_data", b"model_data"),
+        (b"model_data", b"old_data!!", b"old_data!!"),
+        (b"new_model_data", b"old_data", b"new_model_data"),
     ],
-    ids=["same_size_check_true", "diff_size_check_true", "existing_size_check_false"],
+    ids=["same_size_same_bytes", "same_size_skipped", "different_size_replaced"],
 )
-@pytest.mark.usefixtures("mock_rclone_copy")
 def test_copy_model_weights_with_existing_files(
     tmp_path: pathlib.Path,
     source_content: bytes,
     dest_content: bytes,
-    *,
-    size_check: bool,
     expected_content: bytes,
 ) -> None:
-    """Test copy_model_weights behavior with existing files and different size_check settings."""
+    """Existing files are skipped when sizes match and replaced when they differ."""
     source = tmp_path / "source"
     dest = tmp_path / "dest"
     source.mkdir()
     dest.mkdir()
 
-    # Create files
     source_file = source / "model.bin"
     source_file.write_bytes(source_content)
     dest_file = dest / "model.bin"
     dest_file.write_bytes(dest_content)
 
-    # Copy
-    model_utils.copy_model_weights(source, dest, size_check=size_check)
+    model_utils.copy_model_weights(source, dest)
 
-    # Verify the content is as expected (whether skipped or copied)
     assert dest_file.read_bytes() == expected_content
 
 
@@ -560,7 +506,6 @@ def test_copy_model_weights_error_cases(
         model_utils.copy_model_weights(source, dest)
 
 
-@pytest.mark.usefixtures("mock_rclone_copy")
 def test_copy_model_weights_creates_dest_if_missing(tmp_path: pathlib.Path) -> None:
     """Test that copy_model_weights creates destination directory if it doesn't exist."""
     source = tmp_path / "source"
@@ -569,65 +514,22 @@ def test_copy_model_weights_creates_dest_if_missing(tmp_path: pathlib.Path) -> N
 
     (source / "model.bin").write_bytes(b"data")
 
-    # Destination doesn't exist yet
     assert not dest.exists()
 
-    # Copy should create it
     model_utils.copy_model_weights(source, dest)
 
     assert dest.exists()
     assert (dest / "model.bin").read_bytes() == b"data"
 
 
-@pytest.mark.usefixtures("mock_rclone_copy")
-def test_copy_model_weights_copies_new_files_when_size_check_false(tmp_path: pathlib.Path) -> None:
-    """Test that copy_model_weights still copies new files when size_check=False."""
+def test_copy_model_weights_does_not_recopy_into_nested_destination(tmp_path: pathlib.Path) -> None:
+    """A destination inside the source is not walked again during the same copy."""
     source = tmp_path / "source"
-    dest = tmp_path / "dest"
     source.mkdir()
-    dest.mkdir()
+    (source / "model.bin").write_bytes(b"data")
+    nested = source / "local"
 
-    # Create source files
-    (source / "model.bin").write_bytes(b"model_data")
-    (source / "config.json").write_text('{"key": "value"}')
+    model_utils.copy_model_weights(source, nested)
 
-    # Create only one file in destination
-    (dest / "model.bin").write_bytes(b"existing")
-
-    # Copy with size_check=False
-    model_utils.copy_model_weights(source, dest, size_check=False)
-
-    # Existing file should be unchanged
-    assert (dest / "model.bin").read_bytes() == b"existing"
-    # New file should be copied
-    assert (dest / "config.json").read_text() == '{"key": "value"}'
-
-
-def test_copy_model_weights_raises_when_rclone_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    """Test user-facing error when rclone executable is unavailable."""
-    source = tmp_path / "source"
-    dest = tmp_path / "dest"
-    source.mkdir()
-
-    def fake_run(cmd: list[str], *, capture_output: bool, text: bool, check: bool, stdin: int) -> None:
-        del cmd, capture_output, text, check, stdin
-        raise FileNotFoundError
-
-    monkeypatch.setattr(model_utils.subprocess, "run", fake_run)
-    with pytest.raises(OSError, match="rclone command not found"):
-        model_utils.copy_model_weights(source, dest)
-
-
-def test_copy_model_weights_raises_when_rclone_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    """Test user-facing error when rclone returns a failure code."""
-    source = tmp_path / "source"
-    dest = tmp_path / "dest"
-    source.mkdir()
-
-    def fake_run(cmd: list[str], *, capture_output: bool, text: bool, check: bool, stdin: int) -> None:
-        del capture_output, text, check, stdin
-        raise subprocess.CalledProcessError(returncode=3, cmd=cmd, stderr="copy failed")
-
-    monkeypatch.setattr(model_utils.subprocess, "run", fake_run)
-    with pytest.raises(OSError, match="rclone failed with exit code 3"):
-        model_utils.copy_model_weights(source, dest)
+    assert (nested / "model.bin").read_bytes() == b"data"
+    assert not (nested / "local").exists()
