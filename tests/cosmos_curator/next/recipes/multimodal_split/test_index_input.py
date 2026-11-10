@@ -47,7 +47,7 @@ from .conftest import DEVICE_ORIGIN_NS, selected_source_timestamps
 @pytest.fixture
 def indexed_camera(tmp_path: Path, make_session: Callable[..., Path]) -> tuple[Path, dict[str, Any], Path]:
     """Index a real camera using the producer, then expose its manifest row for fault injection."""
-    session = make_session(tmp_path / "sessions", "session-000", frames=60, write_timestamps=False)
+    session = make_session(tmp_path / "sessions", "session-000", frames=60, sensor_timestamps=False)
     media = session / "camera/front.mp4"
     config = ResolvedMp4IndexConfig.resolve_config_data(
         {
@@ -101,10 +101,20 @@ def test_manifest_config_validates_locations(tmp_path: Path) -> None:
         MultimodalSplitInputConfig(input_path_prefix=str(tmp_path), mp4_index_uri="https://example.com/index")
 
 
+@pytest.mark.parametrize("manifest", [{}, {"mp4_index_uri": None}])
+def test_input_index_is_required_even_with_legacy_timestamps(tmp_path: Path, manifest: dict[str, Any]) -> None:
+    """A source sidecar cannot make an omitted or null manifest valid."""
+    np.save(tmp_path / "front.mp4.timestamps.npy", np.array([1, 2], dtype=np.int64))
+    with pytest.raises(ValidationError, match="mp4_index_uri"):
+        MultimodalSplitInputConfig.model_validate({"input_path_prefix": str(tmp_path), **manifest})
+
+
+@pytest.mark.parametrize("sidecar", ["absent", "valid", "malformed"])
 def test_indexed_eof_drives_planning_and_playable_clips(
     indexed_camera: tuple[Path, dict[str, Any], Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     monkeypatch: pytest.MonkeyPatch,
+    sidecar: str,
 ) -> None:
     """Use indexed EOF through real decoding without external timestamp inputs."""
     session, row, manifest = indexed_camera
@@ -112,10 +122,12 @@ def test_indexed_eof_drives_planning_and_playable_clips(
     times = [DEVICE_ORIGIN_NS + round(i * 1e9 / 30) for i in range(60)]
     for frame, timestamp in zip(row["frames"], times, strict=True):
         frame["eof_ns"] = timestamp
-    (session / "camera/front.mp4.timestamps.npy").write_bytes(b"broken sidecar")
+    if sidecar == "valid":
+        np.save(session / "camera/front.mp4.timestamps.npy", np.asarray(times, dtype=np.int64))
+    elif sidecar == "malformed":
+        (session / "camera/front.mp4.timestamps.npy").write_bytes(b"broken sidecar")
     _write_manifest(row, manifest)
-    monkeypatch.setattr(plan, "load_container_pts_ns", _forbid_direct_index)
-    monkeypatch.setattr(plan, "load_sensor_timestamps_ns", _forbid_direct_index)
+    monkeypatch.setattr(np, "load", _forbid_direct_index)
     monkeypatch.setattr("cosmos_curator.core.sensors.sensors.streaming_camera_sensor.index_video", _forbid_direct_index)
     config = _config(make_config, session, manifest)
     plans = _plan(session, config)
@@ -128,6 +140,7 @@ def test_indexed_eof_drives_planning_and_playable_clips(
     for item in outcomes:
         with av.open(item["media_location"]) as container:
             assert len(list(container.decode(video=0))) == 30
+    assert not list(Path(config.output.path).rglob("*.npy"))
 
 
 @pytest.mark.parametrize("field", ["eof_ns", "moe_ns", "sof_ns", "pts_ns", "edited_pts_ns"])
@@ -260,13 +273,11 @@ def test_indexed_windows_continue_after_a_partial_encode_failure(
 def test_index_without_eof_refuses_deprecated_sidecar(
     indexed_camera: tuple[Path, dict[str, Any], Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An obsolete external artifact cannot substitute for missing indexed EOF."""
     session, row, manifest = indexed_camera
     np.save(session / "camera/front.mp4.timestamps.npy", np.array([DEVICE_ORIGIN_NS], dtype=np.int64))
     _write_manifest(row, manifest)
-    monkeypatch.setattr(plan, "load_container_pts_ns", _forbid_direct_index)
     assert _plan(session, _config(make_config, session, manifest)) == []
 
 
@@ -274,14 +285,12 @@ def test_index_without_eof_refuses_deprecated_sidecar(
 def test_pts_fallback_uses_index_only_when_allowed(
     indexed_camera: tuple[Path, dict[str, Any], Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
-    monkeypatch: pytest.MonkeyPatch,
     *,
     allow_pts: bool,
 ) -> None:
     """Require explicit permission before using container timestamps."""
     session, row, manifest = indexed_camera
     _write_manifest(row, manifest)
-    monkeypatch.setattr(plan, "load_container_pts_ns", _forbid_direct_index)
     plans = _plan(
         session,
         _config(

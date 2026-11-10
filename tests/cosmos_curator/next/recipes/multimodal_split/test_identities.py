@@ -133,6 +133,9 @@ def test_episode_and_materialization_digest_fixtures(
         video_bitrate="4M",
         gop_size=30,
     )
+    config = config.model_copy(
+        update={"input": config.input.model_copy(update={"mp4_index_uri": "/input/mp4-index/manifest.lance"})}
+    )
     span = Span(start_ns=_S, end_ns=2 * _S)
     source_id = make_source_id("/input/session")
     episode_id = make_episode_id(source_id, span)
@@ -154,9 +157,8 @@ def test_episode_and_materialization_digest_fixtures(
     assert source_id == "e0f6ba3e1fd54cf7adc3e4491d1caca4e5337e9f86cbc2c5f0bf0175abd081d5"
     assert episode_id == "7bc8dd600c888cd42eb331f95b841438d9cc2db59e5468609956e61543d3c490"
     assert split_clip_id == "1f03756437498fbb1aa8043900ce985b94c4f893c5bdb1311a32616a967a69ac"
-    # The output and input roots are excluded, but the fixture config retains
-    # its actual temporary path only in those excluded fields.
-    assert split_digest == "4bea84899829d885bc44a323c413473b37f895033254b8a95d7bc2868a989c18"
+    # The manifest participates in the contract, so pin its location independently of tmp_path.
+    assert split_digest == "4af38609460ffe012b6cf5a3c9b30d23e47412e65829211528103c30bb12b042"
     assert (
         make_materialization_digest(
             episode_id=episode_id,
@@ -166,7 +168,7 @@ def test_episode_and_materialization_digest_fixtures(
             row_count=30,
             camera_media=camera_media,
         )
-        == "95674b3778da43be931eb014422ca626195754a83d27e1dcd21b470216e61557"
+        == "27b62640ff1ecc6e96dffd387ec59a058745d467536249613e0b2e59fc1fb0c9"
     )
 
 

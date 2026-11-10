@@ -20,12 +20,16 @@ from pathlib import Path
 from typing import Any
 
 import av
+import lance
 import numpy as np
+import pyarrow as pa
 import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory, timestamp_pb2
 from mcap.writer import Writer as McapWriter
 
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
+from cosmos_curator.next.recipes.mp4_index.config import ResolvedMp4IndexConfig
+from cosmos_curator.next.recipes.mp4_index.contracts import VIDEO_MANIFEST_SCHEMA, make_video_id
+from cosmos_curator.next.recipes.mp4_index.processing import process_one_video, result_table
 from cosmos_curator.next.recipes.multimodal_split.config import ResolvedMultimodalSplitConfig
 from cosmos_curator.next.recipes.multimodal_split.output_index import find_output_index
 from cosmos_curator.next.recipes.multimodal_split.plan import span_planner
@@ -41,6 +45,32 @@ _HEIGHT = 16
 # timeline apart from a presentation one, and that is the whole distinction the
 # recipe now turns on.
 DEVICE_ORIGIN_NS = 3_517_693_838_000
+
+
+def input_manifest_uri(root: Path) -> Path:
+    """Keep fixture indexes outside the session-discovery prefix."""
+    return root.with_name(f"{root.name}-mp4-index") / "manifest.lance"
+
+
+def extend_source_index(manifest: str, *, frames: int) -> None:
+    """Make a fixture index claim extra packets so real decoding fails after valid clips."""
+    rows = lance.dataset(manifest).to_table().to_pylist()
+    for row in rows:
+        samples = row["frames"]
+        period_ticks = samples[1]["dts_ticks"] - samples[0]["dts_ticks"]
+        period_ns = samples[1]["eof_ns"] - samples[0]["eof_ns"]
+        while len(samples) < frames:
+            samples.append(
+                {
+                    **samples[-1],
+                    "dts_ticks": samples[-1]["dts_ticks"] + period_ticks,
+                    "eof_ns": samples[-1]["eof_ns"] + period_ns,
+                    "offset": row["media_size_bytes"],
+                    "is_keyframe": False,
+                }
+            )
+        row["metadata"]["frame_count"] = frames
+    lance.write_dataset(pa.Table.from_pylist(rows, schema=VIDEO_MANIFEST_SCHEMA), manifest, mode="overwrite")
 
 
 @pytest.fixture
@@ -64,7 +94,7 @@ def make_session() -> Callable[..., Path]:
         uri_pattern: str = "camera/front.mp4",
         step: int = 2,
         origin_ns: int = DEVICE_ORIGIN_NS,
-        write_timestamps: bool = True,
+        sensor_timestamps: bool = True,
     ) -> Path:
         path = root / session_id / uri_pattern
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,21 +108,28 @@ def make_session() -> Callable[..., Path]:
             for packet in stream.encode(None):
                 container.mux(packet)
 
-        # The sensor-timestamp artifact the recorder's converter writes beside
-        # every camera. Both paths take their bounds from this instead of from the
-        # container, so a session without one is not processable. It carries the
-        # recorder's clock, which is what makes a camera clip joinable with the
-        # other sensors; the container's own timeline starts at zero.
-        # round(k * period), not k * round(period): a period that is not a whole
-        # number of nanoseconds drifts otherwise, and the drift costs a clip.
-        #
-        # Skippable so a test can stand up a session whose camera has no sensor
-        # timestamp sidecar, which requires an explicit container-PTS choice.
-        if write_timestamps:
-            period_ns = _NS_PER_SECOND / fps
-            timestamps_ns = np.array([origin_ns + round(index * period_ns) for index in range(frames)], dtype=np.int64)
-            with (path.parent / f"{path.name}.timestamps.npy").open("wb") as timeline:
-                write_timestamps_ns(timestamps_ns, timeline)
+        manifest = input_manifest_uri(root)
+        index_config = ResolvedMp4IndexConfig.resolve_config_data(
+            {
+                "schema_version": 1,
+                "kind": "mp4-index",
+                "input": {"uris": [str(path)], "container_kind": "nonfragmented"},
+                "output": {"path": str(manifest.parent)},
+            }
+        )
+        result = process_one_video(
+            {"video_id": make_video_id(str(path)), "media_location": str(path)}, config=index_config
+        )
+        assert result["status"] == "success"
+        row = result_table(result).to_pylist()[0]
+        if sensor_timestamps:
+            for index, frame in enumerate(row["frames"]):
+                frame["eof_ns"] = origin_ns + round(index * _NS_PER_SECOND / fps)
+        lance.write_dataset(
+            pa.Table.from_pylist([row], schema=VIDEO_MANIFEST_SCHEMA),
+            str(manifest),
+            mode="append" if manifest.exists() else "create",
+        )
         return root / session_id
 
     return build
@@ -472,11 +509,14 @@ def make_config() -> Callable[..., ResolvedMultimodalSplitConfig]:
         whole_session: bool = False,
     ) -> ResolvedMultimodalSplitConfig:
         camera_map = cameras or {camera_key: uri_pattern}
+        manifest = input_manifest_uri(input_root)
+        if not manifest.exists():
+            lance.write_dataset(VIDEO_MANIFEST_SCHEMA.empty_table(), str(manifest))
         return ResolvedMultimodalSplitConfig.model_validate(
             {
                 "schema_version": 1,
                 "kind": "multimodal-split",
-                "input": {"input_path_prefix": str(input_root)},
+                "input": {"input_path_prefix": str(input_root), "mp4_index_uri": str(manifest)},
                 "sensors": {
                     **{
                         key: {

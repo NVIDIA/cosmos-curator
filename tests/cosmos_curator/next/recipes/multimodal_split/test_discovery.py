@@ -46,7 +46,7 @@ def test_local_prefix_lists_only_immediate_child_directories(tmp_path: Path) -> 
     _make_sessions(tmp_path, ["session-b", "session-a"])
     (tmp_path / "README.txt").write_text("not a session", encoding="utf-8")
 
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -57,7 +57,7 @@ def test_local_session_uri_is_an_absolute_filesystem_path(tmp_path: Path) -> Non
     """Local session URIs stay filesystem paths beneath the configured prefix."""
     _make_sessions(tmp_path, ["session-a"])
 
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -71,7 +71,7 @@ def test_local_session_uri_is_directly_consumable_by_the_storage_helpers(tmp_pat
     reject every local session as missing its cameras.
     """
     _make_sessions(tmp_path, ["session-a"])
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
     session_uri = table.column("session_uri").to_pylist()[0]
@@ -117,7 +117,7 @@ def test_local_prefix_discovery_never_enumerates_inside_a_session(
     monkeypatch.setattr(os, "scandir", _recording_scandir)
     monkeypatch.setattr(os, "walk", _recording_walk)
     monkeypatch.setattr(pathlib.Path, "iterdir", _recording_iterdir)
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     discover_candidate_sessions(config)
 
@@ -126,7 +126,7 @@ def test_local_prefix_discovery_never_enumerates_inside_a_session(
 
 def test_an_empty_prefix_yields_an_empty_table_rather_than_an_error(tmp_path: Path) -> None:
     """A prefix with no sessions is an empty result, not a failure."""
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -136,7 +136,7 @@ def test_an_empty_prefix_yields_an_empty_table_rather_than_an_error(tmp_path: Pa
 
 def test_missing_local_prefix_fails_before_ray_starts(tmp_path: Path) -> None:
     """A typo in the input prefix is reported on the driver instead of yielding nothing."""
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path / "missing"))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path / "missing"))
 
     with pytest.raises(FileNotFoundError, match="Input path prefix does not exist"):
         discover_candidate_sessions(config)
@@ -146,7 +146,7 @@ def test_local_prefix_pointing_at_a_file_is_rejected(tmp_path: Path) -> None:
     """A prefix must name a directory of sessions, not a single object."""
     target = tmp_path / "sessions.txt"
     target.write_text("session-a\n", encoding="utf-8")
-    config = MultimodalSplitInputConfig(input_path_prefix=str(target))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(target))
 
     with pytest.raises(NotADirectoryError, match="is not a directory"):
         discover_candidate_sessions(config)
@@ -160,6 +160,7 @@ def test_session_id_list_canonicalizes_whitespace_blanks_and_duplicates(tmp_path
         encoding="utf-8",
     )
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -178,6 +179,7 @@ def test_session_id_list_does_not_require_the_sessions_to_exist(tmp_path: Path) 
     listing = tmp_path / "sessions.txt"
     listing.write_text("session-a\n", encoding="utf-8")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix=str(tmp_path / "recordings"),
         session_id_list_path=str(listing),
     )
@@ -190,6 +192,7 @@ def test_session_id_list_does_not_require_the_sessions_to_exist(tmp_path: Path) 
 def test_missing_session_id_list_fails_before_ray_starts(tmp_path: Path) -> None:
     """A missing list file is a configuration error, not an empty selection."""
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix=str(tmp_path),
         session_id_list_path=str(tmp_path / "missing.txt"),
     )
@@ -204,6 +207,7 @@ def test_session_ids_that_escape_the_prefix_are_rejected(tmp_path: Path, session
     listing = tmp_path / "sessions.txt"
     listing.write_text(f"session-a\n{session_id}\n", encoding="utf-8")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -217,6 +221,7 @@ def test_limit_is_applied_after_deduplication_and_sorting(tmp_path: Path) -> Non
     listing = tmp_path / "sessions.txt"
     listing.write_text("session-c\nsession-c\nsession-a\nsession-b\n", encoding="utf-8")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
         limit=2,
@@ -230,7 +235,7 @@ def test_limit_is_applied_after_deduplication_and_sorting(tmp_path: Path) -> Non
 def test_output_table_uses_the_declared_non_nullable_large_string_schema(tmp_path: Path) -> None:
     """Large runs must not be constrained by 32-bit string offsets."""
     _make_sessions(tmp_path, ["session-a"])
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -246,7 +251,7 @@ def test_output_table_uses_the_declared_non_nullable_large_string_schema(tmp_pat
 def test_discovery_is_stable_across_repeated_runs(tmp_path: Path) -> None:
     """Two runs over the same prefix produce byte-identical tables."""
     _make_sessions(tmp_path, ["session-c", "session-a", "session-b"])
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     assert discover_candidate_sessions(config).equals(discover_candidate_sessions(config))
 
@@ -259,8 +264,12 @@ def test_session_id_list_order_does_not_affect_the_result(tmp_path: Path) -> Non
     reverse.write_text("session-c\nsession-b\nsession-a\n", encoding="utf-8")
     base = {"input_path_prefix": "s3://example-bucket/recordings"}
 
-    forward_table = discover_candidate_sessions(MultimodalSplitInputConfig(**base, session_id_list_path=str(forward)))
-    reverse_table = discover_candidate_sessions(MultimodalSplitInputConfig(**base, session_id_list_path=str(reverse)))
+    forward_table = discover_candidate_sessions(
+        MultimodalSplitInputConfig(mp4_index_uri="/index.lance", **base, session_id_list_path=str(forward))
+    )
+    reverse_table = discover_candidate_sessions(
+        MultimodalSplitInputConfig(mp4_index_uri="/index.lance", **base, session_id_list_path=str(reverse))
+    )
 
     assert forward_table.equals(reverse_table)
 
@@ -269,8 +278,12 @@ def test_file_uri_prefix_is_discovered_like_a_local_path(tmp_path: Path) -> None
     """A file:// prefix and the equivalent bare path give the same candidates."""
     _make_sessions(tmp_path, ["session-a"])
 
-    from_uri = discover_candidate_sessions(MultimodalSplitInputConfig(input_path_prefix=tmp_path.as_uri()))
-    from_path = discover_candidate_sessions(MultimodalSplitInputConfig(input_path_prefix=str(tmp_path)))
+    from_uri = discover_candidate_sessions(
+        MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=tmp_path.as_uri())
+    )
+    from_path = discover_candidate_sessions(
+        MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
+    )
 
     assert from_uri.equals(from_path)
 
@@ -280,6 +293,7 @@ def test_session_id_list_tolerates_crlf_line_endings(tmp_path: Path) -> None:
     listing = tmp_path / "sessions.txt"
     listing.write_bytes(b"session-a\r\nsession-b\r\n")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -294,6 +308,7 @@ def test_session_id_list_tolerates_a_utf8_byte_order_mark(tmp_path: Path) -> Non
     listing = tmp_path / "sessions.txt"
     listing.write_bytes("\ufeffsession-a\nsession-b\n".encode())
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -308,6 +323,7 @@ def test_a_list_of_only_blank_lines_yields_an_empty_table(tmp_path: Path) -> Non
     listing = tmp_path / "sessions.txt"
     listing.write_text("\n   \n\t\n", encoding="utf-8")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -321,7 +337,7 @@ def test_a_list_of_only_blank_lines_yields_an_empty_table(tmp_path: Path) -> Non
 def test_limit_larger_than_the_selection_returns_everything(tmp_path: Path) -> None:
     """An oversized limit is a cap, not a requirement."""
     _make_sessions(tmp_path, ["session-a", "session-b"])
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path), limit=100)
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path), limit=100)
 
     table = discover_candidate_sessions(config)
 
@@ -332,7 +348,11 @@ def test_filesystem_root_prefix_joins_without_a_doubled_separator(tmp_path: Path
     """A root prefix must not produce a doubled leading separator."""
     listing = tmp_path / "sessions.txt"
     listing.write_text("session-a\n", encoding="utf-8")
-    config = MultimodalSplitInputConfig(input_path_prefix="/", session_id_list_path=str(listing))
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
+        input_path_prefix="/",
+        session_id_list_path=str(listing),
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -343,7 +363,7 @@ def test_a_relative_prefix_is_absolutized_for_ray_workers(tmp_path: Path, monkey
     """Ray workers do not share the driver's cwd, so a relative prefix cannot survive."""
     _make_sessions(tmp_path, ["session-a"])
     monkeypatch.chdir(tmp_path.parent)
-    config = MultimodalSplitInputConfig(input_path_prefix=tmp_path.name)
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=tmp_path.name)
 
     table = discover_candidate_sessions(config)
 
@@ -361,7 +381,7 @@ def test_a_symlinked_prefix_keeps_the_name_the_workers_know(tmp_path: Path) -> N
     _make_sessions(real_root, ["session-a"])
     link_root = tmp_path / "current"
     link_root.symlink_to(real_root)
-    config = MultimodalSplitInputConfig(input_path_prefix=str(link_root))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(link_root))
 
     table = discover_candidate_sessions(config)
 
@@ -372,7 +392,7 @@ def test_a_home_relative_prefix_is_expanded(tmp_path: Path, monkeypatch: pytest.
     """A ~-prefixed path is expanded rather than treated as a literal directory name."""
     _make_sessions(tmp_path, ["session-a"])
     monkeypatch.setenv("HOME", str(tmp_path))
-    config = MultimodalSplitInputConfig(input_path_prefix="~")
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix="~")
 
     table = discover_candidate_sessions(config)
 
@@ -384,7 +404,7 @@ def test_a_percent_encoded_file_uri_prefix_is_decoded(tmp_path: Path) -> None:
     spaced = tmp_path / "my recordings"
     spaced.mkdir()
     _make_sessions(spaced, ["session-a"])
-    config = MultimodalSplitInputConfig(input_path_prefix=spaced.as_uri())
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=spaced.as_uri())
 
     table = discover_candidate_sessions(config)
 
@@ -400,7 +420,7 @@ def test_a_non_utf8_directory_name_is_reported_with_its_name(tmp_path: Path) -> 
     except (OSError, UnicodeError) as exc:  # pragma: no cover - filesystem dependent
         pytest.skip(f"filesystem rejects non-UTF-8 names: {exc}")
 
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     with pytest.raises(ValueError, match="not valid UTF-8"):
         discover_candidate_sessions(config)
@@ -415,6 +435,7 @@ def test_only_newlines_split_the_session_id_list(tmp_path: Path, separator: str)
     listing = tmp_path / "sessions.txt"
     listing.write_text(f"sess{separator}ion-a\n", encoding="utf-8")
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path=str(listing),
     )
@@ -434,7 +455,7 @@ def test_a_symlinked_session_is_a_second_candidate_for_the_same_recording(tmp_pa
     """
     _make_sessions(tmp_path, ["session-a"])
     (tmp_path / "latest").symlink_to(tmp_path / "session-a")
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -445,7 +466,7 @@ def test_a_dangling_symlink_is_excluded_rather_than_reported(tmp_path: Path) -> 
     """A session whose mount is not ready yet is silently absent, not a failure."""
     _make_sessions(tmp_path, ["session-a"])
     (tmp_path / "not-mounted-yet").symlink_to(tmp_path / "nowhere")
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
 
@@ -457,7 +478,11 @@ def test_both_spellings_of_the_file_uri_root_are_usable(tmp_path: Path, prefix: 
     """A root file:// URI must survive canonicalization and still be joinable."""
     listing = tmp_path / "sessions.txt"
     listing.write_text("session-a\n", encoding="utf-8")
-    config = MultimodalSplitInputConfig(input_path_prefix=prefix, session_id_list_path=str(listing))
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
+        input_path_prefix=prefix,
+        session_id_list_path=str(listing),
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -472,7 +497,7 @@ def test_awkward_but_legal_session_names_stay_reachable(tmp_path: Path, session_
     them would let a name like ``%2F`` change what the path means.
     """
     _make_sessions(tmp_path, [session_id])
-    config = MultimodalSplitInputConfig(input_path_prefix=str(tmp_path))
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix=str(tmp_path))
 
     table = discover_candidate_sessions(config)
     session_uri = table.column("session_uri").to_pylist()[0]

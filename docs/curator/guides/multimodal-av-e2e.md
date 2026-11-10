@@ -85,18 +85,15 @@ For video-only captioning or embeddings, an ordinary `mp4-index` manifest can be
 `camera_alignment_fields: [pts_ns]` (or `[edited_pts_ns]`) on each camera. These episodes
 have `timestamp_source: container_pts` and cannot be used for the rear Ego-caption example below.
 
-With a manifest, deprecated `.timestamps.npy` input files are ignored. Without
-one, the `eof_ns` entry accepts a legacy timestamp sidecar, whose unidentified clock
-is recorded as null in `clip.json`; explicit PTS choices read the container.
-SOF/MOE require an index. A broken preferred sidecar remains a failure.
-If your recorder exports camera timestamps as `.mp4.timestamps.npy` files instead of an
-index, omit `input.mp4_index_uri` and keep those files next to the source MP4s. For Ego
-captioning, verify that these timestamps use the same clock as the Ego MCAP's `log_time`.
+`input.mp4_index_uri` is required. Timestamp NPY sidecars are not read or written;
+existing `.timestamps.npy` files are ignored even if malformed. Recorded camera
+timestamps must be supplied through the index. For Ego captioning, verify that the
+selected indexed sensor timestamps use the same clock as the Ego MCAP's `log_time`.
 
 The manifest does not record packet discard flags; only use indexed inputs whose
 samples correspond one-to-one with decoded frames. The forward-only decoder still
 reads the source media once to produce clips; it does not repeat index extraction.
-Adding or changing the manifest input changes the recovery contract, so use a new
+Changing the manifest input changes the recovery contract, so use a new
 output dataset when switching an existing run to a different index input.
 The ordered list replaces `allow_pts_fallback`; existing boolean configs must be
 updated, and outputs from the previous split contract require a fresh output dataset.

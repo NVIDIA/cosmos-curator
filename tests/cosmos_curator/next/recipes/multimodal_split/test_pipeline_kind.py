@@ -37,7 +37,11 @@ def _write_config(root: Path, prefix: str, *, clip: dict[str, object] | None = N
     payload = {
         "schema_version": 1,
         "kind": "multimodal-split",
-        "input": {"input_path_prefix": prefix, **input_fields},
+        "input": {
+            "input_path_prefix": prefix,
+            "mp4_index_uri": f"{prefix.rstrip('/')}-mp4-index/manifest.lance",
+            **input_fields,
+        },
         "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "camera/front.mp4"}},
         "output": {"path": str(root / "media")},
         # Shorter than the 10 s default so a fixture session holds whole clips
@@ -96,7 +100,7 @@ def test_the_template_preamble_names_the_settings_that_exclude_none_drops() -> N
 
     assert "input.session_id_list_path" in rendered
     assert "input.limit" in rendered
-    assert yaml.safe_load(rendered)["input"].keys() == {"input_path_prefix"}
+    assert yaml.safe_load(rendered)["input"].keys() == {"input_path_prefix", "mp4_index_uri"}
 
 
 def test_the_template_payload_agrees_with_the_template_yaml() -> None:
@@ -251,7 +255,7 @@ def test_the_schema_documents_the_input_section() -> None:
     """`pipeline schema` is how an operator discovers the fields."""
     schema = json.loads(MULTIMODAL_SPLIT_KIND.schema_json())
 
-    assert schema["$defs"]["MultimodalSplitInputConfig"]["required"] == ["input_path_prefix"]
+    assert schema["$defs"]["MultimodalSplitInputConfig"]["required"] == ["input_path_prefix", "mp4_index_uri"]
     assert {"duration_s", "sampling_fps"} <= schema["$defs"]["MultimodalSplitClipConfig"]["properties"].keys()
     # ``clip`` and ``encoder`` are fully defaulted, so adding them must not make them mandatory.
     # ``sensors`` and ``output`` have no defensible default and must stay required.
@@ -306,7 +310,7 @@ def test_preparing_a_run_does_not_execute_it(tmp_path: Path) -> None:
 
     prepared = MULTIMODAL_SPLIT_KIND.prepare_run(path, set_overrides=[])
 
-    with pytest.raises(FileNotFoundError, match="Input path prefix does not exist"):
+    with pytest.raises(FileNotFoundError, match="Configured mp4-index manifest does not exist"):
         prepared()
 
 

@@ -74,8 +74,7 @@ def run_config(config: ResolvedMultimodalSplitConfig) -> dict[str, Any]:
     the whole run in one process, and nothing here needs more than the count.
     """
     started_at = monotonic()
-    if config.input.mp4_index_uri is not None:
-        Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=config.execution.storage_profile)
+    Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=config.execution.storage_profile)
     sessions = discover_candidate_sessions(config.input, storage_profile=config.execution.storage_profile)
     if sessions.num_rows == 0:
         msg = (

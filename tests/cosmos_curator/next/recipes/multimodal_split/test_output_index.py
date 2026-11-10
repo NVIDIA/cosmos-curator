@@ -21,6 +21,8 @@ from cosmos_curator.core.utils.storage.s3_client import S3Client
 from cosmos_curator.next.recipes.mp4_index.lance_sink import open_or_create_manifest_table
 from cosmos_curator.next.recipes.multimodal_split import output_index, storage
 
+from .conftest import DEVICE_ORIGIN_NS
+
 
 def test_retry_checksum_streams_s3_through_a_bounded_read_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
     """The real smart_open reader hashes a remote payload without an unbounded body read."""
@@ -48,7 +50,7 @@ def output_candidate(tmp_path: Path, make_session: Callable[..., Path]) -> tuple
     """Prepare an encoded MP4 and the identity/timing fields for its output index."""
     session = make_session(tmp_path / "input", "session", frames=30)
     local = session / "camera/front.mp4"
-    timestamps = np.load(session / "camera/front.mp4.timestamps.npy")
+    timestamps = np.array([DEVICE_ORIGIN_NS + round(i * 1e9 / 30) for i in range(30)], dtype=np.int64)
     destination = str(tmp_path / "output/front.mp4")
     return local, {
         "destination": destination,

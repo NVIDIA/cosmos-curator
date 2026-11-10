@@ -25,16 +25,10 @@ import fnmatch
 import io
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, BinaryIO, cast
+from typing import Any, cast
 
-import numpy as np
-import numpy.typing as npt
 import smart_open
 
-from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
-from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
-from cosmos_curator.core.sensors.utils.timestamps import read_timestamps_ns
-from cosmos_curator.core.sensors.utils.video import make_index_and_metadata
 from cosmos_curator.core.utils.storage.s3_client import S3Client
 from cosmos_curator.core.utils.storage.storage_utils import (
     get_files_relative,
@@ -43,7 +37,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
 )
 from cosmos_curator.next.recipes.multimodal_split.mcap_streams import read_bounds
 from cosmos_curator.next.recipes.multimodal_split.reports import errors_prefix
-from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed, timestamps_sidecar_uri
+from cosmos_curator.next.recipes.multimodal_split.uris import resolve_sensor_uri, slashed
 from cosmos_curator.next.utils.local_uri import local_path
 
 
@@ -101,54 +95,6 @@ def open_sensor_source(
         # smart_open types its return as BinaryIO; every backend reachable here
         # yields a seekable buffered reader, which is DataSource's third arm.
         yield cast("io.BufferedIOBase", stream)
-
-
-def load_sensor_timestamps_ns(
-    sensor_uri: str, *, storage_profile: str = "default", read_buffer_bytes: int | None = None
-) -> npt.NDArray[np.int64]:
-    """Load the camera's sensor timestamps, in nanoseconds.
-
-    The camera's own timestamps, not a rate: real sensor-time deltas on 30 fps
-    footage measure 33330 to 33361 microseconds, so a timeline derived from a
-    nominal rate drifts against the camera it describes.
-    """
-    with open_sensor_source(
-        timestamps_sidecar_uri(sensor_uri), storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes
-    ) as stream:
-        # open_sensor_source is typed to DataSource's BufferedIOBase arm; np.load
-        # wants the narrower BinaryIO, and every stream reachable here satisfies it.
-        return read_timestamps_ns(cast("BinaryIO", stream))
-
-
-def load_container_pts_ns(
-    sensor_uri: str,
-    *,
-    storage_profile: str = "default",
-    read_buffer_bytes: int | None = None,
-    alignment_field: VideoFrameAlignmentField = VideoFrameAlignmentField.EDITED_PTS_NS,
-) -> npt.NDArray[np.int64]:
-    """Read a camera's presentation timestamps by indexing its own container.
-
-    ``pts_ns`` selects container PTS before playback edits; ``edited_pts_ns``
-    applies supported edit-list shifts. Either requires an eager indexing pass.
-
-    Raises:
-        ValueError: If the field is not a container clock or there are no displayable frames.
-
-    """
-    if alignment_field not in (VideoFrameAlignmentField.PTS_NS, VideoFrameAlignmentField.EDITED_PTS_NS):
-        msg = "container timestamps require pts_ns or edited_pts_ns"
-        raise ValueError(msg)
-    with open_sensor_source(sensor_uri, storage_profile=storage_profile, read_buffer_bytes=read_buffer_bytes) as stream:
-        if alignment_field is VideoFrameAlignmentField.PTS_NS:
-            timestamps_ns = StreamingCameraSensor(stream, alignment_field=alignment_field).timestamps_ns
-        else:
-            video_index, _ = make_index_and_metadata(stream)
-            timestamps_ns = video_index.display_pts_ns
-        if len(timestamps_ns) == 0:
-            msg = f"{sensor_uri} has no displayable frames, so it has no container PTS to fall back to"
-            raise ValueError(msg)
-        return timestamps_ns
 
 
 def load_mcap_bounds(

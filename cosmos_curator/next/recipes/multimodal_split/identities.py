@@ -150,7 +150,7 @@ def make_split_contract_digest(config: ResolvedMultimodalSplitConfig) -> str:
             },
             # Index input can change the camera timeline and therefore frame selection.
             # Keep the digest key stable across the config field rename.
-            **({"index_manifest_uri": config.input.mp4_index_uri} if config.input.mp4_index_uri else {}),
+            "index_manifest_uri": config.input.mp4_index_uri,
             "cameras": [
                 {
                     "camera_key": key,

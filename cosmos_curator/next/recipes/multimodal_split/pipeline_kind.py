@@ -46,6 +46,7 @@ def _template_payload() -> dict[str, Any]:
             {"path": "schema_version", "example": 1},
             {"path": "kind", "example": "multimodal-split"},
             {"path": "input.input_path_prefix", "example": "s3://example-bucket/recordings"},
+            {"path": "input.mp4_index_uri", "example": "s3://example-bucket/mp4-index/manifest.lance"},
             {
                 "path": "sensors",
                 "example": {

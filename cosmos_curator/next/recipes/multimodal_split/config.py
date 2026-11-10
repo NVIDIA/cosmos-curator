@@ -80,7 +80,7 @@ MultimodalSplitSampling = Literal["nearest_neighbor", "interpolate"]
 SENSOR_TYPE_CAMERA = "camera"
 
 #: Kinds whose source artifact is an MCAP, so planning takes their bounds from a
-#: topic rather than from a timeline sidecar. Says nothing about how they are cut.
+#: topic rather than from a camera index. Says nothing about how they are cut.
 MCAP_SENSOR_TYPES: frozenset[str] = frozenset({"egotrajectory", "gps", "imu"})
 
 #: Kinds cut by copying records at the rate they were recorded. With
@@ -136,10 +136,10 @@ class MultimodalSplitInputConfig(BaseModel):
         description="Optional newline-delimited UTF-8 file of session IDs to join to input_path_prefix.",
         examples=["s3://example-bucket/sessions.txt"],
     )
-    mp4_index_uri: str | None = Field(
-        default=None,
-        description="Optional manifest.lance URI produced by mp4-index. Require a current record for each camera; "
-        "use eof_ns or explicitly allowed container PTS, without external timestamp sidecars.",
+    mp4_index_uri: str = Field(
+        min_length=1,
+        description="Required manifest.lance URI produced by mp4-index. Each camera must have a current, usable record "
+        "supplying its configured indexed clock and decode metadata.",
         examples=["s3://example-bucket/mp4-index/manifest.lance"],
     )
     limit: int | None = Field(
@@ -723,7 +723,7 @@ class ResolvedMultimodalSplitConfig(BaseModel):
     def mcap_sensors(self) -> dict[str, MultimodalSplitSensorConfig]:
         """Return the sensors whose source is an MCAP, however their clip is written.
 
-        Planning takes their bounds from a topic rather than a timeline sidecar,
+        Planning takes their bounds from a topic rather than a camera index,
         which is all this set decides. ``COPIED_SENSOR_TYPES`` and
         ``ALIGNED_SENSOR_TYPES`` partition it by how the clip is produced.
         """
@@ -748,7 +748,10 @@ class ResolvedMultimodalSplitConfig(BaseModel):
 _TEMPLATE_BASE: dict[str, Any] = {
     "schema_version": 1,
     "kind": "multimodal-split",
-    "input": {"input_path_prefix": "s3://example-bucket/recordings"},
+    "input": {
+        "input_path_prefix": "s3://example-bucket/recordings",
+        "mp4_index_uri": "s3://example-bucket/mp4-index/manifest.lance",
+    },
     "sensors": {"front": {"sensor_type": "camera", "uri_pattern": "*/camera_front.mp4"}},
     "output": {"path": "s3://example-bucket/media"},
 }
@@ -758,7 +761,6 @@ _TEMPLATE_PREAMBLE = """\
 # Every setting with a non-null default is shown; unchanged settings may be removed.
 # These default to null, so they are omitted above and are named here instead:
 #   input.session_id_list_path  read session IDs from a file instead of listing the prefix
-#   input.mp4_index_uri         mp4-index manifest.lance supplying indexed camera timelines
 #   input.limit                 cap how many sessions are kept
 #   sensors.<key>.topic         which topic to cut from an MCAP carrying more than one
 #   sensors.<key>.sampling      nearest_neighbor or interpolate; required for a gps sensor

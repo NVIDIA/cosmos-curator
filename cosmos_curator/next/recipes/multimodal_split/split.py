@@ -44,9 +44,8 @@ from cosmos_curator.core.sensors.sampling.policy import (
 )
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.gps_sensor import GpsSensor
-from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor, stream_camera_windows
+from cosmos_curator.core.sensors.sensors.streaming_camera_sensor import StreamingCameraSensor
 from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
-from cosmos_curator.core.sensors.utils.video import iter_video_frames
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.recipes.multimodal_split.config import (
@@ -736,17 +735,14 @@ def _open_camera_windows(  # noqa: PLR0913 -- source, planned spans/timeline, an
     *,
     camera_alignment_field: str | None,
 ) -> Iterator[StreamingCameraData]:
-    """Serve planned spans using indexed timestamps or the legacy external timeline."""
+    """Serve planned spans using the selected indexed clock."""
     policy = NearestTimestampPolicy(max_delta_ns=config.video.max_delta_ns)
     spec = _spec_for_spans(spans, config)
-    if config.input.mp4_index_uri is None:
-        payloads = stream_camera_windows(iter_video_frames(source), timeline_ns, spec, policy=policy)
-    else:
-        if camera_alignment_field is None:
-            msg = "indexed camera plan has no selected camera_alignment_field"
-            raise ValueError(msg)
-        sensor = _open_camera_sensor(
-            source, sensor_uri, timeline_ns, config.input.mp4_index_uri, storage_profile, camera_alignment_field
-        )
-        payloads = sensor.sample(spec, policy=policy)
+    if camera_alignment_field is None:
+        msg = "indexed camera plan has no selected camera_alignment_field"
+        raise ValueError(msg)
+    sensor = _open_camera_sensor(
+        source, sensor_uri, timeline_ns, config.input.mp4_index_uri, storage_profile, camera_alignment_field
+    )
+    payloads = sensor.sample(spec, policy=policy)
     return (window for window in payloads if window.align_timestamps_ns.size)

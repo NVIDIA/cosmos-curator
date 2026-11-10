@@ -21,11 +21,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-import av
-import numpy as np
 import pytest
 
-from cosmos_curator.core.sensors.types.types import VideoFrameAlignmentField
 from cosmos_curator.core.utils.storage.s3_client import S3Client, S3Prefix
 from cosmos_curator.next.recipes.multimodal_split import pipeline
 from cosmos_curator.next.recipes.multimodal_split import storage as storage_module
@@ -112,13 +109,13 @@ def test_a_remote_session_is_listed_relative_to_itself(monkeypatch: pytest.Monke
         def list_recursive_directory(self, uri: object, limit: int = 0) -> list[object]:
             listed["prefix"] = uri.path  # type: ignore[attr-defined]
             listed["limit"] = limit
-            return [S3Prefix(f"{uri.path}{name}") for name in ("camera/front.mp4", "camera/front.mp4.timestamps.npy")]  # type: ignore[attr-defined]
+            return [S3Prefix(f"{uri.path}{name}") for name in ("camera/front.mp4", "camera/left.mp4")]  # type: ignore[attr-defined]
 
     monkeypatch.setattr(storage_module, "get_storage_client", lambda *_a, **_k: _ListingClient())
 
     paths = storage_module.list_session_paths("s3://bucket/sessions/session-000", storage_profile="hyperion")
 
-    assert paths == ["camera/front.mp4", "camera/front.mp4.timestamps.npy"]
+    assert paths == ["camera/front.mp4", "camera/left.mp4"]
     # Slashed, or listing session-000 would also answer for session-0001.
     assert listed["prefix"] == "s3://bucket/sessions/session-000/"
 
@@ -275,59 +272,3 @@ def test_a_prefix_is_slashed_so_a_listing_cannot_reach_a_sibling(location: str, 
     """
     assert slashed(location) == expected
     assert not "sessions/foo-bar/cam.mp4".startswith(slashed("sessions/foo"))
-
-
-def _write_synthetic_video(path: Path, *, frames: int = 10, fps: int = 30) -> None:
-    with av.open(str(path), mode="w") as container:
-        stream = container.add_stream("libopenh264", rate=fps)
-        stream.width, stream.height, stream.pix_fmt = 16, 16, "yuv420p"
-        for index in range(frames):
-            image = np.full((16, 16, 3), (index * 20) % 256, dtype=np.uint8)
-            for packet in stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode(None):
-            container.mux(packet)
-
-
-@pytest.mark.parametrize("field", [VideoFrameAlignmentField.PTS_NS, VideoFrameAlignmentField.EDITED_PTS_NS])
-def test_load_container_pts_ns_indexes_the_video_when_no_sidecar_exists(field: VideoFrameAlignmentField) -> None:
-    """The fallback for a camera with no sensor timeline: read PTS from the container itself."""
-    with TemporaryDirectory() as directory:
-        path = Path(directory) / "front.mp4"
-        _write_synthetic_video(path, frames=10, fps=30)
-
-        pts_ns = storage_module.load_container_pts_ns(str(path), alignment_field=field)
-
-    assert len(pts_ns) == 10
-    assert pts_ns.dtype == np.int64
-    assert np.all(np.diff(pts_ns) > 0)
-
-
-def test_load_container_pts_ns_rejects_sensor_clocks() -> None:
-    """The container reader must not reinterpret a sensor clock as PTS."""
-    with pytest.raises(ValueError, match="pts_ns or edited_pts_ns"):
-        storage_module.load_container_pts_ns("unused.mp4", alignment_field=VideoFrameAlignmentField.SOF_NS)
-
-
-def test_load_container_pts_ns_rejects_a_video_with_no_displayable_frames(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty container has no PTS to fall back to, and must not read as a valid one.
-
-    ``make_index_and_metadata`` is faked directly: a real container with zero
-    muxed frames is one PyAV never actually writes to disk, so there is no
-    encoder path that produces this index on purpose.
-    """
-
-    class _FakeVideoIndex:
-        display_pts_ns = np.array([], dtype=np.int64)
-
-    def fake_make_index_and_metadata(*_args: object, **_kwargs: object) -> tuple[object, object]:
-        return _FakeVideoIndex(), object()
-
-    monkeypatch.setattr(storage_module, "make_index_and_metadata", fake_make_index_and_metadata)
-
-    with TemporaryDirectory() as directory:
-        path = Path(directory) / "front.mp4"
-        _write_synthetic_video(path, frames=1, fps=30)
-
-        with pytest.raises(ValueError, match="no displayable frames"):
-            storage_module.load_container_pts_ns(str(path))

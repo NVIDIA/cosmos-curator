@@ -26,7 +26,6 @@ import pyarrow as pa
 import pytest
 import ray
 
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import pipeline
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
@@ -42,6 +41,8 @@ from cosmos_curator.next.recipes.multimodal_split.reports import (
     sensor_error_uri,
     write_sensor_errors,
 )
+
+from .conftest import DEVICE_ORIGIN_NS, extend_source_index
 
 
 def test_episode_accounting_rejects_a_missing_terminal_outcome() -> None:
@@ -116,7 +117,7 @@ def test_whole_session_mode_publishes_one_episode_covering_the_full_session(
     ``duration_s`` multiple of it.
     """
     root = tmp_path / "recordings"
-    session = make_session(root, "session-000")
+    make_session(root, "session-000")
     media = tmp_path / "media"
     config = make_config(root, media, whole_session=True)
 
@@ -131,7 +132,7 @@ def test_whole_session_mode_publishes_one_episode_covering_the_full_session(
     assert summary["failures"] == 0
     assert len(list(media.rglob("*.mp4"))) == 1
 
-    timestamps_ns = np.load(session / "camera" / "front.mp4.timestamps.npy")
+    timestamps_ns = np.array([DEVICE_ORIGIN_NS + round(i * 1e9 / 30) for i in range(90)], dtype=np.int64)
     spans = plan_common_spans({"front": timestamps_ns}, config)
     assert len(spans) == 1
 
@@ -559,19 +560,15 @@ def test_a_split_failure_reaches_the_summary(
     report zero failures beside a clip count nobody could reconcile.
 
     The failure is made rather than mocked, because splitting happens in a Ray
-    worker and a patch in this process would never reach it: a timeline
-    describing more observations than its container holds is discovered by the
+    worker and a patch in this process would never reach it: an index
+    describing more packets than its media holds is discovered by the
     walk, which is the one kind of split failure a test can arrange from outside.
     """
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     config = make_config(root, tmp_path / "media", duration_s=1.0)
 
-    timeline_path = next((root / "session-000").rglob("*.timestamps.npy"))
-    written = np.load(timeline_path)
-    step = int(written[1] - written[0])
-    with timeline_path.open("wb") as handle:
-        write_timestamps_ns(np.arange(int(written[0]), int(written[0]) + 180 * step, step, dtype=np.int64), handle)
+    extend_source_index(config.input.mp4_index_uri, frames=180)
 
     summary = run_config(config)
 

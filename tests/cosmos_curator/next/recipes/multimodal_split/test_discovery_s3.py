@@ -109,7 +109,9 @@ def fake_s3(monkeypatch: pytest.MonkeyPatch) -> _FakeS3Client:
 @pytest.mark.usefixtures("fake_s3")
 def test_s3_prefix_lists_only_immediate_child_prefixes() -> None:
     """Loose objects beside the sessions and sibling prefixes are not candidates."""
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -122,7 +124,9 @@ def test_s3_prefix_lists_only_immediate_child_prefixes() -> None:
 
 def test_s3_prefix_discovery_delegates_the_child_scope_to_the_store(fake_s3: _FakeS3Client) -> None:
     """A delimited listing keeps discovery O(sessions) instead of O(all objects)."""
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     discover_candidate_sessions(config)
 
@@ -137,7 +141,9 @@ def test_s3_prefix_discovery_never_reads_or_probes_a_session_artifact(fake_s3: _
     Asserting only on downloads would miss existence probing, which is the cheaper
     and likelier way for artifact resolution to leak into discovery.
     """
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     discover_candidate_sessions(config)
 
@@ -147,7 +153,7 @@ def test_s3_prefix_discovery_never_reads_or_probes_a_session_artifact(fake_s3: _
 
 def test_s3_bucket_root_prefix_lists_from_the_bucket(fake_s3: _FakeS3Client) -> None:
     """A bucket-root prefix produces neither a leading nor a doubled separator."""
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket")
+    config = MultimodalSplitInputConfig(mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket")
 
     table = discover_candidate_sessions(config)
 
@@ -162,6 +168,7 @@ def test_s3_session_id_list_is_read_and_joined_to_the_prefix(fake_s3: _FakeS3Cli
     """A remote list file drives selection without listing the prefix at all."""
     fake_s3.payloads["s3://example-bucket/sessions.txt"] = b"  session-c \n\nsession-a\nsession-c\n"
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path="s3://example-bucket/sessions.txt",
     )
@@ -180,7 +187,11 @@ def test_s3_session_id_list_is_read_and_joined_to_the_prefix(fake_s3: _FakeS3Cli
 @pytest.mark.usefixtures("fake_s3")
 def test_s3_limit_is_applied_after_sorting() -> None:
     """The limit takes a stable prefix of the canonical order."""
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings", limit=2)
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
+        input_path_prefix="s3://example-bucket/recordings",
+        limit=2,
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -190,7 +201,9 @@ def test_s3_limit_is_applied_after_sorting() -> None:
 def test_an_unavailable_s3_client_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
     """Discovery never silently returns an empty selection when S3 is unreachable."""
     monkeypatch.setattr(discovery, "get_storage_client", lambda *_args, **_kwargs: None)
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     with pytest.raises(TypeError, match="S3 client"):
         discover_candidate_sessions(config)
@@ -200,6 +213,7 @@ def test_s3_session_id_list_tolerates_a_utf8_byte_order_mark(fake_s3: _FakeS3Cli
     """A BOM must not silently become part of the first session ID."""
     fake_s3.payloads["s3://example-bucket/sessions.txt"] = "\ufeffsession-a\nsession-b\n".encode()
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path="s3://example-bucket/sessions.txt",
     )
@@ -212,6 +226,7 @@ def test_s3_session_id_list_tolerates_a_utf8_byte_order_mark(fake_s3: _FakeS3Cli
 def test_missing_s3_session_id_list_fails_fast_like_a_missing_local_one(fake_s3: _FakeS3Client) -> None:
     """A typo in a remote list path must not burn the read-retry budget first."""
     config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path="s3://example-bucket/missing.txt",
     )
@@ -230,7 +245,9 @@ def test_missing_s3_prefix_fails_instead_of_curating_nothing(monkeypatch: pytest
     """
     client = _FakeS3Client()
     monkeypatch.setattr(discovery, "get_storage_client", lambda *_args, **_kwargs: client)
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordigns")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordigns"
+    )
 
     with pytest.raises(FileNotFoundError, match="does not exist or contains no objects"):
         discover_candidate_sessions(config)
@@ -240,7 +257,9 @@ def test_a_prefix_holding_only_loose_objects_is_an_empty_selection(monkeypatch: 
     """A prefix that exists but has no child prefixes is empty, not missing."""
     client = _FakeS3Client(keys=("recordings/manifest.json",))
     monkeypatch.setattr(discovery, "get_storage_client", lambda *_args, **_kwargs: client)
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -251,7 +270,9 @@ def test_double_slash_keys_do_not_produce_an_empty_session_id(monkeypatch: pytes
     """A key with a doubled separator yields a blank child that must be dropped."""
     client = _FakeS3Client(keys=("recordings//stray.mp4", "recordings/session-a/imu.mcap"))
     monkeypatch.setattr(discovery, "get_storage_client", lambda *_args, **_kwargs: client)
-    config = MultimodalSplitInputConfig(input_path_prefix="s3://example-bucket/recordings")
+    config = MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance", input_path_prefix="s3://example-bucket/recordings"
+    )
 
     table = discover_candidate_sessions(config)
 
@@ -279,6 +300,7 @@ class _RefusingS3Client(_FakeS3Client):
 
 def _list_config() -> MultimodalSplitInputConfig:
     return MultimodalSplitInputConfig(
+        mp4_index_uri="/index.lance",
         input_path_prefix="s3://example-bucket/recordings",
         session_id_list_path="s3://example-bucket/sessions.txt",
     )

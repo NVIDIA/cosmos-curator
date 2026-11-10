@@ -148,8 +148,7 @@ contract. The per-clip `clip.json` and sparse files under `errors/` remain path-
 publication inputs or current canonical state. Sensor outcomes carried within one invocation are transient assembly
 inputs and are not another durable table.
 
-`clip.json` records each camera's selected clock in `camera_alignment_fields`;
-null identifies an unlabeled legacy timestamp sidecar.
+`clip.json` records each camera's selected indexed clock in `camera_alignment_fields`.
 
 Each re-encoded MP4 is indexed from its own bytes. Its MP4 and decoder `moov` payload are published with
 conditional writes before `<camera>.mp4.index.lance` is atomically created with its complete single row.
@@ -278,7 +277,7 @@ across rendering choices.
     "duration_ns": <resolved integer duration>,
     "sampling_fps": <resolved sampling rate>
   },
-  # Present only when configured; changing the indexed timeline source is a contract change.
+  # Required; changing the indexed timeline source is a contract change.
   "index_manifest_uri": <input.mp4_index_uri>,
   "cameras": [
     {"camera_key": <key>, "sensor_type": <type>, "camera_alignment_fields": <ordered list>},
@@ -364,7 +363,8 @@ Record schema version 3 publishes half-open intervals `[start_ns, exclusive_end_
 defaulting to `[eof_ns]`. Selecting `pts_ns` or `edited_pts_ns` on any camera marks the
 whole episode `"container_pts"`. The former uses container PTS before playback edits;
 the latter applies supported edit-list shifts. Media contract version 4 replaces both output timestamp
-sidecars with indexed episode timing. Legacy recorder sidecars are still supported as input.
+sidecars with indexed episode timing. Input camera indexes are required; timestamp NPY
+sidecars are not read or written.
 
 Split contract version 6 includes the ordered preferences. It replaces the former
 `allow_pts_fallback` setting and rejects reconciliation with outputs from earlier
@@ -416,10 +416,9 @@ For each planned logical episode:
    touches no artifact path.
 3. An incompatible match fails before a manifest, MP4, or sensor MCAP is rewritten.
 
-Reconciliation also assumes a configured `input.mp4_index_uri` refers to immutable indexed records.
-Reconciliation assumes resolved source artifacts—and each camera's input sensor-timestamp sidecar derived from its
-source URI—remain immutable in place. Canonical reuse does not rehash those inputs. Corrected inputs must use a new
-session location, and therefore a new source identity.
+Reconciliation assumes the required `input.mp4_index_uri` refers to immutable indexed records
+and resolved source artifacts remain immutable in place. Canonical reuse does not rehash those inputs.
+Corrected inputs must use a new session location, and therefore a new source identity.
 
 Each non-reconciled sensor emits exactly one current-run outcome per planned span. Both successes and failures carry the
 complete shared episode facts and expected row count. Successes additionally carry all artifact descriptors that apply

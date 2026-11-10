@@ -19,6 +19,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+import lance
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -39,7 +40,7 @@ from cosmos_curator.next.recipes.multimodal_split.plan import (
 from cosmos_curator.next.recipes.multimodal_split.reports import plan_error_uri
 from cosmos_curator.next.recipes.multimodal_split.storage import resolve_sensor_pattern
 
-from .conftest import DEVICE_ORIGIN_NS
+from .conftest import DEVICE_ORIGIN_NS, input_manifest_uri
 
 _MS = 1_000_000
 _EPOCH = 1_700_000_000 * 1_000_000_000
@@ -231,7 +232,7 @@ def test_a_camera_missing_its_timeline_is_refused_without_an_alternative_clock(
 ) -> None:
     """A recording with video and no sensor timeline stays a broken camera by default."""
     root = tmp_path / "recordings"
-    session = make_session(root, "session-000", write_timestamps=False)
+    session = make_session(root, "session-000", sensor_timestamps=False)
     config = make_config(root, tmp_path / "media")
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
@@ -246,9 +247,9 @@ def test_a_camera_missing_its_timeline_falls_back_to_container_pts_when_allowed(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """An explicit container clock can serve a camera with no timestamp sidecar."""
+    """An explicit indexed container clock can serve a camera without recorded sensor timestamps."""
     root = tmp_path / "recordings"
-    session = make_session(root, "session-000", write_timestamps=False)
+    session = make_session(root, "session-000", sensor_timestamps=False)
     config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]})
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
@@ -260,13 +261,13 @@ def test_a_camera_missing_its_timeline_falls_back_to_container_pts_when_allowed(
 
 
 @pytest.mark.parametrize("fields", [["pts_ns", "eof_ns"], ["sof_ns", "moe_ns", "pts_ns"]])
-def test_explicit_pts_precedes_a_legacy_sidecar(
+def test_explicit_indexed_pts_precedes_a_sensor_clock(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
     fields: list[str],
 ) -> None:
-    """A legacy sidecar must not override an earlier available container clock."""
+    """Indexed sensor timestamps must not override an earlier available PTS clock."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000")
     config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": fields})
@@ -283,7 +284,7 @@ def test_a_camera_whose_container_pts_also_fails_is_an_open_sensor_failure(
     tmp_path: Path,
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A camera with neither a sidecar nor a readable container reports an open_sensor failure."""
+    """A present camera with no usable index record reports an open_sensor failure."""
     root = tmp_path / "recordings"
     camera_path = root / "session-000" / "camera" / "front.mp4"
     camera_path.parent.mkdir(parents=True)
@@ -300,15 +301,19 @@ def test_a_camera_whose_container_pts_also_fails_is_an_open_sensor_failure(
     assert [entry["stage"] for entry in report["failures"]] == ["open_sensor"]
 
 
-def test_a_malformed_timeline_sidecar_never_falls_back(
+def test_an_invalid_indexed_timeline_never_falls_back(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """A corrupt preferred sidecar fails the camera even when container PTS is next in the list."""
+    """An invalid preferred indexed clock fails even when container PTS is next in the list."""
     root = tmp_path / "recordings"
     session = make_session(root, "session-000")
-    (session / "camera" / "front.mp4.timestamps.npy").write_bytes(b"not a valid npy timeline")
+    manifest = input_manifest_uri(root)
+    table = lance.dataset(str(manifest)).to_table()
+    rows = table.to_pylist()
+    rows[0]["frames"][1]["eof_ns"] = rows[0]["frames"][0]["eof_ns"]
+    lance.write_dataset(pa.Table.from_pylist(rows, schema=table.schema), str(manifest), mode="overwrite")
     config = make_config(root, tmp_path / "media", camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]})
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)
@@ -322,35 +327,17 @@ def test_a_mixed_session_marks_the_whole_episode_container_pts(
     tmp_path: Path,
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One camera falling back to container PTS taints the whole episode's timestamp_source.
-
-    A clip is one moment across every view the rig promised, so a reader must
-    not be able to read ``timestamp_source`` as "sensor" for an episode where
-    only one of two cameras actually has a sensor timeline.
-
-    ``load_container_pts_ns`` is faked to land on the same clock as ``left``'s
-    real sensor timeline: a real container's own PTS restarts at 0 per file
-    (see ``CameraSensor``'s docstring on why it's an inferior fallback), so two
-    cameras on genuinely unrelated clocks would cover no common window at all --
-    a real planning failure, but not the one this test is pinning.
-    """
+    """One indexed PTS camera marks the entire episode as container-clock based."""
     root = tmp_path / "recordings"
-    make_session(root, "session-000", uri_pattern="camera/front.mp4", write_timestamps=False)
-    make_session(root, "session-000", uri_pattern="camera/left.mp4", write_timestamps=True)
+    make_session(root, "session-000", uri_pattern="camera/front.mp4", sensor_timestamps=False)
+    make_session(root, "session-000", uri_pattern="camera/left.mp4", origin_ns=0)
     config = make_config(
         root,
         tmp_path / "media",
         cameras={"front": "camera/front.mp4", "left": "camera/left.mp4"},
         camera_alignment_fields={"front": ["eof_ns", "edited_pts_ns"]},
     )
-
-    def fake_load_container_pts_ns(*_args: object, **_kwargs: object) -> np.ndarray:
-        period_ns = round(1_000_000_000 / 30)
-        return np.array([DEVICE_ORIGIN_NS + index * period_ns for index in range(90)], dtype=np.int64)
-
-    monkeypatch.setattr(plan_module, "load_container_pts_ns", fake_load_container_pts_ns)
 
     results = span_planner(
         {"source_session_id": "session-000", "session_uri": str(root / "session-000")}, config=config
@@ -664,7 +651,9 @@ def test_a_present_camera_that_cannot_be_read_refuses_the_session_even_when_opti
     """
     root = tmp_path / "recordings"
     session = make_session(root, "session-000")
-    (session / "camera" / "front.mp4.timestamps.npy").unlink()
+    manifest = input_manifest_uri(root)
+    dataset = lance.dataset(str(manifest))
+    lance.write_dataset(dataset.schema.empty_table(), str(manifest), mode="overwrite")
     config = make_config(root, tmp_path / "media", optional_cameras=frozenset({"front"}))
 
     results = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)

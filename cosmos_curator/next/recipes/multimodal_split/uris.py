@@ -19,7 +19,6 @@ Where a session's artifacts live, expressed as string joins. Nothing here opens
 anything: a URI is a name, and resolving one to bytes is storage's job.
 """
 
-_TIMESTAMPS_SIDECAR_SUFFIX = ".timestamps.npy"
 SESSIONS_PREFIX = "sessions"
 
 
@@ -31,14 +30,6 @@ def slashed(location: str) -> str:
     answer with a sibling's contents.
     """
     return location if location.endswith("/") else f"{location}/"
-
-
-def timestamps_sidecar_uri(media_uri: str) -> str:
-    """Return the ``.timestamps.npy`` sidecar beside *media_uri*.
-
-    Legacy recorder input only; generated episodes use output MP4 indexes.
-    """
-    return f"{media_uri}{_TIMESTAMPS_SIDECAR_SUFFIX}"
 
 
 def resolve_sensor_uri(session_uri: str, uri_pattern: str) -> str:

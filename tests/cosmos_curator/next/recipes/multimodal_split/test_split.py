@@ -33,9 +33,9 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.descriptor import FieldDescriptor
 from mcap.reader import make_reader as mcap_make_reader
 
-from cosmos_curator.core.sensors.sensors import camera_sensor
+from cosmos_curator.core.sensors.sensors import camera_sensor, streaming_camera_sensor
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
-from cosmos_curator.core.sensors.utils.timestamps import write_timestamps_ns
+from cosmos_curator.core.sensors.utils.video import StreamingDecodePlan, StreamingVideoDecoder
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.multimodal_split import output_index
 from cosmos_curator.next.recipes.multimodal_split import split as split_module
@@ -58,6 +58,7 @@ from cosmos_curator.next.recipes.multimodal_split.split import (
 
 from .conftest import (
     DEVICE_ORIGIN_NS,
+    extend_source_index,
     gps_source_fixes,
     output_index_record,
     selected_source_timestamps,
@@ -927,15 +928,7 @@ def test_a_timeline_that_outruns_its_media_reports_every_span_it_cost(
     make_session: Callable[..., Path],
     make_config: Callable[..., ResolvedMultimodalSplitConfig],
 ) -> None:
-    """Planning trusts the timeline, so only the walk can find it wrong.
-
-    The sensor is handed a timeline rather than asked to verify one -- checking
-    means walking the file, which is the cost it exists to avoid. A sidecar
-    describing more observations than its container holds is therefore found
-    partway through, and every span after that point is unproducible too. Each
-    is recorded, because a clip that never appears and never fails is one nobody
-    goes looking for: the run is simply short, and nothing says why.
-    """
+    """An index claiming absent packets reports every episode lost to decoder failure."""
     root = tmp_path / "recordings"
     make_session(root, "session-000", frames=90)
     config = make_config(root, tmp_path / "media", duration_s=1.0)
@@ -943,12 +936,7 @@ def test_a_timeline_that_outruns_its_media_reports_every_span_it_cost(
 
     # Twice the observations the container can serve, so planning proposes spans
     # the media runs out partway through.
-    timeline_path = next((root / "session-000").rglob("*.timestamps.npy"))
-    written = np.load(timeline_path)
-    step = int(written[1] - written[0])
-    stretched = np.arange(int(written[0]), int(written[0]) + 180 * step, step, dtype=np.int64)
-    with timeline_path.open("wb") as handle:
-        write_timestamps_ns(stretched, handle)
+    extend_source_index(config.input.mp4_index_uri, frames=180)
 
     planned = {
         str(entry["clip_id"])
@@ -1040,17 +1028,13 @@ def test_a_failure_that_ends_the_pass_early_reports_the_spans_after_it(
 ) -> None:
     """Failure to reach the next window reports it and every later planned clip."""
     root = tmp_path / "recordings"
-    # Five spans planned from the timeline, seventy frames of media: the third
+    # Five spans planned from the index, seventy frames of media: the third
     # span is where the container runs out, and two spans follow it.
     make_session(root, "session-000", frames=70)
     config = make_config(root, tmp_path / "media", duration_s=1.0)
     item = {"source_session_id": "session-000", "session_uri": str(root / "session-000")}
 
-    timeline_path = next((root / "session-000").rglob("*.timestamps.npy"))
-    written = np.load(timeline_path)
-    step = int(written[1] - written[0])
-    with timeline_path.open("wb") as handle:
-        write_timestamps_ns(np.arange(int(written[0]), int(written[0]) + 150 * step, step, dtype=np.int64), handle)
+    extend_source_index(config.input.mp4_index_uri, frames=150)
 
     real_encode = split_module.encode_frames_to_path
     calls = {"n": 0}
@@ -1135,8 +1119,8 @@ def test_non_contiguous_clips_share_one_decode_pass(
     config = make_config(root, tmp_path / "sparse")
     plan = span_planner(item, config=config)[0]
     plan["spans"] = [plan["spans"][0], plan["spans"][2]]
-    decoder = Mock(wraps=split_module.iter_video_frames)
-    monkeypatch.setattr(split_module, "iter_video_frames", decoder)
+    decoder = Mock(wraps=streaming_camera_sensor.StreamingVideoDecoder)
+    monkeypatch.setattr(streaming_camera_sensor, "StreamingVideoDecoder", decoder)
 
     outcomes = split_module.split_session(plan, config=config)
 
@@ -1158,18 +1142,19 @@ def test_decoder_failure_stops_the_camera_and_reports_remaining_clips(
     session = make_session(root, "session-000", frames=90)
     config = make_config(root, tmp_path / "media")
     plan = span_planner({"source_session_id": "session-000", "session_uri": str(session)}, config=config)[0]
-    real_decode = split_module.iter_video_frames
+    real_decode = streaming_camera_sensor.execute_streaming_decode_plan
 
-    def fail_partway(source: io.BufferedIOBase) -> Iterator[tuple[int, np.ndarray]]:
-        for index, row in enumerate(real_decode(source)):
-            if index == 40:
+    def fail_partway(state: StreamingVideoDecoder, plan: StreamingDecodePlan) -> Iterator[tuple[int, np.ndarray]]:
+        for position, pixels in real_decode(state, plan):
+            if position == 40:
                 msg = "decoder failed"
                 raise ValueError(msg)
-            yield row
+            yield position, pixels
 
-    decoder = Mock(side_effect=fail_partway)
+    decoder = Mock(wraps=streaming_camera_sensor.StreamingVideoDecoder)
     encoder = Mock(wraps=split_module.encode_frames_to_path)
-    monkeypatch.setattr(split_module, "iter_video_frames", decoder)
+    monkeypatch.setattr(streaming_camera_sensor, "StreamingVideoDecoder", decoder)
+    monkeypatch.setattr(streaming_camera_sensor, "execute_streaming_decode_plan", fail_partway)
     monkeypatch.setattr(split_module, "encode_frames_to_path", encoder)
 
     outcomes = split_module.split_session(plan, config=config)
@@ -2040,7 +2025,7 @@ def test_output_index_preserves_repeated_source_frames(
     assert [align for align, _, _ in frames] == index["alignment_timestamps_ns"]
     assert [source for _, source, _ in frames] == index["source_timestamps_ns"]
     assert [mean for _, _, mean in frames] == _decoded_means(Path(clip["clip_location"]))
-    source_times = np.load(root / "session-000/camera/front.mp4.timestamps.npy")
+    source_times = np.array([DEVICE_ORIGIN_NS + round(i * 1e9 / 15) for i in range(15)], dtype=np.int64)
     expected_positions = np.abs(source_times[:, None] - np.asarray(index["alignment_timestamps_ns"])).argmin(axis=0)
     assert [source for _, source, _ in frames] == source_times[expected_positions].tolist()
     source_means = np.asarray(_decoded_means(root / "session-000/camera/front.mp4"))

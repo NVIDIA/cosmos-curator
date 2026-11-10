@@ -35,12 +35,11 @@ import pyarrow.compute as pc
 
 from cosmos_curator.core.sensors.exceptions import AlignmentError, AlignmentFailureReason
 from cosmos_curator.core.sensors.sampling.sampler import find_closest_indices
-from cosmos_curator.core.sensors.types.types import TimestampSource, VideoFrameAlignmentField
+from cosmos_curator.core.sensors.types.types import TimestampSource
 from cosmos_curator.next.media.spans import Span
 from cosmos_curator.next.recipes.mp4_index.index_lookup import Mp4IndexLookup
 from cosmos_curator.next.recipes.multimodal_split.config import (
     SENSOR_TYPE_CAMERA,
-    MultimodalSplitSensorConfig,
     ResolvedMultimodalSplitConfig,
 )
 from cosmos_curator.next.recipes.multimodal_split.grids import (
@@ -66,12 +65,9 @@ from cosmos_curator.next.recipes.multimodal_split.reports import (
 )
 from cosmos_curator.next.recipes.multimodal_split.storage import (
     list_session_paths,
-    load_container_pts_ns,
     load_mcap_bounds,
-    load_sensor_timestamps_ns,
     resolve_sensor_pattern,
 )
-from cosmos_curator.next.recipes.multimodal_split.uris import timestamps_sidecar_uri
 
 CAMERA_PLAN = "camera_plan"
 MCAP_PLAN = "mcap_plan"
@@ -148,7 +144,7 @@ def open_cameras(
     *,
     config: ResolvedMultimodalSplitConfig,
     storage_profile: str,
-) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], dict[str, str | None], list[dict[str, Any]]]:
+) -> tuple[dict[str, str], dict[str, npt.NDArray[np.int64]], dict[str, str], list[dict[str, Any]]]:
     """Resolve and read every camera in *session_uri*, and say which ones failed.
 
     Failures are per sensor, so one names the camera that failed. Attributing all
@@ -174,20 +170,11 @@ def open_cameras(
     the entire video. An indexed camera must have a current, valid record;
     deprecated ``.timestamps.npy`` inputs are ignored. The third return value
     maps each camera to its selected clock for decoding and provenance.
-
-    Without a manifest, ``eof_ns`` accepts a listed legacy sidecar, recorded as
-    None because sidecars do not identify their clock. Explicit PTS choices read
-    the container; SOF/MOE require an index. A listed-but-broken sidecar is a
-    failure rather than permission to change clocks.
     """
-    index_lookup = (
-        Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=storage_profile)
-        if config.input.mp4_index_uri is not None
-        else None
-    )
+    index_lookup = Mp4IndexLookup.open_required(config.input.mp4_index_uri, storage_profile=storage_profile)
     sensor_uris: dict[str, str] = {}
     timelines: dict[str, npt.NDArray[np.int64]] = {}
-    alignment_fields: dict[str, str | None] = {}
+    alignment_fields: dict[str, str] = {}
     failures: list[dict[str, Any]] = []
     for key, camera in config.cameras.items():
         # Resolving and reading are separate because only the first can say the
@@ -206,14 +193,10 @@ def open_cameras(
             failures.append(failure(session_id, key, None, "open_sensor", error))
             continue
         try:
-            timeline, alignment_field = _camera_timeline(
-                uri,
-                session_uri,
-                session_paths,
-                camera=camera,
-                config=config,
-                storage_profile=storage_profile,
-                index_lookup=index_lookup,
+            index, metadata = index_lookup.require_index_for(uri, storage_profile=storage_profile)
+            assert camera.camera_alignment_fields is not None
+            timeline, alignment_field = indexed_timeline(
+                index, metadata, alignment_fields=camera.camera_alignment_fields
             )
         except Exception as error:  # noqa: BLE001 -- one unreadable timeline is one failed sensor
             failures.append(failure(session_id, key, None, "open_sensor", error))
@@ -226,41 +209,6 @@ def open_cameras(
         no_camera = ValueError("no configured camera could be opened")
         failures.append(failure(session_id, None, None, "open_sensor", no_camera))
     return sensor_uris, timelines, alignment_fields, failures
-
-
-def _camera_timeline(  # noqa: PLR0913 -- the source, available artifacts, and configured read contract
-    uri: str,
-    session_uri: str,
-    session_paths: list[str],
-    *,
-    camera: MultimodalSplitSensorConfig,
-    config: ResolvedMultimodalSplitConfig,
-    storage_profile: str,
-    index_lookup: Mp4IndexLookup | None,
-) -> tuple[npt.NDArray[np.int64], str | None]:
-    """Select one clock per camera; None identifies a legacy external sidecar."""
-    fields = camera.camera_alignment_fields
-    assert fields is not None
-    if index_lookup is not None:
-        index, metadata = index_lookup.require_index_for(uri, storage_profile=storage_profile)
-        return indexed_timeline(index, metadata, alignment_fields=fields)
-    relative_match = uri.removeprefix(f"{session_uri.rstrip('/')}/")
-    has_sidecar = timestamps_sidecar_uri(relative_match) in session_paths
-    # A listed-but-broken sidecar is a fault, not permission to change clocks.
-    for field in fields:
-        if field == "eof_ns" and has_sidecar:
-            return load_sensor_timestamps_ns(
-                uri, storage_profile=storage_profile, read_buffer_bytes=config.execution.read_buffer_bytes
-            ), None
-        if field in ("pts_ns", "edited_pts_ns"):
-            return load_container_pts_ns(
-                uri,
-                storage_profile=storage_profile,
-                read_buffer_bytes=config.execution.read_buffer_bytes,
-                alignment_field=VideoFrameAlignmentField(field),
-            ), field
-    msg = f"no sensor-timestamp sidecar or requested camera timestamps for {uri}; SOF/MOE require input.mp4_index_uri"
-    raise FileNotFoundError(msg)
 
 
 def open_mcap_sensors(
